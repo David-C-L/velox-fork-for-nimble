@@ -113,6 +113,15 @@ DEFINE_string(
     "",
     "Column to sort by for the 'sibling' arm. Must be row-aligned with the "
     "measured column, i.e. the same rows in the same order.");
+DEFINE_bool(
+    reorder_pin_splits,
+    false,
+    "Reuse the shipped order's split for every arm instead of selecting one per "
+    "arm. Off by default because it is not what an encoder does: it sees the "
+    "data in the order it arrives and splits on that. Pinning encodes a column "
+    "with a split fitted to a different ordering, which lets a transform earn "
+    "credit for compensating for a bad split. On only as a diagnostic, to "
+    "compare a section index across arms.");
 DEFINE_bool(validate, true, "Round-trip every transform before scoring it");
 DEFINE_bool(dry_run, false, "Print the sweep plan and exit");
 DEFINE_bool(
@@ -703,6 +712,83 @@ std::vector<uint32_t> buildArmPermutation(
     }
     return order;
   }
+  if (arm.kind == "mergeirr") {
+    // An irregular merge: k monotone runs consumed in random order, so the
+    // stride between consecutive rows of one run varies. Unlike the regular
+    // round robin this is not a stride permutation, and nothing in the data
+    // says which run a row came from, so no family can key on it.
+    const int runs = std::max(1, arm.param);
+    const auto sorted =
+        stableOrderBy(count, [&ownValues](uint32_t i) { return ownValues[i]; });
+    const size_t perRun = (count + runs - 1) / runs;
+    std::vector<size_t> cursor(runs, 0);
+    std::vector<int> live;
+    for (int run = 0; run < runs; ++run) {
+      if (static_cast<size_t>(run) * perRun < count) {
+        live.push_back(run);
+      }
+    }
+    size_t out = 0;
+    while (!live.empty() && out < count) {
+      std::uniform_int_distribution<size_t> pick(0, live.size() - 1);
+      const size_t slot = pick(rng);
+      const int run = live[slot];
+      const size_t index = static_cast<size_t>(run) * perRun + cursor[run];
+      const size_t runEnd = std::min(
+          static_cast<size_t>(run + 1) * perRun, count);
+      order[out++] = sorted[index];
+      if (++cursor[run] + static_cast<size_t>(run) * perRun >= runEnd) {
+        live.erase(live.begin() + static_cast<int64_t>(slot));
+      }
+    }
+    return order;
+  }
+  if (arm.kind == "mergekey") {
+    // The realistic multi-writer case: rows are partitioned by a field the
+    // value already carries, each partition is ordered, and the partitions are
+    // interleaved at irregular rates. A Snowflake column looks like this, with
+    // the worker and datacenter bits as the partition key. Because the key is
+    // in the data, the permutation that undoes the interleave is derivable
+    // from an already-decoded section, which is what the key-derived family
+    // needs and what every earlier arm denied it.
+    std::vector<uint32_t> byKey(count);
+    std::iota(byKey.begin(), byKey.end(), 0u);
+    std::stable_sort(
+        byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {
+          const uint64_t ka = sectionKey(a);
+          const uint64_t kb = sectionKey(b);
+          if (ka != kb) {
+            return ka < kb;
+          }
+          return ownValues[a] < ownValues[b];
+        });
+    std::vector<std::vector<uint32_t>> partitions;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t row = byKey[i];
+      if (i == 0 || sectionKey(row) != sectionKey(byKey[i - 1])) {
+        partitions.emplace_back();
+      }
+      partitions.back().push_back(row);
+    }
+    std::vector<size_t> cursor(partitions.size(), 0);
+    std::vector<size_t> live;
+    for (size_t i = 0; i < partitions.size(); ++i) {
+      if (!partitions[i].empty()) {
+        live.push_back(i);
+      }
+    }
+    size_t out = 0;
+    while (!live.empty() && out < count) {
+      std::uniform_int_distribution<size_t> pick(0, live.size() - 1);
+      const size_t slot = pick(rng);
+      const size_t part = live[slot];
+      order[out++] = partitions[part][cursor[part]];
+      if (++cursor[part] >= partitions[part].size()) {
+        live.erase(live.begin() + static_cast<int64_t>(slot));
+      }
+    }
+    return order;
+  }
   if (arm.kind == "blockshuffle") {
     // Locally ordered, globally not: an append-heavy table. Because the layer
     // under test is block-local, this is the control that says whether global
@@ -1009,7 +1095,33 @@ int runBenchmark() {
       auto physical = std::span<const Phys>(
           reinterpret_cast<const Phys*>(ordered.data()), ordered.size());
 
-      std::cout << "   arm " << armToken << "\n";
+      // An encoder sees the data in the order it arrives and splits on that,
+      // so the split is re-selected per arm unless the diagnostic flag pins
+      // it. The shipped-order split above is still what defines the arms
+      // themselves, which is a property of how the data was written rather
+      // than of how it is encoded.
+      std::vector<SegmentPlan> armSegments = segments;
+      if (!FLAGS_reorder_pin_splits) {
+        std::vector<uint64_t> armSamples;
+        sampleIntoU64(physical, armSamples, defaultSamplerConfig());
+        if (!armSamples.empty()) {
+          armSegments = selectSplits(
+                            armSamples,
+                            kBits,
+                            ordered.size(),
+                            defaultSelectorConfig())
+                            .segments;
+        }
+      }
+      const auto armNumSections = static_cast<int>(armSegments.size());
+      const auto armCandidates = buildCandidates(families, armNumSections);
+
+      std::cout << "   arm " << armToken << " : " << armNumSections
+                << " sections:";
+      for (const auto& segment : armSegments) {
+        std::cout << " [" << segment.bitStart << ".." << segment.bitEnd << "]";
+      }
+      std::cout << "\n";
 
       for (Inventory inventory : inventories) {
         const auto encodings = inventoryEncodings(inventory);
@@ -1024,18 +1136,18 @@ int runBenchmark() {
           }
 
           double sumBaselinePerElem = 0.0;
-          std::vector<double> sumNetPerElem(candidates.size(), 0.0);
-          std::vector<double> sumForcedPerElem(candidates.size(), 0.0);
+          std::vector<double> sumNetPerElem(armCandidates.size(), 0.0);
+          std::vector<double> sumForcedPerElem(armCandidates.size(), 0.0);
 
           for (size_t block = 0; block < blockLimit; ++block) {
             const size_t begin = block * blockRows;
 
             // Extract every section for this block once; each candidate then
             // rewrites the sections rather than re-reading the column.
-            std::vector<std::vector<uint64_t>> sections(numSections);
-            std::vector<int> widths(numSections);
-            for (int s = 0; s < numSections; ++s) {
-              const int width = segments[s].bitEnd - segments[s].bitStart + 1;
+            std::vector<std::vector<uint64_t>> sections(armNumSections);
+            std::vector<int> widths(armNumSections);
+            for (int s = 0; s < armNumSections; ++s) {
+              const int width = armSegments[s].bitEnd - armSegments[s].bitStart + 1;
               widths[s] = width;
               const uint64_t mask = width >= 64
                   ? ~uint64_t{0}
@@ -1044,15 +1156,15 @@ int runBenchmark() {
               for (uint32_t i = 0; i < blockRows; ++i) {
                 const auto value =
                     static_cast<uint64_t>(physical[begin + i]);
-                sections[s][i] = (value >> segments[s].bitStart) & mask;
+                sections[s][i] = (value >> armSegments[s].bitStart) & mask;
               }
             }
 
-            std::vector<size_t> baselineBits(numSections, 0);
+            std::vector<size_t> baselineBits(armNumSections, 0);
             std::vector<EncodingType> baselineEncoding(
-                numSections, EncodingType::Trivial);
+                armNumSections, EncodingType::Trivial);
             size_t blockBaselineBits = 0;
-            for (int s = 0; s < numSections; ++s) {
+            for (int s = 0; s < armNumSections; ++s) {
               const size_t bytes = bestSectionBytes(
                   sections[s],
                   widths[s],
@@ -1065,12 +1177,12 @@ int runBenchmark() {
             sumBaselinePerElem +=
                 static_cast<double>(blockBaselineBits) / blockRows;
 
-            for (size_t c = 0; c < candidates.size(); ++c) {
-              const auto& candidate = candidates[c];
+            for (size_t c = 0; c < armCandidates.size(); ++c) {
+              const auto& candidate = armCandidates[c];
               double optInBits = 0.0;
               double forcedBits = 0.0;
 
-              for (int s = 0; s < numSections; ++s) {
+              for (int s = 0; s < armNumSections; ++s) {
                 // A key section drives the permutation, so it must reach the
                 // decoder in original order and cannot itself be permuted.
                 if (candidate.family == "B" && candidate.keySection == s) {
@@ -1129,7 +1241,7 @@ int runBenchmark() {
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
                 csv.set("block_index", static_cast<int64_t>(block));
-                csv.set("num_sections", static_cast<int64_t>(numSections));
+                csv.set("num_sections", static_cast<int64_t>(armNumSections));
                 csv.set("family", candidate.family);
                 csv.set("transform", candidate.name);
                 csv.set("param", candidate.param);
@@ -1138,8 +1250,8 @@ int runBenchmark() {
                 csv.set("scope", "SECTION");
                 csv.set("section_index", static_cast<int64_t>(s));
                 csv.set(
-                    "bit_start", static_cast<int64_t>(segments[s].bitStart));
-                csv.set("bit_end", static_cast<int64_t>(segments[s].bitEnd));
+                    "bit_start", static_cast<int64_t>(armSegments[s].bitStart));
+                csv.set("bit_end", static_cast<int64_t>(armSegments[s].bitEnd));
                 csv.set("section_width", static_cast<int64_t>(widths[s]));
                 csv.set(
                     "encoding_baseline", encodingName(baselineEncoding[s]));
@@ -1171,7 +1283,7 @@ int runBenchmark() {
               csv.set("inventory", inventoryName(inventory));
               csv.set("block_rows", static_cast<int64_t>(blockRows));
               csv.set("block_index", static_cast<int64_t>(block));
-              csv.set("num_sections", static_cast<int64_t>(numSections));
+              csv.set("num_sections", static_cast<int64_t>(armNumSections));
               csv.set("family", candidate.family);
               csv.set("transform", candidate.name);
               csv.set("param", candidate.param);
@@ -1213,7 +1325,7 @@ int runBenchmark() {
 
           // Console summary: the ranked view the design document reads from.
           const double baselinePerElem = sumBaselinePerElem / blockLimit;
-          std::vector<size_t> ranking(candidates.size());
+          std::vector<size_t> ranking(armCandidates.size());
           std::iota(ranking.begin(), ranking.end(), size_t{0});
           std::sort(
               ranking.begin(),
@@ -1233,8 +1345,8 @@ int runBenchmark() {
             if (optIn <= 0.0) {
               break;
             }
-            std::cout << "      " << std::setw(12) << candidates[c].name << " "
-                      << std::setw(18) << candidates[c].param
+            std::cout << "      " << std::setw(12) << armCandidates[c].name << " "
+                      << std::setw(18) << armCandidates[c].param
                       << "  opt-in=" << std::showpos << std::setprecision(2)
                       << optIn << "  forced=" << forced << std::noshowpos
                       << " b/e\n";
