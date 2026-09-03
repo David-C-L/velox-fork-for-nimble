@@ -1233,6 +1233,7 @@ int runBenchmark() {
       "encode_ns_per_row",
       "prod_split_bits",
       "oracle_split_bits",
+      "global_split_bits",
       "prod_split_sections",
       "oracle_split_sections",
       "skipped"};
@@ -1606,6 +1607,12 @@ int runBenchmark() {
 
             std::map<std::string, double> prodTotal;
             std::map<std::string, double> oracleTotal;
+            // Summed cost grid across blocks. A DP over this picks ONE split
+            // for every block, which is what the encoding can actually
+            // express: a split covers a stream, not a block. Comparing it
+            // against the per-block oracle separates the cost model's error
+            // from per-block adaptivity, which no cost-model fix can reach.
+            std::map<std::string, std::vector<std::vector<double>>> summedCost;
 
             for (size_t block = 0; block < searchBlocks; ++block) {
               const size_t begin = block * blockStride * blockRows;
@@ -1657,6 +1664,20 @@ int runBenchmark() {
                 prodTotal[searchTransform.name] += onProdSplit;
                 oracleTotal[searchTransform.name] +=
                     splitDp(cost, kBits, splitPenalty);
+
+                auto& summed = summedCost[searchTransform.name];
+                if (summed.empty()) {
+                  summed.assign(kBits, std::vector<double>(kBits, 0.0));
+                }
+                for (int l = 0; l < kBits; ++l) {
+                  for (int r = l; r < kBits; ++r) {
+                    if (cost[l][r] != std::numeric_limits<double>::infinity()) {
+                      summed[l][r] += cost[l][r];
+                    } else {
+                      summed[l][r] = std::numeric_limits<double>::infinity();
+                    }
+                  }
+                }
               }
             }
 
@@ -1665,6 +1686,11 @@ int runBenchmark() {
                   static_cast<double>(searchBlocks) * blockRows;
               const double prodPerElem = prod / denominator;
               const double oraclePerElem = oracleTotal[name] / denominator;
+              // One split for all blocks, chosen against real bytes. This is
+              // the ceiling a better cost model could reach.
+              const double globalPerElem =
+                  splitDp(summedCost[name], kBits, splitPenalty * searchBlocks) /
+                  denominator;
 
               csv.beginRow();
               csv.set("driver", "bench_reorder_oracle");
@@ -1678,6 +1704,7 @@ int runBenchmark() {
               csv.set("section_index", static_cast<int64_t>(-1));
               csv.set("prod_split_bits", prodPerElem);
               csv.set("oracle_split_bits", oraclePerElem);
+              csv.set("global_split_bits", globalPerElem);
               csv.set(
                   "prod_split_sections", static_cast<int64_t>(armNumSections));
               csv.set("net_bits_per_elem", prodPerElem - oraclePerElem);
@@ -1687,8 +1714,10 @@ int runBenchmark() {
               std::cout << "      split-search " << std::setw(12) << name
                         << "  prod-split " << std::fixed << std::setprecision(2)
                         << prodPerElem << "  transform-aware split "
-                        << oraclePerElem << "  worth " << std::showpos
-                        << (prodPerElem - oraclePerElem) << std::noshowpos
+                        << oraclePerElem << "  one-split oracle "
+                        << globalPerElem << "  cost-model gap " << std::showpos
+                        << (prodPerElem - globalPerElem) << "  per-block extra "
+                        << (globalPerElem - oraclePerElem) << std::noshowpos
                         << " b/e\n";
             }
           }

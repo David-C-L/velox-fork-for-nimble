@@ -430,11 +430,49 @@ be building the smaller lever against a baseline that is about to move.
 
 No format change. No new encoding. The largest measured number in the whole study.
 
-Choosing boundaries against real encoded bytes rather than the DP's cost model is worth 1 to 9
-b/e, positive in 34 of 36 measured cells. `MlIdCostModelOracleBenchmark` already measures the
-gap between the two, so the work is to narrow it: improve the per-encoding cost functions in
-`SubIntSplitCostModels.h`, or sample-encode the top few candidate ranges rather than trusting
-the model for all of them.
+**What the gap is.** The DP in `SubIntSplitSelector.h` costs every candidate bit range with
+`bestCostBits`, and that estimate is wrong in four separate ways:
+
+```cpp
+const SegmentMetrics metrics = collector.compute(segValues, requiredFlags);
+const double perSampleCost = costFn(metrics, numSamples, bitWidth, bestEnc);
+const double fullCost = perSampleCost * fullCount / numSamples;
+```
+
+1. `bestCostBits` is an **analytic formula over summary metrics**, cardinality, run count,
+   min and max, rather than an encode. It predicts a size, it does not measure one.
+2. It scores **seven flat encodings and omits Delta and Huffman entirely**, neither of which
+   appears in its `consider` list. Under production nested selection Delta wins 24,133 sections
+   and Huffman 33,761, so ranges where those win are mispriced by construction.
+3. **Dictionary is priced without its nested index encoding.** With flat scoring Dictionary
+   never wins a single section; with real nested selection it wins 47,608. The model is costing
+   Dictionary as though its codes were stored raw.
+4. `perSampleCost * fullCount / numSamples` **extrapolates linearly from a sample**, which is
+   wrong for RLE, whose run structure changes with length, and for Dictionary, whose alphabet
+   does not grow linearly with rows.
+
+**How large it is, separated from per-block adaptivity.** An earlier measurement compared the
+production split against a per-block oracle, which conflated the model's error with something a
+cost-model fix cannot reach: a split covers a stream, not a block, so per-block boundaries are
+not expressible. Re-measured with a single oracle split chosen across all blocks, the two
+separate cleanly and the per-block part is small:
+
+| Dataset, arm, inventory | Production split | One-split oracle | Cost-model gap | Per-block extra |
+|---|---|---|---|---|
+| `snowflake`, shipped, base | 47.62 | 43.52 | **+4.10 b/e (8.6%)** | +1.06 |
+| `snowflake`, `mergeirr=8`, base | 57.98 | 49.49 | **+8.48 b/e (14.6%)** | +0.17 |
+| `osm_s2_l30`, shipped, base | 45.78 | 41.71 | **+4.06 b/e (8.9%)** | +0.15 |
+| `osm_h3_r9`, shipped, base | 13.49 | 11.98 | **+1.51 b/e (11.2%)** | +0.28 |
+| `osm_h3_r9`, shipped, entropy | 12.05 | 11.44 | +0.61 b/e (5.1%) | +0.41 |
+
+The cost-model gap runs +0.19 to +8.61 b/e and the per-block remainder +0.00 to +1.06, so
+almost all of it is reachable by a single, stream-wide split chosen better.
+
+**The work.** Add Delta and Huffman to `bestCostBits`; price Dictionary with a nested index
+rather than raw codes; and replace the linear extrapolation, or sample-encode the top few
+candidate ranges instead of trusting the model for all 2080 of them.
+`MlIdCostModelOracleBenchmark` already reports top-1 accuracy, Spearman correlation and
+plan-level regret against a true-bytes oracle, so it measures progress directly.
 
 **Gate.** Re-run `MlIdReorderOracleBenchmark`. On OSM and Snowflake the best transform adds
 +0.00 and +0.73 b/e once boundaries are good, so if this stage lands most of its available
