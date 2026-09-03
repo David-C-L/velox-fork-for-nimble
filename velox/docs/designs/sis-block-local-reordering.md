@@ -468,16 +468,71 @@ separate cleanly and the per-block part is small:
 The cost-model gap runs +0.19 to +8.61 b/e and the per-block remainder +0.00 to +1.06, so
 almost all of it is reachable by a single, stream-wide split chosen better.
 
-**The work.** Add Delta and Huffman to `bestCostBits`; price Dictionary with a nested index
-rather than raw codes; and replace the linear extrapolation, or sample-encode the top few
-candidate ranges instead of trusting the model for all 2080 of them.
-`MlIdCostModelOracleBenchmark` already reports top-1 accuracy, Spearman correlation and
-plan-level regret against a true-bytes oracle, so it measures progress directly.
+**Most of this work already exists on `nimble-880-migration`.** That branch's `bestCostBits`
+considers fourteen candidates against seven here, adding Delta, Huffman, PFOR, FOR, DeltaBlock
+and FrequencyPartition, and corrects the MainlyConstant, Dictionary and Delta biases:
+
+| Commit | What |
+|---|---|
+| `a96b8a08f` | cost models for FOR and Delta |
+| `cf93566da` | cost models for Huffman and DeltaBlock |
+| `665409bcf` | corrects SIS cost-model bias for MainlyConstant, Dictionary and Delta |
+| `23afc685f` | corrects the Delta restatement charge and packed-delta rounding |
+| `1beaab46b`, `db951ac40`, `410f2ff74` | FrequencyPartition cost model and index sizing |
+
+**What is missing is validation through the drivers, not the code.** Those commits touch only
+`SubIntSplitCostModels.h` and `SubIntSplitCostModelsTest.cpp`, which are unit tests over the
+cost functions themselves. No results directory references that branch, and although
+`MlIdCostModelOracleBenchmark` exists there it does not appear to have been run against it. A
+unit test can confirm a formula returns the number its author intended; it cannot show that the
+DP now picks better boundaries, which is the thing that matters.
+
+So stage 0 is: merge that branch forward, then run `MlIdCostModelOracleBenchmark` for top-1
+accuracy, Spearman correlation and plan-level regret against a true-bytes oracle, and
+`MlIdReorderOracleBenchmark` for the end-to-end split quality, and see how much of the gap
+below it actually closes. The remaining known weakness after that is the linear extrapolation
+`perSampleCost * fullCount / numSamples`, which none of those commits addresses.
 
 **Gate.** Re-run `MlIdReorderOracleBenchmark`. On OSM and Snowflake the best transform adds
 +0.00 and +0.73 b/e once boundaries are good, so if this stage lands most of its available
 gain, the reordering layer's value on those columns is already spoken for and only the PublicBI
 case justifies going further.
+
+### What the layer is worth after stage 0
+
+Measured, by scoring the best transform on top of a single stream-wide split chosen against
+real bytes, which is the ceiling stage 0 aims at. Across 36 cells stage 0 takes a median
++3.85 b/e and the layer keeps a median +1.66 b/e, but the median hides the shape of it, which
+is what decides the scope.
+
+| Column | Stage 0 takes | Layer keeps after | Layer % |
+|---|---|---|---|
+| OSM `s2_l30`, all arms | +3.78 to +4.38 b/e | **+0.00** | 0.0% |
+| OSM `h3_r9`, all arms | +0.19 to +2.15 b/e | +0.00 to +0.26 | 0 to 2.2% |
+| `snowflake`, shipped | +4.10 b/e | +1.54, and +0.00 under entropy | 0 to 3.5% |
+| `snowflake`, `mergeirr=8` | +8.48 b/e | +3.08, +1.75 under entropy | 4.0 to 6.2% |
+| `xmark_prepost_full`, shipped | +7.55 b/e | +4.65, +1.44 under entropy | 12 to 26% |
+| `publicbi_id1`, all arms | +1.22 to +5.47 b/e | **+4.68 to +6.88** | 28 to 37% |
+| `publicbi_npi`, all arms | −0.01 to +7.78 b/e | **+8.01 to +9.62** | 27 to 64% |
+
+**On the designed ID schemes the layer is essentially gone.** OSM `s2_l30` keeps exactly +0.00
+on every arm and inventory; `h3_r9` keeps at most +0.26 b/e. Snowflake keeps +1.5 to +3.1 b/e
+on some arms and exactly +0.00 on shipped-with-entropy. Fixing the cost model captures what the
+transform was capturing, which is the substitution effect measured earlier, now quantified
+against the realistic one-split ceiling rather than a per-block one.
+
+**On the arbitrary BI columns it survives intact and sometimes grows.** `Medicare1.NPI` keeps
++8.01 to +9.62 b/e, 27 to 64% of the post-stage-0 size, and on its irregular-merge arm stage 0
+buys nothing at all (−0.01) while the layer buys +8.79 b/e. `Corporations.Id1` keeps +4.68 to
++6.88 b/e. Both *increase* under an entropy coder rather than shrinking.
+
+**So the scope after stage 0 is PublicBI-shaped columns, plus XMark.** That is a narrower and
+more honest case than the one this design opened with, and it should be stated to anyone
+deciding whether to build it: if the target columns are Snowflake- or OSM-shaped, stage 0 is
+the whole project.
+
+One caveat in the layer's favour. The one-split oracle is a ceiling stage 0 will not fully
+reach, so wherever stage 0 falls short the layer retains more than the table shows.
 
 ### Stage 1. Check whether relabelling needs a wire change at all
 
