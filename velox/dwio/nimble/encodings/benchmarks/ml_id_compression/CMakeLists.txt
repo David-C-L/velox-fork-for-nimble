@@ -130,6 +130,12 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_ablation_benchmark MlIdAblationBenchmark.cpp
 )
 
+# MlIdReorderOracleBenchmark: scores block-local reordering transforms for SIS
+# sections against the real cost of restoring the original row order.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_reorder_oracle_benchmark MlIdReorderOracleBenchmark.cpp
+)
+
 # MlIdSmokeBenchmark: encode + decode correctness check (no timing). Sweeps
 # every supported element type, so it is also the compile-coverage gate.
 nimble_add_ml_id_benchmark(
