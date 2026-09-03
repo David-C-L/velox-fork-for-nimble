@@ -1139,8 +1139,16 @@ int runBenchmark() {
           std::vector<double> sumNetPerElem(armCandidates.size(), 0.0);
           std::vector<double> sumForcedPerElem(armCandidates.size(), 0.0);
 
+          // Blocks are sampled across the whole column rather than taken
+          // from the front. An arm permutes the column globally, so the first
+          // N blocks of one arm hold different rows from the first N of
+          // another: on a descending file the front blocks carry the largest
+          // values while the sorted arm's front blocks carry the smallest.
+          // Striding makes every arm cover the same rows, which is what makes
+          // one arm's baseline comparable to another's.
+          const size_t blockStride = std::max<size_t>(1, totalBlocks / blockLimit);
           for (size_t block = 0; block < blockLimit; ++block) {
-            const size_t begin = block * blockRows;
+            const size_t begin = block * blockStride * blockRows;
 
             // Extract every section for this block once; each candidate then
             // rewrites the sections rather than re-reading the column.
@@ -1240,7 +1248,7 @@ int runBenchmark() {
                 csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
-                csv.set("block_index", static_cast<int64_t>(block));
+                csv.set("block_index", static_cast<int64_t>(block * blockStride));
                 csv.set("num_sections", static_cast<int64_t>(armNumSections));
                 csv.set("family", candidate.family);
                 csv.set("transform", candidate.name);
@@ -1282,7 +1290,7 @@ int runBenchmark() {
               csv.set("order_arm", armToken);
               csv.set("inventory", inventoryName(inventory));
               csv.set("block_rows", static_cast<int64_t>(blockRows));
-              csv.set("block_index", static_cast<int64_t>(block));
+              csv.set("block_index", static_cast<int64_t>(block * blockStride));
               csv.set("num_sections", static_cast<int64_t>(armNumSections));
               csv.set("family", candidate.family);
               csv.set("transform", candidate.name);
@@ -1307,7 +1315,7 @@ int runBenchmark() {
                 csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
-                csv.set("block_index", static_cast<int64_t>(block));
+                csv.set("block_index", static_cast<int64_t>(block * blockStride));
                 csv.set("family", candidate.family);
                 csv.set("transform", candidate.name);
                 csv.set("param", candidate.param);
