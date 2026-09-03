@@ -108,6 +108,11 @@ DEFINE_bool(
     reorder_forced_baseline,
     true,
     "Also score each permutation family forced on every section");
+DEFINE_string(
+    reorder_sibling_file,
+    "",
+    "Column to sort by for the 'sibling' arm. Must be row-aligned with the "
+    "measured column, i.e. the same rows in the same order.");
 DEFINE_bool(validate, true, "Round-trip every transform before scoring it");
 DEFINE_bool(dry_run, false, "Print the sweep plan and exit");
 DEFINE_bool(
@@ -570,6 +575,158 @@ SectionOutcome applyCandidate(
   return outcome;
 }
 
+// ---------------------------------------------------------------------------
+// Input-order arms
+// ---------------------------------------------------------------------------
+
+// An arm rearranges the column before any split selection or transform, so it
+// controls what structure exists in the input and how it lines up with the
+// sections. The two extremes on their own are a poor probe: shuffling destroys
+// structure, so the gain from re-sorting and the cost of storing the
+// permutation rise together and cancel. The interesting cases sit between,
+// where the data carries real order that is misaligned with the section that
+// could exploit it.
+struct OrderArm {
+  std::string label;
+  std::string kind;
+  int param{0};
+};
+
+OrderArm parseOrderArm(const std::string& token) {
+  OrderArm arm;
+  arm.label = token;
+  const auto equals = token.find('=');
+  if (equals == std::string::npos) {
+    arm.kind = token;
+    return arm;
+  }
+  arm.kind = token.substr(0, equals);
+  arm.param = std::stoi(token.substr(equals + 1));
+  return arm;
+}
+
+// Stable sort of row indices by an arbitrary key, so ties keep file order.
+template <typename KeyFn>
+std::vector<uint32_t> stableOrderBy(size_t count, KeyFn key) {
+  std::vector<uint32_t> order(count);
+  std::iota(order.begin(), order.end(), 0u);
+  std::stable_sort(order.begin(), order.end(), [&key](uint32_t a, uint32_t b) {
+    return key(a) < key(b);
+  });
+  return order;
+}
+
+// Builds one arm's row order. `sectionKey` supplies section values for the arms
+// that sort on one, and is taken from the shipped order so that every arm is
+// defined against the same split.
+std::vector<uint32_t> buildArmPermutation(
+    const OrderArm& arm,
+    size_t count,
+    uint64_t seed,
+    const std::function<uint64_t(uint32_t)>& sectionKey,
+    const std::vector<uint64_t>& ownValues,
+    const std::vector<uint64_t>& siblingValues,
+    bool& ok) {
+  ok = true;
+  std::vector<uint32_t> order(count);
+  std::iota(order.begin(), order.end(), 0u);
+  std::mt19937_64 rng(seed ^ 0x5eed5eed5eed5eedULL);
+
+  if (arm.kind == "shipped") {
+    return order;
+  }
+  if (arm.kind == "shuffled") {
+    std::shuffle(order.begin(), order.end(), rng);
+    return order;
+  }
+  if (arm.kind == "sorted") {
+    return stableOrderBy(
+        count, [&ownValues](uint32_t i) { return ownValues[i]; });
+  }
+  if (arm.kind == "reversed") {
+    std::reverse(order.begin(), order.end());
+    return order;
+  }
+  if (arm.kind == "sorted_by_section") {
+    return stableOrderBy(count, sectionKey);
+  }
+  if (arm.kind == "sibling") {
+    if (siblingValues.size() != count) {
+      ok = false;
+      return order;
+    }
+    return stableOrderBy(
+        count, [&siblingValues](uint32_t i) { return siblingValues[i]; });
+  }
+  if (arm.kind == "displaced") {
+    // Sorted, then every row displaced by a bounded random offset. Sweeping
+    // the window traces the whole range between sorted and shuffled instead of
+    // sampling only the endpoints, which is what decides whether a stored
+    // permutation index can ever pay.
+    const auto sorted =
+        stableOrderBy(count, [&ownValues](uint32_t i) { return ownValues[i]; });
+    const int window = std::max(0, arm.param);
+    if (window == 0) {
+      return sorted;
+    }
+    std::vector<std::pair<int64_t, uint32_t>> keyed(count);
+    std::uniform_int_distribution<int64_t> jitter(-window, window);
+    for (size_t i = 0; i < count; ++i) {
+      keyed[i] = {static_cast<int64_t>(i) + jitter(rng), sorted[i]};
+    }
+    std::stable_sort(
+        keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+          return a.first < b.first;
+        });
+    for (size_t i = 0; i < count; ++i) {
+      order[i] = keyed[i].second;
+    }
+    return order;
+  }
+  if (arm.kind == "merge") {
+    // A k-way merge of monotone runs, which is what a column written by k
+    // shards or partitions looks like. The permutation that undoes it is a
+    // de-interleave, derivable from whichever section carries the shard id, so
+    // this is the case the key-derived family is designed for.
+    const int runs = std::max(1, arm.param);
+    const auto sorted =
+        stableOrderBy(count, [&ownValues](uint32_t i) { return ownValues[i]; });
+    const size_t perRun = (count + runs - 1) / runs;
+    size_t out = 0;
+    for (size_t offset = 0; offset < perRun; ++offset) {
+      for (int run = 0; run < runs; ++run) {
+        const size_t index = static_cast<size_t>(run) * perRun + offset;
+        if (index < count) {
+          order[out++] = sorted[index];
+        }
+      }
+    }
+    return order;
+  }
+  if (arm.kind == "blockshuffle") {
+    // Locally ordered, globally not: an append-heavy table. Because the layer
+    // under test is block-local, this is the control that says whether global
+    // disorder matters at all once within-block order is preserved.
+    const int group = std::max(1, arm.param);
+    const size_t numGroups = (count + group - 1) / group;
+    std::vector<uint32_t> groupOrder(numGroups);
+    std::iota(groupOrder.begin(), groupOrder.end(), 0u);
+    std::shuffle(groupOrder.begin(), groupOrder.end(), rng);
+    size_t out = 0;
+    for (uint32_t g : groupOrder) {
+      const size_t begin = static_cast<size_t>(g) * group;
+      const size_t end = std::min(begin + group, count);
+      for (size_t i = begin; i < end; ++i) {
+        order[out++] = static_cast<uint32_t>(i);
+      }
+    }
+    return order;
+  }
+
+  ok = false;
+  return order;
+}
+
 std::vector<Candidate> buildCandidates(
     const std::vector<std::string>& families,
     int numSections) {
@@ -763,44 +920,96 @@ int runBenchmark() {
       continue;
     }
 
-    for (const auto& arm : orderArms) {
-      std::vector<Elem> ordered(data.begin(), data.end());
-      if (arm == "shuffled") {
-        // A column's shipped order is often incidental; the randomised arm is
-        // what separates a property of the encoding from an accident of the
-        // file.
-        std::mt19937_64 rng(seed ^ 0x5eed5eed5eed5eedULL);
-        std::shuffle(ordered.begin(), ordered.end(), rng);
-      } else if (arm != "shipped") {
-        std::cerr << "Unknown order arm: " << arm << "\n";
-        return 1;
+    // The split is selected once, from the shipped order, and reused by every
+    // arm. Re-selecting per arm would let a reordered input land on different
+    // boundaries, which silently makes a section index mean something
+    // different in each arm and invalidates any cross-arm comparison of the
+    // key-derived family.
+    std::vector<uint64_t> shippedSamples;
+    {
+      auto shippedPhysical = std::span<const Phys>(
+          reinterpret_cast<const Phys*>(data.data()), data.size());
+      sampleIntoU64(shippedPhysical, shippedSamples, defaultSamplerConfig());
+    }
+    if (shippedSamples.empty()) {
+      std::cerr << "  [SKIP] " << dataset.name << ": empty sample\n";
+      continue;
+    }
+    const auto selection = selectSplits(
+        shippedSamples, kBits, data.size(), defaultSelectorConfig());
+    const auto& segments = selection.segments;
+    const auto numSections = static_cast<int>(segments.size());
+    const auto candidates = buildCandidates(families, numSections);
+
+    std::cout << "== " << dataset.name << " : " << numSections
+              << " sections:";
+    for (const auto& segment : segments) {
+      std::cout << " [" << segment.bitStart << ".." << segment.bitEnd << "]";
+    }
+    std::cout << "\n";
+
+    // Values in shipped order, used to define the arms.
+    std::vector<uint64_t> ownValues(data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+      ownValues[i] = static_cast<uint64_t>(
+          reinterpret_cast<const Phys*>(data.data())[i]);
+    }
+
+    std::vector<uint64_t> siblingValues;
+    if (!FLAGS_reorder_sibling_file.empty()) {
+      try {
+        const auto sibling =
+            detail::loadColumnLines<Elem>(FLAGS_reorder_sibling_file, numRows);
+        siblingValues.resize(sibling.size());
+        for (size_t i = 0; i < sibling.size(); ++i) {
+          siblingValues[i] = static_cast<uint64_t>(
+              reinterpret_cast<const Phys*>(sibling.data())[i]);
+        }
+      } catch (const std::exception& ex) {
+        std::cerr << "  [WARN] sibling column unavailable: " << ex.what()
+                  << "\n";
+      }
+    }
+
+    for (const auto& armToken : orderArms) {
+      const OrderArm arm = parseOrderArm(armToken);
+
+      // Arms that sort on a section use the split selected above, so the key
+      // means the same thing in every arm.
+      const int keySection = std::min(arm.param, numSections - 1);
+      const int keyStart = segments[std::max(0, keySection)].bitStart;
+      const int keyWidth = segments[std::max(0, keySection)].bitEnd -
+          segments[std::max(0, keySection)].bitStart + 1;
+      const uint64_t keyMask =
+          keyWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << keyWidth) - 1);
+      const std::function<uint64_t(uint32_t)> sectionKey =
+          [&ownValues, keyStart, keyMask](uint32_t i) {
+            return (ownValues[i] >> keyStart) & keyMask;
+          };
+
+      bool armOk = true;
+      const auto armOrder = buildArmPermutation(
+          arm,
+          data.size(),
+          seed,
+          sectionKey,
+          ownValues,
+          siblingValues,
+          armOk);
+      if (!armOk) {
+        std::cerr << "  [SKIP] unusable order arm: " << armToken << "\n";
+        continue;
+      }
+
+      std::vector<Elem> ordered(data.size());
+      for (size_t i = 0; i < armOrder.size(); ++i) {
+        ordered[i] = data[armOrder[i]];
       }
 
       auto physical = std::span<const Phys>(
           reinterpret_cast<const Phys*>(ordered.data()), ordered.size());
 
-      // The splits come from the production selector, so the sections scored
-      // here are the sections SubIntSplit would actually choose.
-      std::vector<uint64_t> samples;
-      sampleIntoU64(physical, samples, defaultSamplerConfig());
-      if (samples.empty()) {
-        std::cerr << "  [SKIP] " << dataset.name << "/" << arm
-                  << ": empty sample\n";
-        continue;
-      }
-      const auto selection =
-          selectSplits(samples, kBits, ordered.size(), defaultSelectorConfig());
-      const auto& segments = selection.segments;
-      const auto numSections = static_cast<int>(segments.size());
-
-      std::cout << "== " << dataset.name << " / " << arm << " : "
-                << numSections << " sections:";
-      for (const auto& segment : segments) {
-        std::cout << " [" << segment.bitStart << ".." << segment.bitEnd << "]";
-      }
-      std::cout << "\n";
-
-      const auto candidates = buildCandidates(families, numSections);
+      std::cout << "   arm " << armToken << "\n";
 
       for (Inventory inventory : inventories) {
         const auto encodings = inventoryEncodings(inventory);
@@ -916,7 +1125,7 @@ int runBenchmark() {
                 csv.set("driver", "bench_reorder_oracle");
                 csv.set("dtype", elemTypeName<Elem>());
                 csv.set("dataset", dataset.name);
-                csv.set("order_arm", arm);
+                csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
                 csv.set("block_index", static_cast<int64_t>(block));
@@ -958,7 +1167,7 @@ int runBenchmark() {
               csv.set("driver", "bench_reorder_oracle");
               csv.set("dtype", elemTypeName<Elem>());
               csv.set("dataset", dataset.name);
-              csv.set("order_arm", arm);
+              csv.set("order_arm", armToken);
               csv.set("inventory", inventoryName(inventory));
               csv.set("block_rows", static_cast<int64_t>(blockRows));
               csv.set("block_index", static_cast<int64_t>(block));
@@ -983,7 +1192,7 @@ int runBenchmark() {
                 csv.set("driver", "bench_reorder_oracle");
                 csv.set("dtype", elemTypeName<Elem>());
                 csv.set("dataset", dataset.name);
-                csv.set("order_arm", arm);
+                csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
                 csv.set("block_index", static_cast<int64_t>(block));
