@@ -94,7 +94,49 @@ change is made once, but both `SubIntSplitEncoding` and `SubIntSplitEncodingView
 it.
 
 The key section is stored **unpermuted**. It is what rebuilds the order, so it cannot itself
-be reordered.
+be reordered. This holds for a composed transform too, which begins with the same permutation.
+
+### Compatibility
+
+**New reader, old data: safe.** Every stream written before this change carries zero in the
+reserved byte, which means no transform, so old data reads unchanged.
+
+**Old reader, new data: unsafe, and silently so.** The current parser reads the reserved byte
+and discards it:
+
+```cpp
+const uint8_t splitCount = encoding::read<uint8_t>(pos);
+encoding::read<uint8_t>(pos); // reserved order byte
+```
+
+Nothing validates it. An existing reader handed a stream with a non-zero transform id would
+decode the sections, skip the inverse, and return **transformed values as though they were the
+originals**: wrong data, no error, no signal. The extra header fields would also shift the
+section triples it expects.
+
+So the reserved byte alone is not a safe migration. The options, in order of preference:
+
+1. **Allocate a new `EncodingType`.** An old reader meets an encoding it does not know and
+   fails loudly in the factory, which is the correct behaviour for data it cannot decode. This
+   costs one enum value and is the recommended route.
+2. Reuse the reserved byte, and only where every reader is known to be upgraded first. Cheaper
+   on the wire, but it converts a version skew into silent corruption rather than an error.
+
+Whichever is chosen, a reader that meets an unknown transform id must fail rather than decode:
+an unrecognised transform produces wrong values, not degraded ones.
+
+### Relabelling may not need a format change at all
+
+Worth establishing before any wire change is made. Of the sections where dense or frequency
+relabelling is adopted, **59% had already chosen `Dictionary` and switched to
+`FixedBitWidth` after relabelling**, with a further 16 to 18% switching to `Varint`. That is
+close to what `DictionaryEncoding` already does: it stores an alphabet and per-row codes.
+
+The gain is therefore coming from how the *codes* are encoded, not from the relabelling being
+a new capability. It may be reachable by improving the encoding of a dictionary's index stream,
+or by letting nested selection consider dense-remap-then-bit-pack, neither of which touches the
+SubIntSplit header. Gray coding is the exception: it is a genuine value map, carries no
+codebook, and has no existing equivalent.
 
 ### Encode
 
@@ -240,6 +282,65 @@ conventions in the nimble CMakeLists:
 * A section used as a key must round-trip while stored unpermuted.
 * An unknown transform id must throw, not misdecode.
 * Point-lookup latency with and without the rank cache, against the 908 ns view baseline.
+
+## Where the gains are, by column
+
+The gains are not spread evenly, and the columns they favour are not the ones this encoding
+was built for.
+
+| Column | Best realistic arm | Gain | Family |
+|---|---|---|---|
+| `Medicare1.NPI` | interleaved | 28 to 32% | key-derived |
+| OSM `h3_r9`, coarse | interleaved | 17 to 22% | key-derived |
+| OSM `h3_r9`, coarse | sorted by a sibling | 8% | key-derived |
+| OSM `s2_l30`, `h3_r15`, `morton_2x32`, fine | interleaved by a carried key | 7.5 to 10.6% | key-derived |
+| OSM fine | any other realistic arm | under 1% | any |
+| `snowflake` | shipped | 3.5% single, 5 to 6% composed | bit-plane, or key-derived then bit-plane |
+
+**Fine-resolution spatial columns and Snowflake are the weak cases.** On `s2_l30`, `h3_r15`
+and `morton_2x32` no family clears 1% on any arm except `mergekey`, where a key carried in the
+value gives the permutation something to group by. That is consistent with the earlier finding
+that the low bits of a fine space-filling-curve position are incompressible noise: there is no
+structure for a reordering to expose, at any resolution the curve is fine enough to be
+near-unique. The coarse `h3_r9` behaves completely differently, at 8 to 22%.
+
+Snowflake resists every single transform, at most 3.5% from bit-plane transposition and under
+1.1% from the key-derived permutation, and the bit-plane gain largely disappears under an
+entropy coder. Its one real result comes from composition, below.
+
+## Do transforms stack?
+
+Measured, by composing the key-derived permutation with a per-section transform and scoring the
+result as its own candidate. Across 52 cells the composition delivers a **median of 85% of the
+sum of its parts, with a lower quartile of 48%**. They overlap rather than add.
+
+More importantly, composition is often **worse than the better component alone**:
+
+| Column, arm, inventory | Key-derived alone | Second alone | Composed |
+|---|---|---|---|
+| `osm_s2_l30_sorted`, `mergeirr=8`, entropy | +6.16 | +0.00 | **+0.05** |
+| `publicbi_npi`, `mergeirr=8`, base | +6.28 | +0.00 | **+0.30** |
+| `osm_h3_r9`, `mergekey=3`, base | +5.84 | +0.21 | **+2.92** |
+
+Permuting rows and then rewriting the section's values can destroy the structure the
+permutation just created, and a greedy chain finds that out only after it has committed.
+
+Genuine synergy does exist, and it is where Snowflake's only real result lives:
+
+| Column, arm, inventory | Key-derived | Second | Composed | Sum |
+|---|---|---|---|---|
+| `snowflake`, `mergeirr=8`, base | +0.13 | +0.06 | **+2.71** | +0.19 |
+| `snowflake`, `mergeirr=8`, entropy | +0.01 | +0.05 | **+2.55** | +0.06 |
+| `snowflake`, `mergekey=3`, base | +0.11 | +1.77 | **+3.11** | +1.88 |
+
+There the permutation groups equal values together and only a bit-oriented transform can
+monetise the result: neither alone sees it.
+
+**The design consequence is concrete.** A composed transform must be evaluated as its own
+candidate with its own measured size. The selector must not chain transforms greedily, and
+must not assume additivity in a cost model, because both would be wrong more often than right.
+That is why `SectionTransform` takes the section and returns a rewritten section rather than
+offering a `compose` operation: composition is a candidate, not an operator.
 
 ## Costs
 

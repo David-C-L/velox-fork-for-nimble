@@ -412,6 +412,9 @@ struct Candidate {
   uint32_t rows{0};
   uint32_t columns{0};
   uint32_t groupSize{0};
+  // Family G composes a key-derived permutation with a second, per-section
+  // transform, to test whether the two stack or overlap.
+  std::string second;
 };
 
 // The outcome of applying one candidate to one section.
@@ -500,6 +503,67 @@ SectionOutcome applyCandidate(
         auto scratch = rx::applyPermutation(outcome.transformed, inverse);
         inverseSink = inverseSink + (scratch.empty() ? 0 : scratch.front());
       });
+    }
+    outcome.applicable = true;
+    outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - applyStart)
+                                .count() /
+        numRows;
+    return outcome;
+  }
+
+  if (candidate.family == "G") {
+    // A key-derived permutation, then a per-section transform on the permuted
+    // values. The two act on different things, row order and section values,
+    // so if their gains are independent they should add.
+    if (key.size() != section.size()) {
+      return outcome;
+    }
+    const auto permutation = rx::keyDerivedPermutation(key);
+    const auto permuted = rx::applyPermutation(section, permutation);
+
+    std::vector<uint64_t> codebook;
+    std::vector<uint64_t> alphabet;
+    uint32_t primaryIndex = 0;
+    std::vector<uint64_t> stacked;
+    size_t restorationBits = 0;
+
+    if (candidate.second == "E_frequency") {
+      stacked = rx::frequencyRelabel(permuted, codebook);
+      restorationBits = codebook.size() * static_cast<size_t>(width);
+    } else if (candidate.second == "F_bitplane") {
+      stacked = rx::bitPlaneTranspose(permuted, width);
+    } else if (candidate.second == "F_bwt_mtf") {
+      const auto burrowsWheeler =
+          rx::burrowsWheelerTransform(permuted, primaryIndex);
+      alphabet = rx::sortedAlphabetOf(burrowsWheeler);
+      stacked = rx::moveToFront(burrowsWheeler);
+      int indexWidth = 1;
+      while (indexWidth < 32 && (numRows >> indexWidth) != 0) {
+        ++indexWidth;
+      }
+      restorationBits = static_cast<size_t>(indexWidth) +
+          alphabet.size() * static_cast<size_t>(width);
+    } else {
+      return outcome;
+    }
+
+    outcome.transformed = stacked;
+    outcome.restorationBits = restorationBits;
+
+    if (validate) {
+      std::vector<uint64_t> undone;
+      if (candidate.second == "E_frequency") {
+        undone = rx::relabelInverse(stacked, codebook);
+      } else if (candidate.second == "F_bitplane") {
+        undone = rx::inverseBitPlaneTranspose(stacked, width);
+      } else {
+        undone = rx::inverseBurrowsWheelerTransform(
+            rx::inverseMoveToFront(stacked, alphabet), primaryIndex);
+      }
+      const auto restored =
+          rx::applyPermutation(undone, rx::invertPermutation(permutation));
+      outcome.roundTripOk = (restored == section);
     }
     outcome.applicable = true;
     outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
@@ -911,6 +975,23 @@ std::vector<Candidate> buildCandidates(
       candidate.restoration = rx::Restoration::StoredIndex;
       candidate.groupSize = groupSize;
       candidates.push_back(candidate);
+    }
+  }
+
+  if (wants("G")) {
+    for (int key = 0; key < numSections; ++key) {
+      for (const auto& second :
+           std::vector<std::string>{"E_frequency", "F_bitplane", "F_bwt_mtf"}) {
+        Candidate candidate;
+        candidate.family = "G";
+        candidate.name = "G_key+" + second;
+        candidate.param = "key_section=" + std::to_string(key);
+        candidate.restoration = rx::Restoration::KeyDerived;
+        candidate.permutation = false;
+        candidate.keySection = key;
+        candidate.second = second;
+        candidates.push_back(candidate);
+      }
     }
   }
 
@@ -1360,7 +1441,11 @@ int runBenchmark() {
               for (int s = 0; s < armNumSections; ++s) {
                 // A key section drives the permutation, so it must reach the
                 // decoder in original order and cannot itself be permuted.
-                if (candidate.family == "B" && candidate.keySection == s) {
+                // The key section rebuilds the order, so it must reach the
+                // decoder unpermuted. This holds for the composed family too,
+                // which starts with the same key-derived permutation.
+                if ((candidate.family == "B" || candidate.family == "G") &&
+                    candidate.keySection == s) {
                   continue;
                 }
 
