@@ -420,6 +420,104 @@ The two are complements only on the PublicBI columns, where the transform still 
 coder, then re-run the oracle. This layer is worth building for interleaved arrivals regardless,
 because its gain there survives both, but its value on the designed ID schemes largely does not.
 
+## Implementation plan
+
+Staged, with a gate at the end of each stage, because two of the stages need no format change
+and one of them may remove the need for part of the layer. Building the transform first would
+be building the smaller lever against a baseline that is about to move.
+
+### Stage 0. Close the cost-model gap in split selection
+
+No format change. No new encoding. The largest measured number in the whole study.
+
+Choosing boundaries against real encoded bytes rather than the DP's cost model is worth 1 to 9
+b/e, positive in 34 of 36 measured cells. `MlIdCostModelOracleBenchmark` already measures the
+gap between the two, so the work is to narrow it: improve the per-encoding cost functions in
+`SubIntSplitCostModels.h`, or sample-encode the top few candidate ranges rather than trusting
+the model for all of them.
+
+**Gate.** Re-run `MlIdReorderOracleBenchmark`. On OSM and Snowflake the best transform adds
++0.00 and +0.73 b/e once boundaries are good, so if this stage lands most of its available
+gain, the reordering layer's value on those columns is already spoken for and only the PublicBI
+case justifies going further.
+
+### Stage 1. Check whether relabelling needs a wire change at all
+
+No format change until the answer is known.
+
+Of the sections where dense or frequency relabelling is adopted, 59% had already chosen
+`Dictionary` and switched to `FixedBitWidth` afterwards. That is close to what
+`DictionaryEncoding` already does. Try reaching the same gain by improving how a dictionary's
+index stream is encoded, or by letting nested selection consider dense-remap-then-bit-pack.
+
+**Gate.** If the `Medicare1.NPI` gain of +2.05 b/e (6.0%) is reachable this way, the whole
+relabelling family needs no transform id, no codebook in the header and no decoder change.
+Only Gray coding would remain genuinely new, and it stores nothing.
+
+### Stage 2. The transform framework and the key-derived permutation
+
+The first stage that touches the format.
+
+1. `SectionTransform` and the transform id registry in `encodings/subintsplit/`, with the
+   identity transform only, so the plumbing lands before any behaviour does.
+2. **Allocate a new `EncodingType`** rather than reusing the reserved header byte. The current
+   parser reads that byte and discards it without validation, so an old reader given new data
+   would skip the inverse and return transformed values as originals: wrong data, silently. A
+   new encoding type makes an old reader fail in the factory instead.
+3. `KeyDerivedTransform`: build the permutation once per block, gather per section, hold the
+   key section unpermuted.
+4. Encode-side selection: score each section with and without, keep it only where it pays,
+   using real encoded sizes rather than an estimate.
+5. Decode: undo the order once on the assembled values in the chunk loop, not once per section.
+6. `SubIntSplitEncodingView`: a per-block rank cache, since a single probe otherwise costs a
+   counting pass over the block.
+
+**Gate.** Shadow mode first: encode both ways, compare sizes and assert the round trip, ship
+neither. Only enable once the shadow numbers reproduce the harness on real data.
+
+### Stage 3. Selection policy and the cost of looking
+
+Trying every candidate key multiplies split selection by roughly the section count, 5 to 8x, so
+the encoder needs a reason to look before it pays that.
+
+A cheap gate on the existing sample: if no section is a plausible key, meaning none has low
+enough cardinality to group by, or if grouping by the best candidate does not reduce run counts
+in the other sections, skip the whole family. The sampler in `SubIntSplitSampler.h` already
+produces what this needs.
+
+Selection must also respect the read shape, since the key-derived permutation is O(block) per
+point probe. A column expected to serve point lookups should not get it.
+
+### Stage 4. Composition, only as explicit candidates
+
+Composed transforms are worth having: they are where Snowflake's only substantial result lives,
++2.71 b/e (4.8%) on an irregular merge, surviving an entropy coder. But composition delivers a
+median 85% of the sum of its parts and is frequently worse than the better component alone, as
+low as +0.05 b/e where the permutation alone gives +6.16.
+
+So a composed transform is enumerated and measured as its own candidate. The selector must not
+chain greedily and must not estimate a composition as a sum of its parts.
+
+### Stage 5. Re-evaluate after delta and an entropy coder
+
+The prior reports identify these as SubIntSplit's real gap against OpenZL, and they change what
+every transform is worth: delta competes with the block transforms and compounds with the
+key-derived permutation. Re-running the harness afterwards is one command and decides whether
+anything beyond stage 2 is still justified.
+
+### What would make this not worth doing
+
+Stated up front so the gates mean something.
+
+* Stage 0 recovers most of its 1 to 9 b/e and the target columns are OSM or Snowflake shaped.
+  The transform adds +0.00 to +0.73 b/e there once boundaries are good.
+* The target columns arrive already well ordered. In their own natural order these columns give
+  0.1 to 2.0 b/e, against 3.7 to 6.2 b/e when interleaved.
+* The workload is point lookups rather than scans. The key-derived permutation is O(block) per
+  probe.
+* Stage 1 shows relabelling is reachable through `Dictionary`, and relabelling was the only
+  family wanted.
+
 ## Alternatives rejected
 
 * **Storing the permutation index.** The obvious design, and it never pays: +0.0000 b/e in all
