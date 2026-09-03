@@ -421,6 +421,9 @@ struct SectionOutcome {
   size_t restorationBits{0};
   bool roundTripOk{true};
   double inverseNsPerRow{kNaN};
+  // Forward cost, which is what an encoder pays. For the key-derived family it
+  // includes building the permutation, which the inverse does not.
+  double applyNsPerRow{kNaN};
 };
 
 // Applies a candidate to a section and, when validation is on, checks that the
@@ -439,6 +442,7 @@ SectionOutcome applyCandidate(
   if (numRows == 0) {
     return outcome;
   }
+  const auto applyStart = std::chrono::steady_clock::now();
 
   const auto timeInverse = [&](const std::function<void()>& inverse) {
     const auto start = std::chrono::steady_clock::now();
@@ -498,6 +502,10 @@ SectionOutcome applyCandidate(
       });
     }
     outcome.applicable = true;
+    outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - applyStart)
+                                .count() /
+        numRows;
     return outcome;
   }
 
@@ -531,6 +539,10 @@ SectionOutcome applyCandidate(
       }
     }
     outcome.applicable = true;
+    outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - applyStart)
+                                .count() /
+        numRows;
     return outcome;
   }
 
@@ -548,6 +560,10 @@ SectionOutcome applyCandidate(
         });
       }
       outcome.applicable = true;
+      outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
+                                  std::chrono::steady_clock::now() - applyStart)
+                                  .count() /
+          numRows;
       return outcome;
     }
 
@@ -592,6 +608,10 @@ SectionOutcome applyCandidate(
       }
     }
     outcome.applicable = true;
+    outcome.applyNsPerRow = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - applyStart)
+                                .count() /
+        numRows;
     return outcome;
   }
 
@@ -1128,6 +1148,8 @@ int runBenchmark() {
       "adopted",
       "round_trip_ok",
       "inverse_ns_per_row",
+      "apply_ns_per_row",
+      "encode_ns_per_row",
       "prod_split_bits",
       "oracle_split_bits",
       "prod_split_sections",
@@ -1366,12 +1388,20 @@ int runBenchmark() {
                 }
 
                 EncodingType transformedEncoding = EncodingType::Trivial;
+                const auto encodeStart = std::chrono::steady_clock::now();
                 const size_t bytes = bestSectionBytes(
                     outcome.transformed,
                     widths[s],
                     encodings,
                     CompressionType::Uncompressed,
                     transformedEncoding);
+                // Selection encodes the section once per candidate encoding,
+                // so this is the cost the transform is being compared against.
+                const double encodeNsPerRow =
+                    std::chrono::duration<double, std::nano>(
+                        std::chrono::steady_clock::now() - encodeStart)
+                        .count() /
+                    blockRows;
                 if (bytes == kEncodeFailed) {
                   continue;
                 }
@@ -1421,6 +1451,8 @@ int runBenchmark() {
                 csv.set("adopted", static_cast<int64_t>(gain > 0.0 ? 1 : 0));
                 csv.set("round_trip_ok", static_cast<int64_t>(1));
                 csv.set("inverse_ns_per_row", outcome.inverseNsPerRow);
+                csv.set("apply_ns_per_row", outcome.applyNsPerRow);
+                csv.set("encode_ns_per_row", encodeNsPerRow);
                 csv.set("skipped", static_cast<int64_t>(0));
                 csv.endRow();
               }
