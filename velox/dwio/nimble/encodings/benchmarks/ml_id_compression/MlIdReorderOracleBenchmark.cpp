@@ -49,6 +49,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <functional>
 #include <numeric>
 #include <random>
@@ -122,6 +123,19 @@ DEFINE_bool(
     "with a split fitted to a different ordering, which lets a transform earn "
     "credit for compensating for a bad split. On only as a diagnostic, to "
     "compare a section index across arms.");
+DEFINE_bool(
+    reorder_split_search,
+    false,
+    "Also choose the split with knowledge of the transform, and report what "
+    "that is worth. Every other number in this driver uses boundaries picked "
+    "on the untransformed column, which is a floor: a boundary is only worth "
+    "placing where the resulting section compresses, and a transform changes "
+    "which sections compress.");
+DEFINE_int32(
+    reorder_split_search_blocks,
+    4,
+    "Blocks per cell for the split search. It costs an encode per bit range "
+    "per transform, so it runs on far fewer blocks than the main sweep.");
 DEFINE_bool(validate, true, "Round-trip every transform before scoring it");
 DEFINE_bool(dry_run, false, "Print the sweep plan and exit");
 DEFINE_bool(
@@ -911,6 +925,133 @@ std::vector<Candidate> buildCandidates(
 // Driver
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Transform-aware split selection
+// ---------------------------------------------------------------------------
+
+// One transform the split search can be run under. The search needs a
+// transform that can be applied to an arbitrary bit range, since it evaluates
+// every candidate range; the key-derived family qualifies only once its
+// permutation is fixed in advance, which is what `permutation` carries.
+struct SearchTransform {
+  std::string name;
+  // Empty means identity.
+  std::function<std::vector<uint64_t>(const std::vector<uint64_t>&, int)> apply;
+  // Restoration cost in bits, given the section width and value count.
+  std::function<size_t(const std::vector<uint64_t>&, int)> restoration;
+};
+
+// Minimum-cost partition of [0, kBits) given the cost of every bit range,
+// charging the same per-split penalty the production selector uses so the two
+// are comparable.
+double splitDp(
+    const std::vector<std::vector<double>>& cost,
+    int kBits,
+    double splitPenalty) {
+  constexpr double kInfinity = std::numeric_limits<double>::infinity();
+  std::vector<double> best(kBits + 1, kInfinity);
+  best[0] = 0.0;
+  for (int end = 1; end <= kBits; ++end) {
+    for (int start = 0; start < end; ++start) {
+      const double here = cost[start][end - 1];
+      if (best[start] == kInfinity || here == kInfinity) {
+        continue;
+      }
+      const double candidate =
+          best[start] + here + (start > 0 ? splitPenalty : 0.0);
+      if (candidate < best[end]) {
+        best[end] = candidate;
+      }
+    }
+  }
+  return best[kBits];
+}
+
+// Encoded size of one bit range of one block, under a transform.
+template <typename Phys>
+double rangeCost(
+    const std::span<const Phys>& physical,
+    size_t begin,
+    uint32_t blockRows,
+    int bitStart,
+    int bitEnd,
+    const SearchTransform& transform,
+    const std::vector<EncodingType>& inventory) {
+  const int width = bitEnd - bitStart + 1;
+  const uint64_t mask =
+      width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+  std::vector<uint64_t> values(blockRows);
+  for (uint32_t i = 0; i < blockRows; ++i) {
+    values[i] =
+        (static_cast<uint64_t>(physical[begin + i]) >> bitStart) & mask;
+  }
+
+  size_t restorationBits = 0;
+  if (transform.apply) {
+    restorationBits = transform.restoration(values, width);
+    values = transform.apply(values, width);
+  }
+
+  EncodingType chosen = EncodingType::Trivial;
+  const size_t bytes = bestSectionBytes(
+      values, width, inventory, CompressionType::Uncompressed, chosen);
+  if (bytes == kEncodeFailed) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return static_cast<double>(bytes * 8 + restorationBits);
+}
+
+std::vector<SearchTransform> buildSearchTransforms(
+    const std::vector<uint32_t>& keyPermutation) {
+  std::vector<SearchTransform> transforms;
+  transforms.push_back({"identity", nullptr, nullptr});
+
+  transforms.push_back(
+      {"E_frequency",
+       [](const std::vector<uint64_t>& values, int) {
+         std::vector<uint64_t> codebook;
+         return rx::frequencyRelabel(values, codebook);
+       },
+       [](const std::vector<uint64_t>& values, int width) {
+         return rx::sortedAlphabetOf(values).size() *
+             static_cast<size_t>(width);
+       }});
+
+  transforms.push_back(
+      {"F_bitplane",
+       [](const std::vector<uint64_t>& values, int width) {
+         return rx::bitPlaneTranspose(values, width);
+       },
+       [](const std::vector<uint64_t>&, int) { return size_t{0}; }});
+
+  transforms.push_back(
+      {"F_bwt_mtf",
+       [](const std::vector<uint64_t>& values, int) {
+         uint32_t primaryIndex = 0;
+         return rx::moveToFront(
+             rx::burrowsWheelerTransform(values, primaryIndex));
+       },
+       [](const std::vector<uint64_t>& values, int width) {
+         size_t bits = 10; // primary index
+         bits += rx::sortedAlphabetOf(values).size() *
+             static_cast<size_t>(width);
+         return bits;
+       }});
+
+  if (!keyPermutation.empty()) {
+    // The key-derived permutation depends on a section, and the search is
+    // choosing sections, so the permutation is fixed in advance from the
+    // production split's best key and held constant while boundaries move.
+    transforms.push_back(
+        {"B_key",
+         [keyPermutation](const std::vector<uint64_t>& values, int) {
+           return rx::applyPermutation(values, keyPermutation);
+         },
+         [](const std::vector<uint64_t>&, int) { return size_t{0}; }});
+  }
+  return transforms;
+}
+
 template <typename Elem>
 int runBenchmark() {
   using Phys = typename TypeTraits<Elem>::physicalType;
@@ -987,6 +1128,10 @@ int runBenchmark() {
       "adopted",
       "round_trip_ok",
       "inverse_ns_per_row",
+      "prod_split_bits",
+      "oracle_split_bits",
+      "prod_split_sections",
+      "oracle_split_sections",
       "skipped"};
 
   const std::string csvPath = FLAGS_mlidc_output_csv.empty()
@@ -1328,6 +1473,106 @@ int runBenchmark() {
                 csv.set("skipped", static_cast<int64_t>(0));
                 csv.endRow();
               }
+            }
+          }
+
+          if (FLAGS_reorder_split_search) {
+            // How much is left on the table by choosing boundaries before
+            // knowing the transform. Compared like for like: the same DP and
+            // the same per-split penalty, once with range costs measured on
+            // the untransformed section and once on the transformed one.
+            const double splitPenalty = defaultSelectorConfig().splitPenalty;
+            const size_t searchBlocks = std::min<size_t>(
+                blockLimit,
+                static_cast<size_t>(
+                    std::max(1, FLAGS_reorder_split_search_blocks)));
+
+            std::map<std::string, double> prodTotal;
+            std::map<std::string, double> oracleTotal;
+
+            for (size_t block = 0; block < searchBlocks; ++block) {
+              const size_t begin = block * blockStride * blockRows;
+
+              // The key-derived permutation is a property of this block, so it
+              // is rebuilt per block. The key itself is fixed to the production
+              // split's first section, because the search is choosing sections
+              // and the key would otherwise move with them.
+              std::vector<uint32_t> keyPermutation;
+              if (armNumSections > 1) {
+                const int keyStart = armSegments[0].bitStart;
+                const int keyWidth =
+                    armSegments[0].bitEnd - armSegments[0].bitStart + 1;
+                const uint64_t keyMask = keyWidth >= 64
+                    ? ~uint64_t{0}
+                    : ((uint64_t{1} << keyWidth) - 1);
+                std::vector<uint64_t> keyValues(blockRows);
+                for (uint32_t i = 0; i < blockRows; ++i) {
+                  keyValues[i] =
+                      (static_cast<uint64_t>(physical[begin + i]) >> keyStart) &
+                      keyMask;
+                }
+                keyPermutation = rx::keyDerivedPermutation(keyValues);
+              }
+
+              for (const auto& searchTransform :
+                   buildSearchTransforms(keyPermutation)) {
+                std::vector<std::vector<double>> cost(
+                    kBits,
+                    std::vector<double>(
+                        kBits, std::numeric_limits<double>::infinity()));
+                for (int l = 0; l < kBits; ++l) {
+                  for (int r = l; r < kBits; ++r) {
+                    cost[l][r] = rangeCost<Phys>(
+                        physical,
+                        begin,
+                        blockRows,
+                        l,
+                        r,
+                        searchTransform,
+                        encodings);
+                  }
+                }
+
+                double onProdSplit = 0.0;
+                for (const auto& segment : armSegments) {
+                  onProdSplit += cost[segment.bitStart][segment.bitEnd];
+                }
+                prodTotal[searchTransform.name] += onProdSplit;
+                oracleTotal[searchTransform.name] +=
+                    splitDp(cost, kBits, splitPenalty);
+              }
+            }
+
+            for (const auto& [name, prod] : prodTotal) {
+              const double denominator =
+                  static_cast<double>(searchBlocks) * blockRows;
+              const double prodPerElem = prod / denominator;
+              const double oraclePerElem = oracleTotal[name] / denominator;
+
+              csv.beginRow();
+              csv.set("driver", "bench_reorder_oracle");
+              csv.set("dtype", elemTypeName<Elem>());
+              csv.set("dataset", dataset.name);
+              csv.set("order_arm", armToken);
+              csv.set("inventory", inventoryName(inventory));
+              csv.set("block_rows", static_cast<int64_t>(blockRows));
+              csv.set("scope", "SPLIT_SEARCH");
+              csv.set("transform", name);
+              csv.set("section_index", static_cast<int64_t>(-1));
+              csv.set("prod_split_bits", prodPerElem);
+              csv.set("oracle_split_bits", oraclePerElem);
+              csv.set(
+                  "prod_split_sections", static_cast<int64_t>(armNumSections));
+              csv.set("net_bits_per_elem", prodPerElem - oraclePerElem);
+              csv.set("skipped", static_cast<int64_t>(0));
+              csv.endRow();
+
+              std::cout << "      split-search " << std::setw(12) << name
+                        << "  prod-split " << std::fixed << std::setprecision(2)
+                        << prodPerElem << "  transform-aware split "
+                        << oraclePerElem << "  worth " << std::showpos
+                        << (prodPerElem - oraclePerElem) << std::noshowpos
+                        << " b/e\n";
             }
           }
 
