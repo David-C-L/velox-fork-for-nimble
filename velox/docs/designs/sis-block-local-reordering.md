@@ -2,6 +2,17 @@
 
 *2026-09-03*
 
+## Units
+
+Every figure carries **bits per element (b/e)**, the encoded size divided by the row count, and
+the same figure as a **percentage of that cell's own baseline**. Both are needed: baselines
+across the measured columns span 13 to 57 b/e, so a percentage alone hides how much data a
+change moves, and a bit count alone hides whether it is a large or small share of the column.
+
+A third column, **MB per 10M rows**, appears where absolute scale is the point. One bit per
+element is 1.25 MB per 10 million rows, so a 2 b/e saving on a billion-row column is about
+250 MB.
+
 ## Motivation
 
 SubIntSplit cuts an integer column into contiguous bit-range sections and gives each its own
@@ -288,14 +299,16 @@ conventions in the nimble CMakeLists:
 The gains are not spread evenly, and the columns they favour are not the ones this encoding
 was built for.
 
-| Column | Best realistic arm | Gain | Family |
-|---|---|---|---|
-| `Medicare1.NPI` | interleaved | 28 to 32% | key-derived |
-| OSM `h3_r9`, coarse | interleaved | 17 to 22% | key-derived |
-| OSM `h3_r9`, coarse | sorted by a sibling | 8% | key-derived |
-| OSM `s2_l30`, `h3_r15`, `morton_2x32`, fine | interleaved by a carried key | 7.5 to 10.6% | key-derived |
-| OSM fine | any other realistic arm | under 1% | any |
-| `snowflake` | shipped | 3.5% single, 5 to 6% composed | bit-plane, or key-derived then bit-plane |
+| Column | Best realistic arm | Baseline b/e | Gain b/e | Gain % | MB/10M rows | Family |
+|---|---|---|---|---|---|---|
+| `Medicare1.NPI` | interleaved | 20.7 | +6.2 | 30% | 7.8 | key-derived |
+| OSM `h3_r9`, coarse | interleaved | 16.7 | +3.7 | 22% | 4.6 | key-derived |
+| OSM `h3_r9`, coarse | sorted by a sibling | 11.2 | +0.9 | 8% | 1.1 | key-derived |
+| OSM fine, `mergekey` | interleaved by a carried key | 49.4 to 58.1 | +4.4 to +5.2 | 7.5 to 10.6% | 5.5 to 6.5 | key-derived |
+| OSM fine | any other realistic arm | 26 to 45 | under +0.5 | under 1% | under 0.6 | any |
+| `snowflake` | shipped | 48.1 | +1.4 | 2.9% | 1.7 | bit-plane |
+| `snowflake` | `mergekey=3` | 44.5 | **+3.1** | **7.0%** | 3.9 | key-derived then bit-plane |
+| `snowflake` | `mergeirr=8` | 57.0 | **+2.7** | **4.8%** | 3.4 | key-derived then bit-plane |
 
 **Fine-resolution spatial columns and Snowflake are the weak cases.** On `s2_l30`, `h3_r15`
 and `morton_2x32` no family clears 1% on any arm except `mergekey`, where a key carried in the
@@ -304,9 +317,10 @@ that the low bits of a fine space-filling-curve position are incompressible nois
 structure for a reordering to expose, at any resolution the curve is fine enough to be
 near-unique. The coarse `h3_r9` behaves completely differently, at 8 to 22%.
 
-Snowflake resists every single transform, at most 3.5% from bit-plane transposition and under
-1.1% from the key-derived permutation, and the bit-plane gain largely disappears under an
-entropy coder. Its one real result comes from composition, below.
+Snowflake resists every *single* transform: at most +1.4 b/e (2.9%) from bit-plane
+transposition on its shipped order, falling to +0.33 b/e (0.8%) once an entropy coder is
+available, and under +0.15 b/e (0.3%) from the key-derived permutation. Its one substantial
+result comes from composition, below, and that one does survive an entropy coder.
 
 ## Do transforms stack?
 
@@ -327,11 +341,16 @@ permutation just created, and a greedy chain finds that out only after it has co
 
 Genuine synergy does exist, and it is where Snowflake's only real result lives:
 
-| Column, arm, inventory | Key-derived | Second | Composed | Sum |
-|---|---|---|---|---|
-| `snowflake`, `mergeirr=8`, base | +0.13 | +0.06 | **+2.71** | +0.19 |
-| `snowflake`, `mergeirr=8`, entropy | +0.01 | +0.05 | **+2.55** | +0.06 |
-| `snowflake`, `mergekey=3`, base | +0.11 | +1.77 | **+3.11** | +1.88 |
+All figures bits per element, with the composed result also as a share of that cell's baseline.
+
+| Column, arm, inventory | Baseline | Key-derived | Second | Composed | Sum | Composed % | MB/10M |
+|---|---|---|---|---|---|---|---|
+| `snowflake`, `mergeirr=8`, base | 56.96 | +0.13 | +0.06 | **+2.71** | +0.19 | **4.8%** | 3.4 |
+| `snowflake`, `mergeirr=8`, entropy | 51.52 | +0.13 | +0.05 | **+2.55** | +0.18 | **4.9%** | 3.2 |
+| `snowflake`, `mergekey=3`, base | 44.52 | +0.11 | +1.77 | **+3.11** | +1.88 | **7.0%** | 3.9 |
+
+This is the one place Snowflake gains anything worth having, and it holds under an entropy
+coder, which the single bit-plane transform does not.
 
 There the permutation groups equal values together and only a bit-oriented transform can
 monetise the result: neither alone sees it.
