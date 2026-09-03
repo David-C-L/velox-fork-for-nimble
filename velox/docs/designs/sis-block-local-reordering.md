@@ -18,28 +18,50 @@ rows in their original order?
 An oracle study measured every plausible way of doing it: six transform families across twenty
 input orders, nine columns, three encoder inventories and two block sizes, with real encodes
 throughout and round-trip verification on every block. The full results are in
-`sis_reorder_results.md`. One family survives, and this document specifies it.
+`sis_reorder_results.md`. Three families survive, and this document specifies them and the
+extension point they share.
 
 ## Summary of what the measurements support
 
-**Build the key-derived permutation. Do not build anything else.**
+Three families are worth building, and they are worth building in this order, because the
+order is by robustness rather than by headline size.
+
+| Rank | Family | Gain | Cost | Point access |
+|---|---|---|---|---|
+| 1 | **Value relabelling** | 6% on `Medicare1.NPI` as shipped, 9 to 11% on OSM under interleaved arrival, and it *grows* with a richer inventory | Gray costs 0.94% of encode; frequency and dense need a hash map, see below | **true O(1)**, rows never move |
+| 2 | **Key-derived permutation** | 28 to 32% on `Medicare1.NPI`, 17 to 22% on OSM `h3_r9`, under interleaved arrival | 1.7% encode, 0.51 ns/row bulk decode | **O(block) per probe** unless cached |
+| 3 | Closed-form permutation | 30% on XMark as shipped, near zero elsewhere, and it collapses to 1.02 b/e once delta exists | 2.8% of encode | true O(1) |
+
+Relabelling is placed first despite the smaller headline because it is the only one of the
+three that never moves a row. There is no permutation to invert, no rank to reconstruct and no
+key section to keep unpermuted, so point lookups are unaffected and the decoder change is a
+value mapping rather than an addressing change. It is also the family whose gain *rises* when
+delta and an entropy coder are added, where the block transforms fall away.
+
+The key-derived permutation is the larger win where a column arrives interleaved, and is the
+one to reach for on scan-shaped workloads.
+
+The closed-form family is included only because it is nearly free to implement and is the
+cheapest possible special case; it should not be built before delta lands, since delta removes
+the structure it exploits.
+
+**Not worth building, on direct evidence:**
 
 | Family | Verdict |
 |---|---|
-| Key-derived permutation | Build it. Up to 30% smaller on interleaved arrivals, survives delta and an entropy coder |
 | Stored permutation index | Closed. +0.0000 b/e in all 176 measured cells, including near-sorted inputs |
 | Group reorder | Closed. Clears 0.01 b/e in 7 of 176 cells, never exceeds +0.21 |
-| Closed-form permutation | Only wins where a field is a row counter, and that win disappears once delta exists |
-| Value relabelling | Small but real, 6% on one column; cheap enough to reconsider later |
-| BWT and bit-plane transposition | Largest raw gains, but they need delta and an entropy coder to be absent, and BWT forfeits point access outright |
+| BWT and BWT+MTF | Largest raw gains, but they need delta and an entropy coder absent, and BWT forfeits point access outright |
+| Bit-plane transposition | 17% on `Corporations.Id1`, but 24 to 434 ns/row to invert, and its gain there is a symptom of the split selector under-splitting |
 
 ## Scope
 
 * Block-local only. A permutation applies within a fixed block, 1024 rows by default, which
   matches `kViewChunkSize` so the view's existing chunk loop can absorb the inverse without a
   new per-row branch.
-* One family: a stable sort of the block by the value of another section, which the decoder
-  has already read. Nothing is stored, because the decoder recomputes the same sort.
+* Three families behind one extension point: value relabelling, which never moves a row; a
+  key-derived permutation, a stable sort of the block by another section the decoder has
+  already read; and closed-form permutations. None of them stores a per-row index.
 * Rows are always returned in their original order. No reader change is required.
 
 ## Design
@@ -52,8 +74,17 @@ throughout and round-trip verification on every block. The full results are in
 ```
 [standard Encoding prefix]
 [1B]  splitCount
-[1B]  transformId          0 = none, 1 = key-derived permutation
-[1B]  keySectionIndex      present only when transformId != 0
+[1B]  transformId          0 = none
+                           1 = key-derived permutation
+                           2 = value relabel, frequency
+                           3 = value relabel, dense
+                           4 = value relabel, Gray
+                           5 = closed-form permutation
+[1B]  transformParam       key section index, or the closed-form shape.
+                           Present only when transformId != 0, and only for
+                           the transforms that take one.
+[per-section codebook]     Only for the relabelling transforms that carry one;
+                           Gray carries none.
 [splitCount x 6B]  {bitStart, bitEnd, encodedSize}
 [section bytes...]
 ```
@@ -112,20 +143,115 @@ Two mitigations, and the design should carry the first:
 `readTypedAt` in `SubIntSplitEncodingView` must consult the cache rather than assume O(1)
 addressing.
 
+## Implementation structure
+
+The point of specifying this is that three families are being built and more may follow, so
+the extension point matters as much as the first implementation.
+
+### Files
+
+All new code lives in a SubIntSplit-scoped directory, so no other nimble encoding is touched
+by code it does not use:
+
+```
+velox/dwio/nimble/encodings/subintsplit/
+    SectionTransform.h          the interface and the transform id registry
+    ValueRelabelTransform.h     frequency, dense and Gray relabelling
+    KeyDerivedTransform.h       the stable sort by another section
+    ClosedFormTransform.h       stride and transpose
+    tests/SectionTransformTests.cpp
+```
+
+Names describe the concept. Per `CODING_STYLE.md` nothing here is named `*Utils`, `*Helpers`
+or `*Common`, since those names attract unrelated functions and lose cohesion.
+
+### The interface
+
+One abstract transform, one file per family, so a family can be added without modifying an
+existing one:
+
+```cpp
+/// Rewrites one SubIntSplit section within a block, reversibly.
+class SectionTransform {
+ public:
+  virtual ~SectionTransform() = default;
+
+  /// Identifies the transform on the wire. Stable across releases.
+  virtual TransformId id() const = 0;
+
+  /// Rewrites `values` in place for encoding. `context` carries the block's
+  /// already-decoded key section, for transforms that need one.
+  virtual void apply(std::span<uint64_t> values, const TransformContext& context) = 0;
+
+  /// Restores the original values. Must be exact for every input.
+  virtual void invert(std::span<uint64_t> values, const TransformContext& context) = 0;
+
+  /// Restoration cost in bits, so section selection can charge for it.
+  virtual size_t restorationBits(std::span<const uint64_t> values, int width) const = 0;
+
+  /// Whether a single row can be read without reconstructing the block.
+  virtual bool supportsPointAccess() const = 0;
+};
+```
+
+`supportsPointAccess` is on the interface rather than implied, because it is the property that
+decides whether a transform may be selected for a point-lookup-shaped read, and it differs
+across the three families being built.
+
+Method bodies go in the corresponding `.cpp`; per the style guide only trivial one-liners stay
+in a header. Every public method carries a `///` comment; private members use `//`.
+
+### Transform ids and forward compatibility
+
+`transformId` is a dense enum, appended to and never renumbered, since it is on the wire.
+
+A reader that meets an unknown `transformId` **must fail cleanly rather than decode**, because
+an unrecognised transform silently produces wrong values rather than an obvious error:
+
+```cpp
+VELOX_CHECK_LT(
+    transformId, kTransformIdCount, "Unsupported SubIntSplit transform id: {}", transformId);
+```
+
+Runtime information goes at the end of the message, after the static description, per the
+style guide. `transformId == 0` means no transform, which is what every stream written before
+this change already contains, so old data reads unchanged.
+
 ### Selection
 
-A section is only worth permuting if it pays for itself. The encoder should score, per section,
-the encoded size with and without the permutation and keep the transform only where it wins,
-leaving other sections in identity order. Charging every section for a transform only some of
-them want is not a small mistake: on XMark the same transform reads +1.07 b/e when sections may
-decline it and −1.44 b/e when they may not.
+A transform is chosen per section, and only when it pays for itself: a section takes
+`max(0, gain - restorationBits)` and otherwise stays untransformed. Charging every section for
+a transform only some of them want is not a small mistake; on XMark the same transform reads
++1.07 b/e when sections may decline it and −1.44 b/e when they may not.
 
-The key section is chosen by trying each section as a candidate key and keeping the best. That
-multiplies split-selection cost by roughly the section count.
+Selection must also respect the read shape. A transform whose `supportsPointAccess()` is false
+should not be selected when the column is expected to serve point lookups, which is the hook
+the `Encoding::Options` already carries policy for.
+
+### Testing
+
+Tests go in `encodings/subintsplit/tests/`, next to the code, following the grouped-test
+conventions in the nimble CMakeLists:
+
+* Round-trip every transform over a matrix of block sizes, section widths and data shapes
+  including constant, low-cardinality, monotone and random. The oracle harness already does
+  this and reports zero failures across roughly 2.4 million rows.
+* A key-derived permutation keyed on the section it sorted by must be the identity.
+* A section used as a key must round-trip while stored unpermuted.
+* An unknown transform id must throw, not misdecode.
+* Point-lookup latency with and without the rank cache, against the 908 ns view baseline.
 
 ## Costs
 
 Measured, on 1024-row blocks.
+
+**Value relabelling.** Gray coding costs 1.4 ns/row to apply, 0.94% of the encoding-selection
+pass, and stores no codebook at all. Frequency and dense relabelling measure 103 and 64 ns/row
+in the reference implementation, which is 50 to 80% of encode, but that is a linear lookup per
+value; a hash map makes both comparable to Gray. Decode is a codebook lookup per value, 2.2 to
+3.3 ns/row, and rows never move so point access is unaffected.
+
+**Key-derived permutation.**
 
 | Step | Cost | Paid |
 |---|---|---|
@@ -188,13 +314,3 @@ because its gain there survives both, but its value on the designed ID schemes l
   costs 24 to 434 ns/row to invert. Its gain there is also a symptom rather than a win: `Id1`
   gets a single 64-bit section for a column using about 20 bits, so the transform is
   compensating for the split selector under-splitting.
-
-## Testing
-
-* Round-trip every transform on every block. The oracle harness does this and reports zero
-  failures across roughly 2.4 million measured rows; the production path should assert the same
-  invariant in tests.
-* A section used as a key must be stored unpermuted, and a permutation keyed on section *k*
-  applied to section *k* must be the identity. Both are cheap assertions.
-* Point-lookup latency with and without the rank cache, against the 908 ns view baseline.
-* `MlIdReorderOracleBenchmark` regenerates every number here.
