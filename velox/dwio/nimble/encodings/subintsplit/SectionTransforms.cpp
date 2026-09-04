@@ -259,6 +259,11 @@ class RelabelTransform : public SectionTransform {
 
 class BurrowsWheelerTransform : public SectionTransform {
  public:
+  // Distinct values past which move-to-front is not applied. Chosen so the
+  // alphabet stays cheap to scan and cheap to store; beyond it the transform
+  // is a loss on both counts.
+  static constexpr size_t kMoveToFrontAlphabetLimit = 256;
+
   explicit BurrowsWheelerTransform(bool moveToFront)
       : moveToFront_{moveToFront} {}
 
@@ -286,7 +291,7 @@ class BurrowsWheelerTransform : public SectionTransform {
     }
     std::copy(scratch.begin(), scratch.end(), values.begin());
 
-    if (!moveToFront_) {
+    if (!moveToFront_ || state.codebook.empty()) {
       return;
     }
     // Replace each value by how recently it was last seen. Clustered values
@@ -309,9 +314,23 @@ class BurrowsWheelerTransform : public SectionTransform {
 
   void prepareSection(std::span<const uint64_t> section, TransformState& shared)
       const override {
-    if (moveToFront_) {
-      shared.codebook = sortedAlphabet(section);
+    if (!moveToFront_) {
+      return;
     }
+    // Move-to-front's premise is that a value recurs soon after it was last
+    // seen, which only holds for a small alphabet: it costs a scan of the
+    // alphabet per value, and stores the alphabet outright. Past the limit it
+    // pays for neither, so the section keeps the plain Burrows-Wheeler
+    // transform instead.
+    //
+    // An empty codebook is how that decision reaches the decoder. It needs no
+    // separate wire field, and it cannot disagree with what encode did, since
+    // both sides read the same absence.
+    auto alphabet = sortedAlphabet(section);
+    if (alphabet.size() > kMoveToFrontAlphabetLimit) {
+      return;
+    }
+    shared.codebook = std::move(alphabet);
   }
 
   void invert(
@@ -321,7 +340,7 @@ class BurrowsWheelerTransform : public SectionTransform {
     if (values.empty()) {
       return;
     }
-    if (moveToFront_) {
+    if (moveToFront_ && !state.codebook.empty()) {
       std::vector<uint64_t> alphabet = state.codebook;
       for (auto& value : values) {
         NIMBLE_CHECK(
