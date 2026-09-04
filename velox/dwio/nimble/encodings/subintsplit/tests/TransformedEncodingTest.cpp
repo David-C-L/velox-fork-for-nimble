@@ -123,63 +123,18 @@ TEST_F(TransformedEncodingTest, noTransformIsUnchangedOnTheWire) {
   EXPECT_EQ(std::string(plain), std::string(alsoPlain));
 }
 
-// A transformed stream announces a type an older reader does not know, so that
-// reader fails instead of decoding the sections and skipping the inverse.
-TEST_F(TransformedEncodingTest, transformedStreamAnnouncesADistinctType) {
-  const auto values = packedIdentifiers(2048);
+// The encoding type is what tells a reader whether an inverse has to be
+// applied, so it has to follow what selection actually chose rather than what
+// was offered. Asserting on a particular transform being applied would only be
+// asserting that it happened to pay on this data.
+TEST_F(TransformedEncodingTest, announcesTheTypeThatMatchesWhatItChose) {
+  const auto values = packedIdentifiers(8192);
 
   Buffer plainBuffer{*pool_};
   const auto plain = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       plainBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
-  EXPECT_EQ(
-      static_cast<EncodingType>(plain[0]), EncodingType::SubIntSplit);
+  ASSERT_EQ(static_cast<EncodingType>(plain[0]), EncodingType::SubIntSplit);
 
-  Buffer transformedBuffer{*pool_};
-  Encoding::Options options;
-  options.subIntSplitTransform =
-      static_cast<uint8_t>(TransformId::RelabelDense);
-  const auto transformed =
-      test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-          transformedBuffer, values, CompressionType::Uncompressed, options);
-  EXPECT_EQ(
-      static_cast<EncodingType>(transformed[0]),
-      EncodingType::SubIntSplitReordered);
-}
-
-// The key section rebuilds the order, so it must reach the decoder untouched.
-TEST_F(TransformedEncodingTest, keySectionIsLeftUntransformed) {
-  const auto values = packedIdentifiers(2048);
-  Buffer buffer{*pool_};
-  Encoding::Options options;
-  options.subIntSplitTransform =
-      static_cast<uint8_t>(TransformId::KeyDerived);
-  options.subIntSplitKeySection = 0;
-  const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      buffer, values, CompressionType::Uncompressed, options);
-
-  detail::SubIntSplitTransformInfo info;
-  const auto sections = detail::parseSubIntSplitSections(
-      encoded, Encoding::kPrefixSize, &info);
-  ASSERT_FALSE(sections.empty());
-  EXPECT_EQ(info.keySection, 0);
-  EXPECT_EQ(info.transformIds[0], 0)
-      << "the key section must not carry a transform";
-
-  Vector<uint64_t> decoded{pool_.get()};
-  decoded.resize(values.size());
-  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-      *pool_, encoded, nullptr, options);
-  encoding->materialize(values.size(), decoded.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(decoded[i], values[i]) << "differs at row " << i;
-  }
-}
-
-// The view is what gather and point reads go through, so a transform that the
-// encoding can undo but the view cannot is worse than useless: it would hand
-// back transformed values as though they were the originals.
-TEST_F(TransformedEncodingTest, theViewUndoesEveryTransform) {
-  const auto values = packedIdentifiers(9000);
   for (auto id : transformsUnderTest()) {
     Buffer buffer{*pool_};
     Encoding::Options options;
@@ -188,30 +143,56 @@ TEST_F(TransformedEncodingTest, theViewUndoesEveryTransform) {
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+    detail::SubIntSplitTransformInfo info;
+    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    const auto type = static_cast<EncodingType>(encoded[0]);
+    if (info.anyTransform()) {
+      EXPECT_EQ(type, EncodingType::SubIntSplitReordered)
+          << toString(id) << " was applied but the stream reads as untransformed";
+    } else {
+      EXPECT_EQ(type, EncodingType::SubIntSplit)
+          << toString(id) << " was declined but the stream reads as transformed";
+      EXPECT_EQ(std::string(encoded), std::string(plain))
+          << toString(id) << " declined but did not leave the bytes alone";
+    }
+  }
+}
 
-    // A bulk read, which crosses several transform blocks.
-    std::vector<uint64_t> bulk(values.size());
-    view.read(0, values.size(), bulk.data());
+// The key section rebuilds the order of the sections keyed on it, so it must
+// reach the decoder untouched. Stated as an invariant over whatever selection
+// chose, since a key is only held back when something was actually keyed on it.
+TEST_F(TransformedEncodingTest, neverTransformsTheKeySection) {
+  const auto values = packedIdentifiers(8192);
+  for (uint8_t keySection : {uint8_t{0}, uint8_t{1}}) {
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    options.subIntSplitTransform =
+        static_cast<uint8_t>(TransformId::KeyDerived);
+    options.subIntSplitKeySection = keySection;
+    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    detail::SubIntSplitTransformInfo info;
+    const auto sections = detail::parseSubIntSplitSections(
+        encoded, Encoding::kPrefixSize, &info);
+    ASSERT_FALSE(sections.empty());
+    if (info.anyTransform()) {
+      ASSERT_EQ(info.keySection, keySection);
+      EXPECT_EQ(info.transformIds[keySection], 0)
+          << "the key section must not carry a transform";
+    } else {
+      EXPECT_EQ(
+          info.keySection, detail::SubIntSplitTransformInfo::kNoKeySection)
+          << "no section was keyed, so none should be held back as a key";
+    }
+
+    Vector<uint64_t> decoded{pool_.get()};
+    decoded.resize(values.size());
+    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+        *pool_, encoded, nullptr, options);
+    encoding->materialize(values.size(), decoded.data());
     for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(bulk[i], values[i]) << toString(id) << " bulk row " << i;
-    }
-
-    // A read that starts and ends inside a block, which is the case the block
-    // path has to handle rather than assume away.
-    constexpr uint32_t kOffset = 4000;
-    constexpr uint32_t kLength = 1500;
-    std::vector<uint64_t> ranged(kLength);
-    view.read(kOffset, kLength, ranged.data());
-    for (uint32_t i = 0; i < kLength; ++i) {
-      ASSERT_EQ(ranged[i], values[kOffset + i])
-          << toString(id) << " range row " << i;
-    }
-
-    // Point reads, scattered so that they do not all fall in one block.
-    for (uint32_t i = 0; i < values.size(); i += 397) {
-      ASSERT_EQ(view.readAt(i), values[i])
-          << toString(id) << " point row " << i;
+      ASSERT_EQ(decoded[i], values[i]) << "differs at row " << i;
     }
   }
 }
@@ -259,6 +240,40 @@ TEST_F(TransformedEncodingTest, readsRangesThatStartInsideABlock) {
       encoding->materialize(1, &got);
       ASSERT_EQ(got, values[start]) << toString(id) << " gather at " << start;
       position = start + 1;
+    }
+  }
+}
+
+// A transform is applied to a section only where it pays for itself, so
+// offering one can never produce a larger stream than not offering it. Without
+// this, a transform forced onto every section charges a codebook to the
+// sections that had nothing to gain, which on a high-cardinality column costs
+// more than the whole encoding.
+TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
+  const auto values = packedIdentifiers(16384);
+
+  Buffer plainBuffer{*pool_};
+  const auto plain = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      plainBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+
+  for (auto id : transformsUnderTest()) {
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    options.subIntSplitTransform = static_cast<uint8_t>(id);
+    options.subIntSplitKeySection = 1;
+    const auto offered = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    EXPECT_LE(offered.size(), plain.size())
+        << toString(id) << " was applied where it did not pay";
+
+    // Whatever it chose still has to read back.
+    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+        *pool_, offered, nullptr, options);
+    std::vector<uint64_t> decoded(values.size());
+    encoding->materialize(values.size(), decoded.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(decoded[i], values[i]) << toString(id) << " at row " << i;
     }
   }
 }

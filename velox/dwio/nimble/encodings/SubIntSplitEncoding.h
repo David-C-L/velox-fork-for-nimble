@@ -811,58 +811,13 @@ std::string_view SubIntSplitEncoding<T>::encode(
     transformInfo.keySection = keySection;
   }
 
-  for (uint8_t s = 0; s < splitCount; ++s) {
-    const auto& seg = segments[s];
-    const int width = seg.bitEnd - seg.bitStart + 1;
-    const uint8_t sb = sectionStorageBytes(width);
-
-    auto sectionU64 = extractSection(seg);
-
-    const bool transformThis = transform != nullptr &&
-        !(transform->needsKeySection() && s == keySection);
-    if (transformThis) {
-      transformInfo.transformIds[s] = static_cast<uint8_t>(transform->id());
-      if (transform->isElementwise()) {
-        // Nothing moves, so there is no span to bound: one codebook covers the
-        // section, and blocking it would only repeat that codebook.
-        subintsplit::TransformState state;
-        subintsplit::TransformContext context{
-            .keySection = keyValues, .width = width};
-        transform->apply(sectionU64, context, state);
-        transformInfo.codebooks[s] = std::move(state.codebook);
-      } else {
-        // Applied one block at a time so the decoder can undo it inside its
-        // chunk loop. Over the whole column the inverse of the first row would
-        // depend on the last, which forces every reader to hold the section
-        // entire and costs a point lookup the column rather than a block.
-        const uint32_t blockSize = subintsplit::kTransformBlockSize;
-        transformInfo.blockSize = blockSize;
-        // Whatever the transform needs that does not vary by block is derived
-        // from the section once and stored once.
-        subintsplit::TransformState sharedState;
-        transform->prepareSection(sectionU64, sharedState);
-        transformInfo.codebooks[s] = sharedState.codebook;
-        for (uint32_t start = 0; start < valueCount; start += blockSize) {
-          const uint32_t count =
-              std::min<uint32_t>(blockSize, valueCount - start);
-          subintsplit::TransformState state;
-          state.codebook = sharedState.codebook;
-          subintsplit::TransformContext context{
-              .keySection = keyValues.empty()
-                  ? std::span<const uint64_t>{}
-                  : std::span<const uint64_t>(keyValues.data() + start, count),
-              .width = width};
-          transform->apply(
-              std::span<uint64_t>(sectionU64.data() + start, count),
-              context,
-              state);
-          transformInfo.primaryIndices[s].push_back(state.primaryIndex);
-        }
-      }
-    }
-
+  // Encodes one section at its storage width. Called more than once per
+  // section, since choosing whether to transform means pricing both.
+  const auto encodeSection = [&](uint8_t s,
+                                 uint8_t storageBytes,
+                                 const std::vector<uint64_t>& sectionU64) {
     std::string_view encoded;
-    switch (sb) {
+    switch (storageBytes) {
       case 1: {
         Vector<uint8_t> sectionValues{sectionPool, valueCount};
         for (uint32_t i = 0; i < valueCount; ++i) {
@@ -919,7 +874,105 @@ std::string_view SubIntSplitEncoding<T>::encode(
         NIMBLE_UNREACHABLE("Invalid SubIntSplit section storage width.");
       }
     }
-    sectionData.push_back(encoded);
+    return encoded;
+  };
+
+  // Rewrites one section with the transform, and reports what the state it
+  // produced will cost on the wire, so the two candidates can be compared on
+  // the same terms.
+  const auto applyTransform = [&](int width,
+                                  std::vector<uint64_t>& sectionU64,
+                                  std::vector<uint64_t>& codebook,
+                                  std::vector<uint32_t>& primaryIndices) {
+    if (transform->isElementwise()) {
+      // Nothing moves, so there is no span to bound: one codebook covers the
+      // section, and blocking it would only repeat that codebook.
+      subintsplit::TransformState state;
+      subintsplit::TransformContext context{
+          .keySection = keyValues, .width = width};
+      transform->apply(sectionU64, context, state);
+      codebook = std::move(state.codebook);
+    } else {
+      // Applied one block at a time so the decoder can undo it inside its
+      // chunk loop. Over the whole column the inverse of the first row would
+      // depend on the last, which forces every reader to hold the section
+      // entire and costs a point lookup the column rather than a block.
+      const uint32_t blockSize = subintsplit::kTransformBlockSize;
+      // Whatever the transform needs that does not vary by block is derived
+      // from the section once and stored once.
+      subintsplit::TransformState sharedState;
+      transform->prepareSection(sectionU64, sharedState);
+      codebook = sharedState.codebook;
+      for (uint32_t start = 0; start < valueCount; start += blockSize) {
+        const uint32_t count = std::min<uint32_t>(blockSize, valueCount - start);
+        subintsplit::TransformState state;
+        state.codebook = sharedState.codebook;
+        subintsplit::TransformContext context{
+            .keySection = keyValues.empty()
+                ? std::span<const uint64_t>{}
+                : std::span<const uint64_t>(keyValues.data() + start, count),
+            .width = width};
+        transform->apply(
+            std::span<uint64_t>(sectionU64.data() + start, count),
+            context,
+            state);
+        primaryIndices.push_back(state.primaryIndex);
+      }
+    }
+    // What subIntSplitTransformHeaderSize will charge for this section: the
+    // codebook and its count, and the per-block state and its count.
+    return 4 + codebook.size() * sizeof(uint64_t) + 4 +
+        primaryIndices.size() * 4;
+  };
+
+  for (uint8_t s = 0; s < splitCount; ++s) {
+    const auto& seg = segments[s];
+    const int width = seg.bitEnd - seg.bitStart + 1;
+    const uint8_t sb = sectionStorageBytes(width);
+
+    const auto sectionU64 = extractSection(seg);
+    const std::string_view plain = encodeSection(s, sb, sectionU64);
+
+    // The key section rebuilds the order of the others, so it is never itself
+    // transformed however well it would compress.
+    const bool mayTransform = transform != nullptr &&
+        !(transform->needsKeySection() && s == keySection);
+    if (!mayTransform) {
+      sectionData.push_back(plain);
+      continue;
+    }
+
+    // A transform is worth applying to a section only where it pays for
+    // itself, so both candidates are priced on what they actually encode to,
+    // the transform's stored state included, and the smaller is kept. Applying
+    // one everywhere costs a codebook per section for the sections that had
+    // nothing to gain, which loses by more than the sections that gain can
+    // recover.
+    auto transformed = sectionU64;
+    std::vector<uint64_t> codebook;
+    std::vector<uint32_t> primaryIndices;
+    const size_t stateBytes =
+        applyTransform(width, transformed, codebook, primaryIndices);
+    const std::string_view alternative = encodeSection(s, sb, transformed);
+
+    if (alternative.size() + stateBytes < plain.size()) {
+      transformInfo.transformIds[s] = static_cast<uint8_t>(transform->id());
+      transformInfo.codebooks[s] = std::move(codebook);
+      transformInfo.primaryIndices[s] = std::move(primaryIndices);
+      if (!transform->isElementwise()) {
+        transformInfo.blockSize = subintsplit::kTransformBlockSize;
+      }
+      sectionData.push_back(alternative);
+    } else {
+      sectionData.push_back(plain);
+    }
+  }
+
+  // A key section is only worth holding back if some other section was
+  // actually keyed on it.
+  if (!transformInfo.anyTransform()) {
+    transformInfo.keySection =
+        detail::SubIntSplitTransformInfo::kNoKeySection;
   }
 
   // Write final encoding to main buffer.
