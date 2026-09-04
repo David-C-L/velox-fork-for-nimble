@@ -1,4 +1,8 @@
-# Block-Local Reordering for SubIntSplit Sections
+# Reversible Section Transforms for SubIntSplit
+
+Formerly "Block-Local Reordering". The name no longer fits: blocking turned out
+to be what one family needs rather than what the design is, and confining it to
+that family is most of what makes the layer worth having.
 
 *2026-09-03*
 
@@ -67,24 +71,45 @@ the structure it exploits.
 
 ## Scope
 
-* Block-local only. A permutation applies within a fixed block, which bounds both what a reader
-  must hold to undo it and how far a point lookup has to reconstruct.
+* Blocked only where a block is what makes a row reachable. The first version of this design
+  blocked everything that moved a row, on the assumption that moving rows is what puts a row out
+  of reach. That is wrong, and it was expensive: blocking a key-derived permutation at 4096 rows
+  took its gain on `Medicare1.NPI` from +5.99 b/e to +0.00, because a sort clusters far better
+  over a section than over 4096 rows, and it bought nothing in exchange.
 
-  As built, the block is 4096 rows, matching `kSubIntSplitChunkSize`, so the decoder undoes a
-  transform inside the chunk loop it already runs rather than materialising whole sections. The
-  size is carried on the wire, so a later writer may choose a different one without breaking
-  this reader.
+  What decides it is whether undoing one row requires undoing the rows around it. The interface
+  states this as `positionMapping()`:
 
-  Not every transform needs a block. A transform that maps values without regard to their
-  neighbours -- the three relabellings -- is *elementwise*: it carries one codebook for the whole
-  section and is undone wherever the value happens to be read, so blocking it would only repeat
-  the codebook. Everything that moves rows is blocked. The distinction is on the interface as
-  `isElementwise()`, because it decides where state lives, not only how fast a probe is.
+  | | blocked? | how one row is read |
+  |---|---|---|
+  | `InPlace` (the three relabellings) | no | the value is undone where it stands |
+  | `Permuted` (key-derived) | no | one offset, from a map built off the key section |
+  | `Gathered` (bit-plane) | no | `width` computable offsets, reassembled by the transform |
+  | `Sequential` (Burrows-Wheeler, BWT+MTF) | **yes** | a chain through the block, no closed form |
+
+  A key-derived permutation sends each row to its rank in the sort of the key section, and the
+  key section reaches the reader in original order precisely so it can order the rest. So where
+  a row went is derivable without reading a single transformed value: a reader builds that map
+  once and then addresses any row through one indirection. Bit-plane is the same in kind but not
+  in shape -- a row's bits sit at `width` computable positions rather than one -- so it supplies
+  `gatherRow` instead of a map, with the reader providing the fetch and the transform providing
+  the arithmetic.
+
+  Only Burrows-Wheeler is left, and only because its inverse is a chain of lookups with no closed
+  form. Its block is 4096 rows, matching `kSubIntSplitChunkSize`, and the size is carried on the
+  wire so a later writer may choose another without breaking this reader. A zero block size means
+  nothing was blocked, which a reader must take as "the span is the whole column" rather than
+  defaulting to a chunk and inverting a whole-column permutation piecewise.
 
   A blocked transform that still wants a dictionary derives it once from the whole section via
   `prepareSection`, rather than storing one per block. Burrows-Wheeler with move-to-front is the
   case that forced this: a per-block alphabet costs more than the transform saves, and a
   section-wide alphabet is a superset of every block's, which is all move-to-front requires.
+  Move-to-front also declines a section whose alphabet exceeds a limit, since it scans that
+  alphabet per value and stores it outright, and past the limit it pays for neither.
+* Which section a key-derived permutation sorts by is searched, not fixed. Which section groups
+  the others is a property of the data, and guessing it wrong reports that the transform does not
+  pay when what did not pay was the guess.
 * Three families behind one extension point: value relabelling, which never moves a row; a
   key-derived permutation, a stable sort of the block by another section the decoder has
   already read; and closed-form permutations. None of them stores a per-row index.
@@ -308,6 +333,48 @@ conventions in the nimble CMakeLists:
 * A section used as a key must round-trip while stored unpermuted.
 * An unknown transform id must throw, not misdecode.
 * Point-lookup latency with and without the rank cache, against the 908 ns view baseline.
+
+## What the built layer measures
+
+Measured at 524288 rows per column. The full tables are in
+`MetaNimbleProject/sis_transform_results.md`.
+
+**The layer's worth is a property of how a column arrived, not of the column.**
+On the order a file stores, five of eight columns gain under 1%. On an
+interleaved arrival order the same layer on the same rows recovers 20 to 42%.
+
+| column | shipped | best interleaved |
+|---|---|---|
+| `osm_h3_r9` | +3.70% | +35.65% |
+| `publicbi_npi` | +22.19% | +42.29% |
+| `snowflake` | +0.59% | +10.33% |
+| `xmark_prepost` | +38.01% (BWT) | +30.65% (key-derived) |
+
+A stored file is usually the arrival order already sorted, so measuring only
+what the file holds tests the layer on the input with least left to recover.
+This is why the benchmark carries an arrival-order axis rather than reading
+each column as shipped.
+
+The two families respond to arrival order in opposite directions. Key-derived
+recovers *structured* disorder: it gains most where rows arrived interleaved
+from ordered writers, because the interleave leaves the groupings intact and a
+sort on the right section puts them back. Random shuffling is a different case,
+and a worse one -- `osm_h3_r9` gives +8.47% shuffled against +35.65% merged --
+because shuffling destroys the groupings rather than interleaving them.
+Burrows-Wheeler is the reverse: worth +38.01% on `xmark` as stored and nothing
+at all once interleaved, since the repeated context it exploits is exactly what
+interleaving destroys.
+
+What each costs a reader follows the position mapping, not the gain:
+
+| | compression | point lookup |
+|---|---|---|
+| key-derived, `publicbi_npi` | +22.19% | 199 ns against 38.6 ns |
+| bit-plane, `xmark` | +14.72% | 784 ns against 557 ns |
+| Burrows-Wheeler, `xmark` | +38.01% | 174054 ns against 557 ns |
+
+On two OSM columns key-derived probes came back faster than the untransformed
+baseline, because permuting improved locality for the section it sorted on.
 
 ## Where the gains are, by column
 
