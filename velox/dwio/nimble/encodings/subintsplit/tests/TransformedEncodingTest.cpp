@@ -216,4 +216,51 @@ TEST_F(TransformedEncodingTest, theViewUndoesEveryTransform) {
   }
 }
 
+// The sequential decoder serves point and gather reads in the drivers by
+// resetting, skipping and materialising, so a read that starts inside a
+// transform block has to work rather than be refused.
+TEST_F(TransformedEncodingTest, readsRangesThatStartInsideABlock) {
+  const auto values = packedIdentifiers(9000);
+  for (auto id : transformsUnderTest()) {
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    options.subIntSplitTransform = static_cast<uint8_t>(id);
+    options.subIntSplitKeySection = 1;
+    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+        *pool_, encoded, nullptr, options);
+
+    // Offsets that fall inside a block, span a boundary, and reach the ragged
+    // last block.
+    const std::vector<std::pair<uint32_t, uint32_t>> ranges{
+        {1, 1}, {4095, 3}, {4096, 1}, {1234, 5000}, {8999, 1}, {0, 9000}};
+    for (auto [offset, count] : ranges) {
+      encoding->reset();
+      if (offset > 0) {
+        encoding->skip(offset);
+      }
+      std::vector<uint64_t> got(count);
+      encoding->materialize(count, got.data());
+      for (uint32_t i = 0; i < count; ++i) {
+        ASSERT_EQ(got[i], values[offset + i])
+            << toString(id) << " at offset " << offset << " row " << i;
+      }
+    }
+
+    // A gather: several ranges in ascending order without an intervening
+    // reset, which is how the gather driver drives it.
+    encoding->reset();
+    uint32_t position = 0;
+    for (uint32_t start : {10u, 4100u, 4200u, 8000u}) {
+      encoding->skip(start - position);
+      uint64_t got = 0;
+      encoding->materialize(1, &got);
+      ASSERT_EQ(got, values[start]) << toString(id) << " gather at " << start;
+      position = start + 1;
+    }
+  }
+}
+
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
