@@ -357,7 +357,7 @@ int runBenchmark() {
             collector.compute(sectionU64, requiredFlags);
         EncodingType modelBestEnc = EncodingType::Trivial;
         const double modelBestBits =
-            bestCostBits(metrics, sampleSize, width, modelBestEnc);
+            bestCostBits(metrics, sampleSize, width, sectionU64, modelBestEnc);
 
         ModelCell& mc = modelGrid[l][r];
         mc.bestBits = modelBestBits;
