@@ -93,6 +93,7 @@ int runBenchmark() {
       "family",
       "variant",
       "inventory",
+      "transform",
       "is_sequential",
       "N",
       "seed",

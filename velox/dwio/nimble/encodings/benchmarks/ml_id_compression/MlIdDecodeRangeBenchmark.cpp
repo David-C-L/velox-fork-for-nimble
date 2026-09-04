@@ -126,6 +126,7 @@ int runBenchmark() {
       "family",
       "variant",
       "inventory",
+      "transform",
       "is_sequential",
       "fast_skip",
       "random_access",

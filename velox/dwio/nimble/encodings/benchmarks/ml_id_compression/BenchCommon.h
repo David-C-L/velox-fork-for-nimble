@@ -334,6 +334,8 @@ struct EncoderEntry {
   // Which cost-model inventory SubIntSplit was allowed to choose from. Only
   // meaningful for the SubIntSplit family; empty elsewhere.
   std::string inventory;
+  // Section transform applied, empty when none. The ablation arm.
+  std::string transform;
   bool isSequential{true};
   bool fastSkip{false};
   bool randomAccess{false};
@@ -1133,6 +1135,73 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
       };
       encoders.push_back(std::move(entry));
+    }
+  }
+
+  // One entry per transform, so the ablation is an encoder row rather than a
+  // new loop in every driver: bulk, gather and point pick these up unchanged.
+  // The key section is section 1 where a transform needs one, which is the
+  // first section above the low-order bits on the columns measured here.
+  {
+    const std::vector<std::pair<subintsplit::TransformId, const char*>> arms{
+        {subintsplit::TransformId::KeyDerived, "key_derived"},
+        {subintsplit::TransformId::RelabelFrequency, "relabel_frequency"},
+        {subintsplit::TransformId::RelabelDense, "relabel_dense"},
+        {subintsplit::TransformId::RelabelGray, "relabel_gray"},
+        {subintsplit::TransformId::BurrowsWheeler, "bwt"},
+        {subintsplit::TransformId::BurrowsWheelerMoveToFront, "bwt_mtf"},
+        {subintsplit::TransformId::BitPlane, "bitplane"},
+    };
+    for (const auto& [transformId, name] : arms) {
+      const auto rawId = static_cast<uint8_t>(transformId);
+
+      {
+        EncoderEntry<T> entry;
+        entry.name = std::string("SIS/") + name;
+        entry.family = "SubIntSplit";
+        entry.variant = "real_nested";
+        entry.inventory = "full";
+        entry.transform = name;
+        entry.isSequential = false;
+        entry.fastSkip = false;
+        entry.randomAccess = false;
+        entry.factory = [rawId](
+                            const Vector<T>& data,
+                            const Encoding::Options& opts) {
+          Encoding::Options o = opts;
+          o.subIntSplitTransform = rawId;
+          o.subIntSplitKeySection = 1;
+          auto impl =
+              std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+          impl->target.encode(data, o, /*realNestedSelection=*/true);
+          return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+        };
+        encoders.push_back(std::move(entry));
+      }
+
+      {
+        EncoderEntry<T> entry;
+        entry.name = std::string("SIS/") + name + "+view";
+        entry.family = "SubIntSplit";
+        entry.variant = "real_nested_view";
+        entry.inventory = "full";
+        entry.transform = name;
+        entry.isSequential = false;
+        entry.fastSkip = true;
+        entry.randomAccess = true;
+        entry.factory = [rawId](
+                            const Vector<T>& data,
+                            const Encoding::Options& opts) {
+          Encoding::Options o = opts;
+          o.subIntSplitTransform = rawId;
+          o.subIntSplitKeySection = 1;
+          auto impl = std::make_unique<
+              NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+          impl->encodeWith(data, o, /*realNestedSelection=*/true);
+          return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+        };
+        encoders.push_back(std::move(entry));
+      }
     }
   }
 

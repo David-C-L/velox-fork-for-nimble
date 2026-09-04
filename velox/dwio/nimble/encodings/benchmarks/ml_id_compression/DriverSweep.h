@@ -110,6 +110,7 @@ void setIdentityColumns(
   csv.set("family", encoder.family);
   csv.set("variant", encoder.variant);
   csv.set("inventory", encoder.inventory);
+  csv.set("transform", encoder.transform);
   csv.set("is_sequential", encoder.isSequential ? int64_t{1} : int64_t{0});
 }
 
