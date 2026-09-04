@@ -45,6 +45,7 @@
 #include "velox/dwio/nimble/compression/Compression.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
@@ -64,6 +65,7 @@ DECLARE_int32(mlidc_iters);
 DECLARE_int64(mlidc_seed);
 DECLARE_string(mlidc_file);
 DECLARE_string(mlidc_dataset_name);
+DECLARE_string(mlidc_input_order);
 DECLARE_string(mlidc_substream_compression);
 DECLARE_string(mlidc_outer_compression);
 DECLARE_int32(mlidc_block_codec_iters);
@@ -774,6 +776,61 @@ T parseColumnValue(const std::string& line) {
 // tools and the results cross-check. That tool parses int64 only
 // (tools/encoding_bench/EncodingBench.cpp:121), so the other types are an
 // extension this suite makes alone.
+// Presents the column in the arrival order the run asked for.
+//
+// The order is applied once, to the input, before anything is encoded. Every
+// encoder then sees the same rows in the same order, so the ablation compares
+// transforms against each other on one input rather than comparing inputs.
+template <typename T>
+Vector<T> applyInputOrder(Vector<T> data) {
+  const auto order = mlidc::parseInputOrder(FLAGS_mlidc_input_order);
+  if (order.kind.empty() || order.kind == "shipped") {
+    return data;
+  }
+
+  std::vector<uint64_t> values(data.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    uint64_t bits = 0;
+    __builtin_memcpy(&bits, &data[i], sizeof(T));
+    values[i] = bits;
+  }
+
+  // mergekey partitions by a field the value already carries, so the key is a
+  // real section of the real split rather than an arbitrary bit range: that is
+  // what makes the interleave undoable from a section the decoder has read.
+  std::function<uint64_t(uint32_t)> keyOf = [](uint32_t) {
+    return uint64_t{0};
+  };
+  if (order.kind == "mergekey") {
+    const auto plan = ::facebook::nimble::detail::subintsplit::selectSplits(
+        values, static_cast<int>(sizeof(T) * 8), values.size());
+    NIMBLE_CHECK(!plan.segments.empty(), "Split selection found no sections.");
+    const size_t which = std::min<size_t>(
+        static_cast<size_t>(std::max(0, order.param)),
+        plan.segments.size() - 1);
+    const int bitStart = plan.segments[which].bitStart;
+    const int width =
+        plan.segments[which].bitEnd - plan.segments[which].bitStart + 1;
+    const uint64_t mask =
+        (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+    const std::vector<uint64_t>* source = &values;
+    keyOf = [source, bitStart, mask](uint32_t row) -> uint64_t {
+      return ((*source)[row] >> bitStart) & mask;
+    };
+  }
+
+  const auto rows = mlidc::buildInputOrder(
+      order, values, keyOf, static_cast<uint64_t>(FLAGS_mlidc_seed));
+
+  auto& pool = benchmarks::benchmarkPool();
+  Vector<T> reordered{pool.get()};
+  reordered.resize(data.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    reordered[i] = data[rows[i]];
+  }
+  return reordered;
+}
+
 template <typename T>
 Vector<T> loadColumnLines(const std::string& path, uint32_t n) {
   std::ifstream file(path);
@@ -876,7 +933,8 @@ std::vector<DatasetEntry<T>> defaultDatasets() {
   // above this is not regenerated per seed, so the seed is ignored.
   if (!FLAGS_mlidc_file.empty()) {
     out.push_back({FLAGS_mlidc_dataset_name, [](uint32_t n, uint64_t /*seed*/) {
-                     return detail::loadColumnLines<T>(FLAGS_mlidc_file, n);
+                     auto data = detail::loadColumnLines<T>(FLAGS_mlidc_file, n);
+                     return detail::applyInputOrder<T>(std::move(data));
                    }});
   }
 

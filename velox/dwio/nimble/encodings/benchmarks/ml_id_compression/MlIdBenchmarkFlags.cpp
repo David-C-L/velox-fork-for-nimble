@@ -78,6 +78,17 @@ DEFINE_int32(
     "decompress per cell would otherwise dominate wall-clock time. Timings for "
     "these entries are correspondingly noisier.");
 DEFINE_string(
+    mlidc_input_order,
+    "shipped",
+    "Order the real-data column is presented in, before any encoding: shipped "
+    "(as the file stores it), shuffled, sorted, mergeirr=k (k monotone runs "
+    "interleaved at irregular rates, with nothing in the data saying which run "
+    "a row came from), or mergekey=s (partitioned by section s, each partition "
+    "ordered, interleaved irregularly -- the multi-writer case a Snowflake id "
+    "actually arrives in). A file's own order is usually the arrival order "
+    "already sorted, which is the input a reordering transform has least to do "
+    "on, so measuring only that understates the layer.");
+DEFINE_string(
     mlidc_dataset_name,
     "twitter-snowflake",
     "Name reported for the --mlidc_file dataset");

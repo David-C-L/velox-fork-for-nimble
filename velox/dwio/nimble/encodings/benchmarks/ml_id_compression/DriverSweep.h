@@ -37,6 +37,8 @@
 // cache for one cell, measure, then write a row. Only the measurement and the
 // driver-specific columns differ, and those stay in the driver.
 
+DECLARE_string(mlidc_input_order);
+
 namespace facebook::nimble::mlidc {
 
 /// Holds the encoder and dataset suites a sweep driver walks, with the cache
@@ -111,6 +113,7 @@ void setIdentityColumns(
   csv.set("variant", encoder.variant);
   csv.set("inventory", encoder.inventory);
   csv.set("transform", encoder.transform);
+  csv.set("input_order", FLAGS_mlidc_input_order);
   csv.set("is_sequential", encoder.isSequential ? int64_t{1} : int64_t{0});
 }
 

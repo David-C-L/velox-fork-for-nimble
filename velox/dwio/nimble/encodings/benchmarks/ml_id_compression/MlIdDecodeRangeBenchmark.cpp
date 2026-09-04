@@ -127,6 +127,7 @@ int runBenchmark() {
       "variant",
       "inventory",
       "transform",
+      "input_order",
       "is_sequential",
       "fast_skip",
       "random_access",

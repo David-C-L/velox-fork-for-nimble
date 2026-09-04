@@ -76,6 +76,7 @@ int runBenchmark() {
       "variant",
       "inventory",
       "transform",
+      "input_order",
       "is_sequential",
       "N",
       "seed",
