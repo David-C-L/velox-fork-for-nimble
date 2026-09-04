@@ -247,6 +247,13 @@ void SubIntSplitEncoding<T>::reset() {
 
 template <typename T>
 void SubIntSplitEncoding<T>::skip(uint32_t rowCount) {
+  // Skipping into the middle of a transform block would leave the next read
+  // unable to undo it, so a transformed stream only skips whole blocks.
+  if (transformInfo_.anyTransform() && transformInfo_.blockSize != 0) {
+    NIMBLE_CHECK(
+        rowCount % transformInfo_.blockSize == 0,
+        "A transformed SubIntSplit stream only skips whole blocks.");
+  }
   for (auto& sec : sections_) {
     sec.encoding->skip(rowCount);
   }
@@ -268,11 +275,10 @@ void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
   // Outer loop: advance through the output in kMaterializeChunkSize-element
   // chunks.  For each chunk, all sections are accumulated before moving to the
   // next chunk, so the output slice and the scratch buffer both stay in L2/L1
-  // A transform covers a whole section, so a transformed section cannot be
-  // inverted one chunk at a time: the inverse of the first rows depends on the
-  // rest. Such a stream takes a separate path that materialises each section
-  // in full, inverts it, and only then accumulates. The untransformed path
-  // below is unchanged and stays chunked.
+  // A transformed stream takes a separate path, because its sections have to
+  // be brought to a common width, inverted, and only then assembled. It is
+  // still chunked, one transform block at a time. The untransformed path below
+  // is unchanged.
   if (transformInfo_.anyTransform()) {
     materializeTransformed(rowCount, output);
     return;
@@ -534,82 +540,135 @@ template <typename T>
 void SubIntSplitEncoding<T>::materializeTransformed(
     uint32_t rowCount,
     physicalType* output) {
-  // The key section orders any key-derived permutation, so it is decoded first
-  // and in original order; every other section's inverse may depend on it.
-  std::vector<uint64_t> keyValues;
+  // Non-elementwise transforms were applied per block, so their inverses are
+  // taken over the same blocks; an elementwise one does not care where the
+  // boundary falls. Advancing in blocks keeps a transformed decode's working
+  // set the same size as an untransformed one's.
+  const uint32_t blockSize = transformInfo_.blockSize != 0
+      ? transformInfo_.blockSize
+      : kMaterializeChunkSize;
+
+  // A block can only be undone whole, so a read has to start on a block
+  // boundary and run to one, or to the end of the stream. Bulk reads do; a
+  // partial read of a transformed stream is refused rather than answered with
+  // values that were never checked.
+  NIMBLE_CHECK(
+      row_ % blockSize == 0,
+      "A transformed SubIntSplit stream must be read from a block boundary.");
+  NIMBLE_CHECK(
+      rowCount % blockSize == 0 || row_ + rowCount == this->rowCount(),
+      "A transformed SubIntSplit stream must be read in whole blocks.");
+
+  // The scratch buffer is sized for the untransformed chunk, which a writer
+  // may have blocked more coarsely than.
+  const uint32_t neededBytes =
+      blockSize * static_cast<uint32_t>(sizeof(physicalType));
+  if (scratchBuf_.size() < neededBytes) [[unlikely]] {
+    scratchBuf_.resize(neededBytes);
+  }
+
   const bool hasKey = transformInfo_.keySection !=
       detail::SubIntSplitTransformInfo::kNoKeySection;
 
   std::vector<std::vector<uint64_t>> sectionValues(sections_.size());
-  for (size_t s = 0; s < sections_.size(); ++s) {
-    auto& sec = sections_[s];
-    sec.encoding->reset();
-    auto& out = sectionValues[s];
-    out.resize(rowCount);
-    switch (sec.storageBytes) {
-      case 1: {
-        Vector<uint8_t> scratch{this->pool_, rowCount};
-        sec.encoding->materialize(rowCount, scratch.data());
-        for (uint32_t i = 0; i < rowCount; ++i) {
-          out[i] = scratch[i];
-        }
-        break;
-      }
-      case 2: {
-        Vector<uint16_t> scratch{this->pool_, rowCount};
-        sec.encoding->materialize(rowCount, scratch.data());
-        for (uint32_t i = 0; i < rowCount; ++i) {
-          out[i] = scratch[i];
-        }
-        break;
-      }
-      case 4: {
-        Vector<uint32_t> scratch{this->pool_, rowCount};
-        sec.encoding->materialize(rowCount, scratch.data());
-        for (uint32_t i = 0; i < rowCount; ++i) {
-          out[i] = scratch[i];
-        }
-        break;
-      }
-      default: {
-        Vector<uint64_t> scratch{this->pool_, rowCount};
-        sec.encoding->materialize(rowCount, scratch.data());
-        for (uint32_t i = 0; i < rowCount; ++i) {
-          out[i] = scratch[i];
-        }
-        break;
-      }
-    }
-    if (hasKey && s == transformInfo_.keySection) {
-      keyValues = out;
-    }
+  for (auto& values : sectionValues) {
+    values.resize(blockSize);
   }
 
-  for (size_t s = 0; s < sections_.size(); ++s) {
-    const uint8_t id = transformInfo_.transformIds.empty()
-        ? uint8_t{0}
-        : transformInfo_.transformIds[s];
-    if (id == 0) {
-      continue;
-    }
-    const auto* transform = subintsplit::transformForRaw(id);
-    subintsplit::TransformState state;
-    state.primaryIndex = transformInfo_.primaryIndices[s];
-    state.codebook = transformInfo_.codebooks[s];
-    subintsplit::TransformContext context{
-        .keySection = keyValues,
-        .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
-    transform->invert(sectionValues[s], context, state);
-  }
+  uint32_t blockIndex = row_ / blockSize;
+  for (uint32_t blockStart = 0; blockStart < rowCount;
+       blockStart += blockSize, ++blockIndex) {
+    const uint32_t blockCount = std::min(blockSize, rowCount - blockStart);
 
-  for (uint32_t i = 0; i < rowCount; ++i) {
-    uint64_t assembled = 0;
+    // Every section is widened to 64 bits first, so a transform never has to
+    // know which width its section was stored at.
     for (size_t s = 0; s < sections_.size(); ++s) {
-      assembled |= (sectionValues[s][i] & sections_[s].mask)
-          << sections_[s].bitStart;
+      auto& sec = sections_[s];
+      auto& out = sectionValues[s];
+      switch (sec.storageBytes) {
+        case 1: {
+          auto* scratch = reinterpret_cast<uint8_t*>(scratchBuf_.data());
+          sec.encoding->materialize(blockCount, scratch);
+          for (uint32_t i = 0; i < blockCount; ++i) {
+            out[i] = scratch[i];
+          }
+          break;
+        }
+        case 2: {
+          auto* scratch = reinterpret_cast<uint16_t*>(scratchBuf_.data());
+          sec.encoding->materialize(blockCount, scratch);
+          for (uint32_t i = 0; i < blockCount; ++i) {
+            out[i] = scratch[i];
+          }
+          break;
+        }
+        case 4: {
+          auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
+          sec.encoding->materialize(blockCount, scratch);
+          for (uint32_t i = 0; i < blockCount; ++i) {
+            out[i] = scratch[i];
+          }
+          break;
+        }
+        default: {
+          auto* scratch = reinterpret_cast<uint64_t*>(scratchBuf_.data());
+          sec.encoding->materialize(blockCount, scratch);
+          for (uint32_t i = 0; i < blockCount; ++i) {
+            out[i] = scratch[i];
+          }
+          break;
+        }
+      }
     }
-    output[i] = static_cast<physicalType>(assembled);
+
+    // The key section rebuilds the order of the others, so it is read in
+    // original order and inverted first, which is why it carries no transform.
+    std::span<const uint64_t> keySpan;
+    if (hasKey) {
+      keySpan = std::span<const uint64_t>(
+          sectionValues[transformInfo_.keySection].data(), blockCount);
+    }
+
+    for (size_t s = 0; s < sections_.size(); ++s) {
+      const uint8_t id = transformInfo_.transformIds[s];
+      if (id == 0) {
+        continue;
+      }
+      const auto* transform = subintsplit::transformForRaw(id);
+      subintsplit::TransformState state;
+      state.codebook = transformInfo_.codebooks[s];
+      const auto& blockState = transformInfo_.primaryIndices[s];
+      if (blockIndex < blockState.size()) {
+        state.primaryIndex = blockState[blockIndex];
+      }
+      subintsplit::TransformContext context{
+          .keySection = keySpan,
+          .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
+      transform->invert(
+          std::span<uint64_t>(sectionValues[s].data(), blockCount),
+          context,
+          state);
+    }
+
+    physicalType* blockOutput = output + blockStart;
+    for (size_t s = 0; s < sections_.size(); ++s) {
+      const auto& sec = sections_[s];
+      const auto& values = sectionValues[s];
+      if (s == 0) {
+        for (uint32_t i = 0; i < blockCount; ++i) {
+          blockOutput[i] =
+              static_cast<physicalType>((values[i] & sec.mask) << sec.bitStart);
+        }
+      } else {
+        for (uint32_t i = 0; i < blockCount; ++i) {
+          blockOutput[i] |=
+              static_cast<physicalType>((values[i] & sec.mask) << sec.bitStart);
+        }
+      }
+    }
   }
+
+  row_ += rowCount;
 }
 
 template <typename T>
@@ -712,7 +771,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
   transformInfo.transformIds.assign(splitCount, 0);
   transformInfo.codebooks.assign(splitCount, {});
-  transformInfo.primaryIndices.assign(splitCount, 0);
+  transformInfo.primaryIndices.assign(splitCount, {});
   transformInfo.keySection =
       detail::SubIntSplitTransformInfo::kNoKeySection;
 
@@ -738,13 +797,44 @@ std::string_view SubIntSplitEncoding<T>::encode(
     const bool transformThis = transform != nullptr &&
         !(transform->needsKeySection() && s == keySection);
     if (transformThis) {
-      subintsplit::TransformState state;
-      subintsplit::TransformContext context{
-          .keySection = keyValues, .width = width};
-      transform->apply(sectionU64, context, state);
       transformInfo.transformIds[s] = static_cast<uint8_t>(transform->id());
-      transformInfo.codebooks[s] = std::move(state.codebook);
-      transformInfo.primaryIndices[s] = state.primaryIndex;
+      if (transform->isElementwise()) {
+        // Nothing moves, so there is no span to bound: one codebook covers the
+        // section, and blocking it would only repeat that codebook.
+        subintsplit::TransformState state;
+        subintsplit::TransformContext context{
+            .keySection = keyValues, .width = width};
+        transform->apply(sectionU64, context, state);
+        transformInfo.codebooks[s] = std::move(state.codebook);
+      } else {
+        // Applied one block at a time so the decoder can undo it inside its
+        // chunk loop. Over the whole column the inverse of the first row would
+        // depend on the last, which forces every reader to hold the section
+        // entire and costs a point lookup the column rather than a block.
+        const uint32_t blockSize = subintsplit::kTransformBlockSize;
+        transformInfo.blockSize = blockSize;
+        // Whatever the transform needs that does not vary by block is derived
+        // from the section once and stored once.
+        subintsplit::TransformState sharedState;
+        transform->prepareSection(sectionU64, sharedState);
+        transformInfo.codebooks[s] = sharedState.codebook;
+        for (uint32_t start = 0; start < valueCount; start += blockSize) {
+          const uint32_t count =
+              std::min<uint32_t>(blockSize, valueCount - start);
+          subintsplit::TransformState state;
+          state.codebook = sharedState.codebook;
+          subintsplit::TransformContext context{
+              .keySection = keyValues.empty()
+                  ? std::span<const uint64_t>{}
+                  : std::span<const uint64_t>(keyValues.data() + start, count),
+              .width = width};
+          transform->apply(
+              std::span<uint64_t>(sectionU64.data() + start, count),
+              context,
+              state);
+          transformInfo.primaryIndices[s].push_back(state.primaryIndex);
+        }
+      }
     }
 
     std::string_view encoded;
@@ -842,6 +932,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
   if (transformed) {
     encoding::write<uint8_t>(transformInfo.keySection, pos);
+    encoding::writeUint32(transformInfo.blockSize, pos);
     for (uint8_t s = 0; s < splitCount; ++s) {
       encoding::write<uint8_t>(transformInfo.transformIds[s], pos);
     }
@@ -854,7 +945,11 @@ std::string_view SubIntSplitEncoding<T>::encode(
       for (uint64_t entry : codebook) {
         encoding::write<uint64_t>(entry, pos);
       }
-      encoding::writeUint32(transformInfo.primaryIndices[s], pos);
+      const auto& blockState = transformInfo.primaryIndices[s];
+      encoding::writeUint32(static_cast<uint32_t>(blockState.size()), pos);
+      for (uint32_t primaryIndex : blockState) {
+        encoding::writeUint32(primaryIndex, pos);
+      }
     }
   }
 

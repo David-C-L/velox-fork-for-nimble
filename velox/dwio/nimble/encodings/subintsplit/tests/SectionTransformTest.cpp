@@ -89,6 +89,7 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
           std::vector<uint64_t> values = original;
           TransformContext context{.keySection = key, .width = width};
           TransformState state;
+          transform->prepareSection(values, state);
           transform->apply(values, context, state);
           transform->invert(values, context, state);
 
@@ -109,6 +110,7 @@ TEST(SectionTransformTest, keyDerivedOnItsOwnKeyIsIdentityOrder) {
   const auto* transform = transformFor(TransformId::KeyDerived);
   TransformContext context{.keySection = key, .width = 6};
   TransformState state;
+  transform->prepareSection(values, state);
   transform->apply(values, context, state);
   EXPECT_TRUE(std::is_sorted(values.begin(), values.end()));
   transform->invert(values, context, state);
@@ -159,6 +161,7 @@ TEST(SectionTransformTest, statePricesOnlyWhatItStores) {
     std::vector<uint64_t> scratch = values;
     TransformContext context{.keySection = key, .width = 8};
     TransformState state;
+    transformFor(id)->prepareSection(scratch, state);
     transformFor(id)->apply(scratch, context, state);
     const auto bits = state.sizeInBits(8);
     if (id == TransformId::KeyDerived || id == TransformId::RelabelGray ||

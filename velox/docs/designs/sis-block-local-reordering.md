@@ -67,9 +67,24 @@ the structure it exploits.
 
 ## Scope
 
-* Block-local only. A permutation applies within a fixed block, 1024 rows by default, which
-  matches `kViewChunkSize` so the view's existing chunk loop can absorb the inverse without a
-  new per-row branch.
+* Block-local only. A permutation applies within a fixed block, which bounds both what a reader
+  must hold to undo it and how far a point lookup has to reconstruct.
+
+  As built, the block is 4096 rows, matching `kSubIntSplitChunkSize`, so the decoder undoes a
+  transform inside the chunk loop it already runs rather than materialising whole sections. The
+  size is carried on the wire, so a later writer may choose a different one without breaking
+  this reader.
+
+  Not every transform needs a block. A transform that maps values without regard to their
+  neighbours -- the three relabellings -- is *elementwise*: it carries one codebook for the whole
+  section and is undone wherever the value happens to be read, so blocking it would only repeat
+  the codebook. Everything that moves rows is blocked. The distinction is on the interface as
+  `isElementwise()`, because it decides where state lives, not only how fast a probe is.
+
+  A blocked transform that still wants a dictionary derives it once from the whole section via
+  `prepareSection`, rather than storing one per block. Burrows-Wheeler with move-to-front is the
+  case that forced this: a per-block alphabet costs more than the transform saves, and a
+  section-wide alphabet is a superset of every block's, which is all move-to-front requires.
 * Three families behind one extension point: value relabelling, which never moves a row; a
   key-derived permutation, a stable sort of the block by another section the decoder has
   already read; and closed-form permutations. None of them stores a per-row index.

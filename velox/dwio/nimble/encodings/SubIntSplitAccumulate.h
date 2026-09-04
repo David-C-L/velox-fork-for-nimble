@@ -70,8 +70,12 @@ struct SubIntSplitTransformInfo {
   std::vector<uint8_t> transformIds;
   // Codebook per section, empty where the transform carries none.
   std::vector<std::vector<uint64_t>> codebooks;
-  // Burrows-Wheeler rotation index per section, 0 where unused.
-  std::vector<uint32_t> primaryIndices;
+  // Rows one non-elementwise transform covers. Zero when nothing is
+  // transformed, or when every transform present is elementwise.
+  uint32_t blockSize{0};
+  // Per-section, per-block state a transform needs back: the Burrows-Wheeler
+  // rotation index. Empty for a section whose transform carries none.
+  std::vector<std::vector<uint32_t>> primaryIndices;
 
   bool anyTransform() const {
     for (uint8_t id : transformIds) {
@@ -92,6 +96,7 @@ inline uint32_t subIntSplitTransformHeaderSize(
     return 0;
   }
   uint32_t size = 1; // key section
+  size += 4; // block size
   size += static_cast<uint32_t>(info.transformIds.size()); // one id per section
   for (size_t i = 0; i < info.transformIds.size(); ++i) {
     if (info.transformIds[i] == 0) {
@@ -99,7 +104,8 @@ inline uint32_t subIntSplitTransformHeaderSize(
     }
     size += 4; // codebook entry count
     size += static_cast<uint32_t>(info.codebooks[i].size() * sizeof(uint64_t));
-    size += 4; // primary index
+    size += 4; // per-block state count
+    size += static_cast<uint32_t>(info.primaryIndices[i].size() * 4);
   }
   return size;
 }
@@ -134,9 +140,10 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   if (transformPresent != 0) {
     SubIntSplitTransformInfo parsed;
     parsed.keySection = encoding::read<uint8_t>(pos);
+    parsed.blockSize = encoding::readUint32(pos);
     parsed.transformIds.resize(splitCount);
     parsed.codebooks.resize(splitCount);
-    parsed.primaryIndices.assign(splitCount, 0);
+    parsed.primaryIndices.resize(splitCount);
     for (uint8_t s = 0; s < splitCount; ++s) {
       parsed.transformIds[s] = encoding::read<uint8_t>(pos);
     }
@@ -149,7 +156,11 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
       for (uint32_t e = 0; e < entries; ++e) {
         parsed.codebooks[s][e] = encoding::read<uint64_t>(pos);
       }
-      parsed.primaryIndices[s] = encoding::readUint32(pos);
+      const uint32_t blocks = encoding::readUint32(pos);
+      parsed.primaryIndices[s].resize(blocks);
+      for (uint32_t b = 0; b < blocks; ++b) {
+        parsed.primaryIndices[s][b] = encoding::readUint32(pos);
+      }
     }
     if (transformInfo != nullptr) {
       *transformInfo = std::move(parsed);
@@ -157,7 +168,7 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   } else if (transformInfo != nullptr) {
     transformInfo->transformIds.assign(splitCount, 0);
     transformInfo->codebooks.assign(splitCount, {});
-    transformInfo->primaryIndices.assign(splitCount, 0);
+    transformInfo->primaryIndices.assign(splitCount, {});
   }
 
   std::vector<SubIntSplitSection> sections(splitCount);

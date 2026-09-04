@@ -72,6 +72,16 @@ enum class TransformId : uint8_t {
 /// One past the highest defined id, for validating what comes off the wire.
 inline constexpr uint8_t kTransformIdCount = 8;
 
+/// Rows a non-elementwise transform is applied to at a time.
+///
+/// A transform that moves rows can only be undone over the same span it was
+/// applied to, so that span bounds what a reader must hold and how far a point
+/// lookup has to reconstruct. It matches the decoder's chunk size, which lets
+/// a transformed stream be undone inside the existing chunk loop rather than
+/// by materialising whole sections. The value is carried on the wire, so a
+/// later writer may choose a different one without breaking this reader.
+inline constexpr uint32_t kTransformBlockSize = 4096;
+
 /// Returns the name of a transform id, for logging and test failures.
 std::string toString(TransformId id);
 
@@ -108,8 +118,22 @@ class SectionTransform {
   /// Identifies this transform on the wire.
   virtual TransformId id() const = 0;
 
+  /// Derives the part of the state that is shared by every block of the
+  /// section, before any block is transformed.
+  ///
+  /// A block-local transform that needs a dictionary would otherwise store one
+  /// per block, which costs more than the transform saves. Deriving it from
+  /// the whole section instead stores it once, and each block's `apply`
+  /// receives it in `shared`. Called once per section at encode; the default
+  /// does nothing.
+  virtual void prepareSection(
+      std::span<const uint64_t> section,
+      TransformState& shared) const;
+
   /// Rewrites `values` in place and fills `state` with whatever `invert` will
-  /// need. `values` holds one block of one section.
+  /// need beyond what `prepareSection` already put there. `values` holds one
+  /// block of one section, and `state` arrives carrying the section-wide
+  /// state.
   virtual void apply(
       std::span<uint64_t> values,
       const TransformContext& context,
@@ -121,6 +145,27 @@ class SectionTransform {
       std::span<uint64_t> values,
       const TransformContext& context,
       const TransformState& state) const = 0;
+
+  /// Undoes the transform for a single value.
+  ///
+  /// Defined only where isElementwise() is true; that is what it means for a
+  /// row to be readable on its own, and it is how a point lookup avoids
+  /// rebuilding a block. Throws otherwise.
+  virtual uint64_t invertValue(uint64_t value, const TransformState& state)
+      const;
+
+  /// Whether the inverse of a row depends only on that row.
+  ///
+  /// An elementwise transform maps values without regard to their neighbours,
+  /// so it needs no block structure: it carries one codebook for the whole
+  /// section and is undone wherever the value happens to be read. Everything
+  /// else is applied per block of kTransformBlockSize rows, so that its
+  /// inverse stays bounded.
+  ///
+  /// Distinct from supportsPointAccess(), which is about what a single probe
+  /// costs rather than what it depends on: a block-local transform could serve
+  /// probes from a rank cache and still not be elementwise.
+  virtual bool isElementwise() const = 0;
 
   /// Whether a single row can be read without reconstructing the block. This
   /// decides whether the transform may serve a point-lookup-shaped read, and

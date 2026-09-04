@@ -152,6 +152,10 @@ class KeyDerivedTransform : public SectionTransform {
 
   // Reading one row needs that row's rank in the sort, which depends on every
   // key value in the block.
+  bool isElementwise() const override {
+    return false;
+  }
+
   bool supportsPointAccess() const override {
     return false;
   }
@@ -217,29 +221,34 @@ class RelabelTransform : public SectionTransform {
     }
   }
 
+  uint64_t invertValue(uint64_t value, const TransformState& state)
+      const override {
+    if (id_ == TransformId::RelabelGray) {
+      uint64_t decoded = value;
+      for (uint64_t shift = 1; shift < 64; shift <<= 1) {
+        decoded ^= decoded >> shift;
+      }
+      return decoded;
+    }
+    NIMBLE_CHECK(
+        value < state.codebook.size(), "Relabel code outside the codebook.");
+    return state.codebook[value];
+  }
+
   void invert(
       std::span<uint64_t> values,
       const TransformContext& /*context*/,
       const TransformState& state) const override {
-    if (id_ == TransformId::RelabelGray) {
-      for (auto& value : values) {
-        uint64_t decoded = value;
-        for (uint64_t shift = 1; shift < 64; shift <<= 1) {
-          decoded ^= decoded >> shift;
-        }
-        value = decoded;
-      }
-      return;
-    }
     for (auto& value : values) {
-      NIMBLE_CHECK(
-          value < state.codebook.size(),
-          "Relabel code outside the codebook.");
-      value = state.codebook[value];
+      value = invertValue(value, state);
     }
   }
 
   // Rows never move, so a single row is still addressable.
+  bool isElementwise() const override {
+    return true;
+  }
+
   bool supportsPointAccess() const override {
     return true;
   }
@@ -281,15 +290,27 @@ class BurrowsWheelerTransform : public SectionTransform {
       return;
     }
     // Replace each value by how recently it was last seen. Clustered values
-    // become small numbers, which the cheap encoders handle well.
-    state.codebook = sortedAlphabet(values);
+    // become small numbers, which the cheap encoders handle well. The alphabet
+    // comes from prepareSection, so it covers the section rather than this
+    // block and is stored once instead of once per block.
     std::vector<uint64_t> alphabet = state.codebook;
     for (auto& value : values) {
       const auto it = std::find(alphabet.begin(), alphabet.end(), value);
+      NIMBLE_CHECK(
+          it != alphabet.end(),
+          "Move-to-front alphabet does not cover the block; "
+          "prepareSection must run over the whole section first.");
       const auto rank = static_cast<uint64_t>(it - alphabet.begin());
       alphabet.erase(it);
       alphabet.insert(alphabet.begin(), value);
       value = rank;
+    }
+  }
+
+  void prepareSection(std::span<const uint64_t> section, TransformState& shared)
+      const override {
+    if (moveToFront_) {
+      shared.codebook = sortedAlphabet(section);
     }
   }
 
@@ -316,6 +337,10 @@ class BurrowsWheelerTransform : public SectionTransform {
 
   // Undoing it is a chain of lookups from one position to the next, so one row
   // cannot be read without rebuilding the block.
+  bool isElementwise() const override {
+    return false;
+  }
+
   bool supportsPointAccess() const override {
     return false;
   }
@@ -375,6 +400,10 @@ class BitPlaneTransform : public SectionTransform {
   }
 
   // Rows are not moved: one row's bits can be gathered from the planes.
+  bool isElementwise() const override {
+    return false;
+  }
+
   bool supportsPointAccess() const override {
     return true;
   }
@@ -389,6 +418,18 @@ const BurrowsWheelerTransform kBurrowsWheelerMoveToFront{/*moveToFront=*/true};
 const BitPlaneTransform kBitPlane;
 
 } // namespace
+
+uint64_t SectionTransform::invertValue(
+    uint64_t /*value*/,
+    const TransformState& /*state*/) const {
+  NIMBLE_UNREACHABLE(
+      "Only an elementwise transform can undo a single value; this one needs "
+      "its whole block.");
+}
+
+void SectionTransform::prepareSection(
+    std::span<const uint64_t> /*section*/,
+    TransformState& /*shared*/) const {}
 
 std::string toString(TransformId id) {
   switch (id) {
