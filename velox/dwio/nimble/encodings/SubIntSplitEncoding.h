@@ -567,10 +567,17 @@ void SubIntSplitEncoding<T>::materializeTransformed(
       ? transformInfo_.blockSize
       : this->rowCount();
 
+  // The cache exists so that a probe does not rebuild a span it has just
+  // rebuilt. It must not answer a read that asks for a whole span: that read
+  // is a decode, and serving it from a cache would report the cost of a copy
+  // in place of the cost of decoding.
+  const bool wantsWholeSpan = rowCount >= blockSize;
+
   for (uint32_t produced = 0; produced < rowCount;) {
     const uint32_t row = row_ + produced;
     const uint32_t blockStart = (row / blockSize) * blockSize;
-    if (blockStart != cachedBlockStart_ || blockCache_.empty()) {
+    if (wantsWholeSpan || blockStart != cachedBlockStart_ ||
+        blockCache_.empty()) {
       decodeTransformBlock(blockStart, blockSize);
     }
     const uint32_t from = row - blockStart;
