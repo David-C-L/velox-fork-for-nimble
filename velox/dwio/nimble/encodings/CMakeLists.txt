@@ -25,6 +25,9 @@ add_subdirectory(legacy)
 if(NIMBLE_BUILD_TESTING)
   add_subdirectory(selection/tests)
 endif()
+if(NIMBLE_BUILD_TESTING AND NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
+  add_subdirectory(subintsplit/tests)
+endif()
 
 add_library(
   nimble_encodings
@@ -46,6 +49,7 @@ add_library(
   common/EncodingTypeDispatch.h
   selection/EncodingSelectionPolicy.cpp
   selection/Statistics.cpp
+  subintsplit/SectionTransforms.cpp
   views/DeltaBlockEncodingView.h
   views/EncodingViewFactory.cpp
   views/HuffmanEncodingView.h
