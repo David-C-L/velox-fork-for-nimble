@@ -189,8 +189,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         const auto mapping = section.transform->positionMapping();
         blockedSection_ = blockedSection_ ||
             mapping == subintsplit::PositionMapping::Sequential;
-        computableSection_ = computableSection_ ||
-            mapping == subintsplit::PositionMapping::Computable;
+        permutedSection_ = permutedSection_ ||
+            mapping == subintsplit::PositionMapping::Permuted;
       }
 
       // A transformed section is not constant in the values it yields, so
@@ -293,21 +293,41 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // followed through the position map. Both are O(1) once the map exists.
   physicalType readOneRow(uint32_t index) const {
     const std::vector<uint32_t>* positions =
-        computableSection_ ? &positionMap() : nullptr;
+        permutedSection_ ? &positionMap() : nullptr;
     physicalType value = constantBits_;
     for (const auto& section : sections_) {
-      uint32_t at = index;
-      if (section.transform != nullptr &&
-          section.transform->positionMapping() ==
-              subintsplit::PositionMapping::Computable) {
-        at = (*positions)[index];
-      }
-      uint64_t sectionValue = section.valueAt(*section.view, at);
-      if (section.transform != nullptr &&
-          section.transform->positionMapping() ==
-              subintsplit::PositionMapping::InPlace) {
-        sectionValue = section.transform->invertValue(
-            sectionValue, section.transformState);
+      uint64_t sectionValue = 0;
+      const auto mapping = section.transform == nullptr
+          ? subintsplit::PositionMapping::InPlace
+          : section.transform->positionMapping();
+      switch (mapping) {
+        case subintsplit::PositionMapping::Permuted:
+          // One offset, taken from the map built off the key section.
+          sectionValue =
+              section.valueAt(*section.view, (*positions)[index]);
+          break;
+        case subintsplit::PositionMapping::Gathered: {
+          // Several offsets, which only the transform knows; it asks for the
+          // words it needs and puts the row back together.
+          const subintsplit::TransformContext context{
+              .keySection = {}, .width = section.width};
+          sectionValue = section.transform->gatherRow(
+              index,
+              this->rowCount_,
+              context,
+              section.transformState,
+              [&section](uint32_t at) {
+                return section.valueAt(*section.view, at);
+              });
+          break;
+        }
+        default:
+          sectionValue = section.valueAt(*section.view, index);
+          if (section.transform != nullptr) {
+            sectionValue = section.transform->invertValue(
+                sectionValue, section.transformState);
+          }
+          break;
       }
       value |= static_cast<physicalType>(sectionValue & section.mask)
           << section.bitStart;
@@ -350,7 +370,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     for (const auto& section : sections_) {
       if (section.transform == nullptr ||
           section.transform->positionMapping() !=
-              subintsplit::PositionMapping::Computable) {
+              subintsplit::PositionMapping::Permuted) {
         continue;
       }
       section.transform->positionMap(
@@ -648,9 +668,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // True where some section carries a Sequential transform, which is what
   // forces reads onto the block path.
   bool blockedSection_{false};
-  // True where some section carries a Computable transform, so reads go
-  // through the position map.
-  bool computableSection_{false};
+  // True where some section carries a Permuted transform, so reads go through
+  // the position map. A Gathered transform needs no such map.
+  bool permutedSection_{false};
 
   // Sections that vary per row. Constant sections are folded into constantBits_
   // at construction and do not appear here.

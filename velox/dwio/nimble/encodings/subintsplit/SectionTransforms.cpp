@@ -154,7 +154,7 @@ class KeyDerivedTransform : public SectionTransform {
   // section reaches the reader in original order, so that rank is derivable
   // without reading a single transformed value.
   PositionMapping positionMapping() const override {
-    return PositionMapping::Computable;
+    return PositionMapping::Permuted;
   }
 
   void positionMap(
@@ -437,14 +437,32 @@ class BitPlaneTransform : public SectionTransform {
     std::copy(rows.begin(), rows.end(), values.begin());
   }
 
-  // A row's bits are gathered from `width` positions across the planes, not
-  // read from one. That is positionally computable, but it is not a row
-  // permutation, so it does not fit the one-offset-per-row position map the
-  // Computable path is built on. Blocked until a bit-gather path exists, which
-  // costs it little: the planes are laid out the same way within a block as
-  // across a section, so the compression is nearly the same either way.
+  // A row's bits sit at `width` computable positions across the planes rather
+  // than at one offset, so it is read by gathering them rather than by
+  // following a permutation. Either way nothing has to be rebuilt, so this
+  // needs no block.
   PositionMapping positionMapping() const override {
-    return PositionMapping::Sequential;
+    return PositionMapping::Gathered;
+  }
+
+  uint64_t gatherRow(
+      uint32_t index,
+      uint32_t count,
+      const TransformContext& context,
+      const TransformState& /*state*/,
+      const std::function<uint64_t(uint32_t)>& readWordAt) const override {
+    const int width = context.width;
+    uint64_t row = 0;
+    for (int bit = 0; bit < width; ++bit) {
+      const uint64_t destination =
+          static_cast<uint64_t>(bit) * count + index;
+      const uint64_t word =
+          readWordAt(static_cast<uint32_t>(destination / width));
+      if ((word >> (destination % width)) & 1ULL) {
+        row |= 1ULL << bit;
+      }
+    }
+    return row;
   }
 
   bool supportsPointAccess() const override {
@@ -477,6 +495,17 @@ void SectionTransform::positionMap(
   NIMBLE_UNREACHABLE(
       "Only a transform with a computable position mapping can say where a "
       "row went without reading the transformed data.");
+}
+
+uint64_t SectionTransform::gatherRow(
+    uint32_t /*index*/,
+    uint32_t /*count*/,
+    const TransformContext& /*context*/,
+    const TransformState& /*state*/,
+    const std::function<uint64_t(uint32_t)>& /*readWordAt*/) const {
+  NIMBLE_UNREACHABLE(
+      "Only a transform that spreads a row across computable offsets can "
+      "gather it back.");
 }
 
 void SectionTransform::prepareSection(

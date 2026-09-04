@@ -136,23 +136,54 @@ TEST(SectionTransformTest, reportsHowItMapsPositions) {
   // order, so a probe follows the map rather than rebuilding anything.
   EXPECT_EQ(
       transformFor(TransformId::KeyDerived)->positionMapping(),
-      PositionMapping::Computable);
+      PositionMapping::Permuted);
   EXPECT_TRUE(transformFor(TransformId::KeyDerived)->supportsPointAccess());
 
+  // A row is spread over computable offsets rather than sent to one, so it is
+  // reassembled rather than followed. Still nothing to rebuild.
+  EXPECT_EQ(
+      transformFor(TransformId::BitPlane)->positionMapping(),
+      PositionMapping::Gathered);
+  EXPECT_TRUE(transformFor(TransformId::BitPlane)->supportsPointAccess());
+
   // Undoing one row means undoing its neighbours, which is what blocking is
-  // for. Bit-plane is here because its inverse is not a row permutation, not
-  // because a row is unreachable.
+  // for, and the only case that needs it.
   for (auto id :
-       {TransformId::BurrowsWheeler,
-        TransformId::BurrowsWheelerMoveToFront,
-        TransformId::BitPlane}) {
+       {TransformId::BurrowsWheeler, TransformId::BurrowsWheelerMoveToFront}) {
     EXPECT_EQ(transformFor(id)->positionMapping(), PositionMapping::Sequential)
         << toString(id);
+    EXPECT_FALSE(transformFor(id)->supportsPointAccess()) << toString(id);
   }
-  EXPECT_FALSE(transformFor(TransformId::BurrowsWheeler)->supportsPointAccess());
 }
 
-// A computable mapping is only meaningful if it agrees with the transform it
+// A gathered row must come back as the row that went in, or the arithmetic
+// that lets bit-plane skip blocking is wrong.
+TEST(SectionTransformTest, gatheredRowMatchesTheRowThatWentIn) {
+  constexpr int kWidth = 12;
+  std::mt19937_64 rng(7);
+  std::vector<uint64_t> values(3000);
+  for (auto& value : values) {
+    value = rng() % (1ULL << kWidth);
+  }
+
+  const auto* transform = transformFor(TransformId::BitPlane);
+  auto planes = values;
+  TransformState state;
+  const TransformContext context{.keySection = {}, .width = kWidth};
+  transform->apply(planes, context, state);
+
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    const uint64_t got = transform->gatherRow(
+        i,
+        static_cast<uint32_t>(values.size()),
+        context,
+        state,
+        [&planes](uint32_t at) { return planes[at]; });
+    ASSERT_EQ(got, values[i]) << "row " << i;
+  }
+}
+
+// A permuted mapping is only meaningful if it agrees with the transform it
 // describes: position i must be where apply() actually put row i.
 TEST(SectionTransformTest, positionMapMatchesWhereTheTransformPutEachRow) {
   std::mt19937_64 rng(99);

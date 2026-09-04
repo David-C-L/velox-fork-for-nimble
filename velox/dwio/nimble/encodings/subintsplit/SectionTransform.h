@@ -19,6 +19,7 @@
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -79,11 +80,16 @@ enum class PositionMapping : uint8_t {
   /// anything about its neighbours.
   InPlace,
   /// Rows move, but where a row went is derivable without reading the
-  /// transformed data -- from the key section, which is stored in original
-  /// order, or by arithmetic. A reader builds that map once and then addresses
-  /// any row through it, so the transform can span the whole section and a
-  /// probe still costs one indirection.
-  Computable,
+  /// transformed data: from the key section, which is stored in original
+  /// order. A reader builds that map once and then addresses any row through
+  /// it, so the transform can span the whole section and a probe still costs
+  /// one indirection.
+  Permuted,
+  /// A row is not stored at one offset, but the offsets it is spread across
+  /// are computable. A probe fetches those and reassembles the row, which is
+  /// more than one read but still a bounded number, so this needs no block
+  /// either.
+  Gathered,
   /// Undoing one row means undoing the rows around it. Only these need to be
   /// applied in blocks, because the block is what bounds the undoing.
   Sequential,
@@ -182,14 +188,28 @@ class SectionTransform {
   /// Fills `positions[i]` with the offset the value of original row i was
   /// stored at.
   ///
-  /// Defined only where positionMapping() is Computable; that is what
-  /// Computable means. A reader builds this once and then reads any row
-  /// through it, which is why such a transform costs a probe an indirection
-  /// rather than a reconstruction. Throws otherwise.
+  /// Defined only where positionMapping() is Permuted; that is what Permuted
+  /// means. A reader builds this once and then reads any row through it, which
+  /// is why such a transform costs a probe an indirection rather than a
+  /// reconstruction. Throws otherwise.
   virtual void positionMap(
       const TransformContext& context,
       const TransformState& state,
       std::span<uint32_t> positions) const;
+
+  /// Reassembles original row `index` out of a section of `count` rows,
+  /// fetching whatever transformed words it needs through `readWordAt`.
+  ///
+  /// Defined only where positionMapping() is Gathered. The reader supplies the
+  /// fetch because it owns the section, and the transform supplies the
+  /// arithmetic because it is the only thing that knows where the row went.
+  /// Throws otherwise.
+  virtual uint64_t gatherRow(
+      uint32_t index,
+      uint32_t count,
+      const TransformContext& context,
+      const TransformState& state,
+      const std::function<uint64_t(uint32_t)>& readWordAt) const;
 
   /// Whether a single row can be read without reconstructing the block. This
   /// decides whether the transform may serve a point-lookup-shaped read, and
