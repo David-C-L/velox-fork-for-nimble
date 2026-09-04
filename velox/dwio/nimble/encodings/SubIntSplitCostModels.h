@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 #include "velox/dwio/nimble/common/Types.h"
@@ -627,16 +628,30 @@ inline double frequencyPartitionCostBits(
   return kOuterHeaderBits + keyCostBits + indexBits + kTierOverheadBits;
 }
 
-// Evaluate all cost models and return the minimum cost in bits.
-// Also sets `bestEncoding` to the winning EncodingType.
-inline double bestCostBits(
+/// Encodings a segment may be costed against. An empty set means all of them,
+/// which is what production selection uses; a restricted set is how an
+/// experiment holds the inventory fixed while something else varies.
+using AllowedEncodings = std::unordered_set<EncodingType>;
+
+/// Evaluates the cost models for `allowed` and returns the minimum cost in
+/// bits, setting `bestEncoding` to the winner. An empty `allowed` considers
+/// every encoding.
+///
+/// This is the single dispatch point over the cost models. Anything wanting a
+/// subset calls it with a set rather than copying the dispatch, because a copy
+/// silently goes stale when an encoding or a signature changes here.
+inline double bestCostBitsRestricted(
     const SegmentMetrics& m,
     size_t numValues,
     int bitWidth,
     const std::vector<uint64_t>& segValues,
+    const AllowedEncodings& allowed,
     EncodingType& bestEncoding) noexcept {
   double best = std::numeric_limits<double>::infinity();
   auto consider = [&](double cost, EncodingType type) noexcept {
+    if (!allowed.empty() && allowed.count(type) == 0) {
+      return;
+    }
     if (cost < best) {
       best = cost;
       bestEncoding = type;
@@ -682,6 +697,19 @@ inline double bestCostBits(
   }
   consider(deltaBlockCostBits(segValues, numValues), EncodingType::DeltaBlock);
   return best;
+}
+
+/// Evaluates every cost model. Equivalent to `bestCostBitsRestricted` with an
+/// empty allowed set, and kept as the name the selector calls by default.
+inline double bestCostBits(
+    const SegmentMetrics& m,
+    size_t numValues,
+    int bitWidth,
+    const std::vector<uint64_t>& segValues,
+    EncodingType& bestEncoding) noexcept {
+  static const AllowedEncodings kAll;
+  return bestCostBitsRestricted(
+      m, numValues, bitWidth, segValues, kAll, bestEncoding);
 }
 
 } // namespace facebook::nimble::detail::subintsplit

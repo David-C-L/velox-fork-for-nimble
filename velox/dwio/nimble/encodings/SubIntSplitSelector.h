@@ -224,4 +224,28 @@ inline SelectorResult selectSplits(
   return selectSplitsImpl(samples, kBits, fullCount, cfg, bestCostBits);
 }
 
+// Selects splits costing segments against `allowed` only. An empty set behaves
+// exactly like selectSplits, so a caller can pass one through unconditionally.
+inline SelectorResult selectSplitsRestricted(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const AllowedEncodings& allowed,
+    const SelectorConfig& cfg = defaultSelectorConfig()) {
+  return selectSplitsImpl(
+      samples,
+      kBits,
+      fullCount,
+      cfg,
+      [&allowed](
+          const SegmentMetrics& m,
+          size_t numValues,
+          int bitWidth,
+          const std::vector<uint64_t>& segValues,
+          EncodingType& bestEnc) noexcept {
+        return bestCostBitsRestricted(
+            m, numValues, bitWidth, segValues, allowed, bestEnc);
+      });
+}
+
 } // namespace facebook::nimble::detail::subintsplit
