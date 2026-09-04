@@ -26,6 +26,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
+#include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
 
 using namespace facebook;
 using namespace facebook::nimble;
@@ -171,6 +172,47 @@ TEST_F(TransformedEncodingTest, keySectionIsLeftUntransformed) {
   encoding->materialize(values.size(), decoded.data());
   for (size_t i = 0; i < values.size(); ++i) {
     ASSERT_EQ(decoded[i], values[i]) << "differs at row " << i;
+  }
+}
+
+// The view is what gather and point reads go through, so a transform that the
+// encoding can undo but the view cannot is worse than useless: it would hand
+// back transformed values as though they were the originals.
+TEST_F(TransformedEncodingTest, theViewUndoesEveryTransform) {
+  const auto values = packedIdentifiers(9000);
+  for (auto id : transformsUnderTest()) {
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    options.subIntSplitTransform = static_cast<uint8_t>(id);
+    options.subIntSplitKeySection = 1;
+    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+
+    // A bulk read, which crosses several transform blocks.
+    std::vector<uint64_t> bulk(values.size());
+    view.read(0, values.size(), bulk.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(bulk[i], values[i]) << toString(id) << " bulk row " << i;
+    }
+
+    // A read that starts and ends inside a block, which is the case the block
+    // path has to handle rather than assume away.
+    constexpr uint32_t kOffset = 4000;
+    constexpr uint32_t kLength = 1500;
+    std::vector<uint64_t> ranged(kLength);
+    view.read(kOffset, kLength, ranged.data());
+    for (uint32_t i = 0; i < kLength; ++i) {
+      ASSERT_EQ(ranged[i], values[kOffset + i])
+          << toString(id) << " range row " << i;
+    }
+
+    // Point reads, scattered so that they do not all fall in one block.
+    for (uint32_t i = 0; i < values.size(); i += 397) {
+      ASSERT_EQ(view.readAt(i), values[i])
+          << toString(id) << " point row " << i;
+    }
   }
 }
 

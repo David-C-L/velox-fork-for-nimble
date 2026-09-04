@@ -20,6 +20,7 @@
 
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/views/EncodingView.h"
@@ -139,13 +140,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       velox::memory::MemoryPool* pool,
       const Encoding::Options& options)
       : TypedEncodingView<T>{data, pool, options} {
-    NIMBLE_CHECK_EQ(this->encodingType_, EncodingType::SubIntSplit);
+    NIMBLE_CHECK(
+        this->encodingType_ == EncodingType::SubIntSplit ||
+            this->encodingType_ == EncodingType::SubIntSplitReordered,
+        "SubIntSplitEncodingView built over a stream that is not SubIntSplit.");
 
-    const auto parsed =
-        detail::parseSubIntSplitSections(data, this->dataOffset_);
+    const auto parsed = detail::parseSubIntSplitSections(
+        data, this->dataOffset_, &transformInfo_);
     NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
+    // Validated before any section is built: a transform this reader does not
+    // know would otherwise be skipped, and the values it returned would look
+    // like ordinary ones.
+    for (uint8_t id : transformInfo_.transformIds) {
+      subintsplit::transformForRaw(id);
+    }
 
-    for (const auto& meta : parsed) {
+    for (size_t wireIndex = 0; wireIndex < parsed.size(); ++wireIndex) {
+      const auto& meta = parsed[wireIndex];
       Section section;
       switch (meta.storageBytes) {
         case 1:
@@ -167,7 +178,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
       // A Constant section contributes the same bits to every row, so resolve
       // it now and keep it out of the per-row work entirely.
-      if (this->rowCount_ > 0 &&
+      // Recorded on every section, transformed or not: the key section is
+      // untransformed by design, and it is still addressed by wire position.
+      section.wireIndex = wireIndex;
+      if (!transformInfo_.transformIds.empty() &&
+          transformInfo_.transformIds[wireIndex] != 0) {
+        section.transform = subintsplit::transformForRaw(
+            transformInfo_.transformIds[wireIndex]);
+        section.transformState.codebook = transformInfo_.codebooks[wireIndex];
+        blockedSection_ =
+            blockedSection_ || !section.transform->isElementwise();
+      }
+
+      // A transformed section is not constant in the values it yields, so
+      // folding it away would drop the inverse along with it. Nor may the key
+      // section be folded, even though it is untransformed and may well be
+      // constant: it is what orders the sections that were permuted by it, and
+      // they need it row by row.
+      const bool isKeySection = wireIndex == transformInfo_.keySection;
+      if (this->rowCount_ > 0 && section.transform == nullptr &&
+          !isKeySection &&
           section.view->encodingType() == EncodingType::Constant) {
         constantBits_ |= static_cast<physicalType>(
                              section.valueAt(*section.view, 0) & section.mask)
@@ -183,7 +213,19 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     int bitStart{0};
     uint64_t mask{0};
     uint8_t storageBytes{8};
+    // Bit width of the section, which a transform needs to know how wide a
+    // value it is working with.
+    int width{0};
     std::unique_ptr<EncodingView> view;
+    // Position on the wire, which is how the header's per-section transform
+    // state is addressed. Not the position in sections_, since folded
+    // constants are dropped from that.
+    size_t wireIndex{0};
+    // Null where the section carries no transform.
+    const subintsplit::SectionTransform* transform{nullptr};
+    // What the transform's inverse needs back. Section-wide; anything that
+    // varies by block lives in transformInfo_.
+    subintsplit::TransformState transformState;
     // Resolved from the storage width at construction. The chunked path
     // switches instead, so that the accumulate kernel stays inlinable.
     uint64_t (*valueAt)(const EncodingView&, uint32_t){nullptr};
@@ -198,6 +240,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         .bitStart = meta.bitStart,
         .mask = meta.mask,
         .storageBytes = meta.storageBytes,
+        .width = meta.bitEnd - meta.bitStart + 1,
         .view = detail::makeSectionView<SectionT>(meta.stream, pool, options),
         .valueAt = &readValueAt<SectionT>,
     };
@@ -234,13 +277,50 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   T readTypedAt(uint32_t index) const final {
     NIMBLE_CHECK_LT(index, this->rowCount_);
+    // A reordering transform put this row somewhere that depends on the rest
+    // of its block, so the block has to be rebuilt to find it. That is the
+    // cost such a transform charges a point lookup, and it is why the
+    // relabellings, which never move a row, are worth keeping separate.
+    if (blockedSection_) {
+      return detail::castFromPhysicalType<T>(readThroughBlock(index));
+    }
     physicalType value = constantBits_;
     for (const auto& section : sections_) {
-      value |= static_cast<physicalType>(
-                   section.valueAt(*section.view, index) & section.mask)
+      uint64_t sectionValue = section.valueAt(*section.view, index);
+      if (section.transform != nullptr) {
+        sectionValue =
+            section.transform->invertValue(sectionValue, section.transformState);
+      }
+      value |= static_cast<physicalType>(sectionValue & section.mask)
           << section.bitStart;
     }
     return detail::castFromPhysicalType<T>(value);
+  }
+
+  // Rebuilds the transform block containing `index` and returns that row.
+  //
+  // The block is cached per thread rather than on the view, because a view is
+  // read concurrently and holds no mutable state of its own. A gather that
+  // stays within a block therefore pays for one reconstruction, which is what
+  // makes the cost of these transforms depend on the access pattern rather
+  // than only on the probe count.
+  physicalType readThroughBlock(uint32_t index) const {
+    const uint32_t blockSize = transformInfo_.blockSize != 0
+        ? transformInfo_.blockSize
+        : kViewChunkSize;
+    const uint32_t blockIndex = index / blockSize;
+    const uint32_t blockStart = blockIndex * blockSize;
+    const uint32_t blockCount =
+        std::min(blockSize, this->rowCount_ - blockStart);
+
+    thread_local BlockCache cache;
+    if (cache.owner != this || cache.blockIndex != blockIndex) {
+      cache.values.resize(blockCount);
+      readPhysicalBlock(blockStart, blockCount, cache.values.data());
+      cache.owner = this;
+      cache.blockIndex = blockIndex;
+    }
+    return cache.values[index - blockStart];
   }
 
   // Chunked the same way as SubIntSplitEncoding::materialize: with the chunk on
@@ -250,6 +330,32 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       const final {
     this->checkReadRange(offset, length);
     if (length == 0) {
+      return;
+    }
+
+    // Any transform sends a range read down the block path. The chunked
+    // accumulate kernel below reads section values straight into the output
+    // word and has nowhere to apply an inverse, so even an elementwise
+    // transform, which a point read undoes in place, needs the slower path
+    // here. Point reads keep the fast path, which is where the elementwise
+    // distinction actually buys something.
+    if (transformInfo_.anyTransform()) {
+      const uint32_t blockSize = transformInfo_.blockSize != 0
+          ? transformInfo_.blockSize
+          : kViewChunkSize;
+      std::vector<physicalType> block;
+      for (uint32_t produced = 0; produced < length;) {
+        const uint32_t row = offset + produced;
+        const uint32_t blockStart = (row / blockSize) * blockSize;
+        const uint32_t blockCount =
+            std::min(blockSize, this->rowCount_ - blockStart);
+        block.resize(blockCount);
+        readPhysicalBlock(blockStart, blockCount, block.data());
+        const uint32_t from = row - blockStart;
+        const uint32_t take = std::min(blockCount - from, length - produced);
+        std::copy_n(block.data() + from, take, output + produced);
+        produced += take;
+      }
       return;
     }
 
@@ -323,10 +429,86 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // One reconstructed transform block, held per thread. Keyed on the view it
+  // came from as well as the block, since one thread may read several views.
+  struct BlockCache {
+    const void* owner{nullptr};
+    uint32_t blockIndex{0};
+    std::vector<physicalType> values;
+  };
+
+  // Reads one whole transform block, undoing every transform on it.
+  //
+  // Sections are widened to 64 bits first so a transform never has to know
+  // which width its section was stored at, and the key section is inverted
+  // nowhere: it is stored in original order precisely so it can order the rest.
+  void readPhysicalBlock(
+      uint32_t blockStart,
+      uint32_t blockCount,
+      physicalType* output) const {
+    std::vector<std::vector<uint64_t>> sectionValues(sections_.size());
+    for (size_t i = 0; i < sections_.size(); ++i) {
+      const auto& section = sections_[i];
+      auto& values = sectionValues[i];
+      values.resize(blockCount);
+      for (uint32_t row = 0; row < blockCount; ++row) {
+        values[row] = section.valueAt(*section.view, blockStart + row);
+      }
+    }
+
+    std::span<const uint64_t> keySpan;
+    if (transformInfo_.keySection !=
+        detail::SubIntSplitTransformInfo::kNoKeySection) {
+      for (size_t i = 0; i < sections_.size(); ++i) {
+        if (sections_[i].wireIndex == transformInfo_.keySection) {
+          keySpan = std::span<const uint64_t>(
+              sectionValues[i].data(), sectionValues[i].size());
+          break;
+        }
+      }
+    }
+
+    const uint32_t blockIndex = transformInfo_.blockSize != 0
+        ? blockStart / transformInfo_.blockSize
+        : 0;
+    for (size_t i = 0; i < sections_.size(); ++i) {
+      const auto& section = sections_[i];
+      if (section.transform == nullptr) {
+        continue;
+      }
+      subintsplit::TransformState state = section.transformState;
+      const auto& blockState = transformInfo_.primaryIndices[section.wireIndex];
+      if (blockIndex < blockState.size()) {
+        state.primaryIndex = blockState[blockIndex];
+      }
+      subintsplit::TransformContext context{
+          .keySection = keySpan, .width = section.width};
+      section.transform->invert(sectionValues[i], context, state);
+    }
+
+    for (uint32_t row = 0; row < blockCount; ++row) {
+      output[row] = constantBits_;
+    }
+    for (size_t i = 0; i < sections_.size(); ++i) {
+      const auto& section = sections_[i];
+      for (uint32_t row = 0; row < blockCount; ++row) {
+        output[row] |=
+            static_cast<physicalType>(sectionValues[i][row] & section.mask)
+            << section.bitStart;
+      }
+    }
+  }
+
   // Rows per chunk in readPhysical. Smaller than the encoding's chunk because
   // the scratch is on the stack, which is what keeps the view const and safe to
   // read concurrently.
   static constexpr uint32_t kViewChunkSize = 1024;
+
+  // Per-section transform metadata from the header, indexed by wire position.
+  detail::SubIntSplitTransformInfo transformInfo_;
+  // True where some section carries a transform that moves rows, which is what
+  // forces reads onto the block path.
+  bool blockedSection_{false};
 
   // Sections that vary per row. Constant sections are folded into constantBits_
   // at construction and do not appear here.
