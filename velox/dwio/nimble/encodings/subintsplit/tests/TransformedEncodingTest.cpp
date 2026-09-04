@@ -278,4 +278,39 @@ TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
   }
 }
 
+// A key-derived permutation spans the whole section, and a probe follows the
+// position map rather than rebuilding anything. This is the property that lets
+// it go unblocked: if the map and a full decode ever disagreed, the gain from
+// not blocking would be bought with wrong answers.
+TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
+  const auto values = packedIdentifiers(9000);
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitTransform = static_cast<uint8_t>(TransformId::KeyDerived);
+  const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, values, CompressionType::Uncompressed, options);
+
+  detail::SubIntSplitTransformInfo info;
+  detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+  if (info.anyTransform()) {
+    EXPECT_EQ(info.blockSize, 0u)
+        << "a key-derived permutation should not be blocked";
+  }
+
+  SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+  std::vector<uint64_t> bulk(values.size());
+  view.read(0, values.size(), bulk.data());
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
+  }
+  // Probed out of order, so a map that only worked when walked forwards would
+  // be caught.
+  for (uint32_t i = 8999; i < values.size(); i -= 331) {
+    ASSERT_EQ(view.readAt(i), values[i]) << "probe row " << i;
+    if (i < 331) {
+      break;
+    }
+  }
+}
+
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS

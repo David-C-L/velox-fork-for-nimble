@@ -150,14 +150,32 @@ class KeyDerivedTransform : public SectionTransform {
     scatter(values, keyOrder(context.keySection));
   }
 
-  // Reading one row needs that row's rank in the sort, which depends on every
-  // key value in the block.
-  bool isElementwise() const override {
-    return false;
+  // Where a row went is its rank in the sort of the key section, and the key
+  // section reaches the reader in original order, so that rank is derivable
+  // without reading a single transformed value.
+  PositionMapping positionMapping() const override {
+    return PositionMapping::Computable;
   }
 
+  void positionMap(
+      const TransformContext& context,
+      const TransformState& /*state*/,
+      std::span<uint32_t> positions) const override {
+    NIMBLE_CHECK(
+        context.keySection.size() == positions.size(),
+        "Key-derived transform needs a key section covering the same rows.");
+    // keyOrder lists, for each stored offset, the original row that landed
+    // there. The reader needs the other direction.
+    const auto order = keyOrder(context.keySection);
+    for (uint32_t offset = 0; offset < order.size(); ++offset) {
+      positions[order[offset]] = offset;
+    }
+  }
+
+  // A probe costs the position map, which is built once, and then a single
+  // indirection.
   bool supportsPointAccess() const override {
-    return false;
+    return true;
   }
 
   bool needsKeySection() const override {
@@ -245,8 +263,8 @@ class RelabelTransform : public SectionTransform {
   }
 
   // Rows never move, so a single row is still addressable.
-  bool isElementwise() const override {
-    return true;
+  PositionMapping positionMapping() const override {
+    return PositionMapping::InPlace;
   }
 
   bool supportsPointAccess() const override {
@@ -355,9 +373,10 @@ class BurrowsWheelerTransform : public SectionTransform {
   }
 
   // Undoing it is a chain of lookups from one position to the next, so one row
-  // cannot be read without rebuilding the block.
-  bool isElementwise() const override {
-    return false;
+  // cannot be read without rebuilding the block. This is the transform that
+  // blocking exists for.
+  PositionMapping positionMapping() const override {
+    return PositionMapping::Sequential;
   }
 
   bool supportsPointAccess() const override {
@@ -418,9 +437,14 @@ class BitPlaneTransform : public SectionTransform {
     std::copy(rows.begin(), rows.end(), values.begin());
   }
 
-  // Rows are not moved: one row's bits can be gathered from the planes.
-  bool isElementwise() const override {
-    return false;
+  // A row's bits are gathered from `width` positions across the planes, not
+  // read from one. That is positionally computable, but it is not a row
+  // permutation, so it does not fit the one-offset-per-row position map the
+  // Computable path is built on. Blocked until a bit-gather path exists, which
+  // costs it little: the planes are laid out the same way within a block as
+  // across a section, so the compression is nearly the same either way.
+  PositionMapping positionMapping() const override {
+    return PositionMapping::Sequential;
   }
 
   bool supportsPointAccess() const override {
@@ -444,6 +468,15 @@ uint64_t SectionTransform::invertValue(
   NIMBLE_UNREACHABLE(
       "Only an elementwise transform can undo a single value; this one needs "
       "its whole block.");
+}
+
+void SectionTransform::positionMap(
+    const TransformContext& /*context*/,
+    const TransformState& /*state*/,
+    std::span<uint32_t> /*positions*/) const {
+  NIMBLE_UNREACHABLE(
+      "Only a transform with a computable position mapping can say where a "
+      "row went without reading the transformed data.");
 }
 
 void SectionTransform::prepareSection(

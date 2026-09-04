@@ -72,14 +72,36 @@ enum class TransformId : uint8_t {
 /// One past the highest defined id, for validating what comes off the wire.
 inline constexpr uint8_t kTransformIdCount = 8;
 
-/// Rows a non-elementwise transform is applied to at a time.
+/// How a transform relates an original row to where its value ended up, which
+/// is what decides whether the transform has to be applied in blocks.
+enum class PositionMapping : uint8_t {
+  /// Values are rewritten where they stand. A row is read without knowing
+  /// anything about its neighbours.
+  InPlace,
+  /// Rows move, but where a row went is derivable without reading the
+  /// transformed data -- from the key section, which is stored in original
+  /// order, or by arithmetic. A reader builds that map once and then addresses
+  /// any row through it, so the transform can span the whole section and a
+  /// probe still costs one indirection.
+  Computable,
+  /// Undoing one row means undoing the rows around it. Only these need to be
+  /// applied in blocks, because the block is what bounds the undoing.
+  Sequential,
+};
+
+/// Rows a Sequential transform is applied to at a time.
 ///
-/// A transform that moves rows can only be undone over the same span it was
-/// applied to, so that span bounds what a reader must hold and how far a point
-/// lookup has to reconstruct. It matches the decoder's chunk size, which lets
-/// a transformed stream be undone inside the existing chunk loop rather than
-/// by materialising whole sections. The value is carried on the wire, so a
-/// later writer may choose a different one without breaking this reader.
+/// A Sequential transform can only be undone over the same span it was applied
+/// to, so that span bounds what a reader must hold and how far a point lookup
+/// has to reconstruct. It matches the decoder's chunk size, which lets such a
+/// stream be undone inside the existing chunk loop rather than by materialising
+/// whole sections. The value is carried on the wire, so a later writer may
+/// choose a different one without breaking this reader.
+///
+/// Computable and InPlace transforms are not blocked: blocking them would cost
+/// compression -- a key-derived sort clusters far better over a section than
+/// over 4096 rows -- and buy nothing, since neither needs a bounded span to
+/// address a row.
 inline constexpr uint32_t kTransformBlockSize = 4096;
 
 /// Returns the name of a transform id, for logging and test failures.
@@ -148,24 +170,26 @@ class SectionTransform {
 
   /// Undoes the transform for a single value.
   ///
-  /// Defined only where isElementwise() is true; that is what it means for a
-  /// row to be readable on its own, and it is how a point lookup avoids
-  /// rebuilding a block. Throws otherwise.
+  /// Defined only where positionMapping() is InPlace. Throws otherwise.
   virtual uint64_t invertValue(uint64_t value, const TransformState& state)
       const;
 
-  /// Whether the inverse of a row depends only on that row.
+  /// How this transform relates an original row to where its value was stored,
+  /// which decides whether it must be applied in blocks and how a reader
+  /// addresses a single row.
+  virtual PositionMapping positionMapping() const = 0;
+
+  /// Fills `positions[i]` with the offset the value of original row i was
+  /// stored at.
   ///
-  /// An elementwise transform maps values without regard to their neighbours,
-  /// so it needs no block structure: it carries one codebook for the whole
-  /// section and is undone wherever the value happens to be read. Everything
-  /// else is applied per block of kTransformBlockSize rows, so that its
-  /// inverse stays bounded.
-  ///
-  /// Distinct from supportsPointAccess(), which is about what a single probe
-  /// costs rather than what it depends on: a block-local transform could serve
-  /// probes from a rank cache and still not be elementwise.
-  virtual bool isElementwise() const = 0;
+  /// Defined only where positionMapping() is Computable; that is what
+  /// Computable means. A reader builds this once and then reads any row
+  /// through it, which is why such a transform costs a probe an indirection
+  /// rather than a reconstruction. Throws otherwise.
+  virtual void positionMap(
+      const TransformContext& context,
+      const TransformState& state,
+      std::span<uint32_t> positions) const;
 
   /// Whether a single row can be read without reconstructing the block. This
   /// decides whether the transform may serve a point-lookup-shaped read, and

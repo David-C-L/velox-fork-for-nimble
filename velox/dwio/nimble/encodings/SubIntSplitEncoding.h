@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -557,9 +558,12 @@ void SubIntSplitEncoding<T>::materializeTransformed(
   // a read is served out of one decoded block at a time. Holding the current
   // block means a read that stays inside it, or one that walks forward through
   // several, pays for each block once rather than once per row.
+  // A zero block size means nothing on this stream was blocked, so the span a
+  // transform has to be undone over is the whole column. Undoing a whole-column
+  // permutation in chunks would silently return the wrong rows.
   const uint32_t blockSize = transformInfo_.blockSize != 0
       ? transformInfo_.blockSize
-      : kMaterializeChunkSize;
+      : this->rowCount();
 
   for (uint32_t produced = 0; produced < rowCount;) {
     const uint32_t row = row_ + produced;
@@ -799,18 +803,6 @@ std::string_view SubIntSplitEncoding<T>::encode(
   transformInfo.keySection =
       detail::SubIntSplitTransformInfo::kNoKeySection;
 
-  // The key section orders the permutation, so it must reach the decoder in
-  // original order and cannot itself be transformed.
-  std::vector<uint64_t> keyValues;
-  if (transform != nullptr && transform->needsKeySection()) {
-    NIMBLE_CHECK_LT(
-        keySection,
-        splitCount,
-        "SubIntSplit key section is outside the split.");
-    keyValues = extractSection(segments[keySection]);
-    transformInfo.keySection = keySection;
-  }
-
   // Encodes one section at its storage width. Called more than once per
   // section, since choosing whether to transform means pricing both.
   const auto encodeSection = [&](uint8_t s,
@@ -880,31 +872,35 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // Rewrites one section with the transform, and reports what the state it
   // produced will cost on the wire, so the two candidates can be compared on
   // the same terms.
+  //
+  // Only a Sequential transform is applied in blocks. Blocking the others
+  // would cost compression -- a key-derived sort clusters far better over a
+  // whole section than over 4096 rows -- and buy nothing, because neither
+  // needs a bounded span to address a row.
   const auto applyTransform = [&](int width,
+                                  const std::vector<uint64_t>& keyValues,
                                   std::vector<uint64_t>& sectionU64,
                                   std::vector<uint64_t>& codebook,
                                   std::vector<uint32_t>& primaryIndices) {
-    if (transform->isElementwise()) {
-      // Nothing moves, so there is no span to bound: one codebook covers the
-      // section, and blocking it would only repeat that codebook.
+    subintsplit::TransformState sharedState;
+    transform->prepareSection(sectionU64, sharedState);
+    codebook = sharedState.codebook;
+
+    if (transform->positionMapping() !=
+        subintsplit::PositionMapping::Sequential) {
       subintsplit::TransformState state;
+      state.codebook = sharedState.codebook;
       subintsplit::TransformContext context{
           .keySection = keyValues, .width = width};
       transform->apply(sectionU64, context, state);
-      codebook = std::move(state.codebook);
+      if (codebook.empty()) {
+        codebook = std::move(state.codebook);
+      }
     } else {
-      // Applied one block at a time so the decoder can undo it inside its
-      // chunk loop. Over the whole column the inverse of the first row would
-      // depend on the last, which forces every reader to hold the section
-      // entire and costs a point lookup the column rather than a block.
       const uint32_t blockSize = subintsplit::kTransformBlockSize;
-      // Whatever the transform needs that does not vary by block is derived
-      // from the section once and stored once.
-      subintsplit::TransformState sharedState;
-      transform->prepareSection(sectionU64, sharedState);
-      codebook = sharedState.codebook;
       for (uint32_t start = 0; start < valueCount; start += blockSize) {
-        const uint32_t count = std::min<uint32_t>(blockSize, valueCount - start);
+        const uint32_t count =
+            std::min<uint32_t>(blockSize, valueCount - start);
         subintsplit::TransformState state;
         state.codebook = sharedState.codebook;
         subintsplit::TransformContext context{
@@ -925,48 +921,97 @@ std::string_view SubIntSplitEncoding<T>::encode(
         primaryIndices.size() * 4;
   };
 
-  for (uint8_t s = 0; s < splitCount; ++s) {
-    const auto& seg = segments[s];
-    const int width = seg.bitEnd - seg.bitStart + 1;
-    const uint8_t sb = sectionStorageBytes(width);
+  // One choice of key section, priced. kNoKeySection means the transform does
+  // not use a key, in which case every section is a candidate to transform.
+  struct Attempt {
+    std::vector<std::string_view> sections;
+    detail::SubIntSplitTransformInfo info;
+    size_t totalBytes{0};
+  };
+  const auto attemptWithKey = [&](uint8_t candidateKey) {
+    Attempt attempt;
+    attempt.info.transformIds.assign(splitCount, 0);
+    attempt.info.codebooks.assign(splitCount, {});
+    attempt.info.primaryIndices.assign(splitCount, {});
+    attempt.info.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
 
-    const auto sectionU64 = extractSection(seg);
-    const std::string_view plain = encodeSection(s, sb, sectionU64);
-
-    // The key section rebuilds the order of the others, so it is never itself
-    // transformed however well it would compress.
-    const bool mayTransform = transform != nullptr &&
-        !(transform->needsKeySection() && s == keySection);
-    if (!mayTransform) {
-      sectionData.push_back(plain);
-      continue;
+    std::vector<uint64_t> keyValues;
+    if (candidateKey != detail::SubIntSplitTransformInfo::kNoKeySection) {
+      keyValues = extractSection(segments[candidateKey]);
+      attempt.info.keySection = candidateKey;
     }
 
-    // A transform is worth applying to a section only where it pays for
-    // itself, so both candidates are priced on what they actually encode to,
-    // the transform's stored state included, and the smaller is kept. Applying
-    // one everywhere costs a codebook per section for the sections that had
-    // nothing to gain, which loses by more than the sections that gain can
-    // recover.
-    auto transformed = sectionU64;
-    std::vector<uint64_t> codebook;
-    std::vector<uint32_t> primaryIndices;
-    const size_t stateBytes =
-        applyTransform(width, transformed, codebook, primaryIndices);
-    const std::string_view alternative = encodeSection(s, sb, transformed);
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      const auto& seg = segments[s];
+      const int width = seg.bitEnd - seg.bitStart + 1;
+      const uint8_t sb = sectionStorageBytes(width);
 
-    if (alternative.size() + stateBytes < plain.size()) {
-      transformInfo.transformIds[s] = static_cast<uint8_t>(transform->id());
-      transformInfo.codebooks[s] = std::move(codebook);
-      transformInfo.primaryIndices[s] = std::move(primaryIndices);
-      if (!transform->isElementwise()) {
-        transformInfo.blockSize = subintsplit::kTransformBlockSize;
+      const auto sectionU64 = extractSection(seg);
+      const std::string_view plain = encodeSection(s, sb, sectionU64);
+
+      // The key section rebuilds the order of the others, so it is never
+      // itself transformed however well it would compress.
+      const bool mayTransform = transform != nullptr && s != candidateKey;
+      if (!mayTransform) {
+        attempt.sections.push_back(plain);
+        attempt.totalBytes += plain.size();
+        continue;
       }
-      sectionData.push_back(alternative);
-    } else {
-      sectionData.push_back(plain);
+
+      // A transform is worth applying to a section only where it pays for
+      // itself, so both candidates are priced on what they actually encode
+      // to, the transform's stored state included, and the smaller is kept.
+      auto transformed = sectionU64;
+      std::vector<uint64_t> codebook;
+      std::vector<uint32_t> primaryIndices;
+      const size_t stateBytes = applyTransform(
+          width, keyValues, transformed, codebook, primaryIndices);
+      const std::string_view alternative = encodeSection(s, sb, transformed);
+
+      if (alternative.size() + stateBytes < plain.size()) {
+        attempt.info.transformIds[s] = static_cast<uint8_t>(transform->id());
+        attempt.info.codebooks[s] = std::move(codebook);
+        attempt.info.primaryIndices[s] = std::move(primaryIndices);
+        if (transform->positionMapping() ==
+            subintsplit::PositionMapping::Sequential) {
+          attempt.info.blockSize = subintsplit::kTransformBlockSize;
+        }
+        attempt.sections.push_back(alternative);
+        attempt.totalBytes += alternative.size() + stateBytes;
+      } else {
+        attempt.sections.push_back(plain);
+        attempt.totalBytes += plain.size();
+      }
     }
+    return attempt;
+  };
+
+  // Which section to key on is a property of the data, not a constant. Every
+  // section is tried and the one that encodes smallest wins, because guessing
+  // it wrong reports that the transform does not pay when what did not pay was
+  // the guess.
+  std::optional<Attempt> best;
+  if (transform != nullptr && transform->needsKeySection()) {
+    if (keySection != detail::SubIntSplitTransformInfo::kNoKeySection) {
+      NIMBLE_CHECK_LT(
+          keySection,
+          splitCount,
+          "SubIntSplit key section is outside the split.");
+      best = attemptWithKey(keySection);
+    } else {
+      for (uint8_t candidate = 0; candidate < splitCount; ++candidate) {
+        auto attempt = attemptWithKey(candidate);
+        if (!best.has_value() || attempt.totalBytes < best->totalBytes) {
+          best = std::move(attempt);
+        }
+      }
+    }
+  } else {
+    best = attemptWithKey(detail::SubIntSplitTransformInfo::kNoKeySection);
   }
+
+  sectionData = std::move(best->sections);
+  transformInfo = std::move(best->info);
 
   // A key section is only worth holding back if some other section was
   // actually keyed on it.

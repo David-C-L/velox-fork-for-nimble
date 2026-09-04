@@ -1140,8 +1140,6 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
 
   // One entry per transform, so the ablation is an encoder row rather than a
   // new loop in every driver: bulk, gather and point pick these up unchanged.
-  // The key section is section 1 where a transform needs one, which is the
-  // first section above the low-order bits on the columns measured here.
   {
     const std::vector<std::pair<subintsplit::TransformId, const char*>> arms{
         {subintsplit::TransformId::KeyDerived, "key_derived"},
@@ -1170,7 +1168,9 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
                             const Encoding::Options& opts) {
           Encoding::Options o = opts;
           o.subIntSplitTransform = rawId;
-          o.subIntSplitKeySection = 1;
+          // 0xFF: let the encoder find the section worth keying on rather
+          // than assert one, since that is a property of the column.
+          o.subIntSplitKeySection = 0xFF;
           auto impl =
               std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
           impl->target.encode(data, o, /*realNestedSelection=*/true);
@@ -1194,7 +1194,9 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
                             const Encoding::Options& opts) {
           Encoding::Options o = opts;
           o.subIntSplitTransform = rawId;
-          o.subIntSplitKeySection = 1;
+          // 0xFF: let the encoder find the section worth keying on rather
+          // than assert one, since that is a property of the column.
+          o.subIntSplitKeySection = 0xFF;
           auto impl = std::make_unique<
               NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
           impl->encodeWith(data, o, /*realNestedSelection=*/true);

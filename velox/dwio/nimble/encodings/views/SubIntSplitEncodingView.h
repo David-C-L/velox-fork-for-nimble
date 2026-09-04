@@ -186,8 +186,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         section.transform = subintsplit::transformForRaw(
             transformInfo_.transformIds[wireIndex]);
         section.transformState.codebook = transformInfo_.codebooks[wireIndex];
-        blockedSection_ =
-            blockedSection_ || !section.transform->isElementwise();
+        const auto mapping = section.transform->positionMapping();
+        blockedSection_ = blockedSection_ ||
+            mapping == subintsplit::PositionMapping::Sequential;
+        computableSection_ = computableSection_ ||
+            mapping == subintsplit::PositionMapping::Computable;
       }
 
       // A transformed section is not constant in the values it yields, so
@@ -277,24 +280,85 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   T readTypedAt(uint32_t index) const final {
     NIMBLE_CHECK_LT(index, this->rowCount_);
-    // A reordering transform put this row somewhere that depends on the rest
-    // of its block, so the block has to be rebuilt to find it. That is the
-    // cost such a transform charges a point lookup, and it is why the
-    // relabellings, which never move a row, are worth keeping separate.
+    // Only a Sequential transform makes a row unreachable on its own: undoing
+    // it is a chain through the block, so the block has to be rebuilt.
     if (blockedSection_) {
       return detail::castFromPhysicalType<T>(readThroughBlock(index));
     }
+    return detail::castFromPhysicalType<T>(readOneRow(index));
+  }
+
+  // Reads one row where every transform present can address it directly: a
+  // relabelling is undone on the value, and a key-derived permutation is
+  // followed through the position map. Both are O(1) once the map exists.
+  physicalType readOneRow(uint32_t index) const {
+    const std::vector<uint32_t>* positions =
+        computableSection_ ? &positionMap() : nullptr;
     physicalType value = constantBits_;
     for (const auto& section : sections_) {
-      uint64_t sectionValue = section.valueAt(*section.view, index);
-      if (section.transform != nullptr) {
-        sectionValue =
-            section.transform->invertValue(sectionValue, section.transformState);
+      uint32_t at = index;
+      if (section.transform != nullptr &&
+          section.transform->positionMapping() ==
+              subintsplit::PositionMapping::Computable) {
+        at = (*positions)[index];
+      }
+      uint64_t sectionValue = section.valueAt(*section.view, at);
+      if (section.transform != nullptr &&
+          section.transform->positionMapping() ==
+              subintsplit::PositionMapping::InPlace) {
+        sectionValue = section.transform->invertValue(
+            sectionValue, section.transformState);
       }
       value |= static_cast<physicalType>(sectionValue & section.mask)
           << section.bitStart;
     }
-    return detail::castFromPhysicalType<T>(value);
+    return value;
+  }
+
+  // Where each original row's value was stored, built once and then reused.
+  //
+  // This is what makes a key-derived permutation cost a probe an indirection
+  // rather than a reconstruction, and so what lets it span a whole section
+  // instead of being cut into blocks. It is derived from the key section
+  // alone, which reaches the reader in original order, so no transformed value
+  // is read to build it. Held per thread, since a view is read concurrently
+  // and keeps no mutable state of its own.
+  const std::vector<uint32_t>& positionMap() const {
+    thread_local PositionCache cache;
+    if (cache.owner == this) {
+      return cache.positions;
+    }
+
+    NIMBLE_CHECK(
+        transformInfo_.keySection !=
+            detail::SubIntSplitTransformInfo::kNoKeySection,
+        "A computable transform needs the key section it was ordered by.");
+    std::vector<uint64_t> keyValues(this->rowCount_);
+    for (const auto& section : sections_) {
+      if (section.wireIndex != transformInfo_.keySection) {
+        continue;
+      }
+      for (uint32_t row = 0; row < this->rowCount_; ++row) {
+        keyValues[row] = section.valueAt(*section.view, row);
+      }
+      break;
+    }
+
+    cache.positions.resize(this->rowCount_);
+    const subintsplit::TransformContext context{
+        .keySection = keyValues, .width = 0};
+    for (const auto& section : sections_) {
+      if (section.transform == nullptr ||
+          section.transform->positionMapping() !=
+              subintsplit::PositionMapping::Computable) {
+        continue;
+      }
+      section.transform->positionMap(
+          context, section.transformState, cache.positions);
+      break;
+    }
+    cache.owner = this;
+    return cache.positions;
   }
 
   // Rebuilds the transform block containing `index` and returns that row.
@@ -307,7 +371,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   physicalType readThroughBlock(uint32_t index) const {
     const uint32_t blockSize = transformInfo_.blockSize != 0
         ? transformInfo_.blockSize
-        : kViewChunkSize;
+        : this->rowCount_;
     const uint32_t blockIndex = index / blockSize;
     const uint32_t blockStart = blockIndex * blockSize;
     const uint32_t blockCount =
@@ -333,16 +397,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
 
-    // Any transform sends a range read down the block path. The chunked
-    // accumulate kernel below reads section values straight into the output
-    // word and has nowhere to apply an inverse, so even an elementwise
-    // transform, which a point read undoes in place, needs the slower path
-    // here. Point reads keep the fast path, which is where the elementwise
-    // distinction actually buys something.
+    // A stream whose transforms can all address a row directly is read row by
+    // row through the position map, which costs a gather but never rebuilds
+    // anything. Only a Sequential transform needs the block path below.
+    if (!blockedSection_ && transformInfo_.anyTransform()) {
+      for (uint32_t i = 0; i < length; ++i) {
+        output[i] = readOneRow(offset + i);
+      }
+      return;
+    }
+
+    // The chunked accumulate kernel further down reads section values straight
+    // into the output word and has nowhere to apply an inverse, so a
+    // transformed stream never reaches it.
     if (transformInfo_.anyTransform()) {
       const uint32_t blockSize = transformInfo_.blockSize != 0
           ? transformInfo_.blockSize
-          : kViewChunkSize;
+          : this->rowCount_;
       std::vector<physicalType> block;
       for (uint32_t produced = 0; produced < length;) {
         const uint32_t row = offset + produced;
@@ -429,6 +500,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // The position map for one view, held per thread. Keyed on the view, since
+  // one thread may read several.
+  struct PositionCache {
+    const void* owner{nullptr};
+    std::vector<uint32_t> positions;
+  };
+
   // One reconstructed transform block, held per thread. Keyed on the view it
   // came from as well as the block, since one thread may read several views.
   struct BlockCache {
@@ -506,9 +584,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   // Per-section transform metadata from the header, indexed by wire position.
   detail::SubIntSplitTransformInfo transformInfo_;
-  // True where some section carries a transform that moves rows, which is what
+  // True where some section carries a Sequential transform, which is what
   // forces reads onto the block path.
   bool blockedSection_{false};
+  // True where some section carries a Computable transform, so reads go
+  // through the position map.
+  bool computableSection_{false};
 
   // Sections that vary per row. Constant sections are folded into constantBits_
   // at construction and do not appear here.

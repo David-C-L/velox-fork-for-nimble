@@ -141,8 +141,11 @@ class Encoding {
     uint8_t subIntSplitTransform = 0;
 
     /// Section whose values order a key-derived permutation, and which is
-    /// therefore stored unpermuted.
-    uint8_t subIntSplitKeySection = 0;
+    /// therefore stored unpermuted. 0xFF, the default, means the encoder tries
+    /// every section and keeps the one that encodes smallest: which section
+    /// groups the others is a property of the data, so fixing it reports that
+    /// the transform did not pay when what did not pay was the guess.
+    uint8_t subIntSplitKeySection = 0xFF;
 
     /// Encodings SubIntSplit may cost a section against when choosing splits.
     /// Empty, the default, means every encoding, which is production

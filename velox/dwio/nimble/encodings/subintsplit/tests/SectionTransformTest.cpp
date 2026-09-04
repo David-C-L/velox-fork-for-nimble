@@ -119,14 +119,61 @@ TEST(SectionTransformTest, keyDerivedOnItsOwnKeyIsIdentityOrder) {
 
 // Point access is what decides whether a transform may serve a point-lookup
 // read, so it is asserted rather than left to a comment.
-TEST(SectionTransformTest, reportsPointAccessHonestly) {
-  EXPECT_FALSE(transformFor(TransformId::KeyDerived)->supportsPointAccess());
+// Whether a transform must be applied in blocks follows from how it maps a row
+// to where that row was stored, and only one of the three ways needs blocking.
+TEST(SectionTransformTest, reportsHowItMapsPositions) {
+  // Values are rewritten where they stand.
+  for (auto id :
+       {TransformId::RelabelFrequency,
+        TransformId::RelabelDense,
+        TransformId::RelabelGray}) {
+    EXPECT_EQ(transformFor(id)->positionMapping(), PositionMapping::InPlace)
+        << toString(id);
+    EXPECT_TRUE(transformFor(id)->supportsPointAccess()) << toString(id);
+  }
+
+  // Rows move, but the key section says where to, and it is stored in original
+  // order, so a probe follows the map rather than rebuilding anything.
+  EXPECT_EQ(
+      transformFor(TransformId::KeyDerived)->positionMapping(),
+      PositionMapping::Computable);
+  EXPECT_TRUE(transformFor(TransformId::KeyDerived)->supportsPointAccess());
+
+  // Undoing one row means undoing its neighbours, which is what blocking is
+  // for. Bit-plane is here because its inverse is not a row permutation, not
+  // because a row is unreachable.
+  for (auto id :
+       {TransformId::BurrowsWheeler,
+        TransformId::BurrowsWheelerMoveToFront,
+        TransformId::BitPlane}) {
+    EXPECT_EQ(transformFor(id)->positionMapping(), PositionMapping::Sequential)
+        << toString(id);
+  }
   EXPECT_FALSE(transformFor(TransformId::BurrowsWheeler)->supportsPointAccess());
-  EXPECT_FALSE(transformFor(TransformId::BurrowsWheelerMoveToFront)
-                   ->supportsPointAccess());
-  EXPECT_TRUE(transformFor(TransformId::RelabelDense)->supportsPointAccess());
-  EXPECT_TRUE(transformFor(TransformId::RelabelGray)->supportsPointAccess());
-  EXPECT_TRUE(transformFor(TransformId::BitPlane)->supportsPointAccess());
+}
+
+// A computable mapping is only meaningful if it agrees with the transform it
+// describes: position i must be where apply() actually put row i.
+TEST(SectionTransformTest, positionMapMatchesWhereTheTransformPutEachRow) {
+  std::mt19937_64 rng(99);
+  std::vector<uint64_t> keys(5000);
+  std::vector<uint64_t> values(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = rng() % 17;
+    values[i] = i;
+  }
+
+  const auto* transform = transformFor(TransformId::KeyDerived);
+  auto transformed = values;
+  TransformState state;
+  const TransformContext context{.keySection = keys, .width = 16};
+  transform->apply(transformed, context, state);
+
+  std::vector<uint32_t> positions(values.size());
+  transform->positionMap(context, state, positions);
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(transformed[positions[i]], values[i]) << "row " << i;
+  }
 }
 
 TEST(SectionTransformTest, onlyKeyDerivedNeedsAKeySection) {
