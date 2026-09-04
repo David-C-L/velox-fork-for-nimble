@@ -81,7 +81,8 @@ int runBenchmark() {
 
   std::vector<std::string> csvColumns = {
       "driver",        "dtype",       "dataset",       "encoding",
-      "family",        "variant",     "is_sequential", "fast_skip",
+      "family",        "variant",
+      "inventory",     "is_sequential", "fast_skip",
       "random_access", "N",           "seed",          "cache_state",
       "evict_method",  "evict_ns",    "payload_bytes", "compression_ratio",
       "iterations",    "warmup",      "time_ns",       "time_p90_ns",

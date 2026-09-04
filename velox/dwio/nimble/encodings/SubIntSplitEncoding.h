@@ -541,10 +541,13 @@ std::string_view SubIntSplitEncoding<T>::encode(
     detail::subintsplit::sampleIntoU64<physicalType>(
         values, sampleBuf, detail::subintsplit::defaultSamplerConfig());
 
-    auto selectorResult = detail::subintsplit::selectSplits(
+    // An empty allowed set costs every encoding, so this is the production
+    // path unless a caller has deliberately narrowed the inventory.
+    auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
         valueCount,
+        options.subIntSplitAllowedEncodings,
         detail::subintsplit::defaultSelectorConfig());
 
     segments = std::move(selectorResult.segments);

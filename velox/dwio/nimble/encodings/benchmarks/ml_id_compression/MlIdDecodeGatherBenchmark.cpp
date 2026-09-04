@@ -113,6 +113,7 @@ int runBenchmark() {
       "encoding",
       "family",
       "variant",
+      "inventory",
       "is_sequential",
       "N",
       "seed",

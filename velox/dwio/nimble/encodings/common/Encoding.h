@@ -133,6 +133,13 @@ class Encoding {
     /// 2 = TierTagArray, 3 = EliasFano.
     uint8_t frequencyPartitionIndex = 0;
 
+    /// Encodings SubIntSplit may cost a section against when choosing splits.
+    /// Empty, the default, means every encoding, which is production
+    /// behaviour. A restricted set holds the inventory fixed so that the
+    /// effect of the cost models can be measured on its own, and does not
+    /// change the format: it only narrows what the selector considers.
+    std::unordered_set<EncodingType> subIntSplitAllowedEncodings;
+
     /// Block size for BlockBitPacking encoding. Determines how many rows
     /// are packed per block. Written to the stream header; the reader
     /// reads it back from the stream (self-describing).

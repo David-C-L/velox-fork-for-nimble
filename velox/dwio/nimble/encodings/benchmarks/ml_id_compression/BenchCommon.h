@@ -30,6 +30,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include <folly/FileUtil.h>
@@ -330,6 +331,9 @@ struct EncoderEntry {
   std::string name;
   std::string family; // "baseline", "sis-manual", "sis-auto", "fpe-index"
   std::string variant;
+  // Which cost-model inventory SubIntSplit was allowed to choose from. Only
+  // meaningful for the SubIntSplit family; empty elsewhere.
+  std::string inventory;
   bool isSequential{true};
   bool fastSkip{false};
   bool randomAccess{false};
@@ -1041,6 +1045,7 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     entry.name = "SIS/realNested";
     entry.family = "SubIntSplit";
     entry.variant = "real_nested";
+    entry.inventory = "full";
     entry.isSequential = false;
     entry.fastSkip = false;
     entry.randomAccess = false;
@@ -1058,6 +1063,7 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     entry.name = "SIS/realNested+view";
     entry.family = "SubIntSplit";
     entry.variant = "real_nested_view";
+    entry.inventory = "full";
     entry.isSequential = false;
     entry.fastSkip = true;
     entry.randomAccess = true;
@@ -1068,6 +1074,66 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
     encoders.push_back(std::move(entry));
+  }
+
+  // The cost models SubIntSplit scored before Delta, FOR, PFOR, Huffman,
+  // DeltaBlock, BlockBitPacking, SimdForBitpack and FrequencyPartition were
+  // added. Pairing these against the entries above isolates what the richer
+  // inventory is worth, on compression and on decode, within one binary.
+  {
+    const std::unordered_set<EncodingType> legacyInventory{
+        EncodingType::Trivial,
+        EncodingType::FixedBitWidth,
+        EncodingType::Constant,
+        EncodingType::MainlyConstant,
+        EncodingType::RLE,
+        EncodingType::Varint,
+        EncodingType::Dictionary,
+    };
+
+    {
+      EncoderEntry<T> entry;
+      entry.name = "SIS/legacyCost";
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested";
+      entry.inventory = "legacy";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [legacyInventory](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitAllowedEncodings = legacyInventory;
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+
+    {
+      EncoderEntry<T> entry;
+      entry.name = "SIS/legacyCost+view";
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested_view";
+      entry.inventory = "legacy";
+      entry.isSequential = false;
+      entry.fastSkip = true;
+      entry.randomAccess = true;
+      entry.factory = [legacyInventory](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitAllowedEncodings = legacyInventory;
+        auto impl =
+            std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->encodeWith(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
   }
 
   // Applied last so it wraps whatever the entries above produced.

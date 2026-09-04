@@ -125,6 +125,7 @@ int runBenchmark() {
       "encoding",
       "family",
       "variant",
+      "inventory",
       "is_sequential",
       "fast_skip",
       "random_access",
