@@ -54,6 +54,56 @@ inline constexpr uint8_t subIntSplitSectionStorageBytes(int bitWidth) noexcept {
   return 8;
 }
 
+// Per-section transform metadata, as the header carries it.
+//
+// A section is transformed only where it pays for itself, so the ids are per
+// section rather than one for the stream: charging every section for a
+// transform only some of them want measured far worse than letting each
+// decline.
+struct SubIntSplitTransformInfo {
+  // Index of the section the key-derived permutation sorts by. That section is
+  // stored unpermuted, since it is what rebuilds the order. kNoKeySection when
+  // no section is used as a key.
+  static constexpr uint8_t kNoKeySection = 0xFF;
+  uint8_t keySection{kNoKeySection};
+  // Transform id per section, 0 where the section was left alone.
+  std::vector<uint8_t> transformIds;
+  // Codebook per section, empty where the transform carries none.
+  std::vector<std::vector<uint64_t>> codebooks;
+  // Burrows-Wheeler rotation index per section, 0 where unused.
+  std::vector<uint32_t> primaryIndices;
+
+  bool anyTransform() const {
+    for (uint8_t id : transformIds) {
+      if (id != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+// Bytes the transform block occupies for `info`, zero when nothing is
+// transformed so that an untransformed stream is byte-identical to one written
+// before transforms existed.
+inline uint32_t subIntSplitTransformHeaderSize(
+    const SubIntSplitTransformInfo& info) {
+  if (!info.anyTransform()) {
+    return 0;
+  }
+  uint32_t size = 1; // key section
+  size += static_cast<uint32_t>(info.transformIds.size()); // one id per section
+  for (size_t i = 0; i < info.transformIds.size(); ++i) {
+    if (info.transformIds[i] == 0) {
+      continue;
+    }
+    size += 4; // codebook entry count
+    size += static_cast<uint32_t>(info.codebooks[i].size() * sizeof(uint64_t));
+    size += 4; // primary index
+  }
+  return size;
+}
+
 // One section of a SubIntSplit stream, as the header describes it: which bits
 // it covers, how to mask and shift its values back into place, the width it was
 // stored at, and the bytes of its sub-stream.
@@ -73,10 +123,42 @@ struct SubIntSplitSection {
 // one of them. `data` is the whole stream, `dataOffset` its prefix size.
 inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
     std::string_view data,
-    uint32_t dataOffset) {
+    uint32_t dataOffset,
+    SubIntSplitTransformInfo* transformInfo = nullptr) {
   const char* pos = data.data() + dataOffset;
   const uint8_t splitCount = encoding::read<uint8_t>(pos);
-  encoding::read<uint8_t>(pos); // reserved order byte
+  // Zero here means no transform, which is what every stream written before
+  // transforms existed carries, so those parse exactly as before.
+  const uint8_t transformPresent = encoding::read<uint8_t>(pos);
+
+  if (transformPresent != 0) {
+    SubIntSplitTransformInfo parsed;
+    parsed.keySection = encoding::read<uint8_t>(pos);
+    parsed.transformIds.resize(splitCount);
+    parsed.codebooks.resize(splitCount);
+    parsed.primaryIndices.assign(splitCount, 0);
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      parsed.transformIds[s] = encoding::read<uint8_t>(pos);
+    }
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      if (parsed.transformIds[s] == 0) {
+        continue;
+      }
+      const uint32_t entries = encoding::readUint32(pos);
+      parsed.codebooks[s].resize(entries);
+      for (uint32_t e = 0; e < entries; ++e) {
+        parsed.codebooks[s][e] = encoding::read<uint64_t>(pos);
+      }
+      parsed.primaryIndices[s] = encoding::readUint32(pos);
+    }
+    if (transformInfo != nullptr) {
+      *transformInfo = std::move(parsed);
+    }
+  } else if (transformInfo != nullptr) {
+    transformInfo->transformIds.assign(splitCount, 0);
+    transformInfo->codebooks.assign(splitCount, {});
+    transformInfo->primaryIndices.assign(splitCount, 0);
+  }
 
   std::vector<SubIntSplitSection> sections(splitCount);
   // The triples are contiguous, so read them all before walking the payloads.

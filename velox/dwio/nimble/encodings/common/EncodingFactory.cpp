@@ -197,7 +197,10 @@ std::unique_ptr<Encoding> EncodingFactory::create(
     // SubIntSplit and FrequencyPartition integration (re-enabled for
     // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    case EncodingType::SubIntSplit: {
+    // Both types are read by the same class; the header says whether the
+    // sections carry a transform.
+    case EncodingType::SubIntSplit:
+    case EncodingType::SubIntSplitReordered: {
       RETURN_ENCODING_BY_VARINT_TYPE(SubIntSplitEncoding, dataType);
     }
     case EncodingType::FrequencyPartition: {

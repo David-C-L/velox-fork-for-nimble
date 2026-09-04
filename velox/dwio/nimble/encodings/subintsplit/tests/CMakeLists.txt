@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(nimble_subintsplit_tests SectionTransformTest.cpp)
+add_executable(
+  nimble_subintsplit_tests
+  SectionTransformTest.cpp
+  TransformedEncodingTest.cpp
+)
 
 add_test(nimble_subintsplit_tests nimble_subintsplit_tests)
 
 target_link_libraries(
   nimble_subintsplit_tests
   nimble_encodings
+  nimble_encodings_tests_utils
+  velox_memory
   GTest::gtest
   GTest::gtest_main
   GTest::gmock

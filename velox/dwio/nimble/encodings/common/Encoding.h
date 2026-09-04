@@ -133,6 +133,17 @@ class Encoding {
     /// 2 = TierTagArray, 3 = EliasFano.
     uint8_t frequencyPartitionIndex = 0;
 
+    /// Reversible transform applied to SubIntSplit's sections, as a
+    /// subintsplit::TransformId. Zero, the default, applies none and writes
+    /// the stream in the original format. The section named by
+    /// subIntSplitKeySection is always left untransformed, since a key-derived
+    /// permutation is rebuilt from it at read time.
+    uint8_t subIntSplitTransform = 0;
+
+    /// Section whose values order a key-derived permutation, and which is
+    /// therefore stored unpermuted.
+    uint8_t subIntSplitKeySection = 0;
+
     /// Encodings SubIntSplit may cost a section against when choosing splits.
     /// Empty, the default, means every encoding, which is production
     /// behaviour. A restricted set holds the inventory fixed so that the

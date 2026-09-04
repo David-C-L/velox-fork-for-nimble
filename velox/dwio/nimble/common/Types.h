@@ -166,6 +166,14 @@ enum class EncodingType {
   // decode time. Produced only by EncodingSliceFactory, never by encoding
   // selection.
   Slice = 23,
+  // SubIntSplit whose sections carry a reversible transform. A distinct type
+  // rather than a flag inside SubIntSplit, so that a reader without transform
+  // support fails on an encoding it does not know instead of decoding the
+  // sections and skipping the inverse, which would return transformed values
+  // as though they were the originals.
+  // EXPERIMENTAL: Not production-ready. Do not enable for production tables
+  // without consulting the Nimble team (oncall: dwios).
+  SubIntSplitReordered = 24,
 };
 std::string toString(EncodingType encodingType);
 /// Returns the encoding type for 'name'. Throws if 'name' is unknown.
