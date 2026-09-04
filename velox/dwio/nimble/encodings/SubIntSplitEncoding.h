@@ -159,22 +159,25 @@ class SubIntSplitEncoding
 
   std::vector<SectionInfo> sections_;
 
-  // Persistent scratch buffer reused across materialize() calls. Sized to
-  // kMaterializeChunkSize * sizeof(physicalType) bytes on first use.
   // Per-section transform metadata from the header. Empty ids mean the stream
   // predates transforms, or chose none.
   detail::SubIntSplitTransformInfo transformInfo_;
+  // Widened section values for the block being decoded, reused across blocks.
+  std::vector<std::vector<uint64_t>> sectionScratch_;
   // The block currently held in blockCache_, and the row the sections stand
   // at. Only meaningful for a transformed stream.
   uint32_t cachedBlockStart_{0};
   uint32_t sectionsAt_{0};
   std::vector<physicalType> blockCache_;
+
   // Decodes a stream whose sections carry a transform, out of whole blocks.
   void materializeTransformed(uint32_t rowCount, physicalType* output);
 
   // Decodes and inverts the block at `blockStart` into blockCache_.
   void decodeTransformBlock(uint32_t blockStart, uint32_t blockSize);
 
+  // Persistent scratch buffer reused across materialize() calls. Sized to
+  // kMaterializeChunkSize * sizeof(physicalType) bytes on first use.
   Vector<uint8_t> scratchBuf_;
 
   // Logical read cursor (rows consumed so far). Maintained across skip(),
@@ -605,8 +608,12 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   }
 
   // Every section is widened to 64 bits first, so a transform never has to
-  // know which width its section was stored at.
-  std::vector<std::vector<uint64_t>> sectionValues(sections_.size());
+  // know which width its section was stored at. The buffers are held across
+  // blocks rather than allocated per block: a bulk decode walks thousands of
+  // them, and that allocation would otherwise be charged to the transform when
+  // it belongs to this loop.
+  auto& sectionValues = sectionScratch_;
+  sectionValues.resize(sections_.size());
   for (size_t s = 0; s < sections_.size(); ++s) {
     auto& sec = sections_[s];
     auto& values = sectionValues[s];

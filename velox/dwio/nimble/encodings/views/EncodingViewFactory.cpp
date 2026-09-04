@@ -124,8 +124,10 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
           "SimdForBitpack encoding only supports integral data types, got {}.",
           TypeTraits<T>::dataType);
     case EncodingType::SubIntSplit:
+    case EncodingType::SubIntSplitReordered:
       // Mirrors SubIntSplitEncoding's own constraints: it splits a numeric word
-      // into bit ranges, so 32- and 64-bit numerics only.
+      // into bit ranges, so 32- and 64-bit numerics only. Both types are read
+      // by the same view, which undoes any transform the sections carry.
       if constexpr (
           isNumericType<physicalType>() &&
           (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
@@ -187,7 +189,8 @@ bool supportsEncodingView(EncodingType encodingType) {
       EncodingType::PFOR,
       EncodingType::SimdForBitpack,
       EncodingType::BlockBitPacking,
-      EncodingType::SubIntSplit};
+      EncodingType::SubIntSplit,
+      EncodingType::SubIntSplitReordered};
   return std::find(
              kViewableEncodings.begin(),
              kViewableEncodings.end(),
