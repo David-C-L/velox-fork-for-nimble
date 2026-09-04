@@ -254,9 +254,11 @@ void SubIntSplitEncoding<T>::reset() {
     sec.encoding->reset();
   }
   row_ = 0;
-  cachedBlockStart_ = 0;
   sectionsAt_ = 0;
-  blockCache_.clear();
+  // blockCache_ is deliberately kept. It holds decoded rows addressed by their
+  // absolute position, which rewinding the cursor does not invalidate, and a
+  // point read reaches this class by resetting before every probe: dropping it
+  // would make each probe decode the span again.
 }
 
 template <typename T>

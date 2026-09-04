@@ -397,13 +397,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
 
-    // A stream whose transforms can all address a row directly is read row by
-    // row through the position map, which costs a gather but never rebuilds
-    // anything. Only a Sequential transform needs the block path below.
+    // A stream whose transforms can all address a row directly has two ways to
+    // be read, and which is faster depends on how much of it is wanted.
+    //
+    // Reading row by row through the position map touches only the rows asked
+    // for, so it wins for a short range. But it gathers, and a gather gives up
+    // the sequential kernel the untransformed path uses, so over a long range
+    // it loses badly to simply decoding each section in order and undoing the
+    // transform across the whole span. The crossover is set where the gather's
+    // per-row cost starts to exceed decoding rows that were not asked for.
     if (!blockedSection_ && transformInfo_.anyTransform()) {
-      for (uint32_t i = 0; i < length; ++i) {
-        output[i] = readOneRow(offset + i);
+      if (length * kGatherAdvantage < this->rowCount_) {
+        for (uint32_t i = 0; i < length; ++i) {
+          output[i] = readOneRow(offset + i);
+        }
+        return;
       }
+      readWholeSpan(offset, length, output);
       return;
     }
 
@@ -515,6 +525,41 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     std::vector<physicalType> values;
   };
 
+  // How much cheaper a gathered row is than a decoded one. Below this ratio of
+  // wanted rows to total rows, gathering only what was asked for wins; above
+  // it, decoding the span in order and undoing it wholesale wins even though
+  // it decodes rows nobody wanted.
+  static constexpr uint32_t kGatherAdvantage = 8;
+
+  // Decodes every section in order across the whole column, undoes the
+  // transforms over that span, and keeps the requested rows.
+  //
+  // This is what a bulk read of a computable transform should cost: the
+  // sections come off their encodings sequentially, and the inverse is a
+  // permutation applied once, rather than a random access per row.
+  void readWholeSpan(uint32_t offset, uint32_t length, physicalType* output)
+      const {
+    std::vector<physicalType> whole(this->rowCount_);
+    readPhysicalBlock(0, this->rowCount_, whole.data());
+    std::copy_n(whole.data() + offset, length, output);
+  }
+
+  // Decodes `count` rows of one section in one go and widens them to 64 bits,
+  // which is the width every transform works in.
+  template <typename SectionT>
+  static void widenSectionRun(
+      const Section& section,
+      uint32_t offset,
+      uint32_t count,
+      std::vector<uint8_t>& scratch,
+      std::vector<uint64_t>& out) {
+    auto* values = reinterpret_cast<SectionT*>(scratch.data());
+    section.view->read(offset, count, values);
+    for (uint32_t row = 0; row < count; ++row) {
+      out[row] = static_cast<uint64_t>(values[row]);
+    }
+  }
+
   // Reads one whole transform block, undoing every transform on it.
   //
   // Sections are widened to 64 bits first so a transform never has to know
@@ -524,13 +569,29 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       uint32_t blockStart,
       uint32_t blockCount,
       physicalType* output) const {
+    // Read sequentially rather than a row at a time: the section views decode
+    // a run far faster than they answer the same number of separate probes,
+    // and this is the path a bulk read takes.
     std::vector<std::vector<uint64_t>> sectionValues(sections_.size());
+    std::vector<uint8_t> scratch(
+        static_cast<size_t>(blockCount) * sizeof(physicalType));
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
       auto& values = sectionValues[i];
       values.resize(blockCount);
-      for (uint32_t row = 0; row < blockCount; ++row) {
-        values[row] = section.valueAt(*section.view, blockStart + row);
+      switch (section.storageBytes) {
+        case 1:
+          widenSectionRun<uint8_t>(section, blockStart, blockCount, scratch, values);
+          break;
+        case 2:
+          widenSectionRun<uint16_t>(section, blockStart, blockCount, scratch, values);
+          break;
+        case 4:
+          widenSectionRun<uint32_t>(section, blockStart, blockCount, scratch, values);
+          break;
+        default:
+          widenSectionRun<uint64_t>(section, blockStart, blockCount, scratch, values);
+          break;
       }
     }
 
