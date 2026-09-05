@@ -125,6 +125,75 @@ void inverseBurrowsWheeler(std::span<uint64_t> values, uint32_t primaryIndex) {
 
 // --------------------------------------------------------------------------
 
+// Numbers the distinct values of a key section, in first-seen order.
+//
+// Open-addressed and flat, so a lookup touches one cache line rather than
+// following a pointer into the heap. This is on the decode path for every row
+// of a key-derived section, and the node-based map it replaces was where
+// profiling found nearly half of the first-level read misses.
+class RunTable {
+ public:
+  explicit RunTable(size_t rows) {
+    size_t capacity = 1024;
+    // Start near the plausible number of distinct keys rather than growing
+    // into it, but never larger than the rows themselves.
+    while (capacity < rows / 8 && capacity < (size_t{1} << 20)) {
+      capacity <<= 1;
+    }
+    reset(capacity);
+  }
+
+  uint32_t idOf(uint64_t key) {
+    size_t slot = mix(key) & mask_;
+    while (used_[slot] != 0) {
+      if (slotKey_[slot] == key) {
+        return slotId_[slot];
+      }
+      slot = (slot + 1) & mask_;
+    }
+    const auto id = static_cast<uint32_t>(distinct.size());
+    used_[slot] = 1;
+    slotKey_[slot] = key;
+    slotId_[slot] = id;
+    distinct.push_back(key);
+    if (distinct.size() * 10 >= (mask_ + 1) * 7) {
+      grow();
+    }
+    return id;
+  }
+
+  std::vector<uint64_t> distinct;
+
+ private:
+  static uint64_t mix(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+  }
+
+  void reset(size_t capacity) {
+    mask_ = capacity - 1;
+    used_.assign(capacity, 0);
+    slotKey_.assign(capacity, 0);
+    slotId_.assign(capacity, 0);
+  }
+
+  void grow() {
+    auto keys = distinct;
+    reset((mask_ + 1) << 1);
+    distinct.clear();
+    for (uint64_t key : keys) {
+      idOf(key);
+    }
+  }
+
+  size_t mask_{0};
+  std::vector<uint8_t> used_;
+  std::vector<uint64_t> slotKey_;
+  std::vector<uint32_t> slotId_;
+};
+
 class KeyDerivedTransform : public SectionTransform {
  public:
   TransformId id() const override {
@@ -164,35 +233,34 @@ class KeyDerivedTransform : public SectionTransform {
     //
     // k is small wherever this transform pays: it pays by grouping rows, which
     // needs the key to have far fewer values than the section has rows.
-    // Runs are numbered in one pass, so nothing here sorts. Sorting the key to
-    // find its distinct values would cost as much as rebuilding the whole
-    // permutation, which is what this exists to avoid.
-    std::unordered_map<uint64_t, uint32_t> runOf;
+    // Runs are numbered in one pass over the rows. The table that numbers them
+    // is a flat open-addressed one rather than a node-based map: it holds only
+    // as many entries as there are distinct keys, which is few wherever this
+    // transform pays, so it stays in cache, where a map that chases a pointer
+    // per row does not. Profiling put nearly half of all first-level read
+    // misses in this function, and they were those probes.
+    RunTable table(count);
     std::vector<uint32_t> runOfRow(count);
     for (size_t i = 0; i < count; ++i) {
-      const auto inserted =
-          runOf.emplace(keys[i], static_cast<uint32_t>(runOf.size()));
-      runOfRow[i] = inserted.first->second;
+      runOfRow[i] = table.idOf(keys[i]);
     }
+    const size_t runs = table.distinct.size();
 
-    // A stable sort keeps the runs in first-seen order only if the key is
-    // itself ordered, so the run starts follow the key's sorted order rather
-    // than the order the rows introduced them.
-    std::vector<uint64_t> distinct(runOf.size());
-    for (const auto& entry : runOf) {
-      distinct[entry.second] = entry.first;
-    }
-    std::vector<uint32_t> rank(runOf.size());
+    // The rows were laid out in the key's sorted order, so the runs are walked
+    // in that order too. Only the distinct keys are sorted, of which there are
+    // few; sorting the rows is what this whole path exists to avoid.
+    std::vector<uint32_t> rank(runs);
     std::iota(rank.begin(), rank.end(), 0u);
+    const auto& distinct = table.distinct;
     std::sort(rank.begin(), rank.end(), [&distinct](uint32_t a, uint32_t b) {
       return distinct[a] < distinct[b];
     });
-    std::vector<uint32_t> position(runOf.size());
-    for (uint32_t i = 0; i < rank.size(); ++i) {
+    std::vector<uint32_t> position(runs);
+    for (uint32_t i = 0; i < runs; ++i) {
       position[rank[i]] = i;
     }
 
-    std::vector<uint32_t> cursor(runOf.size() + 1, 0);
+    std::vector<uint32_t> cursor(runs + 1, 0);
     for (size_t i = 0; i < count; ++i) {
       ++cursor[position[runOfRow[i]] + 1];
     }
