@@ -239,21 +239,36 @@ class KeyDerivedTransform : public SectionTransform {
     // transform pays, so it stays in cache, where a map that chases a pointer
     // per row does not. Profiling put nearly half of all first-level read
     // misses in this function, and they were those probes.
-    RunTable table(count);
-    std::vector<uint32_t> runOfRow(count);
-    for (size_t i = 0; i < count; ++i) {
-      runOfRow[i] = table.idOf(keys[i]);
+    // The reader hands over dense run ids where the encoding holding the key
+    // already had them, which a dictionary does. Rebuilding them means hashing
+    // every row to recover ids that were already there, and profiling put that
+    // and the sort it feeds at a third of the instructions on one column.
+    std::vector<uint32_t> derivedIds;
+    std::vector<uint64_t> derivedValues;
+    const bool given = !context.keyRunIds.empty();
+    if (!given) {
+      RunTable table(count);
+      derivedIds.resize(count);
+      for (size_t i = 0; i < count; ++i) {
+        derivedIds[i] = table.idOf(keys[i]);
+      }
+      derivedValues = std::move(table.distinct);
     }
-    const size_t runs = table.distinct.size();
+    const std::span<const uint32_t> runOfRow =
+        given ? context.keyRunIds : std::span<const uint32_t>(derivedIds);
+    const std::span<const uint64_t> runValues =
+        given ? context.keyRunValues : std::span<const uint64_t>(derivedValues);
+    NIMBLE_CHECK_EQ(
+        runOfRow.size(), count, "Key-derived needs one run id per row.");
+    const size_t runs = runValues.size();
 
     // The rows were laid out in the key's sorted order, so the runs are walked
     // in that order too. Only the distinct keys are sorted, of which there are
     // few; sorting the rows is what this whole path exists to avoid.
     std::vector<uint32_t> rank(runs);
     std::iota(rank.begin(), rank.end(), 0u);
-    const auto& distinct = table.distinct;
-    std::sort(rank.begin(), rank.end(), [&distinct](uint32_t a, uint32_t b) {
-      return distinct[a] < distinct[b];
+    std::sort(rank.begin(), rank.end(), [runValues](uint32_t a, uint32_t b) {
+      return runValues[a] < runValues[b];
     });
     std::vector<uint32_t> position(runs);
     for (uint32_t i = 0; i < runs; ++i) {

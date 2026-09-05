@@ -643,14 +643,27 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
 
     std::span<const uint64_t> keySpan;
+    // Where the key's own encoding already holds dense ids -- a dictionary
+    // does -- they are taken rather than rebuilt. A transform that groups rows
+    // by key would otherwise hash every row to recover them.
+    thread_local std::vector<uint32_t> runIds;
+    thread_local std::vector<uint64_t> runValues;
+    runIds.clear();
+    runValues.clear();
     if (transformInfo_.keySection !=
         detail::SubIntSplitTransformInfo::kNoKeySection) {
       for (size_t i = 0; i < sections_.size(); ++i) {
-        if (sections_[i].wireIndex == transformInfo_.keySection) {
-          keySpan = std::span<const uint64_t>(
-              sectionValues[i].data(), sectionValues[i].size());
-          break;
+        if (sections_[i].wireIndex != transformInfo_.keySection) {
+          continue;
         }
+        keySpan = std::span<const uint64_t>(
+            sectionValues[i].data(), sectionValues[i].size());
+        if (!sections_[i].view->denseRunIds(
+                blockStart, blockCount, runIds, runValues)) {
+          runIds.clear();
+          runValues.clear();
+        }
+        break;
       }
     }
 
@@ -668,7 +681,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         state.primaryIndex = blockState[blockIndex];
       }
       subintsplit::TransformContext context{
-          .keySection = keySpan, .width = section.width};
+          .keySection = keySpan,
+          .width = section.width,
+          .keyRunIds = runIds,
+          .keyRunValues = runValues};
       section.transform->invert(sectionValues[i], context, state);
     }
 

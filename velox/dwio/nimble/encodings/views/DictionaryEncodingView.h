@@ -60,6 +60,29 @@ class DictionaryEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // The indices are already the dense ids a caller grouping rows by value
+  // would otherwise rebuild, and the alphabet is already decoded, so both are
+  // handed over rather than derived again. Declined when the alphabet was too
+  // large to hold, since then there is nothing to hand over.
+  bool denseRunIds(
+      uint32_t offset,
+      uint32_t length,
+      std::vector<uint32_t>& ids,
+      std::vector<uint64_t>& table) const final {
+    if (resolved_.empty()) {
+      return false;
+    }
+    ids.resize(length);
+    indices_->read(offset, length, ids.data());
+    table.resize(resolved_.size());
+    for (size_t i = 0; i < resolved_.size(); ++i) {
+      uint64_t bits = 0;
+      __builtin_memcpy(&bits, &resolved_[i], sizeof(physicalType));
+      table[i] = bits;
+    }
+    return true;
+  }
+
  private:
   T readTypedAt(uint32_t index) const final {
     NIMBLE_CHECK_LT(index, this->rowCount_);

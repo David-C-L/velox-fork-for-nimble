@@ -121,6 +121,15 @@ struct TransformContext {
   /// Bit width of the section being transformed, which sets the width of any
   /// codebook entry.
   int width{0};
+  /// Dense run ids for the key section, one per row, where the encoding
+  /// holding that section already had them. Empty otherwise, and a transform
+  /// that wants them must then derive them from keySection itself.
+  ///
+  /// These carry no order: whoever supplies them decides how they are numbered,
+  /// so a transform needing the key's value order takes it from keyRunValues.
+  std::span<const uint32_t> keyRunIds;
+  /// The value each run id stands for. As many entries as there are runs.
+  std::span<const uint64_t> keyRunValues;
 };
 
 /// State a transform produces at encode and needs back at decode. What it
