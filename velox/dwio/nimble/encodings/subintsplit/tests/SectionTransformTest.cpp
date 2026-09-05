@@ -117,6 +117,70 @@ TEST(SectionTransformTest, keyDerivedOnItsOwnKeyIsIdentityOrder) {
   EXPECT_EQ(values, key);
 }
 
+// Undoing the permutation walks one cursor per distinct key, so how many keys
+// there are decides both what it costs and how much bookkeeping there is to get
+// wrong. Every other round-trip test here uses low-cardinality keys, so this
+// pushes the run count into the thousands, through the path that derives the
+// run ids itself rather than being handed them.
+TEST(SectionTransformTest, keyDerivedRoundTripsWithManyDistinctKeys) {
+  constexpr size_t kCount = 20'000;
+  constexpr size_t kDistinctKeys = 5'000;
+  std::mt19937_64 rng(42);
+  std::vector<uint64_t> key(kCount);
+  for (auto& value : key) {
+    value = rng() % kDistinctKeys;
+  }
+  const auto original = makeSection(kCount, 20, Shape::Uniform, 99);
+  std::vector<uint64_t> values = original;
+
+  const auto* transform = transformFor(TransformId::KeyDerived);
+  TransformContext context{.keySection = key, .width = 20};
+  TransformState state;
+  transform->apply(values, context, state);
+  transform->invert(values, context, state);
+  EXPECT_EQ(values, original);
+}
+
+// Same large-k round trip, but through the path where the key's own encoding
+// already hands back dense run ids, as a dictionary-backed key section would.
+// Ids follow the dictionary's sorted numbering rather than first-appearance
+// order, so this also checks that the merge does not assume the two coincide.
+TEST(SectionTransformTest, keyDerivedRoundTripsWithManyDistinctKeysGivenRunIds) {
+  constexpr size_t kCount = 20'000;
+  constexpr size_t kDistinctKeys = 5'000;
+  std::mt19937_64 rng(7);
+  std::vector<uint64_t> key(kCount);
+  for (auto& value : key) {
+    value = rng() % kDistinctKeys;
+  }
+
+  std::vector<uint64_t> distinctKeys(key.begin(), key.end());
+  std::sort(distinctKeys.begin(), distinctKeys.end());
+  distinctKeys.erase(
+      std::unique(distinctKeys.begin(), distinctKeys.end()),
+      distinctKeys.end());
+  std::vector<uint32_t> runIds(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    runIds[i] = static_cast<uint32_t>(
+        std::lower_bound(distinctKeys.begin(), distinctKeys.end(), key[i]) -
+        distinctKeys.begin());
+  }
+
+  const auto original = makeSection(kCount, 24, Shape::Uniform, 123);
+  std::vector<uint64_t> values = original;
+  const auto* transform = transformFor(TransformId::KeyDerived);
+  TransformContext context{
+      .keySection = key,
+      .width = 24,
+      .keyRunIds = runIds,
+      .keyRunValues = distinctKeys,
+  };
+  TransformState state;
+  transform->apply(values, context, state);
+  transform->invert(values, context, state);
+  EXPECT_EQ(values, original);
+}
+
 // Point access is what decides whether a transform may serve a point-lookup
 // read, so it is asserted rather than left to a comment.
 // Whether a transform must be applied in blocks follows from how it maps a row

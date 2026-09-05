@@ -313,4 +313,47 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
   }
 }
 
+// A permuted section is moved at whatever width it was stored at, and the
+// narrow widths are a different code path from the 64-bit one. Every other test
+// here uses values whose sections land at eight bytes, so this shapes them to
+// split into a narrow low section under a low-cardinality high one -- the shape
+// Medicare1.NPI has, and the one that first exercised the narrow path only when
+// a benchmark crashed on it.
+TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
+  Vector<uint64_t> values{pool_.get()};
+  values.resize(20000);
+  std::mt19937_64 rng(31);
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    // Ten low bits, so the low section is far narrower than a word, under a
+    // high field holding few distinct values for the sort to group by.
+    const uint64_t low = rng() % 1024;
+    const uint64_t high = rng() % 40;
+    values[i] = (high << 10) | low;
+  }
+
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitTransform = static_cast<uint8_t>(TransformId::KeyDerived);
+  const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, values, CompressionType::Uncompressed, options);
+
+  SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+  std::vector<uint64_t> bulk(values.size());
+  view.read(0, values.size(), bulk.data());
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
+  }
+  for (uint32_t i = 0; i < values.size(); i += 97) {
+    ASSERT_EQ(view.readAt(i), values[i]) << "probe row " << i;
+  }
+
+  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+      *pool_, encoded, nullptr, options);
+  std::vector<uint64_t> sequential(values.size());
+  encoding->materialize(values.size(), sequential.data());
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(sequential[i], values[i]) << "sequential row " << i;
+  }
+}
+
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS

@@ -601,6 +601,36 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // Reads a permuted section at its own width, puts its rows back where they
+  // belong, and accumulates them through the same kernel an untransformed
+  // section uses.
+  //
+  // The whole section is read because the permutation scatters across it: a
+  // row's value can sit anywhere. That is affordable precisely because it is
+  // sequential, where the widened path paid for the scatter and the width both.
+  template <typename SectionT>
+  void permuteSection(
+      const Section& section,
+      uint32_t blockStart,
+      uint32_t blockCount,
+      physicalType* output) const {
+    const auto& positions = positionMap();
+
+    thread_local std::vector<uint8_t> whole;
+    thread_local std::vector<uint8_t> moved;
+    whole.resize(static_cast<size_t>(this->rowCount_) * sizeof(SectionT));
+    moved.resize(static_cast<size_t>(blockCount) * sizeof(SectionT));
+
+    auto* source = reinterpret_cast<SectionT*>(whole.data());
+    section.view->read(0, this->rowCount_, source);
+    auto* destination = reinterpret_cast<SectionT*>(moved.data());
+    for (uint32_t row = 0; row < blockCount; ++row) {
+      destination[row] = source[positions[blockStart + row]];
+    }
+    detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
+        destination, output, blockCount, section.mask, section.bitStart);
+  }
+
   // Reads one whole transform block, undoing every transform on it.
   //
   // Sections are widened to 64 bits first so a transform never has to know
@@ -627,7 +657,19 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // nor keys one is assembled by the same kernel an untransformed stream
     // uses, rather than paying for a widening and a scalar pass it has no use
     // for.
-    const auto needsWidening = [this](const Section& section) {
+    const auto isPermuted = [](const Section& section) {
+      return section.transform != nullptr &&
+          section.transform->positionMapping() ==
+          subintsplit::PositionMapping::Permuted;
+    };
+    // Only a section that a transform will rewrite in 64 bits needs widening,
+    // plus the key, which those transforms read as context. A permuted section
+    // is not rewritten at all -- its values only move -- so it stays at its own
+    // width and goes through the accumulate kernel like any other.
+    const auto needsWidening = [this, &isPermuted](const Section& section) {
+      if (isPermuted(section)) {
+        return false;
+      }
       return section.transform != nullptr ||
           section.wireIndex == transformInfo_.keySection;
     };
@@ -687,6 +729,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       if (section.transform == nullptr) {
         continue;
       }
+      // A permuted section was never widened and is put back where it belongs
+      // at its own width further down, so there is nothing to undo here.
+      if (isPermuted(section)) {
+        continue;
+      }
       subintsplit::TransformState state = section.transformState;
       const auto& blockState = transformInfo_.primaryIndices[section.wireIndex];
       if (blockIndex < blockState.size()) {
@@ -705,6 +752,29 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
+      if (isPermuted(section)) {
+        // Moved, then accumulated at its own width. Widening this to 64 bits
+        // first and assembling the word by hand costs several times the memory
+        // traffic and gives up the kernel, which is where a transformed decode
+        // was losing to an untransformed one: the permutation itself is nearly
+        // free, and a scattered read of this array runs an order of magnitude
+        // faster than the decode that contains it.
+        switch (section.storageBytes) {
+          case 1:
+            permuteSection<uint8_t>(section, blockStart, blockCount, output);
+            break;
+          case 2:
+            permuteSection<uint16_t>(section, blockStart, blockCount, output);
+            break;
+          case 4:
+            permuteSection<uint32_t>(section, blockStart, blockCount, output);
+            break;
+          default:
+            permuteSection<uint64_t>(section, blockStart, blockCount, output);
+            break;
+        }
+        continue;
+      }
       if (!needsWidening(section)) {
         // Straight through the accumulate kernel, from the section's own
         // storage width.
