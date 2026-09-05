@@ -666,11 +666,27 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // plus the key, which those transforms read as context. A permuted section
     // is not rewritten at all -- its values only move -- so it stays at its own
     // width and goes through the accumulate kernel like any other.
-    const auto needsWidening = [this, &isPermuted](const Section& section) {
+    // The key is widened only for transforms that read it as context. A
+    // permuted section does not: it follows the position map, which was built
+    // from the key's own encoding. So when nothing on the stream rewrites
+    // values, the key section is never read as values at all, where before it
+    // was unpacked a second time to serve a span nobody looked at.
+    bool rewritesValues = false;
+    for (const auto& section : sections_) {
+      if (section.transform != nullptr && !isPermuted(section)) {
+        rewritesValues = true;
+        break;
+      }
+    }
+    const auto needsWidening = [this, &isPermuted, rewritesValues](
+                                   const Section& section) {
       if (isPermuted(section)) {
         return false;
       }
-      return section.transform != nullptr ||
+      if (section.transform != nullptr) {
+        return true;
+      }
+      return rewritesValues &&
           section.wireIndex == transformInfo_.keySection;
     };
     for (size_t i = 0; i < sections_.size(); ++i) {
