@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 #include <utility>
 
 namespace facebook::nimble::subintsplit {
@@ -147,7 +148,61 @@ class KeyDerivedTransform : public SectionTransform {
     NIMBLE_CHECK(
         context.keySection.size() == values.size(),
         "Key-derived transform needs a key section covering the same rows.");
-    scatter(values, keyOrder(context.keySection));
+    const auto keys = context.keySection;
+    const size_t count = values.size();
+    if (count == 0) {
+      return;
+    }
+
+    // The permutation this undoes is not an arbitrary one: it is a stable sort
+    // by the key, so a row sits at its key's run start plus its rank within
+    // that run. Undoing it is therefore a k-way merge -- walk the rows in
+    // order and take the next value from that row's run -- rather than a
+    // scatter. The writes come out sequential and the reads follow k cursors
+    // that only move forward, so the cost is set by how many distinct keys
+    // there are rather than by how far apart a permutation threw things.
+    //
+    // k is small wherever this transform pays: it pays by grouping rows, which
+    // needs the key to have far fewer values than the section has rows.
+    // Runs are numbered in one pass, so nothing here sorts. Sorting the key to
+    // find its distinct values would cost as much as rebuilding the whole
+    // permutation, which is what this exists to avoid.
+    std::unordered_map<uint64_t, uint32_t> runOf;
+    std::vector<uint32_t> runOfRow(count);
+    for (size_t i = 0; i < count; ++i) {
+      const auto inserted =
+          runOf.emplace(keys[i], static_cast<uint32_t>(runOf.size()));
+      runOfRow[i] = inserted.first->second;
+    }
+
+    // A stable sort keeps the runs in first-seen order only if the key is
+    // itself ordered, so the run starts follow the key's sorted order rather
+    // than the order the rows introduced them.
+    std::vector<uint64_t> distinct(runOf.size());
+    for (const auto& entry : runOf) {
+      distinct[entry.second] = entry.first;
+    }
+    std::vector<uint32_t> rank(runOf.size());
+    std::iota(rank.begin(), rank.end(), 0u);
+    std::sort(rank.begin(), rank.end(), [&distinct](uint32_t a, uint32_t b) {
+      return distinct[a] < distinct[b];
+    });
+    std::vector<uint32_t> position(runOf.size());
+    for (uint32_t i = 0; i < rank.size(); ++i) {
+      position[rank[i]] = i;
+    }
+
+    std::vector<uint32_t> cursor(runOf.size() + 1, 0);
+    for (size_t i = 0; i < count; ++i) {
+      ++cursor[position[runOfRow[i]] + 1];
+    }
+    std::partial_sum(cursor.begin(), cursor.end(), cursor.begin());
+
+    std::vector<uint64_t> rows(count);
+    for (size_t i = 0; i < count; ++i) {
+      rows[i] = values[cursor[position[runOfRow[i]]]++];
+    }
+    std::copy(rows.begin(), rows.end(), values.begin());
   }
 
   // Where a row went is its rank in the sort of the key section, and the key
