@@ -99,9 +99,8 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
           context.encoders.begin(),
           context.encoders.end(),
           [&](const auto& entry) { return entry.name == want; });
-      if (it == context.encoders.end()) {
-        throw std::runtime_error("Unknown encoder name: " + want);
-      }
+      NIMBLE_USER_CHECK(
+          it != context.encoders.end(), "Unknown encoder name: {}", want);
       filtered.push_back(std::move(*it));
     }
     context.encoders = std::move(filtered);
