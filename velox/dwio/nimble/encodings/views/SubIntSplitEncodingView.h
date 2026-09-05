@@ -353,11 +353,20 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         transformInfo_.keySection !=
             detail::SubIntSplitTransformInfo::kNoKeySection,
         "A computable transform needs the key section it was ordered by.");
-    std::vector<uint64_t> keyValues(this->rowCount_);
+    // Taken from the key's own encoding where it has them, which spares
+    // reading the whole key section a value at a time just to derive what the
+    // encoding already held.
+    std::vector<uint32_t> runIds;
+    std::vector<uint64_t> runValues;
+    std::vector<uint64_t> keyValues;
     for (const auto& section : sections_) {
       if (section.wireIndex != transformInfo_.keySection) {
         continue;
       }
+      if (section.view->denseRunIds(0, this->rowCount_, runIds, runValues)) {
+        break;
+      }
+      keyValues.resize(this->rowCount_);
       for (uint32_t row = 0; row < this->rowCount_; ++row) {
         keyValues[row] = section.valueAt(*section.view, row);
       }
@@ -366,7 +375,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
     cache.positions.resize(this->rowCount_);
     const subintsplit::TransformContext context{
-        .keySection = keyValues, .width = 0};
+        .keySection = keyValues,
+        .width = 0,
+        .keyRunIds = runIds,
+        .keyRunValues = runValues};
     for (const auto& section : sections_) {
       if (section.transform == nullptr ||
           section.transform->positionMapping() !=

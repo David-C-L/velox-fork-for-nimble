@@ -20,10 +20,11 @@
 #include <cstring>
 #include <memory>
 #include <optional>
-#include <unordered_set>
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include "folly/container/F14Set.h"
 
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
@@ -726,11 +727,11 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
   // gather.
   constexpr size_t kMinRowsPerRun = 4;
   if (key.size() <= kSample) {
-    const std::unordered_set<uint64_t> distinct(key.begin(), key.end());
+    const folly::F14FastSet<uint64_t> distinct(key.begin(), key.end());
     return distinct.size() * kMinRowsPerRun <= key.size();
   }
   const size_t stride = key.size() / kSample;
-  std::unordered_set<uint64_t> distinct;
+  folly::F14FastSet<uint64_t> distinct;
   distinct.reserve(kSample);
   for (size_t i = 0; i < key.size(); i += stride) {
     distinct.insert(key[i]);

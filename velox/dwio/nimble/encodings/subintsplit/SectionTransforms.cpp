@@ -20,8 +20,9 @@
 
 #include <algorithm>
 #include <numeric>
-#include <unordered_map>
 #include <utility>
+
+#include "folly/container/F14Map.h"
 
 namespace facebook::nimble::subintsplit {
 namespace {
@@ -125,75 +126,6 @@ void inverseBurrowsWheeler(std::span<uint64_t> values, uint32_t primaryIndex) {
 
 // --------------------------------------------------------------------------
 
-// Numbers the distinct values of a key section, in first-seen order.
-//
-// Open-addressed and flat, so a lookup touches one cache line rather than
-// following a pointer into the heap. This is on the decode path for every row
-// of a key-derived section, and the node-based map it replaces was where
-// profiling found nearly half of the first-level read misses.
-class RunTable {
- public:
-  explicit RunTable(size_t rows) {
-    size_t capacity = 1024;
-    // Start near the plausible number of distinct keys rather than growing
-    // into it, but never larger than the rows themselves.
-    while (capacity < rows / 8 && capacity < (size_t{1} << 20)) {
-      capacity <<= 1;
-    }
-    reset(capacity);
-  }
-
-  uint32_t idOf(uint64_t key) {
-    size_t slot = mix(key) & mask_;
-    while (used_[slot] != 0) {
-      if (slotKey_[slot] == key) {
-        return slotId_[slot];
-      }
-      slot = (slot + 1) & mask_;
-    }
-    const auto id = static_cast<uint32_t>(distinct.size());
-    used_[slot] = 1;
-    slotKey_[slot] = key;
-    slotId_[slot] = id;
-    distinct.push_back(key);
-    if (distinct.size() * 10 >= (mask_ + 1) * 7) {
-      grow();
-    }
-    return id;
-  }
-
-  std::vector<uint64_t> distinct;
-
- private:
-  static uint64_t mix(uint64_t value) {
-    value += 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31);
-  }
-
-  void reset(size_t capacity) {
-    mask_ = capacity - 1;
-    used_.assign(capacity, 0);
-    slotKey_.assign(capacity, 0);
-    slotId_.assign(capacity, 0);
-  }
-
-  void grow() {
-    auto keys = distinct;
-    reset((mask_ + 1) << 1);
-    distinct.clear();
-    for (uint64_t key : keys) {
-      idOf(key);
-    }
-  }
-
-  size_t mask_{0};
-  std::vector<uint8_t> used_;
-  std::vector<uint64_t> slotKey_;
-  std::vector<uint32_t> slotId_;
-};
-
 class KeyDerivedTransform : public SectionTransform {
  public:
   TransformId id() const override {
@@ -247,12 +179,18 @@ class KeyDerivedTransform : public SectionTransform {
     std::vector<uint64_t> derivedValues;
     const bool given = !context.keyRunIds.empty();
     if (!given) {
-      RunTable table(count);
+      folly::F14FastMap<uint64_t, uint32_t> runOf;
+      runOf.reserve(count / 8);
       derivedIds.resize(count);
       for (size_t i = 0; i < count; ++i) {
-        derivedIds[i] = table.idOf(keys[i]);
+        const auto inserted =
+            runOf.emplace(keys[i], static_cast<uint32_t>(runOf.size()));
+        derivedIds[i] = inserted.first->second;
       }
-      derivedValues = std::move(table.distinct);
+      derivedValues.resize(runOf.size());
+      for (const auto& entry : runOf) {
+        derivedValues[entry.second] = entry.first;
+      }
     }
     const std::span<const uint32_t> runOfRow =
         given ? context.keyRunIds : std::span<const uint32_t>(derivedIds);
@@ -299,14 +237,59 @@ class KeyDerivedTransform : public SectionTransform {
       const TransformContext& context,
       const TransformState& /*state*/,
       std::span<uint32_t> positions) const override {
-    NIMBLE_CHECK(
-        context.keySection.size() == positions.size(),
-        "Key-derived transform needs a key section covering the same rows.");
-    // keyOrder lists, for each stored offset, the original row that landed
-    // there. The reader needs the other direction.
-    const auto order = keyOrder(context.keySection);
-    for (uint32_t offset = 0; offset < order.size(); ++offset) {
-      positions[order[offset]] = offset;
+    const size_t count = positions.size();
+    if (count == 0) {
+      return;
+    }
+
+    // Where a row went is its run's start plus how many rows of that run came
+    // before it, so this counts rather than sorts. Sorting the rows to find
+    // out was the whole cost of a gather: profiling a gather put a stable sort
+    // of the column at the top, rebuilt every time a reader wanted the map.
+    std::vector<uint32_t> derivedIds;
+    std::vector<uint64_t> derivedValues;
+    const bool given = !context.keyRunIds.empty();
+    if (!given) {
+      NIMBLE_CHECK(
+          context.keySection.size() == count,
+          "Key-derived transform needs a key section covering the same rows.");
+      folly::F14FastMap<uint64_t, uint32_t> runOf;
+      runOf.reserve(count / 8);
+      derivedIds.resize(count);
+      for (size_t i = 0; i < count; ++i) {
+        const auto inserted = runOf.emplace(
+            context.keySection[i], static_cast<uint32_t>(runOf.size()));
+        derivedIds[i] = inserted.first->second;
+      }
+      derivedValues.resize(runOf.size());
+      for (const auto& entry : runOf) {
+        derivedValues[entry.second] = entry.first;
+      }
+    }
+    const std::span<const uint32_t> runOfRow =
+        given ? context.keyRunIds : std::span<const uint32_t>(derivedIds);
+    const std::span<const uint64_t> runValues =
+        given ? context.keyRunValues : std::span<const uint64_t>(derivedValues);
+    const size_t runs = runValues.size();
+
+    // Runs are laid out in the key's order, which run ids do not carry.
+    std::vector<uint32_t> rank(runs);
+    std::iota(rank.begin(), rank.end(), 0u);
+    std::sort(rank.begin(), rank.end(), [runValues](uint32_t a, uint32_t b) {
+      return runValues[a] < runValues[b];
+    });
+    std::vector<uint32_t> position(runs);
+    for (uint32_t i = 0; i < runs; ++i) {
+      position[rank[i]] = i;
+    }
+
+    std::vector<uint32_t> cursor(runs + 1, 0);
+    for (size_t i = 0; i < count; ++i) {
+      ++cursor[position[runOfRow[i]] + 1];
+    }
+    std::partial_sum(cursor.begin(), cursor.end(), cursor.begin());
+    for (size_t i = 0; i < count; ++i) {
+      positions[i] = cursor[position[runOfRow[i]]]++;
     }
   }
 
