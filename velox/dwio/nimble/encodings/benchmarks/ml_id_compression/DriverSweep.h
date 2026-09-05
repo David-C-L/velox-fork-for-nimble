@@ -18,10 +18,12 @@
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,29 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
     // Serves partial reads by decompressing the whole column, which is the
     // comparison the decode drivers exist to make.
     context.encoders.push_back(buildOpenZLEncoder<T>());
+  }
+  // Applied last so it can select an OpenZL entry too. Mirrors
+  // --mlidc_datasets: comma-separated names matched against the same name
+  // written to the CSV's encoding column, empty meaning all, and an unknown
+  // name is an error rather than a silent empty result.
+  if (!FLAGS_mlidc_encoders.empty()) {
+    std::vector<EncoderEntry<T>> filtered;
+    std::stringstream names(FLAGS_mlidc_encoders);
+    std::string want;
+    while (std::getline(names, want, ',')) {
+      if (want.empty()) {
+        continue;
+      }
+      auto it = std::find_if(
+          context.encoders.begin(),
+          context.encoders.end(),
+          [&](const auto& entry) { return entry.name == want; });
+      if (it == context.encoders.end()) {
+        throw std::runtime_error("Unknown encoder name: " + want);
+      }
+      filtered.push_back(std::move(*it));
+    }
+    context.encoders = std::move(filtered);
   }
   context.datasets = defaultDatasets<T>();
   context.topology = CacheTopology::detect();

@@ -70,6 +70,7 @@ DECLARE_string(mlidc_substream_compression);
 DECLARE_string(mlidc_outer_compression);
 DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
+DECLARE_string(mlidc_encoders);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);

@@ -69,6 +69,13 @@ DEFINE_string(
     "Comma-separated dataset names to run, e.g. twitter-snowflake. Empty runs "
     "every dataset. Lets a production column be benchmarked without paying for "
     "the synthetic sweep.");
+DEFINE_string(
+    mlidc_encoders,
+    "",
+    "Comma-separated encoder names to run, matched against the same name "
+    "emitted to the CSV's encoding column, e.g. SIS/key_derived+view. Empty "
+    "runs every encoder. Lets one arm's decode be profiled without the "
+    "encode and decode cost of the other thirty in the same run.");
 DEFINE_int32(
     mlidc_block_codec_iters,
     1,
