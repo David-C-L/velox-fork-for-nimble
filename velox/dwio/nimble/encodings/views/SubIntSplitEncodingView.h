@@ -559,7 +559,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // permutation applied once, rather than a random access per row.
   void readWholeSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
-    std::vector<physicalType> whole(this->rowCount_);
+    // A read of the entire column is the common case here and needs no staging
+    // buffer: the span and the output are the same rows, so decode into the
+    // caller's memory directly. Anything narrower still has to decode the span
+    // it depends on and keep the part asked for.
+    if (offset == 0 && length == this->rowCount_) {
+      readPhysicalBlock(0, this->rowCount_, output);
+      return;
+    }
+    thread_local std::vector<physicalType> whole;
+    whole.resize(this->rowCount_);
     readPhysicalBlock(0, this->rowCount_, whole.data());
     std::copy_n(whole.data() + offset, length, output);
   }
@@ -592,11 +601,29 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // Read sequentially rather than a row at a time: the section views decode
     // a run far faster than they answer the same number of separate probes,
     // and this is the path a bulk read takes.
-    std::vector<std::vector<uint64_t>> sectionValues(sections_.size());
-    std::vector<uint8_t> scratch(
-        static_cast<size_t>(blockCount) * sizeof(physicalType));
+    // Held per thread rather than allocated per call: a bulk read reaches this
+    // once per block, and the allocation showed up as the transform's cost when
+    // it belongs to the loop around it. Per thread because a view is read
+    // concurrently and holds no mutable state of its own.
+    thread_local std::vector<std::vector<uint64_t>> sectionValues;
+    thread_local std::vector<uint8_t> scratch;
+    sectionValues.resize(sections_.size());
+    scratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
+    // A section is widened to 64 bits only where something will read it that
+    // way: a transform works in 64 bits, and the key section is handed to
+    // those transforms as context. A section that neither carries a transform
+    // nor keys one is assembled by the same kernel an untransformed stream
+    // uses, rather than paying for a widening and a scalar pass it has no use
+    // for.
+    const auto needsWidening = [this](const Section& section) {
+      return section.transform != nullptr ||
+          section.wireIndex == transformInfo_.keySection;
+    };
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
+      if (!needsWidening(section)) {
+        continue;
+      }
       auto& values = sectionValues[i];
       values.resize(blockCount);
       switch (section.storageBytes) {
@@ -650,6 +677,29 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
+      if (!needsWidening(section)) {
+        // Straight through the accumulate kernel, from the section's own
+        // storage width.
+        switch (section.storageBytes) {
+          case 1:
+            readSectionChunk<uint8_t>(
+                section, blockStart, blockCount, output, false, scratch.data());
+            break;
+          case 2:
+            readSectionChunk<uint16_t>(
+                section, blockStart, blockCount, output, false, scratch.data());
+            break;
+          case 4:
+            readSectionChunk<uint32_t>(
+                section, blockStart, blockCount, output, false, scratch.data());
+            break;
+          default:
+            readSectionChunk<uint64_t>(
+                section, blockStart, blockCount, output, false, scratch.data());
+            break;
+        }
+        continue;
+      }
       for (uint32_t row = 0; row < blockCount; ++row) {
         output[row] |=
             static_cast<physicalType>(sectionValues[i][row] & section.mask)

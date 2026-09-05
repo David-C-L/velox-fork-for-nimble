@@ -459,12 +459,23 @@ class BitPlaneTransform : public SectionTransform {
     }
     // Bit b of row i moves to bit (d % width) of output word d / width, where
     // d = b * count + i, which keeps the output the same length as the input.
+    // Walked one plane at a time rather than one row at a time. Within a plane
+    // the destination advances by one, so the word it lands in and the bit
+    // within that word can be carried forward. Deriving them per bit instead
+    // costs two integer divisions by a width only known at run time, for every
+    // bit of every row, which is what made this the slowest inverse measured.
     std::vector<uint64_t> planes(values.size(), 0);
-    for (uint64_t i = 0; i < count; ++i) {
-      for (int bit = 0; bit < width; ++bit) {
+    for (int bit = 0; bit < width; ++bit) {
+      const uint64_t start = static_cast<uint64_t>(bit) * count;
+      uint64_t word = start / static_cast<uint64_t>(width);
+      int position = static_cast<int>(start % static_cast<uint64_t>(width));
+      for (uint64_t i = 0; i < count; ++i) {
         if ((values[i] >> bit) & 1ULL) {
-          const uint64_t destination = static_cast<uint64_t>(bit) * count + i;
-          planes[destination / width] |= 1ULL << (destination % width);
+          planes[word] |= 1ULL << position;
+        }
+        if (++position == width) {
+          position = 0;
+          ++word;
         }
       }
     }
@@ -481,11 +492,18 @@ class BitPlaneTransform : public SectionTransform {
       return;
     }
     std::vector<uint64_t> rows(values.size(), 0);
-    for (uint64_t i = 0; i < count; ++i) {
-      for (int bit = 0; bit < width; ++bit) {
-        const uint64_t destination = static_cast<uint64_t>(bit) * count + i;
-        if ((values[destination / width] >> (destination % width)) & 1ULL) {
-          rows[i] |= 1ULL << bit;
+    for (int bit = 0; bit < width; ++bit) {
+      const uint64_t start = static_cast<uint64_t>(bit) * count;
+      uint64_t word = start / static_cast<uint64_t>(width);
+      int position = static_cast<int>(start % static_cast<uint64_t>(width));
+      const uint64_t mask = 1ULL << bit;
+      for (uint64_t i = 0; i < count; ++i) {
+        if ((values[word] >> position) & 1ULL) {
+          rows[i] |= mask;
+        }
+        if (++position == width) {
+          position = 0;
+          ++word;
         }
       }
     }
