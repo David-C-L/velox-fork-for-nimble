@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -708,6 +709,35 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   cachedBlockStart_ = blockStart;
 }
 
+// Whether sorting by these values would group anything.
+//
+// A key-derived permutation earns its keep by bringing like rows together, so
+// a key with nearly as many values as there are rows has nothing to bring
+// together: every run is one row long. Worse, the decoder then carries the
+// whole apparatus for it, sorting as many runs as there are rows and probing a
+// table that large once per row, which profiling found dominating decode on a
+// column whose first section is a 19-bit identifier.
+//
+// Judged on a sample, since this only has to separate a key that groups from
+// one that does not.
+inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
+  constexpr size_t kSample = 4096;
+  // Below this, a run averages fewer than four rows and there is little to
+  // gather.
+  constexpr size_t kMinRowsPerRun = 4;
+  if (key.size() <= kSample) {
+    const std::unordered_set<uint64_t> distinct(key.begin(), key.end());
+    return distinct.size() * kMinRowsPerRun <= key.size();
+  }
+  const size_t stride = key.size() / kSample;
+  std::unordered_set<uint64_t> distinct;
+  distinct.reserve(kSample);
+  for (size_t i = 0; i < key.size(); i += stride) {
+    distinct.insert(key[i]);
+  }
+  return distinct.size() * kMinRowsPerRun <= kSample;
+}
+
 template <typename T>
 std::string_view SubIntSplitEncoding<T>::encode(
     EncodingSelection<physicalType>& selection,
@@ -945,9 +975,11 @@ std::string_view SubIntSplitEncoding<T>::encode(
     attempt.info.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
 
     std::vector<uint64_t> keyValues;
+    bool keyGroups = true;
     if (candidateKey != detail::SubIntSplitTransformInfo::kNoKeySection) {
       keyValues = extractSection(segments[candidateKey]);
       attempt.info.keySection = candidateKey;
+      keyGroups = groupsEnoughToKey(keyValues);
     }
 
     for (uint8_t s = 0; s < splitCount; ++s) {
@@ -960,7 +992,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
       // The key section rebuilds the order of the others, so it is never
       // itself transformed however well it would compress.
-      const bool mayTransform = transform != nullptr && s != candidateKey;
+      const bool mayTransform =
+          transform != nullptr && s != candidateKey && keyGroups;
       if (!mayTransform) {
         attempt.sections.push_back(plain);
         attempt.totalBytes += plain.size();
