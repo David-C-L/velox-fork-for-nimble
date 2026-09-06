@@ -18,6 +18,7 @@
 #include <memory>
 #include <vector>
 
+#include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
@@ -292,7 +293,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // relabelling is undone on the value, and a key-derived permutation is
   // followed through the position map. Both are O(1) once the map exists.
   physicalType readOneRow(uint32_t index) const {
-    const std::vector<uint32_t>* positions =
+    const velox::raw_vector<uint32_t>* positions =
         permutedSection_ ? &positionMap() : nullptr;
     physicalType value = constantBits_;
     for (const auto& section : sections_) {
@@ -343,7 +344,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // alone, which reaches the reader in original order, so no transformed value
   // is read to build it. Held per thread, since a view is read concurrently
   // and keeps no mutable state of its own.
-  const std::vector<uint32_t>& positionMap() const {
+  const velox::raw_vector<uint32_t>& positionMap() const {
     thread_local PositionCache cache;
     if (cache.owner == this) {
       return cache.positions;
@@ -386,7 +387,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         continue;
       }
       section.transform->positionMap(
-          context, section.transformState, cache.positions);
+          context,
+          section.transformState,
+          std::span<uint32_t>(cache.positions.data(), cache.positions.size()));
       break;
     }
     cache.owner = this;
@@ -456,7 +459,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       const uint32_t blockSize = transformInfo_.blockSize != 0
           ? transformInfo_.blockSize
           : this->rowCount_;
-      std::vector<physicalType> block;
+      // Held per thread rather than allocated per call: a blocked transform
+      // reaches this once per block of one read, and every element is
+      // overwritten by readPhysicalBlock() below before being read, so
+      // reallocating and zero-filling it fresh each time was pure loss.
+      thread_local velox::raw_vector<physicalType> block;
       for (uint32_t produced = 0; produced < length;) {
         const uint32_t row = offset + produced;
         const uint32_t blockStart = (row / blockSize) * blockSize;
@@ -546,7 +553,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // one thread may read several.
   struct PositionCache {
     const void* owner{nullptr};
-    std::vector<uint32_t> positions;
+    // Always fully overwritten by positionMap() before being read, so an
+    // uninitialised resize costs nothing here.
+    velox::raw_vector<uint32_t> positions;
   };
 
   // One reconstructed transform block, held per thread. Keyed on the view it
@@ -554,7 +563,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   struct BlockCache {
     const void* owner{nullptr};
     uint32_t blockIndex{0};
-    std::vector<physicalType> values;
+    // Always fully overwritten by readPhysicalBlock() before being read.
+    velox::raw_vector<physicalType> values;
   };
 
   // How much cheaper a gathered row is than a decoded one. Below this ratio of
@@ -579,7 +589,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       readPhysicalBlock(0, this->rowCount_, output);
       return;
     }
-    thread_local std::vector<physicalType> whole;
+    // Fully overwritten by readPhysicalBlock() below before being read.
+    thread_local velox::raw_vector<physicalType> whole;
     whole.resize(this->rowCount_);
     readPhysicalBlock(0, this->rowCount_, whole.data());
     std::copy_n(whole.data() + offset, length, output);
@@ -592,8 +603,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       const Section& section,
       uint32_t offset,
       uint32_t count,
-      std::vector<uint8_t>& scratch,
-      std::vector<uint64_t>& out) {
+      velox::raw_vector<uint8_t>& scratch,
+      velox::raw_vector<uint64_t>& out) {
     auto* values = reinterpret_cast<SectionT*>(scratch.data());
     section.view->read(offset, count, values);
     for (uint32_t row = 0; row < count; ++row) {
@@ -616,8 +627,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       physicalType* output) const {
     const auto& positions = positionMap();
 
-    thread_local std::vector<uint8_t> whole;
-    thread_local std::vector<uint8_t> moved;
+    // Both fully overwritten below before being read: `whole` by the
+    // sequential section read, `moved` by the gather loop that follows it.
+    thread_local velox::raw_vector<uint8_t> whole;
+    thread_local velox::raw_vector<uint8_t> moved;
     whole.resize(static_cast<size_t>(this->rowCount_) * sizeof(SectionT));
     moved.resize(static_cast<size_t>(blockCount) * sizeof(SectionT));
 
@@ -647,8 +660,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // once per block, and the allocation showed up as the transform's cost when
     // it belongs to the loop around it. Per thread because a view is read
     // concurrently and holds no mutable state of its own.
-    thread_local std::vector<std::vector<uint64_t>> sectionValues;
-    thread_local std::vector<uint8_t> scratch;
+    // Both fully overwritten before being read: `scratch` in
+    // widenSectionRun(), and each entry of `sectionValues` in the same call,
+    // sized to exactly the range that call writes.
+    thread_local std::vector<velox::raw_vector<uint64_t>> sectionValues;
+    thread_local velox::raw_vector<uint8_t> scratch;
     sectionValues.resize(sections_.size());
     scratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
     // A section is widened to 64 bits only where something will read it that
@@ -760,7 +776,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           .width = section.width,
           .keyRunIds = runIds,
           .keyRunValues = runValues};
-      section.transform->invert(sectionValues[i], context, state);
+      section.transform->invert(
+          std::span<uint64_t>(sectionValues[i].data(), sectionValues[i].size()),
+          context,
+          state);
     }
 
     for (uint32_t row = 0; row < blockCount; ++row) {

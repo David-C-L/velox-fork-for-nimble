@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/FixedBitArray.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/views/EncodingView.h"
@@ -87,8 +88,11 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
 
     // Raw, pre-baseline values: what the table is sized and indexed by. The
     // baseline is folded back in only when a value's id is first assigned,
-    // to record the value a caller actually sees.
-    std::vector<physicalType> raw(length);
+    // to record the value a caller actually sees. Every element is
+    // overwritten below -- by the fill for bitWidth_ == 0, by
+    // bulkGetWithBaseline otherwise -- so nothing is ever read before it is
+    // written and an uninitialised allocation costs nothing here.
+    velox::raw_vector<physicalType> raw(length);
     if (bitWidth_ == 0) {
       std::fill(raw.begin(), raw.end(), physicalType{0});
     } else {
@@ -98,8 +102,15 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
 
     constexpr uint32_t kUnassigned = std::numeric_limits<uint32_t>::max();
     const uint32_t alphabetSize = uint32_t{1} << bitWidth_;
+    // Load-bearing: kUnassigned is a real sentinel a lookup below tests for,
+    // not padding waiting to be overwritten, so this fill stays.
     std::vector<uint32_t> valueToId(alphabetSize, kUnassigned);
-    ids.resize(length);
+    // Built by appending into reserved capacity rather than resizing to
+    // `length` up front: the interface fixes `ids` as std::vector<uint32_t>,
+    // and resizing it first would zero-fill every row only to have this loop
+    // overwrite every one of them again.
+    ids.clear();
+    ids.reserve(length);
     table.clear();
     for (uint32_t i = 0; i < length; ++i) {
       const auto rawValue = static_cast<uint32_t>(raw[i]);
@@ -112,7 +123,7 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
         __builtin_memcpy(&bits, &value, sizeof(physicalType));
         table.push_back(bits);
       }
-      ids[i] = id;
+      ids.push_back(id);
     }
     return true;
   }
