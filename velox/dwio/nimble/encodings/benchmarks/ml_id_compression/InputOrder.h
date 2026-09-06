@@ -102,9 +102,15 @@ inline std::vector<uint32_t> buildInputOrder(
   }
   if (order.kind == "mergeirr") {
     // An irregular merge: k monotone runs consumed in random order, so the
-    // stride between consecutive rows of one run varies. Nothing in the data
-    // says which run a row came from, so no transform can key on it -- this is
-    // the arm that denies the key-derived family its key.
+    // stride between consecutive rows of one run varies. Each run is a
+    // contiguous range of the SORTED order, which for distinct values is a
+    // contiguous range of value magnitude -- so a row's own value (its
+    // high-order bits) does say which run it came from. That is what lets
+    // the key-derived family key on it: the split finds those bits as their
+    // own section, sorts by them, and gathers each run back together.
+    // Measured up to +42% on real columns under this arm. What would deny
+    // the family a key is a run boundary orthogonal to value magnitude --
+    // mergekey's writer partition below, not this.
     const int runs = std::max(1, order.param);
     const auto sorted = detail::stableOrderBy(
         count, [&values](uint32_t i) { return values[i]; });

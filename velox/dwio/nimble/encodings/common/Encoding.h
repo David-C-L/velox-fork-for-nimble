@@ -154,6 +154,18 @@ class Encoding {
     /// change the format: it only narrows what the selector considers.
     std::unordered_set<EncodingType> subIntSplitAllowedEncodings;
 
+    /// Test-only: skips the opt-in cost comparison that keeps a SubIntSplit
+    /// transform only where it encodes smaller, and applies subIntSplitTransform
+    /// to every eligible section regardless. A test that pins a transform id
+    /// without this can pass while never actually exercising the transform,
+    /// because selection is free to decide it does not pay on synthetic data
+    /// -- which is exactly what happened to this encoding's own test suite.
+    /// Requires subIntSplitTransform to name a real transform and
+    /// subIntSplitKeySection to be a valid section (not 0xFF), so this can
+    /// neither force nothing nor search for a key and force at the same time.
+    /// Never set outside tests: production always wants the cost comparison.
+    bool subIntSplitForceApply = false;
+
     /// Block size for BlockBitPacking encoding. Determines how many rows
     /// are packed per block. Written to the stream header; the reader
     /// reads it back from the stream (self-describing).

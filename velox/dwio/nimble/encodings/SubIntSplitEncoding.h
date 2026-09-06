@@ -836,6 +836,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
       static_cast<subintsplit::TransformId>(options.subIntSplitTransform);
   const auto* transform = subintsplit::transformFor(requestedTransform);
   const uint8_t keySection = options.subIntSplitKeySection;
+  if (options.subIntSplitForceApply) {
+    NIMBLE_CHECK_NOT_NULL(
+        transform,
+        "subIntSplitForceApply requires a real subIntSplitTransform.");
+    NIMBLE_CHECK_NE(
+        keySection,
+        uint8_t{0xFF},
+        "subIntSplitForceApply requires a pinned subIntSplitKeySection.");
+  }
 
   transformInfo.transformIds.assign(splitCount, 0);
   transformInfo.codebooks.assign(splitCount, {});
@@ -992,9 +1001,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
       const std::string_view plain = encodeSection(s, sb, sectionU64);
 
       // The key section rebuilds the order of the others, so it is never
-      // itself transformed however well it would compress.
-      const bool mayTransform =
-          transform != nullptr && s != candidateKey && keyGroups;
+      // itself transformed however well it would compress. subIntSplitForceApply
+      // bypasses keyGroups the same way it bypasses the size comparison below --
+      // both are judgements about whether the transform pays, which forcing is
+      // explicitly asking to skip.
+      const bool mayTransform = transform != nullptr && s != candidateKey &&
+          (keyGroups || options.subIntSplitForceApply);
       if (!mayTransform) {
         attempt.sections.push_back(plain);
         attempt.totalBytes += plain.size();
@@ -1011,7 +1023,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
           width, keyValues, transformed, codebook, primaryIndices);
       const std::string_view alternative = encodeSection(s, sb, transformed);
 
-      if (alternative.size() + stateBytes < plain.size()) {
+      if (alternative.size() + stateBytes < plain.size() ||
+          options.subIntSplitForceApply) {
         attempt.info.transformIds[s] = static_cast<uint8_t>(transform->id());
         attempt.info.codebooks[s] = std::move(codebook);
         attempt.info.primaryIndices[s] = std::move(primaryIndices);

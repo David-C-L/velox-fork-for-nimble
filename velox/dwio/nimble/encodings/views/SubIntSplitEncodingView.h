@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -140,7 +141,18 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       std::string_view data,
       velox::memory::MemoryPool* pool,
       const Encoding::Options& options)
-      : TypedEncodingView<T>{data, pool, options} {
+      : TypedEncodingView<T>{data, pool, options},
+        // Identifies this instance for PositionCache and BlockCache below,
+        // for the lifetime of the process: an address can be reused the
+        // moment a view is destroyed, which is not true of a counter that
+        // only ever increases. Both caches were originally keyed on `this`;
+        // a unit test that placement-news a second, differently-sized view
+        // over a first one's address found that BlockCache then reads out
+        // of bounds and PositionCache segfaults, so both are keyed the same
+        // way now rather than one being assumed safe because it looked
+        // different.
+        viewId_{
+            nextViewId_.fetch_add(1, std::memory_order_relaxed)} {
     NIMBLE_CHECK(
         this->encodingType_ == EncodingType::SubIntSplit ||
             this->encodingType_ == EncodingType::SubIntSplitReordered,
@@ -343,10 +355,25 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // instead of being cut into blocks. It is derived from the key section
   // alone, which reaches the reader in original order, so no transformed value
   // is read to build it. Held per thread, since a view is read concurrently
-  // and keeps no mutable state of its own.
+  // and keeps no mutable state of its own -- but thread-local is not enough
+  // by itself: the cache is keyed on viewId_, not on `this`, because `this`
+  // is just an address, and a destroyed view's address can be handed to a
+  // new, unrelated one. A unit test that placement-news a second,
+  // larger-rowCount_ view over a first one's address found this the hard
+  // way: a stale hit returned a positions array sized for the first view's
+  // row count, and the caller indexed it up to the second view's, which
+  // segfaults rather than merely answering wrong.
   const velox::raw_vector<uint32_t>& positionMap() const {
     thread_local PositionCache cache;
-    if (cache.owner == this) {
+    if (cache.owner == viewId_) {
+      // Belt-and-suspenders, same rationale as readThroughBlock()'s bounds
+      // check: a hit relies entirely on viewId_ being unique, and this is
+      // the check that it actually was, before the caller indexes this
+      // array by row up to rowCount_.
+      NIMBLE_DCHECK_EQ(
+          cache.positions.size(),
+          this->rowCount_,
+          "Stale position cache does not match this view's row count.");
       return cache.positions;
     }
 
@@ -392,7 +419,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           std::span<uint32_t>(cache.positions.data(), cache.positions.size()));
       break;
     }
-    cache.owner = this;
+    cache.owner = viewId_;
     return cache.positions;
   }
 
@@ -413,12 +440,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         std::min(blockSize, this->rowCount_ - blockStart);
 
     thread_local BlockCache cache;
-    if (cache.owner != this || cache.blockIndex != blockIndex) {
+    if (cache.owner != viewId_ || cache.blockIndex != blockIndex) {
       cache.values.resize(blockCount);
       readPhysicalBlock(blockStart, blockCount, cache.values.data());
-      cache.owner = this;
+      cache.owner = viewId_;
       cache.blockIndex = blockIndex;
     }
+    // A hit relies entirely on viewId_ being unique for the check
+    // above to be safe; this is the belt-and-suspenders check that it
+    // actually was, so an address-reuse bug here fails loudly in debug
+    // builds instead of reading past cache.values silently. A demonstrated
+    // out-of-bounds read on this exact cache -- keyed on `this` alone,
+    // before this fix -- is why this check exists rather than being assumed
+    // unnecessary the way PositionCache's was.
+    NIMBLE_DCHECK_LT(
+        index - blockStart,
+        cache.values.size(),
+        "Stale block cache would read out of bounds.");
     return cache.values[index - blockStart];
   }
 
@@ -552,16 +590,22 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // The position map for one view, held per thread. Keyed on the view, since
   // one thread may read several.
   struct PositionCache {
-    const void* owner{nullptr};
+    // 0 never matches a real viewId_, which starts at 1.
+    uint64_t owner{0};
     // Always fully overwritten by positionMap() before being read, so an
     // uninitialised resize costs nothing here.
     velox::raw_vector<uint32_t> positions;
   };
 
-  // One reconstructed transform block, held per thread. Keyed on the view it
-  // came from as well as the block, since one thread may read several views.
+  // One reconstructed transform block, held per thread. Keyed on
+  // viewId_ as well as the block, since one thread may read
+  // several views and a raw pointer would not distinguish a live view from
+  // a destroyed one that used to sit at the same address -- demonstrated by
+  // a unit test that placement-news a second, differently-sized stream over
+  // a first one's address and gets back an out-of-bounds read.
   struct BlockCache {
-    const void* owner{nullptr};
+    // 0 never matches a real viewId_, which starts at 1.
+    uint64_t owner{0};
     uint32_t blockIndex{0};
     // Always fully overwritten by readPhysicalBlock() before being read.
     velox::raw_vector<physicalType> values;
@@ -865,6 +909,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // the scratch is on the stack, which is what keeps the view const and safe to
   // read concurrently.
   static constexpr uint32_t kViewChunkSize = 1024;
+
+  // Source of viewId_ below. Shared by every view of this T on
+  // every thread, so the id space has no gaps for a reused address to fall
+  // into.
+  inline static std::atomic<uint64_t> nextViewId_{1};
+  // PositionCache's and BlockCache's shared identity for this instance,
+  // assigned once at construction and never reused, unlike `this`. Declared
+  // first so it initializes right after the base class, matching the
+  // constructor's initializer-list order.
+  const uint64_t viewId_;
 
   // Per-section transform metadata from the header, indexed by wire position.
   detail::SubIntSplitTransformInfo transformInfo_;
