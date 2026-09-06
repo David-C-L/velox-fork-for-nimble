@@ -81,6 +81,8 @@ m4/lt~obsolete.m4
 #m4/
 build/
 _build/
+_build_release/
+_build_debug/
 .ccache/
 ccache/
 #*.m4
@@ -327,3 +329,7 @@ scripts/bm-report/report.html
 scripts/bm-report/result
 dist/
 wheelhouse/
+
+# Written into the repository root by the ml_id_compression benchmark drivers
+# unless --mlidc_output_manifest points elsewhere.
+mlidc_manifest.json
