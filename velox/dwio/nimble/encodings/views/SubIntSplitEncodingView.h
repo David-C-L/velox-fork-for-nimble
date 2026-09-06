@@ -617,8 +617,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // section uses.
   //
   // The whole section is read because the permutation scatters across it: a
-  // row's value can sit anywhere. That is affordable precisely because it is
-  // sequential, where the widened path paid for the scatter and the width both.
+  // row's value can sit anywhere. Reading it at its own width and through this
+  // kernel still beats the widened path, but the gather itself is not cheap:
+  // on a real column it was measured at half of all L1 read misses in this
+  // function, so this is where a transformed decode's memory traffic actually
+  // goes. A memset next to it (killed in a later change, see git history)
+  // mattered more to throughput than the gather itself, by evicting lines
+  // this loop was about to read -- proof that "not cheap" and "the top cost"
+  // are not the same question.
   template <typename SectionT>
   void permuteSection(
       const Section& section,
@@ -791,9 +797,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         // Moved, then accumulated at its own width. Widening this to 64 bits
         // first and assembling the word by hand costs several times the memory
         // traffic and gives up the kernel, which is where a transformed decode
-        // was losing to an untransformed one: the permutation itself is nearly
-        // free, and a scattered read of this array runs an order of magnitude
-        // faster than the decode that contains it.
+        // was losing to an untransformed one. That does not make the gather
+        // free: profiling a real column put it at half of all L1 read misses
+        // in permuteSection, and a stray memset allocated next to it was
+        // costing more than the gather itself by evicting the lines this loop
+        // was about to touch. Cheaper than the alternative is not the same
+        // claim as cheap.
         switch (section.storageBytes) {
           case 1:
             permuteSection<uint8_t>(section, blockStart, blockCount, output);

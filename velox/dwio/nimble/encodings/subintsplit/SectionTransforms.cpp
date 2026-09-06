@@ -484,9 +484,19 @@ class BurrowsWheelerTransform : public SectionTransform {
       for (auto& value : values) {
         NIMBLE_CHECK(
             value < alphabet.size(), "Move-to-front rank outside the alphabet.");
-        const uint64_t original = alphabet[value];
-        alphabet.erase(alphabet.begin() + static_cast<int64_t>(value));
-        alphabet.insert(alphabet.begin(), original);
+        const auto rank = static_cast<size_t>(value);
+        const uint64_t original = alphabet[rank];
+        // erase(begin()+rank) then insert(begin(), original) leaves indices
+        // past `rank` untouched and shifts only the prefix ahead of it right
+        // by one -- but pays for two full-vector memmoves (one per call) to
+        // get there. Shifting just that prefix directly is the same result
+        // for a fraction of the moves, and profiling put this pair of calls,
+        // not the sort in inverseBurrowsWheeler, as move-to-front's dominant
+        // cost.
+        for (size_t j = rank; j > 0; --j) {
+          alphabet[j] = alphabet[j - 1];
+        }
+        alphabet[0] = original;
         value = original;
       }
     }
