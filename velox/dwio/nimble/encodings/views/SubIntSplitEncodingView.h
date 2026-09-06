@@ -742,8 +742,19 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     thread_local std::vector<uint64_t> runValues;
     runIds.clear();
     runValues.clear();
-    if (transformInfo_.keySection !=
-        detail::SubIntSplitTransformInfo::kNoKeySection) {
+    // Only reached by invert() below, and only a section that rewrites values
+    // (not a permuted one) ever calls invert() with this context. Every
+    // transform that currently reads keySection/keyRunIds in its invert() is
+    // itself Permuted, so it never reaches that call either -- meaning a
+    // pure-Permuted stream (KeyDerived alone, the common case) has nothing
+    // downstream that will ever look at keySpan. Computing it anyway meant a
+    // bulk read and a run-id build (denseRunIds) on every call, for a result
+    // nothing read: skip the whole block when rewritesValues is false, the
+    // same condition needsWidening() above already uses to decide whether the
+    // key is worth widening at all.
+    if (rewritesValues &&
+        transformInfo_.keySection !=
+            detail::SubIntSplitTransformInfo::kNoKeySection) {
       for (size_t i = 0; i < sections_.size(); ++i) {
         if (sections_[i].wireIndex != transformInfo_.keySection) {
           continue;
