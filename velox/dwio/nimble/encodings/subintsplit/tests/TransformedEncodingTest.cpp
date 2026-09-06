@@ -356,4 +356,58 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
   }
 }
 
+// permutesNarrowSectionsToo covers only KeyDerived's own width-switched path
+// (permuteSection). The InPlace (Relabel*) and Gathered (BitPlane) families
+// go through a different width-switched path entirely -- widenSectionRun
+// plus invert() on the widened section, in SubIntSplitEncodingView's
+// readPhysicalBlock -- and round 6 changed the scratch buffers that path
+// shares with every other family, without a narrow-width test for any of
+// them. This closes that gap: same narrow-section shape as
+// permutesNarrowSectionsToo, one non-KeyDerived transform per section.
+TEST_F(TransformedEncodingTest, narrowSectionsRoundTripForInPlaceAndGatheredTransforms) {
+  Vector<uint64_t> values{pool_.get()};
+  values.resize(20000);
+  std::mt19937_64 rng(53);
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    // Ten low bits, so the transformed section is far narrower than a word,
+    // under a high field holding few distinct values -- the shape that first
+    // exercised the narrow path for KeyDerived, reused here for the families
+    // that never had a narrow-width test at all.
+    const uint64_t low = rng() % 1024;
+    const uint64_t high = rng() % 40;
+    values[i] = (high << 10) | low;
+  }
+
+  for (auto id :
+       {TransformId::RelabelFrequency,
+        TransformId::RelabelDense,
+        TransformId::RelabelGray,
+        TransformId::BitPlane}) {
+    SCOPED_TRACE(toString(id));
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    options.subIntSplitTransform = static_cast<uint8_t>(id);
+    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+    std::vector<uint64_t> bulk(values.size());
+    view.read(0, values.size(), bulk.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
+    }
+    for (uint32_t i = 0; i < values.size(); i += 97) {
+      ASSERT_EQ(view.readAt(i), values[i]) << "probe row " << i;
+    }
+
+    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+        *pool_, encoded, nullptr, options);
+    std::vector<uint64_t> sequential(values.size());
+    encoding->materialize(values.size(), sequential.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(sequential[i], values[i]) << "sequential row " << i;
+    }
+  }
+}
+
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS

@@ -77,8 +77,20 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
   for (auto id : allTransforms()) {
     const auto* transform = transformFor(id);
     ASSERT_NE(transform, nullptr) << toString(id);
-    for (size_t count : {size_t{1}, size_t{2}, size_t{7}, size_t{256}, size_t{1024}}) {
-      for (int width : {1, 3, 8, 16, 32}) {
+    // Widths include several that do not divide 64 evenly (5, 7, 13, 40, 63)
+    // and the two degenerate ends (1 and 64): bitplane's transpose walks
+    // words and bit positions by width, so a width that leaves a remainder
+    // is exactly where an off-by-one in that walk would show up. Counts
+    // include one that is not a multiple of kTransformBlockSize, so a
+    // family that blocks does not get to round-trip only on whole blocks.
+    for (size_t count :
+         {size_t{1},
+          size_t{2},
+          size_t{7},
+          size_t{256},
+          size_t{1024},
+          static_cast<size_t>(subintsplit::kTransformBlockSize) + 37}) {
+      for (int width : {1, 3, 5, 7, 8, 13, 16, 32, 40, 63, 64}) {
         for (auto shape : {Shape::Uniform, Shape::LowCardinality,
                            Shape::Monotone, Shape::Constant}) {
           const auto original =
