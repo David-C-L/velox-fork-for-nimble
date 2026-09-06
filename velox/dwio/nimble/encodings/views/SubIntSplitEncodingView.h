@@ -470,16 +470,31 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
 
-    // A stream whose transforms can all address a row directly has two ways to
-    // be read, and which is faster depends on how much of it is wanted.
+    // A stream whose transforms can all address a row directly has three ways
+    // to be read.
     //
-    // Reading row by row through the position map touches only the rows asked
-    // for, so it wins for a short range. But it gathers, and a gather gives up
-    // the sequential kernel the untransformed path uses, so over a long range
-    // it loses badly to simply decoding each section in order and undoing the
-    // transform across the whole span. The crossover is set where the gather's
-    // per-row cost starts to exceed decoding rows that were not asked for.
+    // A key-derived permutation is a stable sort by the key, so the position
+    // map's cursor for a given run advances by exactly one on each of that
+    // run's occurrences: consecutive output rows drawn from the same run,
+    // uninterrupted by another run, sit at consecutive source indices. A
+    // partial range therefore decomposes into a handful of contiguous spans
+    // -- one per uninterrupted run of a run -- each readable in one bulk call,
+    // rather than one point probe per row. readPermutedSpan does that whenever
+    // the section is actually Permuted and the request is not the whole
+    // column (which already has a cheaper path below and must keep it, so
+    // this change does not touch bulk decode at all).
+    //
+    // Everything else -- InPlace transforms, and any range that is the whole
+    // column -- keeps the two-way choice this file has used since 556894e55:
+    // gathering row by row wins for a short range, where decoding rows nobody
+    // asked for would dominate; decoding the whole span in order and undoing
+    // the transform across it wins once enough of it is wanted.
     if (!blockedSection_ && transformInfo_.anyTransform()) {
+      if (permutedSection_ &&
+          !(offset == 0 && length == this->rowCount_)) {
+        readPermutedSpan(offset, length, output);
+        return;
+      }
       if (length * kGatherAdvantage < this->rowCount_) {
         for (uint32_t i = 0; i < length; ++i) {
           output[i] = readOneRow(offset + i);
@@ -638,6 +653,119 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     whole.resize(this->rowCount_);
     readPhysicalBlock(0, this->rowCount_, whole.data());
     std::copy_n(whole.data() + offset, length, output);
+  }
+
+  // Reads a partial range of a Permuted-mapped stream in O(length + spans
+  // touched) rather than O(length) point probes.
+  //
+  // Cost model, measured: a first ranged read on a fresh view still pays the
+  // position map's O(n) build (positionMap() is cached per view -- see its
+  // own comment -- so this is a one-time cost per view, not per call, and it
+  // is comparable in instructions to a whole-column decode). Every
+  // subsequent ranged read on the same view is O(length + spans), which is
+  // what turns a constant per-read cost into one proportional to what was
+  // asked for. A workload that opens a view, reads one small range and
+  // closes it will not see the win -- it pays the map build every time.
+  void readPermutedSpan(uint32_t offset, uint32_t length, physicalType* output)
+      const {
+    const auto& positions = positionMap();
+    const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
+    if (seedWithConstant) {
+      std::fill(output, output + length, constantBits_);
+    }
+
+    // Sized to the whole range rather than chunked: this path already pays
+    // for a heap scratch buffer for its permuted sections, so a plain
+    // section gains nothing here from the stack-sized chunking the bulk path
+    // uses for cache residency.
+    thread_local velox::raw_vector<uint8_t> scratch;
+    scratch.resize(static_cast<size_t>(length) * sizeof(physicalType));
+
+    for (size_t s = 0; s < sections_.size(); ++s) {
+      const auto& section = sections_[s];
+      const bool isFirst = !seedWithConstant && s == 0;
+      const bool permuted = section.transform != nullptr &&
+          section.transform->positionMapping() ==
+              subintsplit::PositionMapping::Permuted;
+      if (!permuted) {
+        // Untransformed or declined: values sit in original row order
+        // already, so this is exactly readSectionChunk's job.
+        switch (section.storageBytes) {
+          case 1:
+            readSectionChunk<uint8_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          case 2:
+            readSectionChunk<uint16_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          case 4:
+            readSectionChunk<uint32_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          default:
+            readSectionChunk<uint64_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+        }
+        continue;
+      }
+      switch (section.storageBytes) {
+        case 1:
+          readPermutedSpanSection<uint8_t>(
+              section, offset, length, positions, output, isFirst, scratch);
+          break;
+        case 2:
+          readPermutedSpanSection<uint16_t>(
+              section, offset, length, positions, output, isFirst, scratch);
+          break;
+        case 4:
+          readPermutedSpanSection<uint32_t>(
+              section, offset, length, positions, output, isFirst, scratch);
+          break;
+        default:
+          readPermutedSpanSection<uint64_t>(
+              section, offset, length, positions, output, isFirst, scratch);
+          break;
+      }
+    }
+  }
+
+  // Groups [offset, offset+length) into contiguous spans of source indices
+  // -- consecutive output rows whose position map entries are themselves
+  // consecutive, which is exactly an uninterrupted run of one key -- and
+  // reads each span in one bulk call, rather than probing every row. Spans
+  // are read directly into `scratch` at their own output-relative position,
+  // so the buffer ends up holding the range in output order despite each
+  // span being read from a different, unrelated place in the section.
+  template <typename SectionT>
+  static void readPermutedSpanSection(
+      const Section& section,
+      uint32_t offset,
+      uint32_t length,
+      const velox::raw_vector<uint32_t>& positions,
+      physicalType* output,
+      bool isFirst,
+      velox::raw_vector<uint8_t>& scratch) {
+    auto* values = reinterpret_cast<SectionT*>(scratch.data());
+    uint32_t spanStart = 0;
+    while (spanStart < length) {
+      uint32_t spanEnd = spanStart + 1;
+      while (spanEnd < length &&
+             positions[offset + spanEnd] == positions[offset + spanEnd - 1] + 1) {
+        ++spanEnd;
+      }
+      const uint32_t sourceStart = positions[offset + spanStart];
+      section.view->read(sourceStart, spanEnd - spanStart, values + spanStart);
+      spanStart = spanEnd;
+    }
+    if (isFirst) {
+      detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(
+          values, output, length, section.mask, section.bitStart);
+    } else {
+      detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
+          values, output, length, section.mask, section.bitStart);
+    }
   }
 
   // Decodes `count` rows of one section in one go and widens them to 64 bits,
