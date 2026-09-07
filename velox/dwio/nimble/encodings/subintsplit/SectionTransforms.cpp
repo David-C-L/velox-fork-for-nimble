@@ -24,19 +24,31 @@
 
 #include "folly/container/F14Map.h"
 
+#include "velox/dwio/nimble/common/RadixSort.h"
+
 namespace facebook::nimble::subintsplit {
 namespace {
 
 // Stable sort of row indices by key, ties keeping original order. The decoder
 // reproduces exactly this permutation by re-sorting the key section, which is
 // why nothing needs storing.
+//
+// Radix rather than comparison, and stable radix over the whole key gives the
+// same permutation a stable comparison sort does, so the encoded bytes do not
+// move. What it costs is set by how wide the key is rather than by how many
+// rows there are: a key narrow enough to be worth keying on -- and this
+// transform only pays where the key groups rows, which needs few distinct
+// values -- sorts in one pass. The width is read off the keys rather than
+// taken from the section's bit range, which bounds no tighter and would have
+// to be plumbed here.
 std::vector<uint32_t> keyOrder(std::span<const uint64_t> key) {
   std::vector<uint32_t> order(key.size());
   std::iota(order.begin(), order.end(), 0u);
-  std::stable_sort(
-      order.begin(), order.end(), [key](uint32_t a, uint32_t b) {
-        return key[a] < key[b];
-      });
+  RadixSort<uint32_t> sorter;
+  sorter.sortStable(
+      std::span<uint32_t>(order),
+      [key](uint32_t row) { return key[row]; },
+      significantBits(key));
   return order;
 }
 
