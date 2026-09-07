@@ -920,6 +920,15 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       uint32_t count,
       velox::raw_vector<uint8_t>& scratch,
       velox::raw_vector<uint64_t>& out) {
+    // The buffer comes from the caller, so its size is the caller's promise
+    // rather than anything visible here. Checked because breaking that promise
+    // writes past the end of the heap block and shows up as a segfault a long
+    // way from the cause, which is exactly what happened when the section
+    // reads were chunked and this call was not.
+    NIMBLE_CHECK_GE(
+        scratch.size(),
+        static_cast<size_t>(count) * sizeof(SectionT),
+        "SubIntSplit widening scratch is too small for the run.");
     auto* values = reinterpret_cast<SectionT*>(scratch.data());
     section.view->read(offset, count, values);
     for (uint32_t row = 0; row < count; ++row) {
@@ -1010,6 +1019,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // sized to exactly the range that call writes.
     thread_local std::vector<velox::raw_vector<uint64_t>> sectionValues;
     thread_local velox::raw_vector<uint8_t> scratch;
+    // widenSectionRun() reads a whole block in one call, so it cannot share
+    // the chunk-sized buffer below. Keeping one buffer for both is what made
+    // shrinking that buffer overflow this one: the section reads were chunked
+    // and the widening was not, and a section wide enough to need widening
+    // then wrote a block's worth into a chunk's worth of space.
+    thread_local velox::raw_vector<uint8_t> widenScratch;
     sectionValues.resize(sections_.size());
     // One chunk's worth, not one block's. This used to be sized to the whole
     // block, so a section's values were streamed through a buffer several
@@ -1019,6 +1034,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // kept it in L1; this path did not.
     scratch.resize(
         static_cast<size_t>(kViewChunkSize) * sizeof(physicalType));
+    // A widened read is per block, so this one is sized per block.
+    widenScratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
     // A section is widened to 64 bits only where something will read it that
     // way: a transform works in 64 bits, and the key section is handed to
     // those transforms as context. A section that neither carries a transform
@@ -1066,16 +1083,20 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       values.resize(blockCount);
       switch (section.storageBytes) {
         case 1:
-          widenSectionRun<uint8_t>(section, blockStart, blockCount, scratch, values);
+          widenSectionRun<uint8_t>(
+              section, blockStart, blockCount, widenScratch, values);
           break;
         case 2:
-          widenSectionRun<uint16_t>(section, blockStart, blockCount, scratch, values);
+          widenSectionRun<uint16_t>(
+              section, blockStart, blockCount, widenScratch, values);
           break;
         case 4:
-          widenSectionRun<uint32_t>(section, blockStart, blockCount, scratch, values);
+          widenSectionRun<uint32_t>(
+              section, blockStart, blockCount, widenScratch, values);
           break;
         default:
-          widenSectionRun<uint64_t>(section, blockStart, blockCount, scratch, values);
+          widenSectionRun<uint64_t>(
+              section, blockStart, blockCount, widenScratch, values);
           break;
       }
     }
