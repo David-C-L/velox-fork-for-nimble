@@ -104,17 +104,26 @@ struct SegmentMetrics {
 };
 
 // Single-pass metric collector for extracted bit-range values.
-// Uses a frequency map for unique/dominant counting (capped at
-// kUniqueCountCap) and a running prev-value comparison for run counting.
+// Counts unique and dominant values two ways -- a direct-indexed histogram
+// where the values are narrow enough to index, a frequency map otherwise
+// (capped at kUniqueCountCap) -- and counts runs from a running prev-value
+// comparison.
 //
-// The frequency map is a reusable member: the split selector calls compute()
-// for every bit-range in an O(kBits^2) grid, so allocating a fresh map per
-// call dominated encode time. Clearing and reusing one map preserves its
-// capacity across calls and avoids that allocation churn.
+// Both counting structures are reusable members: the split selector calls
+// compute() for every bit-range in an O(kBits^2) grid, so allocating fresh
+// ones per call dominated encode time. Clearing and reusing them preserves
+// their capacity across calls and avoids that allocation churn.
 class MetricCollector {
  public:
   static constexpr size_t kUniqueCountCap = 1
       << 14; // 16K cap (lighter than full HLL)
+
+  // Segments whose values fit in this many bits are counted in a
+  // direct-indexed array rather than a hash map. The table is 2^16 counters,
+  // 256KB, but a segment touches one slot per distinct value and only those
+  // are cleared again, so what stays resident is the segment's cardinality
+  // rather than the table.
+  static constexpr int kDirectHistogramBits = 16;
 
   // Maps bit_width(v) to a bucket index in [0, 9], grouping every 7 bits.
   static constexpr size_t bitWidthBucket(uint64_t v) noexcept {
@@ -141,6 +150,30 @@ class MetricCollector {
       return out;
     }
 
+    // How wide the values actually are decides how they get counted, and an OR
+    // across the segment bounds them: every value is below
+    // 1 << bit_width(orOfValues). The pass costs a fraction of the hash pass it
+    // lets us avoid, and it bounds tighter than the segment's nominal width
+    // would, so a wide bit range whose sampled values happen to be small is
+    // still counted directly.
+    bool useDirectHistogram = false;
+    if (doFreq) {
+      uint64_t orOfValues = 0;
+      for (size_t i = 0; i < n; ++i) {
+        orOfValues |= values[i];
+      }
+      // The n bound is not about memory. Past kUniqueCountCap distinct values
+      // the map path stops counting and freezes what it has, and a direct
+      // histogram cannot reproduce those frozen counts. It never has to: a
+      // segment of at most kUniqueCountCap values cannot hold more distinct
+      // ones than that.
+      useDirectHistogram = std::bit_width(orOfValues) <= kDirectHistogramBits &&
+          n <= kUniqueCountCap;
+      if (useDirectHistogram && counts_.empty()) {
+        counts_.assign(size_t{1} << kDirectHistogramBits, 0u);
+      }
+    }
+
     const uint64_t v0 = values[0];
     if (doMin) {
       out.min = v0;
@@ -156,9 +189,15 @@ class MetricCollector {
     bool capped = false;
     uint32_t maxCount = 0;
     if (doFreq) {
-      freqMap_.clear();
-      freqMap_.reserve(std::min(n, kUniqueCountCap));
-      freqMap_.emplace(v0, 1u);
+      if (useDirectHistogram) {
+        touched_.clear();
+        counts_[v0] = 1;
+        touched_.push_back(static_cast<uint32_t>(v0));
+      } else {
+        freqMap_.clear();
+        freqMap_.reserve(std::min(n, kUniqueCountCap));
+        freqMap_.emplace(v0, 1u);
+      }
       maxCount = 1;
     }
 
@@ -176,14 +215,24 @@ class MetricCollector {
       if (doRun && v != prev) {
         ++out.runCount;
       }
-      if (doFreq && !capped) {
-        auto [it, inserted] = freqMap_.try_emplace(v, 0u);
-        const uint32_t count = ++it->second;
-        if (count > maxCount) {
-          maxCount = count;
-        }
-        if (inserted && freqMap_.size() > kUniqueCountCap) {
-          capped = true;
+      if (doFreq) {
+        if (useDirectHistogram) {
+          const uint32_t count = ++counts_[v];
+          if (count == 1) {
+            touched_.push_back(static_cast<uint32_t>(v));
+          }
+          if (count > maxCount) {
+            maxCount = count;
+          }
+        } else if (!capped) {
+          auto [it, inserted] = freqMap_.try_emplace(v, 0u);
+          const uint32_t count = ++it->second;
+          if (count > maxCount) {
+            maxCount = count;
+          }
+          if (inserted && freqMap_.size() > kUniqueCountCap) {
+            capped = true;
+          }
         }
       }
       if (doHist) {
@@ -207,7 +256,9 @@ class MetricCollector {
           static_cast<double>(n) / static_cast<double>(out.runCount);
     }
     if (doUniq) {
-      out.uniqueCount = capped ? (kUniqueCountCap + 1) : freqMap_.size();
+      out.uniqueCount = useDirectHistogram
+          ? touched_.size()
+          : (capped ? (kUniqueCountCap + 1) : freqMap_.size());
       out.uniqueCountCapped = capped;
     }
     if (doDominant) {
@@ -215,30 +266,52 @@ class MetricCollector {
       out.dominantCountCapped = capped;
     }
     if (doFreqTiers && !capped) {
-      // Extract frequency values, sort descending, then compute cumulative
-      // coverage fractions for top {1, 2, 4, 8} distinct values.
-      std::vector<uint32_t> freqs;
-      freqs.reserve(freqMap_.size());
-      for (const auto& [val, cnt] : freqMap_) {
-        freqs.push_back(cnt);
+      // Coverage asks only for the eight largest frequencies, so they are
+      // selected in one pass rather than sorting every distinct value's count.
+      // The array stays zero-padded, which is what makes a short alphabet fall
+      // out on its own: summing past the end adds zeros and leaves the whole
+      // segment, the same total the sorted loop reached by running out of
+      // frequencies to add.
+      std::array<uint32_t, 8> largest{};
+      const auto offer = [&largest](uint32_t frequency) {
+        if (frequency <= largest[7]) {
+          return;
+        }
+        size_t i = 7;
+        while (i > 0 && largest[i - 1] < frequency) {
+          largest[i] = largest[i - 1];
+          --i;
+        }
+        largest[i] = frequency;
+      };
+      if (useDirectHistogram) {
+        for (const uint32_t value : touched_) {
+          offer(counts_[value]);
+        }
+      } else {
+        for (const auto& [val, cnt] : freqMap_) {
+          (void)val;
+          offer(cnt);
+        }
       }
-      std::sort(freqs.begin(), freqs.end(), std::greater<uint32_t>());
 
       constexpr size_t kTopKs[4] = {1, 2, 4, 8};
       const double dn = static_cast<double>(n);
       uint64_t cumFreq = 0;
-      size_t ki = 0;
-      for (size_t fi = 0; fi < freqs.size() && ki < 4; ++fi) {
-        cumFreq += freqs[fi];
-        while (ki < 4 && fi + 1 >= kTopKs[ki]) {
-          out.topKCoverage[ki] = static_cast<double>(cumFreq) / dn;
-          ++ki;
+      size_t taken = 0;
+      for (size_t ki = 0; ki < 4; ++ki) {
+        for (; taken < kTopKs[ki]; ++taken) {
+          cumFreq += largest[taken];
         }
-      }
-      // Fill remaining slots if fewer distinct values than topK thresholds.
-      while (ki < 4) {
         out.topKCoverage[ki] = static_cast<double>(cumFreq) / dn;
-        ++ki;
+      }
+    }
+
+    // Cleared by walking what was touched, so the cost of reuse is the
+    // segment's cardinality rather than the table's size.
+    if (useDirectHistogram) {
+      for (const uint32_t value : touched_) {
+        counts_[value] = 0;
       }
     }
 
@@ -246,8 +319,14 @@ class MetricCollector {
   }
 
  private:
-  // frequency map for unique/dominant counting.
+  // Frequency map for unique/dominant counting, used for segments whose values
+  // are too wide to index directly.
   absl::flat_hash_map<uint64_t, uint32_t> freqMap_;
+
+  // Direct-indexed counts, allocated on first use, and the values a segment
+  // touched so that only those are cleared again.
+  std::vector<uint32_t> counts_;
+  std::vector<uint32_t> touched_;
 };
 
 } // namespace facebook::nimble::detail::subintsplit

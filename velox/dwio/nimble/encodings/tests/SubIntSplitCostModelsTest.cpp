@@ -299,6 +299,47 @@ TEST(
   EXPECT_EQ(bestEncoding, EncodingType::Huffman);
 }
 
+TEST(SubIntSplitCostModelsTest, MetricCollectorCountsBothWaysAlike) {
+  // MetricCollector counts frequencies through a direct-indexed histogram when
+  // the values are narrow enough to index and a hash map otherwise, and the
+  // planner's choices must not be able to tell which it got. Shifting the same
+  // distribution past the histogram's reach picks the other path while leaving
+  // every frequency-derived metric invariant, since shifting is injective.
+  std::vector<uint64_t> narrow;
+  for (uint64_t value = 0; value < 200; ++value) {
+    // Skewed rather than flat, so dominant count and the coverage tiers have
+    // something to distinguish.
+    for (uint64_t repeat = 0; repeat <= value % 7; ++repeat) {
+      narrow.push_back(value);
+    }
+  }
+  std::vector<uint64_t> wide;
+  wide.reserve(narrow.size());
+  for (const uint64_t value : narrow) {
+    wide.push_back((value << 40) | 1);
+  }
+
+  MetricCollector collector;
+  const SegmentMetrics direct =
+      collector.compute(narrow, allCostModelRequiredFlags());
+  const SegmentMetrics hashed =
+      collector.compute(wide, allCostModelRequiredFlags());
+
+  EXPECT_EQ(direct.uniqueCount, hashed.uniqueCount);
+  EXPECT_FALSE(direct.uniqueCountCapped);
+  EXPECT_FALSE(hashed.uniqueCountCapped);
+  EXPECT_EQ(direct.dominantCount, hashed.dominantCount);
+  EXPECT_EQ(direct.topKCoverage, hashed.topKCoverage);
+
+  // A reused collector must not carry counts between segments, which is the
+  // failure a histogram cleared by walking what it touched would show first.
+  const SegmentMetrics again =
+      collector.compute(narrow, allCostModelRequiredFlags());
+  EXPECT_EQ(again.uniqueCount, direct.uniqueCount);
+  EXPECT_EQ(again.dominantCount, direct.dominantCount);
+  EXPECT_EQ(again.topKCoverage, direct.topKCoverage);
+}
+
 TEST(
     SubIntSplitCostModelsTest,
     BestCostBitsWithdrawsHuffmanWhenTheCallerDisallowsIt) {
