@@ -489,13 +489,19 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // measured worse than expected: 1024 calls averaging 32 rows apiece
     // where the sorted version issues close to one call per distinct run.
     //
-    // Below kSpanAdvantage, spans still beat decoding the column whole,
-    // because most of the whole column's cost is the O(rowCount_) map build
-    // this path also pays -- but not the per-row work on top of it. Above
-    // it, decoding the column in order and keeping the slice wins, the same
-    // choice this file has made since 556894e55. There is no separate
-    // row-by-row gather option for a Permuted stream any more: a span of
-    // length one is a point probe, so the span path already subsumes it.
+    // Below kSpanAdvantageNumerator/kSpanAdvantageDenominator of the
+    // column, spans beat decoding it whole -- see the constants themselves
+    // for where that ratio comes from. Above it, decoding the column in
+    // order and keeping the slice wins, the same choice this file has made
+    // since 556894e55.
+    //
+    // Below kMinSpanLength, spans lose to a plain gather for a different
+    // reason: the radix sort's own fixed cost (four passes, each clearing a
+    // count table) no longer has enough rows to amortise over. A range read
+    // at 11 rows measured slightly slower once the sort was added than the
+    // row-by-row probe it replaced; one at 111 rows was already a clear win.
+    // kMinSpanLength is a round number inside that gap, not a measured
+    // boundary -- worth tightening once someone measures closer to it.
     //
     // An InPlace transform has no run structure to sort by -- each row is
     // already independently addressable -- so it keeps the older two-way
@@ -504,7 +510,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // wins once enough of it is wanted.
     if (!blockedSection_ && transformInfo_.anyTransform()) {
       if (permutedSection_) {
-        if (length * kSpanAdvantage < this->rowCount_) {
+        if (length < kMinSpanLength) {
+          for (uint32_t i = 0; i < length; ++i) {
+            output[i] = readOneRow(offset + i);
+          }
+          return;
+        }
+        if (length * kSpanAdvantageNumerator <
+            this->rowCount_ * kSpanAdvantageDenominator) {
           readPermutedSpan(offset, length, output);
           return;
         }
@@ -646,19 +659,34 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // wanted rows to total rows, gathering only what was asked for wins; above
   // it, decoding the span in order and undoing it wholesale wins even though
   // it decodes rows nobody wanted. Only reached by an InPlace transform now;
-  // see kSpanAdvantage for the Permuted equivalent.
+  // see kSpanAdvantageNumerator/Denominator for the Permuted equivalent.
   static constexpr uint32_t kGatherAdvantage = 8;
 
-  // The Permuted equivalent of kGatherAdvantage: below this ratio of wanted
-  // rows to total rows, reading spans wins; above it, decoding the whole
-  // column wins. Set equal to kGatherAdvantage as a starting point, since
-  // that was the empirically observed break-even point of the first,
-  // unmerged version of the span path (regression measured above roughly
-  // rowCount_/9, close to /8) -- and the merged version below should only
-  // need less of the column to win, not more, so this is deliberately
-  // conservative rather than tuned. Revisit once the merged path's own
-  // per-element cost is measured.
-  static constexpr uint32_t kSpanAdvantage = 8;
+  // The Permuted equivalent of kGatherAdvantage, retuned once the radix
+  // sort replaced the comparison sort: spans now cost about 30 ns/element
+  // (0.98 ms for 32768 rows on a 524288-row column), where the whole-column
+  // fallback costs a fixed amount that depends on the column -- about
+  // 7.14 ms on NPI, about 13 ms on h3_r9. Spans win until length * 30 ns
+  // exceeds that fixed cost, which is a different ratio-to-rowCount_ on each
+  // column: roughly 11/5 on NPI, roughly 6/5 on h3_r9. A single constant
+  // cannot be exactly right on both, so this is set to h3_r9's ratio rather
+  // than NPI's, because h3_r9's fallback is the more expensive of the two:
+  // being wrong in NPI's favour costs some throughput in the band between
+  // the two breakeven points, where being wrong in h3_r9's favour would
+  // leave most of its larger win unclaimed. Expressed as a fraction rather
+  // than folded into one integer so retuning does not lose precision to
+  // integer division.
+  static constexpr uint32_t kSpanAdvantageNumerator = 5;
+  static constexpr uint32_t kSpanAdvantageDenominator = 6;
+
+  // Below this many rows, the radix sort's own fixed cost -- four passes,
+  // each clearing a 256-entry count table -- has too little to amortise
+  // over and a plain probe per row wins instead. Measured to lie between 11
+  // rows (span path slightly slower than the gather it replaced) and 111
+  // rows (already a clear win); this picks a round number inside that gap
+  // rather than the measured boundary itself, which nobody has narrowed
+  // further yet.
+  static constexpr uint32_t kMinSpanLength = 64;
 
   // Decodes every section in order across the whole column, undoes the
   // transforms over that span, and keeps the requested rows.
