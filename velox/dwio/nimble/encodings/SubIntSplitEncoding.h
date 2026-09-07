@@ -408,6 +408,19 @@ void SubIntSplitEncoding<T>::readWithVisitor(
       params,
       [&](auto toSkip) { skip(toSkip); },
       [&] {
+        // Reassembling from the sections below returns whatever the sections
+        // hold, which for a reordered stream is the transformed value, not
+        // the original. materialize() is the only decode that undoes a
+        // transform, and it keeps row_ in step itself. The fast path above
+        // already goes through it; this path is reached when useFastPath()
+        // declines -- no AVX2, a non-deterministic filter, a hook -- and
+        // without this it would answer those reads with transformed values
+        // and no error.
+        if (transformInfo_.anyTransform()) {
+          physicalType value = 0;
+          materialize(1, &value);
+          return value;
+        }
         physicalType value = 0;
         for (const auto& sec : sections_) {
           switch (sec.storageBytes) {
