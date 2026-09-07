@@ -17,6 +17,9 @@
 
 #include <algorithm>
 
+#include <folly/CPortability.h>
+
+#include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
@@ -77,11 +80,38 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     }
     auto it = std::upper_bound(runEnds_.begin(), runEnds_.end(), offset);
     NIMBLE_CHECK(it != runEnds_.end());
+
+    // Reading the run values in bulk replaces one virtual call per run with
+    // one for the whole read. That is what a near-whole-column read of a
+    // section carrying a key-derived permutation wants: many short runs,
+    // where the per-run dispatch is the cost and the fill it guards is not
+    // (8.7 ns per row, and 73% of a transformed bulk decode, before this).
+    //
+    // Two things disqualify a read from it, and both are free to test here.
+    //
+    // A short read: locating the last run costs a second binary search over
+    // every run end in the section, and charging that to a read covering a
+    // hundred rows loses more than the handful of probes it saves. The span
+    // path issues those by the thousand, and it showed up as a gather
+    // regression at mid run lengths. Gating on the run count did not recover
+    // it, because the search is paid before the count is known.
+    //
+    // A section of long runs: the saving is one virtual call per run, so it
+    // only outruns the extra search when the fill each call guards is small.
+    // A Dictionary index stream already amortises the dispatch over long
+    // fills, and taking the bulk read there costs it.
+    if (length * kBulkRunValueDenominator >=
+            this->rowCount_ * kBulkRunValueNumerator &&
+        runEnds_.size() * kMaxAverageRunLength >= this->rowCount_) {
+      readRunsInBulk(
+          offset, length, static_cast<uint32_t>(it - runEnds_.begin()), output);
+      return;
+    }
+
     uint32_t outputOffset{0};
     while (outputOffset < length) {
       const auto runIndex = static_cast<uint32_t>(it - runEnds_.begin());
-      const auto runEnd = *it;
-      const auto count = std::min(length - outputOffset, runEnd - offset);
+      const auto count = std::min(length - outputOffset, *it - offset);
       physicalType value;
       values_->readAt(runIndex, &value);
       std::fill(output + outputOffset, output + outputOffset + count, value);
@@ -90,6 +120,53 @@ class RLEEncodingView final : public TypedEncodingView<T> {
       ++it;
     }
   }
+
+  // Kept out of line deliberately. Inlining it into readPhysical() cost an
+  // untransformed bulk decode 7.7% even with the branch made unreachable, so
+  // the loss was code layout in a header this widely included rather than
+  // anything the new path executes. Out of line, readPhysical() keeps the
+  // shape it had and only a read that takes this branch pays for it.
+  FOLLY_NOINLINE void readRunsInBulk(
+      uint32_t offset,
+      uint32_t length,
+      uint32_t firstRun,
+      physicalType* output) const {
+    const auto lastIt =
+        std::upper_bound(runEnds_.begin(), runEnds_.end(), offset + length - 1);
+    NIMBLE_CHECK(lastIt != runEnds_.end());
+    const auto runCount =
+        static_cast<uint32_t>(lastIt - runEnds_.begin()) - firstRun + 1;
+
+    // Held per thread rather than allocated per call: a bulk read reaches
+    // this once per section, and a view is read concurrently.
+    thread_local velox::raw_vector<physicalType> runValues;
+    runValues.resize(runCount);
+    values_->read(firstRun, runCount, runValues.data());
+
+    uint32_t outputOffset{0};
+    uint32_t run{0};
+    while (outputOffset < length) {
+      const auto count =
+          std::min(length - outputOffset, runEnds_[firstRun + run] - offset);
+      std::fill(
+          output + outputOffset, output + outputOffset + count, runValues[run]);
+      outputOffset += count;
+      offset += count;
+      ++run;
+    }
+  }
+
+  // Fraction of the section a read must cover before the bulk run-value read
+  // is worth its second binary search. Half: the whole-column read that
+  // motivates it sits at 1, and the span path's reads sit orders of magnitude
+  // below, so the boundary is not delicate and is not tuned finely.
+  static constexpr uint32_t kBulkRunValueNumerator = 1;
+  static constexpr uint32_t kBulkRunValueDenominator = 2;
+
+  // Longest average run for which the bulk run-value read still pays. The
+  // permuted section that motivates it averages a few rows per run; the
+  // sections it costs on run far longer, so this sits well clear of both.
+  static constexpr uint32_t kMaxAverageRunLength = 32;
 
   Vector<uint32_t> runEnds_;
   std::unique_ptr<TypedEncodingView<T>> values_;
