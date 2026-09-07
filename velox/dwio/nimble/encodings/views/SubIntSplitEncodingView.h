@@ -1011,7 +1011,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     thread_local std::vector<velox::raw_vector<uint64_t>> sectionValues;
     thread_local velox::raw_vector<uint8_t> scratch;
     sectionValues.resize(sections_.size());
-    scratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
+    // One chunk's worth, not one block's. This used to be sized to the whole
+    // block, so a section's values were streamed through a buffer several
+    // times L2 on the way from its view to the accumulate kernel, which is an
+    // L3 round trip for data that is read once, immediately, by the next
+    // instruction. readPhysical has always sized its scratch to a chunk and
+    // kept it in L1; this path did not.
+    scratch.resize(
+        static_cast<size_t>(kViewChunkSize) * sizeof(physicalType));
     // A section is widened to 64 bits only where something will read it that
     // way: a transform works in 64 bits, and the key section is handed to
     // those transforms as context. A section that neither carries a transform
@@ -1183,44 +1190,50 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
       if (!needsWidening(section)) {
         // Straight through the accumulate kernel, from the section's own
-        // storage width.
+        // storage width, a chunk at a time so the scratch stays resident.
+        for (uint32_t chunk = 0; chunk < blockCount; chunk += kViewChunkSize) {
+          const uint32_t chunkCount =
+              std::min(kViewChunkSize, blockCount - chunk);
+          const uint32_t chunkStart = blockStart + chunk;
+          physicalType* chunkOutput = output + chunk;
         switch (section.storageBytes) {
           case 1:
             readSectionChunk<uint8_t>(
                 section,
-                blockStart,
-                blockCount,
-                output,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
                 sectionSeeds,
                 scratch.data());
             break;
           case 2:
             readSectionChunk<uint16_t>(
                 section,
-                blockStart,
-                blockCount,
-                output,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
                 sectionSeeds,
                 scratch.data());
             break;
           case 4:
             readSectionChunk<uint32_t>(
                 section,
-                blockStart,
-                blockCount,
-                output,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
                 sectionSeeds,
                 scratch.data());
             break;
           default:
             readSectionChunk<uint64_t>(
                 section,
-                blockStart,
-                blockCount,
-                output,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
                 sectionSeeds,
                 scratch.data());
             break;
+        }
         }
         continue;
       }
