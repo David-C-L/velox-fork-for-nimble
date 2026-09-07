@@ -983,6 +983,24 @@ std::string_view SubIntSplitEncoding<T>::encode(
         primaryIndices.size() * 4;
   };
 
+  // Neither a section's extracted values nor its untransformed encoding
+  // depends on which section is being tried as the key, so both are done once
+  // per section here. They used to sit inside the attempt below, which the key
+  // search calls once per candidate section, making encode quadratic in the
+  // split count: splitCount * splitCount extractions, each a pass over every
+  // value, and as many full nested encodes. Only the transformed encode
+  // genuinely varies with the key, and that one stays where it is.
+  std::vector<std::vector<uint64_t>> sectionValues64(splitCount);
+  std::vector<uint8_t> sectionStorage(splitCount);
+  std::vector<std::string_view> plainEncoded(splitCount);
+  for (uint8_t s = 0; s < splitCount; ++s) {
+    const auto& seg = segments[s];
+    const int width = seg.bitEnd - seg.bitStart + 1;
+    sectionStorage[s] = sectionStorageBytes(width);
+    sectionValues64[s] = extractSection(seg);
+    plainEncoded[s] = encodeSection(s, sectionStorage[s], sectionValues64[s]);
+  }
+
   // One choice of key section, priced. kNoKeySection means the transform does
   // not use a key, in which case every section is a candidate to transform.
   struct Attempt {
@@ -997,10 +1015,13 @@ std::string_view SubIntSplitEncoding<T>::encode(
     attempt.info.primaryIndices.assign(splitCount, {});
     attempt.info.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
 
-    std::vector<uint64_t> keyValues;
+    const std::vector<uint64_t> noKey;
+    const bool hasKey =
+        candidateKey != detail::SubIntSplitTransformInfo::kNoKeySection;
+    const std::vector<uint64_t>& keyValues =
+        hasKey ? sectionValues64[candidateKey] : noKey;
     bool keyGroups = true;
-    if (candidateKey != detail::SubIntSplitTransformInfo::kNoKeySection) {
-      keyValues = extractSection(segments[candidateKey]);
+    if (hasKey) {
       attempt.info.keySection = candidateKey;
       keyGroups = groupsEnoughToKey(keyValues);
     }
@@ -1008,10 +1029,10 @@ std::string_view SubIntSplitEncoding<T>::encode(
     for (uint8_t s = 0; s < splitCount; ++s) {
       const auto& seg = segments[s];
       const int width = seg.bitEnd - seg.bitStart + 1;
-      const uint8_t sb = sectionStorageBytes(width);
+      const uint8_t sb = sectionStorage[s];
 
-      const auto sectionU64 = extractSection(seg);
-      const std::string_view plain = encodeSection(s, sb, sectionU64);
+      const auto& sectionU64 = sectionValues64[s];
+      const std::string_view plain = plainEncoded[s];
 
       // The key section rebuilds the order of the others, so it is never
       // itself transformed however well it would compress. subIntSplitForceApply
