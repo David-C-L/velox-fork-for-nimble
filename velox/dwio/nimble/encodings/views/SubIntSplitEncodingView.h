@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+
+#include <folly/CPortability.h>
 #include <utility>
 #include <vector>
 
@@ -938,29 +940,43 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // mattered more to throughput than the gather itself, by evicting lines
   // this loop was about to read -- proof that "not cheap" and "the top cost"
   // are not the same question.
+  // Kept out of line for the same reason readRunsInBulk is: fusing the gather
+  // into this body grew it, and inlining the result into readPhysicalBlock
+  // cost the untransformed arm 5% even though that arm never calls this. The
+  // loss was layout in a widely included header, not work. Out of line, the
+  // callers keep their shape, and a function reached once per permuted section
+  // per block pays nothing for the call.
   template <typename SectionT>
-  void permuteSection(
+  FOLLY_NOINLINE void permuteSection(
       const Section& section,
       uint32_t blockStart,
       uint32_t blockCount,
       physicalType* output) const {
     const auto& positions = positionMap();
 
-    // Both fully overwritten below before being read: `whole` by the
-    // sequential section read, `moved` by the gather loop that follows it.
+    // Fully overwritten below before being read, by the sequential section
+    // read.
     thread_local velox::raw_vector<uint8_t> whole;
-    thread_local velox::raw_vector<uint8_t> moved;
     whole.resize(static_cast<size_t>(this->rowCount_) * sizeof(SectionT));
-    moved.resize(static_cast<size_t>(blockCount) * sizeof(SectionT));
 
     auto* source = reinterpret_cast<SectionT*>(whole.data());
     section.view->read(0, this->rowCount_, source);
-    auto* destination = reinterpret_cast<SectionT*>(moved.data());
+
+    // Gathered straight into the output word rather than into a staging
+    // buffer the kernel then reads back. The buffer cost a write and a read of
+    // blockCount elements, which at a whole-column block is two more passes
+    // over memory that does not fit in L2, to hand the kernel a contiguous run
+    // it does not need: the gather is already one load per output element,
+    // and doing the mask and shift here rather than in the kernel adds nothing
+    // to that. The kernel still owns every contiguous case; this is the one
+    // caller that never had a contiguous source.
+    const uint64_t mask = section.mask;
+    const int shift = section.bitStart;
+    const uint32_t* __restrict__ rows = positions.data() + blockStart;
+    physicalType* __restrict__ out = output;
     for (uint32_t row = 0; row < blockCount; ++row) {
-      destination[row] = source[positions[blockStart + row]];
+      out[row] |= static_cast<physicalType>(source[rows[row]] & mask) << shift;
     }
-    detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
-        destination, output, blockCount, section.mask, section.bitStart);
   }
 
   // Reads one whole transform block, undoing every transform on it.
