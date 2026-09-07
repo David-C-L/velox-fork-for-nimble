@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "velox/common/memory/RawVector.h"
@@ -705,6 +706,41 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     uint32_t row;
   };
 
+  // Sorts `order`'s first `length` entries by .source in O(length), rather
+  // than the O(length log length) a comparison sort pays, without an array
+  // sized to rowCount_ either -- a naive counting sort keyed directly on the
+  // source index would need one entry per possible index, reproducing the
+  // exact "cost grows with the column, not with what was asked for" problem
+  // this project already found once in the position map. Four passes of an
+  // 8-bit digit cover any 32-bit source index with a 256-entry count table
+  // per pass: O(length) work, and a fixed, tiny table to clear regardless of
+  // length or rowCount_. A comparison sort was the third-largest cost the
+  // span path measured on it.
+  static void radixSortBySource(
+      velox::raw_vector<SourceRow>& order,
+      uint32_t length) {
+    thread_local velox::raw_vector<SourceRow> radixScratch;
+    radixScratch.resize(length);
+    SourceRow* src = order.data();
+    SourceRow* dst = radixScratch.data();
+    for (int shift = 0; shift < 32; shift += 8) {
+      uint32_t count[257] = {};
+      for (uint32_t i = 0; i < length; ++i) {
+        ++count[((src[i].source >> shift) & 0xFF) + 1];
+      }
+      for (uint32_t digit = 0; digit < 256; ++digit) {
+        count[digit + 1] += count[digit];
+      }
+      for (uint32_t i = 0; i < length; ++i) {
+        const uint32_t digit = (src[i].source >> shift) & 0xFF;
+        dst[count[digit]++] = src[i];
+      }
+      std::swap(src, dst);
+    }
+    // Four passes -- an even number -- leave the fully sorted result back in
+    // `src`, which by construction is order.data() again at this point.
+  }
+
   void readPermutedSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
     const auto& positions = positionMap();
@@ -737,9 +773,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     for (uint32_t i = 0; i < length; ++i) {
       order[i] = {positions[offset + i], i};
     }
-    std::sort(order.begin(), order.end(), [](const SourceRow& a, const SourceRow& b) {
-      return a.source < b.source;
-    });
+    radixSortBySource(order, length);
 
     // Sized to the whole range rather than chunked: this path already pays
     // for a heap scratch buffer for its permuted sections, so a plain
