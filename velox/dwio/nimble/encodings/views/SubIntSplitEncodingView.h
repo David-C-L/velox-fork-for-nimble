@@ -715,7 +715,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // runs then finds one span per key, not per interruption. Shared across
     // every section below, since the position map -- and so this grouping --
     // does not depend on which section is being read.
-    thread_local std::vector<std::pair<uint32_t, uint32_t>> order;
+    // std::vector, unlike velox::raw_vector, value-initialises every element
+    // it grows into on resize() even when the memory was already allocated by
+    // an earlier, larger call -- the same zero-fill this project already
+    // found and removed from decode's other scratch buffers. Every element
+    // here is overwritten by the loop directly below, so that fill was pure
+    // loss on any call whose length exceeds the largest one seen so far.
+    thread_local velox::raw_vector<std::pair<uint32_t, uint32_t>> order;
     order.resize(length);
     for (uint32_t i = 0; i < length; ++i) {
       order[i] = {positions[offset + i], i};
@@ -789,12 +795,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   static void readPermutedSpanSection(
       const Section& section,
       uint32_t length,
-      const std::vector<std::pair<uint32_t, uint32_t>>& order,
+      const velox::raw_vector<std::pair<uint32_t, uint32_t>>& order,
       physicalType* output,
       bool isFirst,
       velox::raw_vector<uint8_t>& scratch) {
     auto* gathered = reinterpret_cast<SectionT*>(scratch.data());
-    thread_local std::vector<SectionT> block;
+    // Same zero-fill hazard as `order` above, paid once per block rather
+    // than once per call: at k=1024 runs this resizes up to 1024 times per
+    // readPermutedSpan call, so a std::vector here was the dominant share of
+    // the span path's per-element cost above bulk decode's.
+    thread_local velox::raw_vector<SectionT> block;
     uint32_t j = 0;
     while (j < length) {
       uint32_t blockEnd = j + 1;
