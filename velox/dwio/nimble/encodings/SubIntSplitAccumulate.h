@@ -30,6 +30,7 @@
 #include <immintrin.h>
 #endif
 
+#include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 
 namespace facebook::nimble::detail {
@@ -132,14 +133,39 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
     uint32_t dataOffset,
     SubIntSplitTransformInfo* transformInfo = nullptr) {
   const char* pos = data.data() + dataOffset;
+  // Every field below comes off the wire, so a corrupt or truncated stream
+  // reaches here as arbitrary bytes. Without these checks a bad length walks
+  // pos past the buffer, a bad entry count resizes a vector by up to 4 billion
+  // elements, and a bad bit range shifts by a negative width. Reads are cheap
+  // relative to a decode and this runs once per stream, not per row.
+  const char* const streamEnd = data.data() + data.size();
+  auto requireBytes = [&](size_t bytes) {
+    NIMBLE_CHECK(
+        pos <= streamEnd && static_cast<size_t>(streamEnd - pos) >= bytes,
+        "SubIntSplit stream is truncated.");
+  };
+
+  requireBytes(2);
   const uint8_t splitCount = encoding::read<uint8_t>(pos);
+  NIMBLE_CHECK(splitCount > 0, "SubIntSplit stream has no sections.");
+  // A section covers at least one bit of a 64-bit value, so there can be no
+  // more sections than bits.
+  NIMBLE_CHECK(
+      splitCount <= 64, "SubIntSplit stream declares too many sections.");
   // Zero here means no transform, which is what every stream written before
   // transforms existed carries, so those parse exactly as before.
   const uint8_t transformPresent = encoding::read<uint8_t>(pos);
 
   if (transformPresent != 0) {
     SubIntSplitTransformInfo parsed;
+    requireBytes(5 + splitCount);
     parsed.keySection = encoding::read<uint8_t>(pos);
+    // The key section is indexed directly when a transform inverts, so a bad
+    // value here would read outside the section vector.
+    NIMBLE_CHECK(
+        parsed.keySection == SubIntSplitTransformInfo::kNoKeySection ||
+            parsed.keySection < splitCount,
+        "SubIntSplit stream names a key section that does not exist.");
     parsed.blockSize = encoding::readUint32(pos);
     parsed.transformIds.resize(splitCount);
     parsed.codebooks.resize(splitCount);
@@ -151,12 +177,18 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
       if (parsed.transformIds[s] == 0) {
         continue;
       }
+      requireBytes(4);
       const uint32_t entries = encoding::readUint32(pos);
+      // Checked before resizing rather than after: the count is what decides
+      // the allocation, so a corrupt one has to be rejected before it is used.
+      requireBytes(static_cast<size_t>(entries) * sizeof(uint64_t));
       parsed.codebooks[s].resize(entries);
       for (uint32_t e = 0; e < entries; ++e) {
         parsed.codebooks[s][e] = encoding::read<uint64_t>(pos);
       }
+      requireBytes(4);
       const uint32_t blocks = encoding::readUint32(pos);
+      requireBytes(static_cast<size_t>(blocks) * sizeof(uint32_t));
       parsed.primaryIndices[s].resize(blocks);
       for (uint32_t b = 0; b < blocks; ++b) {
         parsed.primaryIndices[s][b] = encoding::readUint32(pos);
@@ -174,10 +206,16 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   std::vector<SubIntSplitSection> sections(splitCount);
   // The triples are contiguous, so read them all before walking the payloads.
   std::vector<uint32_t> encodedSizes(splitCount);
+  requireBytes(static_cast<size_t>(splitCount) * 6);
   for (uint8_t s = 0; s < splitCount; ++s) {
     sections[s].bitStart = encoding::read<uint8_t>(pos);
     sections[s].bitEnd = encoding::read<uint8_t>(pos);
     encodedSizes[s] = encoding::readUint32(pos);
+    // An inverted or out-of-range pair would give a negative or over-wide
+    // shift when the mask is built below.
+    NIMBLE_CHECK(
+        sections[s].bitEnd >= sections[s].bitStart && sections[s].bitEnd < 64,
+        "SubIntSplit section has an invalid bit range.");
   }
 
   for (uint8_t s = 0; s < splitCount; ++s) {
@@ -185,6 +223,7 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
     const int width = section.bitEnd - section.bitStart + 1;
     section.mask = (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
     section.storageBytes = subIntSplitSectionStorageBytes(width);
+    requireBytes(encodedSizes[s]);
     section.stream = std::string_view{pos, encodedSizes[s]};
     pos += encodedSizes[s];
   }

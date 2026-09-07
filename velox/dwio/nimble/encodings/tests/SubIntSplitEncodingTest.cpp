@@ -538,6 +538,74 @@ TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {
       nimble::NimbleInternalError);
 }
 
+// Every header field is read straight off the wire, so a corrupt or truncated
+// stream arrives as arbitrary bytes. Each of these used to walk off the end of
+// the buffer, resize a vector by an attacker-chosen count, or shift by a
+// negative width, none of which reports anything.
+TEST(SubIntSplitEncodingTests, truncatedStreamThrowsRatherThanReadingPastEnd) {
+  const std::vector<uint64_t> values{
+      0x1234567890000000ULL,
+      0x1234567890000001ULL,
+      0x1234567890000002ULL,
+      0x1234567890000003ULL};
+  const auto segments = makeFullWidthSegments<uint64_t>();
+  const auto layout = makePreserveLayout<uint64_t>(segments);
+
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  const auto encoded = encodeWithReplayLayout<uint64_t>(layout, values, buffer);
+  ASSERT_GT(encoded.size(), 1u);
+
+  // Every prefix of a valid stream is invalid, and none of them may be read
+  // past. Which check rejects a given prefix is not the point; that one does
+  // is.
+  for (size_t length = 1; length < encoded.size(); ++length) {
+    const std::string_view truncated{encoded.data(), length};
+    EXPECT_THROW(
+        decodeAll<uint64_t>(truncated, *pool), nimble::NimbleException)
+        << "truncated to " << length << " of " << encoded.size() << " bytes";
+  }
+}
+
+TEST(SubIntSplitEncodingTests, invalidSectionBitRangeThrows) {
+  const std::vector<uint64_t> values{
+      0x1234567890000000ULL,
+      0x1234567890000001ULL,
+      0x1234567890000002ULL,
+      0x1234567890000003ULL};
+  const auto segments = makeFullWidthSegments<uint64_t>();
+  const auto layout = makePreserveLayout<uint64_t>(segments);
+
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  const auto encoded = encodeWithReplayLayout<uint64_t>(layout, values, buffer);
+  std::string corrupted{encoded};
+
+  // Find the section header by its own contents rather than by hardcoding the
+  // prefix size: the first section of a full-width split starts at bit 0 and
+  // ends at bit 63, and that pair appears nowhere before it.
+  size_t headerPos = std::string::npos;
+  for (size_t i = 0; i + 1 < corrupted.size(); ++i) {
+    if (static_cast<uint8_t>(corrupted[i]) == 0 &&
+        static_cast<uint8_t>(corrupted[i + 1]) == 63) {
+      headerPos = i;
+      break;
+    }
+  }
+  ASSERT_NE(headerPos, std::string::npos);
+
+  // bitEnd below bitStart gives a negative width, which shifts by a negative
+  // amount when the mask is built.
+  corrupted[headerPos] = static_cast<char>(40);
+  corrupted[headerPos + 1] = static_cast<char>(8);
+  EXPECT_THROW(decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException);
+
+  // A bit index past the width of the value is equally unrepresentable.
+  corrupted[headerPos] = static_cast<char>(0);
+  corrupted[headerPos + 1] = static_cast<char>(200);
+  EXPECT_THROW(decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException);
+}
+
 TEST(SubIntSplitEncodingTests, fullWidthSingleSectionRoundTrip) {
   const std::vector<uint64_t> values{
       0x1234567890000000ULL,
