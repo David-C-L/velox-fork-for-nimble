@@ -299,6 +299,55 @@ TEST(
   EXPECT_EQ(bestEncoding, EncodingType::Huffman);
 }
 
+TEST(SubIntSplitCostModelsTest, MetricCollectorScansBothWaysAlike) {
+  // The scan reaches the caller two ways: one loop that tests which metrics
+  // were asked for on every element, and a specialisation for the four the
+  // selector always wants, which drops those tests and splits the work into a
+  // vectorisable pass and a scalar histogram pass.
+  //
+  // Splitting the traversal is what this checks. The histogram now runs over
+  // its own walk of the values rather than the one that computes everything
+  // else, and the remaining accumulators reassociate, so the values are chosen
+  // to make any disagreement visible: for each bit width, the smallest value of
+  // that width, that value with a low bit set, and the largest. Bucket b covers
+  // bit widths 7b to 7b+6, so this sits on both sides of every bucket boundary
+  // and leaves none of them empty.
+  std::vector<uint64_t> values{0, 1};
+  for (int width = 1; width <= 64; ++width) {
+    const uint64_t smallest = uint64_t{1} << (width - 1);
+    values.push_back(smallest);
+    values.push_back(smallest | 1);
+    values.push_back(width == 64 ? ~uint64_t{0} : (uint64_t{1} << width) - 1);
+  }
+
+  // Any frequencies will do: the three-argument overload takes them as given
+  // and this test is about everything else it returns.
+  MetricCollector collector;
+  const SegmentMetrics counted =
+      collector.compute(values, allCostModelRequiredFlags());
+  FrequencyCounts supplied;
+  supplied.uniqueCount = counted.uniqueCount;
+  supplied.dominantCount = counted.dominantCount;
+  const SegmentMetrics scanned =
+      collector.compute(values, allCostModelRequiredFlags(), supplied);
+
+  EXPECT_EQ(scanned.min, counted.min);
+  EXPECT_EQ(scanned.max, counted.max);
+  EXPECT_EQ(scanned.range, counted.range);
+  EXPECT_EQ(scanned.runCount, counted.runCount);
+  EXPECT_EQ(scanned.avgRunLength, counted.avgRunLength);
+  EXPECT_EQ(scanned.bitWidthBuckets, counted.bitWidthBuckets);
+  EXPECT_EQ(scanned.sumAbsDelta, counted.sumAbsDelta);
+  EXPECT_EQ(scanned.monotonicCount, counted.monotonicCount);
+  EXPECT_EQ(scanned.maxDelta, counted.maxDelta);
+
+  // Every bucket carries something, or the boundaries above were not straddled
+  // and the comparison agreed about nothing.
+  for (size_t bucket = 0; bucket < scanned.bitWidthBuckets.size(); ++bucket) {
+    EXPECT_GT(scanned.bitWidthBuckets[bucket], 0u) << "bucket " << bucket;
+  }
+}
+
 TEST(SubIntSplitCostModelsTest, MetricCollectorCountsBothWaysAlike) {
   // MetricCollector counts frequencies through a direct-indexed histogram when
   // the values are narrow enough to index and a hash map otherwise, and the

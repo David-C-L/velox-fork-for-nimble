@@ -213,6 +213,89 @@ class MetricCollector {
     }
   }
 
+  // The four scan metrics, for the caller that wants all of them and supplies
+  // the frequencies itself. That is every call the split selector makes.
+  //
+  // The general path tests five loop-invariant flags per element. Five
+  // independent flags is thirty-two loop versions, far past what a compiler
+  // will unswitch, so the tests sit in the body and stand between it and any
+  // vectorisation of work that is otherwise ideal for it: a vector min and
+  // max, a shifted compare for runs, a masked max and a horizontal add for the
+  // deltas.
+  //
+  // Nothing about what is computed changes here. Same operands, same
+  // comparisons, same results. The accumulations do reassociate, which is
+  // exact and only exact because every one of them is an integer operation:
+  // unsigned addition is associative and commutative modulo 2^64, overflow
+  // included, and so are min and max. No floating point enters this loop --
+  // avgRunLength is one division afterwards, from the same integer count.
+  static SegmentMetrics scanAll(const std::vector<uint64_t>& values) {
+    const size_t count = values.size();
+    const uint64_t first = values[0];
+
+    uint64_t minimum = first;
+    uint64_t maximum = first;
+    // Transitions between adjacent values. The first run is added back at the
+    // end, which is the same count the general path reaches by starting at one.
+    uint64_t transitions = 0;
+    uint64_t sumAbsDelta = 0;
+    uint64_t monotonic = 0;
+    uint64_t maxDelta = 0;
+
+    // Read as values[i - 1] rather than carried in a variable, so that the
+    // dependency between adjacent elements is an array access the compiler can
+    // serve with a shifted load rather than a loop-carried register.
+    for (size_t i = 1; i < count; ++i) {
+      const uint64_t previous = values[i - 1];
+      const uint64_t value = values[i];
+
+      minimum = std::min(minimum, value);
+      maximum = std::max(maximum, value);
+      transitions += static_cast<uint64_t>(value != previous);
+
+      const bool rising = value >= previous;
+      const uint64_t delta = rising ? value - previous : previous - value;
+      sumAbsDelta += delta;
+      monotonic += static_cast<uint64_t>(rising);
+      // Only a rising pair is a delta the encoding would pack, and taking the
+      // maximum against zero on a falling one leaves it alone.
+      maxDelta = std::max(maxDelta, rising ? delta : uint64_t{0});
+    }
+
+    SegmentMetrics out;
+    out.min = minimum;
+    out.max = maximum;
+    out.range = maximum - minimum;
+    out.runCount = transitions + 1;
+    out.avgRunLength =
+        static_cast<double>(count) / static_cast<double>(out.runCount);
+    out.sumAbsDelta = sumAbsDelta;
+    out.monotonicCount = monotonic;
+    out.maxDelta = maxDelta;
+
+    // The histogram gets its own pass, scalar, in the same form the general
+    // path uses. It is deliberately not in the loop above, and fusing it back
+    // in will make this slower rather than faster.
+    //
+    // The tempting version counts how many values clear each of the nine
+    // bucket thresholds and differences the counts, which removes the indexed
+    // increment -- a scatter, which does not vectorise -- and reads on paper
+    // like nine compares and adds against a leading-zero count, a divide and a
+    // store. It does not fit. Nine counters and nine threshold constants, on
+    // top of the six accumulators above, want twenty-six vector registers
+    // where the machine has sixteen. Measured, the counters went to the stack:
+    // seven times the vector stack traffic of the scalar original on the same
+    // instruction count, and twelve percent slower end to end.
+    //
+    // One more pass over values that are already resident costs far less than
+    // that, and it keeps this metric on arithmetic identical to the path it
+    // has to agree with.
+    for (size_t i = 0; i < count; ++i) {
+      ++out.bitWidthBuckets[bitWidthBucket(values[i])];
+    }
+    return out;
+  }
+
   SegmentMetrics computeImpl(
       const std::vector<uint64_t>& values,
       MetricFlags flags,
@@ -233,6 +316,23 @@ class MetricCollector {
     const size_t n = values.size();
     if (n == 0) {
       return out;
+    }
+
+    // Everything the loop below would compute, with none of the per-element
+    // flag tests. This is every call the selector makes, since it wants all
+    // four scan metrics and supplies the frequencies from its partition.
+    if (supplied != nullptr && doMin && doRun && doHist && doDelta) {
+      SegmentMetrics scanned = scanAll(values);
+      if (doUniq) {
+        scanned.uniqueCount = supplied->uniqueCount;
+      }
+      if (doDominant) {
+        scanned.dominantCount = supplied->dominantCount;
+      }
+      if (doFreqTiers) {
+        fillCoverage(supplied->largest, n, scanned.topKCoverage);
+      }
+      return scanned;
     }
 
     // How wide the values actually are decides how they get counted, and an OR

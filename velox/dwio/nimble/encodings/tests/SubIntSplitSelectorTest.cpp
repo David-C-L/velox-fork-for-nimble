@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
@@ -31,10 +32,16 @@ using namespace facebook::nimble::detail::subintsplit;
 
 namespace {
 
-// Compares the two ways of reaching the frequency metrics, over every bit range
+// Compares the two ways of reaching a segment's metrics, over every bit range
 // the selector's inner loop visits, stepping the partition exactly as that loop
-// does. The counting path is the reference: it is what every measurement on
-// this encoder was made against.
+// does. The flag-checked counting path is the reference: it is what every
+// measurement on this encoder was made against.
+//
+// Both halves of the split are under test here. The three-argument call takes
+// the frequency metrics from the partition and the rest from the specialised
+// scan; the two-argument call counts and scans in one flag-checked loop. Every
+// field has to agree, so the comparison is over all of them rather than over
+// the frequency metrics alone.
 //
 // This is the test that matters, because the way a partition maintained across
 // the loop goes wrong is not arithmetic but lockstep. If the partition and the
@@ -64,16 +71,24 @@ void expectPartitionMatchesCounting(
       const SegmentMetrics given =
           supplied.compute(segValues, flags, partition.counts());
 
-      EXPECT_EQ(given.uniqueCount, counted.uniqueCount)
-          << "bits [" << l << ", " << r << "]";
-      EXPECT_EQ(given.uniqueCountCapped, counted.uniqueCountCapped)
-          << "bits [" << l << ", " << r << "]";
-      EXPECT_EQ(given.dominantCount, counted.dominantCount)
-          << "bits [" << l << ", " << r << "]";
+      const std::string where =
+          "bits [" + std::to_string(l) + ", " + std::to_string(r) + "]";
+      EXPECT_EQ(given.uniqueCount, counted.uniqueCount) << where;
+      EXPECT_EQ(given.uniqueCountCapped, counted.uniqueCountCapped) << where;
+      EXPECT_EQ(given.dominantCount, counted.dominantCount) << where;
       EXPECT_EQ(given.dominantCountCapped, counted.dominantCountCapped)
-          << "bits [" << l << ", " << r << "]";
-      EXPECT_EQ(given.topKCoverage, counted.topKCoverage)
-          << "bits [" << l << ", " << r << "]";
+          << where;
+      EXPECT_EQ(given.topKCoverage, counted.topKCoverage) << where;
+
+      EXPECT_EQ(given.min, counted.min) << where;
+      EXPECT_EQ(given.max, counted.max) << where;
+      EXPECT_EQ(given.range, counted.range) << where;
+      EXPECT_EQ(given.runCount, counted.runCount) << where;
+      EXPECT_EQ(given.avgRunLength, counted.avgRunLength) << where;
+      EXPECT_EQ(given.bitWidthBuckets, counted.bitWidthBuckets) << where;
+      EXPECT_EQ(given.sumAbsDelta, counted.sumAbsDelta) << where;
+      EXPECT_EQ(given.monotonicCount, counted.monotonicCount) << where;
+      EXPECT_EQ(given.maxDelta, counted.maxDelta) << where;
     }
   }
 }
