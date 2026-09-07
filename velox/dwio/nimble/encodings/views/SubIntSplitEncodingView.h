@@ -938,16 +938,6 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // mattered more to throughput than the gather itself, by evicting lines
   // this loop was about to read -- proof that "not cheap" and "the top cost"
   // are not the same question.
-  //
-  // Gathered and accumulated one kViewChunkSize-sized slice at a time,
-  // rather than gathering the whole block into a `moved` buffer that size
-  // and only then handing it to accumulateSubIntSplitSection: a multi-MB
-  // `moved` buffer is evicted from L1 well before the kernel gets to read it
-  // back, where a chunk this size stays resident between the write here and
-  // the read inside the kernel. This is the same chunking the untransformed
-  // path's readSectionChunk already does; the kernel itself is untouched; it
-  // still runs on a contiguous, vectorisable input, just a smaller one, more
-  // often.
   template <typename SectionT>
   void permuteSection(
       const Section& section,
@@ -956,32 +946,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       physicalType* output) const {
     const auto& positions = positionMap();
 
-    // Fully overwritten below before being read.
+    // Both fully overwritten below before being read: `whole` by the
+    // sequential section read, `moved` by the gather loop that follows it.
     thread_local velox::raw_vector<uint8_t> whole;
+    thread_local velox::raw_vector<uint8_t> moved;
     whole.resize(static_cast<size_t>(this->rowCount_) * sizeof(SectionT));
+    moved.resize(static_cast<size_t>(blockCount) * sizeof(SectionT));
+
     auto* source = reinterpret_cast<SectionT*>(whole.data());
     section.view->read(0, this->rowCount_, source);
-
-    // Sized once to a fixed constant rather than to blockCount, so unlike
-    // `whole` this never grows again after its first use.
-    thread_local velox::raw_vector<uint8_t> movedChunk;
-    movedChunk.resize(static_cast<size_t>(kViewChunkSize) * sizeof(SectionT));
-    auto* destination = reinterpret_cast<SectionT*>(movedChunk.data());
-
-    for (uint32_t chunkStart = 0; chunkStart < blockCount;
-         chunkStart += kViewChunkSize) {
-      const uint32_t chunkCount =
-          std::min(kViewChunkSize, blockCount - chunkStart);
-      for (uint32_t row = 0; row < chunkCount; ++row) {
-        destination[row] = source[positions[blockStart + chunkStart + row]];
-      }
-      detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
-          destination,
-          output + chunkStart,
-          chunkCount,
-          section.mask,
-          section.bitStart);
+    auto* destination = reinterpret_cast<SectionT*>(moved.data());
+    for (uint32_t row = 0; row < blockCount; ++row) {
+      destination[row] = source[positions[blockStart + row]];
     }
+    detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
+        destination, output, blockCount, section.mask, section.bitStart);
   }
 
   // Reads one whole transform block, undoing every transform on it.
