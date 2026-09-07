@@ -18,10 +18,10 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
-
-#include <folly/CPortability.h>
 #include <utility>
 #include <vector>
+
+#include <folly/CPortability.h>
 
 #include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/Vector.h"
@@ -951,7 +951,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       const Section& section,
       uint32_t blockStart,
       uint32_t blockCount,
-      physicalType* output) const {
+      physicalType* output,
+      bool isFirst) const {
     const auto& positions = positionMap();
 
     // Fully overwritten below before being read, by the sequential section
@@ -974,6 +975,15 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     const int shift = section.bitStart;
     const uint32_t* __restrict__ rows = positions.data() + blockStart;
     physicalType* __restrict__ out = output;
+    // Seeding writes the whole word, so the caller does not have to clear the
+    // output first. Two loops rather than a branch per row, which is what the
+    // accumulate kernel does for the same reason.
+    if (isFirst) {
+      for (uint32_t row = 0; row < blockCount; ++row) {
+        out[row] = static_cast<physicalType>(source[rows[row]] & mask) << shift;
+      }
+      return;
+    }
     for (uint32_t row = 0; row < blockCount; ++row) {
       out[row] |= static_cast<physicalType>(source[rows[row]] & mask) << shift;
     }
@@ -1128,11 +1138,19 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           state);
     }
 
-    for (uint32_t row = 0; row < blockCount; ++row) {
-      output[row] = constantBits_;
+    // A section that seeds writes the whole word, so the clear is only needed
+    // where nothing will. readPhysical has always known this; this path did
+    // not, and paid a full-column store pass on every block to write zeros
+    // that the first section immediately overwrote.
+    const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
+    if (seedWithConstant) {
+      std::fill_n(output, blockCount, constantBits_);
     }
+    bool isFirst = !seedWithConstant;
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
+      const bool sectionSeeds = isFirst;
+      isFirst = false;
       if (isPermuted(section)) {
         // Moved, then accumulated at its own width. Widening this to 64 bits
         // first and assembling the word by hand costs several times the memory
@@ -1145,16 +1163,20 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         // claim as cheap.
         switch (section.storageBytes) {
           case 1:
-            permuteSection<uint8_t>(section, blockStart, blockCount, output);
+            permuteSection<uint8_t>(
+                section, blockStart, blockCount, output, sectionSeeds);
             break;
           case 2:
-            permuteSection<uint16_t>(section, blockStart, blockCount, output);
+            permuteSection<uint16_t>(
+                section, blockStart, blockCount, output, sectionSeeds);
             break;
           case 4:
-            permuteSection<uint32_t>(section, blockStart, blockCount, output);
+            permuteSection<uint32_t>(
+                section, blockStart, blockCount, output, sectionSeeds);
             break;
           default:
-            permuteSection<uint64_t>(section, blockStart, blockCount, output);
+            permuteSection<uint64_t>(
+                section, blockStart, blockCount, output, sectionSeeds);
             break;
         }
         continue;
@@ -1165,20 +1187,51 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         switch (section.storageBytes) {
           case 1:
             readSectionChunk<uint8_t>(
-                section, blockStart, blockCount, output, false, scratch.data());
+                section,
+                blockStart,
+                blockCount,
+                output,
+                sectionSeeds,
+                scratch.data());
             break;
           case 2:
             readSectionChunk<uint16_t>(
-                section, blockStart, blockCount, output, false, scratch.data());
+                section,
+                blockStart,
+                blockCount,
+                output,
+                sectionSeeds,
+                scratch.data());
             break;
           case 4:
             readSectionChunk<uint32_t>(
-                section, blockStart, blockCount, output, false, scratch.data());
+                section,
+                blockStart,
+                blockCount,
+                output,
+                sectionSeeds,
+                scratch.data());
             break;
           default:
             readSectionChunk<uint64_t>(
-                section, blockStart, blockCount, output, false, scratch.data());
+                section,
+                blockStart,
+                blockCount,
+                output,
+                sectionSeeds,
+                scratch.data());
             break;
+        }
+        continue;
+      }
+      // The third way a section can reach the output, and the one that has to
+      // seed too when it comes first: without this it ORs into memory nothing
+      // has written yet.
+      if (sectionSeeds) {
+        for (uint32_t row = 0; row < blockCount; ++row) {
+          output[row] =
+              static_cast<physicalType>(sectionValues[i][row] & section.mask)
+              << section.bitStart;
         }
         continue;
       }
