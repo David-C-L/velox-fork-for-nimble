@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "velox/dwio/nimble/common/Types.h"
@@ -102,6 +103,125 @@ class BitRangeExtractor {
   int bitEnd_;
 };
 
+// Incremental equality partition over the same bit ranges BitRangeExtractor
+// walks.
+//
+// The extractor keeps a segment's values in row order, which run counting and
+// the delta statistics read. This keeps the same values grouped by equality,
+// which is what the frequency metrics read and what row order cannot give.
+// Neither structure serves the other's purpose, so both run.
+//
+// Why the counts it reports are the counts a hash map would report, rather
+// than an approximation of them: two samples fall in the same group exactly
+// when they agree on the bits the range covers, and their extracted values are
+// equal exactly when they agree on those same bits. The groups therefore ARE
+// the equivalence classes of the extracted value, so the multiset of group
+// sizes IS the multiset of frequencies, and unique count, dominant count and
+// the coverage tiers follow from it directly. That argument is the reason to
+// believe this; the tests exist to catch the implementation failing to match
+// the argument, which is a different thing from establishing it.
+//
+// Widening a range by one bit can only split a group, never merge two, so each
+// step refines the partition in place instead of rebuilding it.
+class BitRangePartition {
+ public:
+  // Starts a fresh left edge: every sample in one group, split by bitStart, so
+  // the partition describes the one-bit range [bitStart, bitStart].
+  void reset(const std::vector<uint64_t>& samples, int bitStart) {
+    values_.assign(samples.begin(), samples.end());
+    starts_.clear();
+    countsDirty_ = true;
+    if (values_.empty()) {
+      return;
+    }
+    starts_.push_back(0);
+    splitGroups(bitStart);
+  }
+
+  // Widens the range by one bit. Free once every group is a singleton, because
+  // no bit can split a group of one: the partition, and so every count taken
+  // from it, is already final for every wider range on this left edge.
+  void extend(int bit) {
+    if (starts_.size() == values_.size()) {
+      return;
+    }
+    splitGroups(bit);
+    countsDirty_ = true;
+  }
+
+  // Frequency metrics for the range covered so far.
+  const FrequencyCounts& counts() {
+    if (countsDirty_) {
+      recomputeCounts();
+      countsDirty_ = false;
+    }
+    return counts_;
+  }
+
+ private:
+  void splitGroups(int bit) {
+    const uint64_t mask = uint64_t{1} << bit;
+    const size_t groupCount = starts_.size();
+    nextStarts_.clear();
+    for (size_t group = 0; group < groupCount; ++group) {
+      const size_t start = starts_[group];
+      const size_t end =
+          group + 1 < groupCount ? starts_[group + 1] : values_.size();
+      // Zeros forward, ones backward, meeting in the middle. This reverses the
+      // ones among themselves, which looks like a bug in a partition and is
+      // not one here: nothing reads the order within a group, only its size.
+      // Not having to be stable is what keeps this to a single pass with no
+      // scratch buffer, where a stable partition would need both.
+      size_t low = start;
+      size_t high = end;
+      while (low < high) {
+        if ((values_[low] & mask) == 0) {
+          ++low;
+        } else {
+          --high;
+          std::swap(values_[low], values_[high]);
+        }
+      }
+      if (low > start) {
+        nextStarts_.push_back(static_cast<uint32_t>(start));
+      }
+      if (end > low) {
+        nextStarts_.push_back(static_cast<uint32_t>(low));
+      }
+    }
+    starts_.swap(nextStarts_);
+  }
+
+  void recomputeCounts() {
+    counts_ = FrequencyCounts{};
+    const size_t groupCount = starts_.size();
+    counts_.uniqueCount = groupCount;
+    LargestFrequencies largest;
+    uint32_t dominant = 0;
+    for (size_t group = 0; group < groupCount; ++group) {
+      const size_t end =
+          group + 1 < groupCount ? starts_[group + 1] : values_.size();
+      const auto size = static_cast<uint32_t>(end - starts_[group]);
+      if (size > dominant) {
+        dominant = size;
+      }
+      largest.offer(size);
+    }
+    counts_.dominantCount = dominant;
+    counts_.largest = largest.values();
+  }
+
+  // The samples themselves, permuted so that each group is contiguous. Holding
+  // values rather than indices keeps every read sequential, and at the sample
+  // sizes the selector uses the whole array sits in the first-level cache.
+  std::vector<uint64_t> values_;
+  // Where each group starts. The last group runs to values_.size().
+  std::vector<uint32_t> starts_;
+  std::vector<uint32_t> nextStarts_;
+  FrequencyCounts counts_;
+  bool countsDirty_{true};
+};
+
 struct SelectorResult {
   std::vector<SegmentPlan> segments;
   double totalCost{0.0};
@@ -143,13 +263,37 @@ inline SelectorResult selectSplitsImpl(
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
 
+  // A partition cannot describe a capped count. Capping freezes the running
+  // maximum at whichever element crossed the cap, which is a property of the
+  // order the values arrived in, and a partition discards that order by
+  // design. It never has to here: capping needs more distinct values than a
+  // sample this size can hold.
+  //
+  // This is a fallback and not an assertion, deliberately. A caller sampling
+  // more than the cap is not doing anything wrong, and this hands them the
+  // counting path they get today rather than failing on them. Please do not
+  // tighten it into a check on the grounds that it reads like one.
+  const bool partitionCounts = numSamples <= MetricCollector::kUniqueCountCap;
+  BitRangePartition partition;
+
   for (int l = 0; l < sz; ++l) {
     extractor.reset(l);
+    if (partitionCounts) {
+      partition.reset(samples, l);
+    }
     for (int r = l; r < sz; ++r) {
       extractor.extend(r);
+      // reset() already covers the one-bit range at r == l, so the partition
+      // widens only from the second column on. The two structures describe the
+      // same bit range at every step, and nothing checks that they do beyond
+      // this pairing, so they are stepped side by side rather than apart.
+      if (partitionCounts && r > l) {
+        partition.extend(r);
+      }
       const std::vector<uint64_t>& segValues = extractor.values();
-      const SegmentMetrics metrics =
-          collector.compute(segValues, requiredFlags);
+      const SegmentMetrics metrics = partitionCounts
+          ? collector.compute(segValues, requiredFlags, partition.counts())
+          : collector.compute(segValues, requiredFlags);
       const int bitWidth = r - l + 1;
 
       EncodingType bestEnc = EncodingType::Trivial;

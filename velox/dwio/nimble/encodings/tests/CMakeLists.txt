@@ -79,7 +79,7 @@ if(NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
   target_sources(
     nimble_encodings_tests
     PRIVATE SubIntSplitEncodingTest.cpp SubIntSplitCostModelsTest.cpp
-            SubIntSplitEncodingViewTest.cpp
+            SubIntSplitEncodingViewTest.cpp SubIntSplitSelectorTest.cpp
   )
 endif()
 

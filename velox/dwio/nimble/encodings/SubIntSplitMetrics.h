@@ -103,6 +103,45 @@ struct SegmentMetrics {
   std::array<double, 4> topKCoverage{};
 };
 
+/// Frequency metrics a caller may supply instead of having MetricCollector
+/// count them, for a caller holding a structure that already knows them.
+struct FrequencyCounts {
+  size_t uniqueCount{0};
+  uint32_t dominantCount{0};
+  // The eight largest frequencies, descending, zero-padded.
+  std::array<uint32_t, 8> largest{};
+};
+
+// Keeps the eight largest frequencies offered to it, descending and
+// zero-padded.
+//
+// Coverage never needs more than eight, so sorting every distinct value's
+// count does far more work than the answer requires. The zero padding is what
+// makes a short alphabet fall out on its own: summing past the end adds zeros
+// and leaves the whole segment, which is the total a sorted walk reaches by
+// running out of frequencies to add.
+class LargestFrequencies {
+ public:
+  void offer(uint32_t frequency) noexcept {
+    if (frequency <= largest_[7]) {
+      return;
+    }
+    size_t i = 7;
+    while (i > 0 && largest_[i - 1] < frequency) {
+      largest_[i] = largest_[i - 1];
+      --i;
+    }
+    largest_[i] = frequency;
+  }
+
+  const std::array<uint32_t, 8>& values() const noexcept {
+    return largest_;
+  }
+
+ private:
+  std::array<uint32_t, 8> largest_{};
+};
+
 // Single-pass metric collector for extracted bit-range values.
 // Counts unique and dominant values two ways -- a direct-indexed histogram
 // where the values are narrow enough to index, a frequency map otherwise
@@ -123,6 +162,13 @@ class MetricCollector {
   // 256KB, but a segment touches one slot per distinct value and only those
   // are cleared again, so what stays resident is the segment's cardinality
   // rather than the table.
+  //
+  // The split selector no longer reaches either counting path: it maintains an
+  // equality partition across its inner loop and supplies the counts through
+  // the FrequencyCounts overload below, which covers every width and costs no
+  // hashing at any of them. Both paths remain for compute()'s other callers,
+  // which hold no such partition. So neither shows in an encode profile, and
+  // that is expected rather than evidence they are dead.
   static constexpr int kDirectHistogramBits = 16;
 
   // Maps bit_width(v) to a bucket index in [0, 9], grouping every 7 bits.
@@ -133,14 +179,53 @@ class MetricCollector {
   SegmentMetrics compute(
       const std::vector<uint64_t>& values,
       MetricFlags flags = static_cast<MetricFlags>(MetricFlag::All)) {
+    return computeImpl(values, flags, nullptr);
+  }
+
+  /// Computes the metrics that come from scanning the segment, and takes the
+  /// ones that come from counting it rather than counting it again. For a
+  /// caller that already holds the frequencies, such as one maintaining an
+  /// equality partition across a grid of bit ranges.
+  SegmentMetrics compute(
+      const std::vector<uint64_t>& values,
+      MetricFlags flags,
+      const FrequencyCounts& counts) {
+    return computeImpl(values, flags, &counts);
+  }
+
+ private:
+  // Cumulative coverage of the top 1, 2, 4 and 8 values, from the eight
+  // largest frequencies. Shared by every path so that supplying counts and
+  // counting them cannot drift apart in the arithmetic.
+  static void fillCoverage(
+      const std::array<uint32_t, 8>& largest,
+      size_t count,
+      std::array<double, 4>& coverage) noexcept {
+    constexpr size_t kTopKs[4] = {1, 2, 4, 8};
+    const double total = static_cast<double>(count);
+    uint64_t cumulative = 0;
+    size_t taken = 0;
+    for (size_t ki = 0; ki < 4; ++ki) {
+      for (; taken < kTopKs[ki]; ++taken) {
+        cumulative += largest[taken];
+      }
+      coverage[ki] = static_cast<double>(cumulative) / total;
+    }
+  }
+
+  SegmentMetrics computeImpl(
+      const std::vector<uint64_t>& values,
+      MetricFlags flags,
+      const FrequencyCounts* supplied) {
     const bool doMin = hasFlag(flags, MetricFlag::MinMax);
     const bool doRun = hasFlag(flags, MetricFlag::RunStats);
     const bool doDominant = hasFlag(flags, MetricFlag::DominantValue);
     const bool doFreqTiers = hasFlag(flags, MetricFlag::FrequencyTiers);
     // FrequencyTiers requires frequency counts, which subsumes UniqueCount.
     const bool doUniq = hasFlag(flags, MetricFlag::UniqueCount) || doFreqTiers;
-    // Unique count and dominant value share a single frequency map pass.
-    const bool doFreq = doUniq || doDominant;
+    // Unique count and dominant value share a single frequency map pass, and
+    // a caller supplying them spares us the pass entirely.
+    const bool doFreq = (doUniq || doDominant) && supplied == nullptr;
     const bool doHist = hasFlag(flags, MetricFlag::BitWidthHistogram);
     const bool doDelta = hasFlag(flags, MetricFlag::DeltaStats);
 
@@ -256,54 +341,33 @@ class MetricCollector {
           static_cast<double>(n) / static_cast<double>(out.runCount);
     }
     if (doUniq) {
-      out.uniqueCount = useDirectHistogram
+      out.uniqueCount = supplied != nullptr ? supplied->uniqueCount
+          : useDirectHistogram
           ? touched_.size()
           : (capped ? (kUniqueCountCap + 1) : freqMap_.size());
       out.uniqueCountCapped = capped;
     }
     if (doDominant) {
-      out.dominantCount = maxCount;
+      out.dominantCount =
+          supplied != nullptr ? supplied->dominantCount : maxCount;
       out.dominantCountCapped = capped;
     }
     if (doFreqTiers && !capped) {
-      // Coverage asks only for the eight largest frequencies, so they are
-      // selected in one pass rather than sorting every distinct value's count.
-      // The array stays zero-padded, which is what makes a short alphabet fall
-      // out on its own: summing past the end adds zeros and leaves the whole
-      // segment, the same total the sorted loop reached by running out of
-      // frequencies to add.
-      std::array<uint32_t, 8> largest{};
-      const auto offer = [&largest](uint32_t frequency) {
-        if (frequency <= largest[7]) {
-          return;
-        }
-        size_t i = 7;
-        while (i > 0 && largest[i - 1] < frequency) {
-          largest[i] = largest[i - 1];
-          --i;
-        }
-        largest[i] = frequency;
-      };
-      if (useDirectHistogram) {
-        for (const uint32_t value : touched_) {
-          offer(counts_[value]);
-        }
+      if (supplied != nullptr) {
+        fillCoverage(supplied->largest, n, out.topKCoverage);
       } else {
-        for (const auto& [val, cnt] : freqMap_) {
-          (void)val;
-          offer(cnt);
+        LargestFrequencies largest;
+        if (useDirectHistogram) {
+          for (const uint32_t value : touched_) {
+            largest.offer(counts_[value]);
+          }
+        } else {
+          for (const auto& [val, cnt] : freqMap_) {
+            (void)val;
+            largest.offer(cnt);
+          }
         }
-      }
-
-      constexpr size_t kTopKs[4] = {1, 2, 4, 8};
-      const double dn = static_cast<double>(n);
-      uint64_t cumFreq = 0;
-      size_t taken = 0;
-      for (size_t ki = 0; ki < 4; ++ki) {
-        for (; taken < kTopKs[ki]; ++taken) {
-          cumFreq += largest[taken];
-        }
-        out.topKCoverage[ki] = static_cast<double>(cumFreq) / dn;
+        fillCoverage(largest.values(), n, out.topKCoverage);
       }
     }
 
@@ -318,7 +382,6 @@ class MetricCollector {
     return out;
   }
 
- private:
   // Frequency map for unique/dominant counting, used for segments whose values
   // are too wide to index directly.
   absl::flat_hash_map<uint64_t, uint32_t> freqMap_;
