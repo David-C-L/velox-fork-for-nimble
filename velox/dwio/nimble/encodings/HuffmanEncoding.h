@@ -214,6 +214,12 @@ class HuffmanEncoding final
     return assignCodeLengths(nodes, queue.top().node, 0, lengths);
   }
 
+  // Whether every Huffman code over `frequencies` fits in kMaxCodeBits.
+  // Answers the only question estimateSize asks of the tree, without building
+  // one. Sorts `frequencies` in place, so the caller must not rely on their
+  // order afterwards.
+  static bool codeLengthsFit(std::vector<uint32_t>& frequencies);
+
   physicalType decodeValue(uint32_t row) const;
 
   Vector<physicalType> alphabet_;
@@ -324,6 +330,84 @@ void HuffmanEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
 }
 
 template <typename T>
+bool HuffmanEncoding<T>::codeLengthsFit(std::vector<uint32_t>& frequencies) {
+  const size_t symbolCount = frequencies.size();
+  // A Huffman tree over k leaves is at most k-1 deep, so a small alphabet
+  // cannot break the limit however skewed its counts are.
+  if (symbolCount <= size_t{kMaxCodeBits} + 1) {
+    return true;
+  }
+
+  std::sort(frequencies.begin(), frequencies.end());
+
+  // Katona-Nemetz: a leaf of weight w at depth d forces a total weight of at
+  // least Fibonacci(d + 2) * w, so a total below Fibonacci(14) times the rarest
+  // count cannot reach depth 13. Held one Fibonacci step short of what the
+  // bound allows, since being certain of the constant is worth more than the
+  // alphabets it would additionally catch: a distribution flat enough to pass
+  // this test is cheap to merge outright anyway.
+  constexpr uint64_t kShallowTotalRatio = 377;
+  uint64_t totalWeight = 0;
+  for (const auto frequency : frequencies) {
+    totalWeight += frequency;
+  }
+  if (totalWeight < kShallowTotalRatio * frequencies.front()) {
+    return true;
+  }
+
+  // buildCodeLengths pops its queue in (frequency, node index) order, and two
+  // sorted sequences reproduce that order exactly: the leaves, sorted by
+  // frequency just above, and the internal nodes, which Huffman creates in
+  // nondecreasing weight order and which therefore stay sorted in creation
+  // order. Every leaf index is below every internal index, so a tie across the
+  // two sequences goes to the leaf. Merging them builds the same tree with no
+  // heap and no nodes, and carrying a height alongside each weight finds the
+  // deepest leaf without walking a tree that no longer exists.
+  //
+  // The loop below also passes through the weight of every internal node it
+  // creates, and those weights sum to the weighted path length sum(f * l),
+  // since each leaf's count is added once per node standing above it. An exact
+  // Huffman bit count, to replace the Shannon sum estimateSize charges today,
+  // is therefore an accumulator here rather than a rewrite, and wants neither
+  // the tree nor per-symbol lengths -- though it would have to bypass the two
+  // early accepts above, which answer without merging anything. Per-symbol
+  // lengths are the one thing this shape cannot give back: a height measures
+  // downward to the deepest leaf, not upward to the root, so lengths would need
+  // child links and a second walk. Nothing asks for them.
+  struct Subtree {
+    uint64_t weight;
+    uint8_t height;
+  };
+  std::vector<Subtree> internals;
+  internals.reserve(symbolCount - 1);
+
+  size_t leafIndex = 0;
+  size_t internalIndex = 0;
+  const auto takeSmallest = [&]() -> Subtree {
+    if (leafIndex < symbolCount &&
+        (internalIndex == internals.size() ||
+         frequencies[leafIndex] <= internals[internalIndex].weight)) {
+      return {frequencies[leafIndex++], 0};
+    }
+    return internals[internalIndex++];
+  };
+
+  for (size_t remaining = symbolCount; remaining > 1; --remaining) {
+    const auto left = takeSmallest();
+    const auto right = takeSmallest();
+    const auto height =
+        static_cast<uint8_t>(1 + std::max(left.height, right.height));
+    // Every node hangs below the root, so a subtree already past the limit is
+    // proof enough that the deepest leaf is too.
+    if (height > kMaxCodeBits) {
+      return false;
+    }
+    internals.push_back({left.weight + right.weight, height});
+  }
+  return true;
+}
+
+template <typename T>
 std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     std::span<const physicalType> values,
     const Statistics<physicalType>& statistics,
@@ -337,30 +421,26 @@ std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     return std::nullopt;
   }
 
-  folly::F14FastMap<physicalType, uint32_t> symbolByValue;
+  // Both questions left to answer -- how many bits the codes take, and whether
+  // the longest of them fits in kMaxCodeBits -- depend only on the multiset of
+  // frequencies, never on which value carries which count. Symbol identity
+  // reaches the tree solely as a tie-break between equally frequent leaves, and
+  // exchanging two equally weighted leaves moves no leaf to a different depth.
+  // So the counts Statistics is already holding answer both, and the pass over
+  // the values that used to rebuild them is redundant.
   std::vector<uint32_t> frequencies;
   frequencies.reserve(uniqueCounts->size());
-  for (const auto value : values) {
-    auto [it, inserted] =
-        symbolByValue.emplace(value, static_cast<uint32_t>(frequencies.size()));
-    if (inserted) {
-      frequencies.push_back(0);
-    }
-    ++frequencies[it->second];
-  }
-  std::vector<TreeNode> nodes;
-  nodes.reserve(2 * frequencies.size() - 1);
-  std::vector<uint8_t> lengths(frequencies.size());
-  if (!buildCodeLengths(frequencies, nodes, lengths)) {
-    return std::nullopt;
-  }
-
   uint64_t encodedBits = 0;
   const uint64_t rowsMinusOne = values.size() - 1;
   for (const auto& [value, count] : uniqueCounts.value()) {
     (void)value;
+    frequencies.push_back(static_cast<uint32_t>(count));
     encodedBits += count * velox::bits::bitsRequired(rowsMinusOne / count);
   }
+  if (!codeLengthsFit(frequencies)) {
+    return std::nullopt;
+  }
+
   const uint64_t checkpoints =
       velox::bits::divRoundUp(values.size(), kCheckpointStride);
   const uint64_t bitstreamBytes = (encodedBits + 7) / 8 + 4;

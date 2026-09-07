@@ -18,9 +18,13 @@
 #include <fmt/core.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <numeric>
+#include <queue>
+#include <random>
+#include <utility>
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/memory/Memory.h"
@@ -299,6 +303,38 @@ TEST_F(HuffmanEncodingTest, estimateRejectsUnsupportedCardinality) {
       std::nullopt);
 }
 
+TEST_F(HuffmanEncodingTest, estimateAcceptsCodeTreeAtLimit) {
+  // One Fibonacci weight short of estimateRejectsCodeTreePastLimit below.
+  // Fibonacci weights are what drive a Huffman tree to its deepest, so these
+  // two tests sit either side of the 12-bit boundary: this one codes its
+  // rarest symbol in exactly 12 bits and must be accepted, the next needs 13
+  // and must not be.
+  constexpr std::array<uint32_t, 13> kFrequencies = {
+      1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233};
+  Vector<uint32_t> values{pool_.get()};
+  for (uint32_t symbol = 0; symbol < kFrequencies.size(); ++symbol) {
+    for (uint32_t count = 0; count < kFrequencies[symbol]; ++count) {
+      values.push_back(symbol);
+    }
+  }
+
+  const std::span<const uint32_t> input{values.data(), values.size()};
+  EXPECT_NO_THROW(encode(values));
+  EXPECT_TRUE(HuffmanEncoding<uint32_t>::estimateSize(
+                  input, Statistics<uint32_t>::create(input))
+                  .has_value());
+}
+
+TEST_F(HuffmanEncodingTest, estimateAcceptsBalancedMaximumAlphabet) {
+  // kMaxSymbols equally frequent symbols build a perfectly balanced tree of
+  // depth log2(4096) = 12, the deepest tree the table can still hold.
+  std::vector<uint32_t> values(HuffmanEncoding<uint32_t>::kMaxSymbols);
+  std::iota(values.begin(), values.end(), 0);
+  EXPECT_TRUE(HuffmanEncoding<uint32_t>::estimateSize(
+                  values, Statistics<uint32_t>::create(values))
+                  .has_value());
+}
+
 TEST_F(HuffmanEncodingTest, estimateRejectsCodeTreePastLimit) {
   constexpr std::array<uint32_t, 14> kFrequencies = {
       1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377};
@@ -344,6 +380,123 @@ TEST_F(HuffmanEncodingTest, estimateSizeIncludesCodesAndCheckpoints) {
       varint::varintSize(bitstreamBytesAcrossCheckpoint) +
       bitstreamBytesAcrossCheckpoint;
   EXPECT_EQ(estimateAcrossCheckpoint, expectedAcrossCheckpoint);
+}
+
+// Maximum leaf depth of the Huffman tree over `frequencies`, built the long
+// way: an explicit tree through a priority queue, then a traversal.
+// Deliberately a different algorithm from the estimator's own feasibility
+// check, so the test below compares two implementations rather than one against
+// a copy of itself.
+uint32_t maxHuffmanCodeLength(const std::vector<uint64_t>& frequencies) {
+  struct Entry {
+    uint64_t frequency;
+    int32_t node;
+
+    bool operator>(const Entry& other) const {
+      return frequency != other.frequency ? frequency > other.frequency
+                                          : node > other.node;
+    }
+  };
+  struct Node {
+    uint64_t frequency;
+    int32_t left;
+    int32_t right;
+  };
+
+  std::vector<Node> nodes;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+  for (uint32_t symbol = 0; symbol < frequencies.size(); ++symbol) {
+    nodes.push_back({frequencies[symbol], -1, -1});
+    queue.push({frequencies[symbol], static_cast<int32_t>(symbol)});
+  }
+  while (queue.size() > 1) {
+    const auto left = queue.top();
+    queue.pop();
+    const auto right = queue.top();
+    queue.pop();
+    const auto node = static_cast<int32_t>(nodes.size());
+    nodes.push_back({left.frequency + right.frequency, left.node, right.node});
+    queue.push({left.frequency + right.frequency, node});
+  }
+
+  uint32_t maxDepth = 0;
+  std::vector<std::pair<int32_t, uint32_t>> pending{{queue.top().node, 0}};
+  while (!pending.empty()) {
+    const auto [node, depth] = pending.back();
+    pending.pop_back();
+    if (nodes[node].left < 0) {
+      maxDepth = std::max(maxDepth, depth);
+      continue;
+    }
+    pending.push_back({nodes[node].left, depth + 1});
+    pending.push_back({nodes[node].right, depth + 1});
+  }
+  return maxDepth;
+}
+
+TEST_F(HuffmanEncodingTest, estimateFeasibilityMatchesTreeDepth) {
+  std::mt19937 rng{20260907};
+  size_t trialsAtLimit = 0;
+  size_t trialsPastLimit = 0;
+
+  for (int trial = 0; trial < 400; ++trial) {
+    // Half the trials grow along a Fibonacci-like chain, from random seeds and
+    // with one weight nudged so the chain is not always exact, because that is
+    // what drives a tree to the 12-bit boundary the estimator has to decide.
+    // The rest stay flat and repetitive to exercise equal-frequency tie-breaks.
+    const bool skewed = trial % 2 == 0;
+    const uint32_t symbolCount = skewed
+        ? std::uniform_int_distribution<uint32_t>{2, 18}(rng)
+        : std::uniform_int_distribution<uint32_t>{2, 40}(rng);
+
+    std::vector<uint64_t> frequencies(symbolCount);
+    if (skewed) {
+      std::uniform_int_distribution<uint64_t> seed{1, 3};
+      frequencies[0] = seed(rng);
+      frequencies[1] = seed(rng);
+      for (uint32_t symbol = 2; symbol < symbolCount; ++symbol) {
+        frequencies[symbol] = frequencies[symbol - 1] + frequencies[symbol - 2];
+      }
+      const uint32_t nudged =
+          std::uniform_int_distribution<uint32_t>{0, symbolCount - 1}(rng);
+      frequencies[nudged] += std::uniform_int_distribution<uint64_t>{0, 2}(rng);
+    } else {
+      for (uint32_t symbol = 0; symbol < symbolCount; ++symbol) {
+        frequencies[symbol] =
+            std::uniform_int_distribution<uint64_t>{1, 4}(rng);
+      }
+    }
+
+    std::vector<uint32_t> values;
+    for (uint32_t symbol = 0; symbol < symbolCount; ++symbol) {
+      values.insert(values.end(), frequencies[symbol], symbol);
+    }
+    // Shuffled so that the estimator numbers its symbols in first-appearance
+    // order rather than in frequency order. The answer must depend on the
+    // multiset of frequencies alone, never on which value carries which count.
+    std::shuffle(values.begin(), values.end(), rng);
+
+    const std::span<const uint32_t> input{values.data(), values.size()};
+    const auto estimate = HuffmanEncoding<uint32_t>::estimateSize(
+        input, Statistics<uint32_t>::create(input));
+    const uint32_t depth = maxHuffmanCodeLength(frequencies);
+
+    EXPECT_EQ(
+        estimate.has_value(), depth <= HuffmanEncoding<uint32_t>::kMaxCodeBits)
+        << "trial " << trial << " with " << symbolCount
+        << " symbols reaching depth " << depth;
+
+    if (depth == HuffmanEncoding<uint32_t>::kMaxCodeBits) {
+      ++trialsAtLimit;
+    } else if (depth == HuffmanEncoding<uint32_t>::kMaxCodeBits + 1) {
+      ++trialsPastLimit;
+    }
+  }
+
+  // An off-by-one in the depth accounting only shows up on the boundary, so
+  // fail loudly if the generated trials never reached it.
+  EXPECT_GT(trialsAtLimit, 0u);
+  EXPECT_GT(trialsPastLimit, 0u);
 }
 
 } // namespace
