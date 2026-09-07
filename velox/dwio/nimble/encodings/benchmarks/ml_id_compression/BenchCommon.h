@@ -1266,6 +1266,75 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
+  // Whether SubIntSplit's planner may cost a bit range as Huffman. Off is now
+  // the default, so huffOn is the arm that reproduces the older behaviour.
+  //
+  // What moves is not which encoding a section gets. Huffman cannot be one on
+  // this path: sections are selected by the policy
+  // BenchEncodingSelectionPolicy::createImpl builds, whose candidates are the
+  // default read factors, and Huffman is not among them. What moves is where
+  // the split boundaries fall, because the planner costs Huffman when it
+  // scores a bit range and the DP minimises over those costs. The sections
+  // those boundaries produce are what a read then pays for, which is how an
+  // encoding that is never read decided read speed.
+  //
+  // Names avoid commas: the --mlidc_encoders filter splits its list on them.
+  {
+    const std::vector<std::pair<uint8_t, const char*>> transformArms{
+        {0, ""},
+        {static_cast<uint8_t>(subintsplit::TransformId::KeyDerived),
+         "key_derived"},
+    };
+    for (const bool allowHuffman : {true, false}) {
+      for (const auto& transformArm : transformArms) {
+        const uint8_t rawId = transformArm.first;
+        const std::string transformName = transformArm.second;
+        for (const bool view : {false, true}) {
+          EncoderEntry<T> entry;
+          std::string name =
+              std::string("SIS/") + (allowHuffman ? "huffOn" : "huffOff");
+          if (!transformName.empty()) {
+            name += "/" + transformName;
+          }
+          if (view) {
+            name += "+view";
+          }
+          entry.name = std::move(name);
+          entry.family = "SubIntSplit";
+          entry.variant = view ? "real_nested_view" : "real_nested";
+          entry.inventory = allowHuffman ? "full" : "no_huffman";
+          entry.transform = transformName;
+          entry.isSequential = false;
+          entry.fastSkip = view;
+          entry.randomAccess = view;
+          entry.factory = [allowHuffman, rawId, view](
+                              const Vector<T>& data,
+                              const Encoding::Options& opts) {
+            Encoding::Options o = opts;
+            o.subIntSplitAllowHuffman = allowHuffman;
+            if (rawId != 0) {
+              o.subIntSplitTransform = rawId;
+              // 0xFF: let the encoder find the section worth keying on
+              // rather than assert one, as the transform arms above do.
+              o.subIntSplitKeySection = 0xFF;
+            }
+            if (view) {
+              auto impl = std::make_unique<
+                  NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+              impl->encodeWith(data, o, /*realNestedSelection=*/true);
+              return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+            }
+            auto impl = std::make_unique<
+                NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+            impl->target.encode(data, o, /*realNestedSelection=*/true);
+            return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+          };
+          encoders.push_back(std::move(entry));
+        }
+      }
+    }
+  }
+
   // Applied last so it wraps whatever the entries above produced.
   const auto outerType = parseCompressionType(FLAGS_mlidc_outer_compression);
   for (auto& entry : encoders) {

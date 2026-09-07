@@ -130,7 +130,21 @@ struct TransformContext {
   std::span<const uint32_t> keyRunIds;
   /// The value each run id stands for. As many entries as there are runs.
   std::span<const uint64_t> keyRunValues;
+  /// The permutation that stably sorts keySection, one row index per row,
+  /// where the caller has already built it. Empty otherwise, and a transform
+  /// that wants it must then derive it from keySection itself.
+  ///
+  /// Supplied because it is a property of the key alone: an encoder trying one
+  /// candidate key across several sections would otherwise rebuild the same
+  /// permutation once per section.
+  std::span<const uint32_t> keyOrder;
 };
+
+/// The permutation that stably sorts `key`, ties keeping their original row
+/// order. Exposed so that a caller holding one key across several sections can
+/// build it once and hand it back through TransformContext::keyOrder, rather
+/// than each section's transform rebuilding the same one.
+std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key);
 
 /// State a transform produces at encode and needs back at decode. What it
 /// holds depends on the transform: a relabelling carries its codebook, a

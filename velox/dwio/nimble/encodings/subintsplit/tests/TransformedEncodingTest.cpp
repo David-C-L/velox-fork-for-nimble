@@ -337,6 +337,62 @@ TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
   }
 }
 
+// Every other test here pins the key section, so none of them runs the search
+// that production actually uses: with subIntSplitKeySection unset the encoder
+// prices one attempt per candidate key and keeps the smallest. That loop is the
+// only place where work belonging to one candidate can reach another, and the
+// permutation a key-derived transform gathers by is built once per attempt.
+//
+// A permutation left over from an earlier candidate would still decode without
+// error, since the reader rebuilds the order from whichever key the header
+// names; it would simply hand back rows in an order nobody asked for. So the
+// check is not that the stream reads back, but that the search returned one of
+// the attempts it was choosing between: whatever key it settled on, pinning
+// that key has to reproduce the same bytes.
+TEST_F(TransformedEncodingTest, keySearchReturnsOneOfTheAttemptsItPriced) {
+  const auto values = packedIdentifiers(16384);
+
+  Encoding::Options searchOptions;
+  searchOptions.subIntSplitTransform =
+      static_cast<uint8_t>(TransformId::KeyDerived);
+  // 0xFF is the default, and means: try every section and keep the best.
+  // subIntSplitForceApply is deliberately not set, since it requires a pinned
+  // key and would therefore skip the very loop under test.
+  searchOptions.subIntSplitKeySection = 0xFF;
+
+  Buffer searchBuffer{*pool_};
+  const auto searched = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      searchBuffer, values, CompressionType::Uncompressed, searchOptions);
+
+  detail::SubIntSplitTransformInfo info;
+  const auto sections = detail::parseSubIntSplitSections(
+      searched, Encoding::kPrefixSize, &info);
+  ASSERT_GT(sections.size(), 1u) << "a key search needs more than one section";
+
+  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+      *pool_, searched, nullptr, searchOptions);
+  std::vector<uint64_t> decoded(values.size());
+  encoding->materialize(values.size(), decoded.data());
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(decoded[i], values[i]) << "row " << i;
+  }
+
+  bool matchedSomeCandidate = false;
+  for (uint8_t candidate = 0; candidate < sections.size(); ++candidate) {
+    Buffer pinnedBuffer{*pool_};
+    Encoding::Options pinnedOptions = searchOptions;
+    pinnedOptions.subIntSplitKeySection = candidate;
+    const auto pinned = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        pinnedBuffer, values, CompressionType::Uncompressed, pinnedOptions);
+    if (pinned == searched) {
+      matchedSomeCandidate = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(matchedSomeCandidate)
+      << "the search produced a stream no single candidate key reproduces";
+}
+
 // A key-derived permutation spans the whole section, and a probe follows the
 // position map rather than rebuilding anything. This is the property that lets
 // it go unblocked: if the map and a full decode ever disagreed, the gain from

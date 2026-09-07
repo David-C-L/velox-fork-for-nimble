@@ -16,8 +16,10 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -724,6 +726,22 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   cachedBlockStart_ = blockStart;
 }
 
+/// Whether a plan of `candidateBytes` displaces the smallest found so far.
+///
+/// Strictly smaller, so the first candidate to reach the minimum keeps it and
+/// which key wins a tie does not depend on the order candidates are tried in.
+///
+/// The search also abandons a candidate the moment its running total stops
+/// satisfying this, which is sound only because the two questions are the same
+/// one: a plan abandoned part-way could not have displaced the incumbent had it
+/// been finished, since a plan's size only grows as sections are added. They
+/// are one function precisely so that they cannot be changed apart -- loosening
+/// this to `<=` without loosening the abandon test alongside it would silently
+/// make the search stop pricing plans it had just decided it wanted.
+inline bool improvesOnBest(size_t candidateBytes, size_t bestBytes) noexcept {
+  return candidateBytes < bestBytes;
+}
+
 // Whether sorting by these values would group anything.
 //
 // A key-derived permutation earns its keep by bringing like rows together, so
@@ -732,16 +750,17 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
 // whole apparatus for it, sorting as many runs as there are rows and probing a
 // table that large once per row, which profiling found dominating decode on a
 // column whose first section is a 19-bit identifier.
-//
-// Judged on a sample, since this only has to separate a key that groups from
-// one that does not.
-inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
+inline bool groupsEnoughToKey(
+    const std::vector<uint64_t>& key,
+    int boundBits) {
   // Below this, a run averages fewer than four rows and there is little to
   // gather.
   constexpr size_t kMinRowsPerRun = 4;
   if (key.empty()) {
     return false;
   }
+  const size_t rowCount = key.size();
+
   // Counted exactly rather than estimated from a sample. The sample this used
   // to take compared the distinct count of 4096 strided rows against 4096
   // instead of against the column, so it asked a different question of a long
@@ -751,14 +770,69 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
   // all, since it cannot be estimated from a small sample within a constant
   // factor however the arithmetic is arranged.
   //
-  // Statistics already builds the unique-value map during selection, so this
-  // is the count that machinery already has. It costs a pass and a hash entry
-  // per distinct value, against an encode that will read this section several
-  // times over.
-  const auto statistics = Statistics<uint64_t>::create(
-      std::span<const uint64_t>(key.data(), key.size()));
-  const size_t distinct = statistics.uniqueCounts().value().size();
-  return distinct * kMinRowsPerRun <= key.size();
+  // Counted, but only up to the point where the answer stops being in doubt.
+  // The test is distinct * kMinRowsPerRun <= rowCount, so a key is refused the
+  // moment its distinct count passes a quarter of the rows, and nothing after
+  // that can bring it back. Stopping there matters more than it looks: the
+  // keys that run longest are the ones with the most distinct values, which
+  // are exactly the ones this refuses, so the early exit fires where the work
+  // would otherwise be largest.
+  //
+  // This used to ask Statistics for the count, which builds a map holding an
+  // entry per distinct value in order to return its size. The map was never
+  // read.
+  const size_t distinctLimit = rowCount / kMinRowsPerRun;
+
+  // One bit per value the section can hold, which needs no hashing at all and
+  // for a key narrow enough to be worth keying on stays in cache. Afforded
+  // only while the bitmap costs no more bytes than the key has rows, so it can
+  // never be the expensive half of this function.
+  const auto bitmapAffordable = [rowCount](int bits) {
+    return bits < 64 && (size_t{1} << bits) <= rowCount * 8;
+  };
+
+  // The caller's bound comes from the section's bit range and costs nothing to
+  // know. These values are one section's bit range, so they start at zero and
+  // their OR bounds them more tightly -- but that OR is a pass over every row,
+  // and it is worth taking only where it might rescue a key the caller's bound
+  // would otherwise send to the hash. Where the bound already fits, tightening
+  // it could only confirm what it already allows.
+  int significantBits = std::min(boundBits, 64);
+  if (!bitmapAffordable(significantBits)) {
+    uint64_t orOfKeys = 0;
+    for (const uint64_t value : key) {
+      orOfKeys |= value;
+    }
+    significantBits = std::bit_width(orOfKeys);
+  }
+
+  size_t distinct = 0;
+  if (bitmapAffordable(significantBits)) {
+    std::vector<uint64_t> seen(
+        ((size_t{1} << significantBits) + 63) / 64, uint64_t{0});
+    for (const uint64_t value : key) {
+      uint64_t& word = seen[value >> 6];
+      const uint64_t bit = uint64_t{1} << (value & 63);
+      if ((word & bit) == 0) {
+        word |= bit;
+        if (++distinct > distinctLimit) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Wide keys still hash, but the set is reserved for what the early exit
+  // allows rather than for the whole column, and it stops at the same point.
+  folly::F14FastSet<uint64_t> seen;
+  seen.reserve(std::min(rowCount, distinctLimit + 1));
+  for (const uint64_t value : key) {
+    if (seen.insert(value).second && ++distinct > distinctLimit) {
+      return false;
+    }
+  }
+  return true;
 }
 
 template <typename T>
@@ -798,12 +872,20 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
     // An empty allowed set costs every encoding, so this is the production
     // path unless a caller has deliberately narrowed the inventory.
+    //
+    // Huffman is withdrawn by default: it was priced into where these
+    // boundaries fall while being unselectable for the sections they produce,
+    // so its cost model steered the planner toward splits nothing would read
+    // well. See Encoding::Options::subIntSplitAllowHuffman for what that cost
+    // and what withdrawing it bought.
+    auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
+    selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
         valueCount,
         options.subIntSplitAllowedEncodings,
-        detail::subintsplit::defaultSelectorConfig());
+        selectorConfig);
 
     segments = std::move(selectorResult.segments);
   }
@@ -845,11 +927,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
     const int width = seg.bitEnd - seg.bitStart + 1;
     const uint64_t mask =
         (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
-    std::vector<uint64_t> out(valueCount);
+    // Appended rather than sized and then overwritten. Sizing it first would
+    // clear a buffer as long as the column, once per section, that the loop
+    // below writes over completely.
+    std::vector<uint64_t> out;
+    out.reserve(valueCount);
     for (uint32_t i = 0; i < valueCount; ++i) {
       uint64_t v = 0;
       __builtin_memcpy(&v, &values[i], sizeof(physicalType));
-      out[i] = (v >> seg.bitStart) & mask;
+      out.push_back((v >> seg.bitStart) & mask);
     }
     return out;
   };
@@ -950,6 +1036,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // needs a bounded span to address a row.
   const auto applyTransform = [&](int width,
                                   const std::vector<uint64_t>& keyValues,
+                                  std::span<const uint32_t> keyOrder,
                                   std::vector<uint64_t>& sectionU64,
                                   std::vector<uint64_t>& codebook,
                                   std::vector<uint32_t>& primaryIndices) {
@@ -962,7 +1049,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
       subintsplit::TransformState state;
       state.codebook = sharedState.codebook;
       subintsplit::TransformContext context{
-          .keySection = keyValues, .width = width};
+          .keySection = keyValues, .width = width, .keyOrder = keyOrder};
       transform->apply(sectionU64, context, state);
       if (codebook.empty()) {
         codebook = std::move(state.codebook);
@@ -974,6 +1061,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::min<uint32_t>(blockSize, valueCount - start);
         subintsplit::TransformState state;
         state.codebook = sharedState.codebook;
+        // No keyOrder: this branch hands the transform one block of the key
+        // at a time, and a permutation of the whole section does not describe
+        // the order within a block.
         subintsplit::TransformContext context{
             .keySection = keyValues.empty()
                 ? std::span<const uint64_t>{}
@@ -1017,8 +1107,18 @@ std::string_view SubIntSplitEncoding<T>::encode(
     detail::SubIntSplitTransformInfo info;
     size_t totalBytes{0};
   };
-  const auto attemptWithKey = [&](uint8_t candidateKey) {
+  //
+  // Returns nothing when the plan it is building has already grown past
+  // `bound`, the smallest complete plan found so far. A plan only grows as
+  // sections are added, so one that has already reached the bound cannot come
+  // back under it, and improvesOnBest is the same test the finished plan would
+  // have faced. Abandoning there is therefore not a heuristic: the candidate
+  // the search settles on is the one it would have settled on had every plan
+  // been priced to the end.
+  const auto attemptWithKey =
+      [&](uint8_t candidateKey, size_t bound) -> std::optional<Attempt> {
     Attempt attempt;
+    attempt.sections.assign(splitCount, std::string_view{});
     attempt.info.transformIds.assign(splitCount, 0);
     attempt.info.codebooks.assign(splitCount, {});
     attempt.info.primaryIndices.assign(splitCount, {});
@@ -1032,29 +1132,75 @@ std::string_view SubIntSplitEncoding<T>::encode(
     bool keyGroups = true;
     if (hasKey) {
       attempt.info.keySection = candidateKey;
-      keyGroups = groupsEnoughToKey(keyValues);
+      const auto& keySegment = segments[candidateKey];
+      keyGroups = groupsEnoughToKey(
+          keyValues, keySegment.bitEnd - keySegment.bitStart + 1);
     }
 
+    // The permutation a key-derived transform gathers by is a property of the
+    // candidate key and of nothing else, so every section in the loop below
+    // was rebuilding the same one. Built once here instead, which makes the
+    // sorting cost of a key search linear in the split count rather than
+    // quadratic. This is the same hoist that took the section extraction and
+    // the untransformed encode out of this loop.
+    //
+    // Local to the attempt on purpose. A permutation left over from a previous
+    // candidate key would reorder rows by a key the stream does not name, so
+    // the lifetime is the one thing here that must not be shared or reused.
+    std::vector<uint32_t> keyPermutation;
+    if (hasKey && transform != nullptr && transform->needsKeySection() &&
+        (keyGroups || options.subIntSplitForceApply)) {
+      keyPermutation = subintsplit::buildKeyOrder(keyValues);
+    }
+
+    // A section that cannot be transformed contributes its plain size whatever
+    // else this attempt decides, so those are settled first and their bytes
+    // are already in the running total before any transform is priced against
+    // the bound. The key section is always one of them.
+    //
+    // The key section rebuilds the order of the others, so it is never itself
+    // transformed however well it would compress. subIntSplitForceApply
+    // bypasses keyGroups the same way it bypasses the size comparison below --
+    // both are judgements about whether the transform pays, which forcing is
+    // explicitly asking to skip.
+    std::vector<uint8_t> transformable;
+    transformable.reserve(splitCount);
     for (uint8_t s = 0; s < splitCount; ++s) {
+      const bool mayTransform = transform != nullptr && s != candidateKey &&
+          (keyGroups || options.subIntSplitForceApply);
+      if (mayTransform) {
+        transformable.push_back(s);
+        continue;
+      }
+      attempt.sections[s] = plainEncoded[s];
+      attempt.totalBytes += plainEncoded[s].size();
+    }
+    if (!improvesOnBest(attempt.totalBytes, bound)) {
+      return std::nullopt;
+    }
+
+    // Biggest plain section first, so the running total climbs toward the
+    // bound as fast as it can and a losing candidate is abandoned after fewer
+    // encodes. Every result is written at its section's index, so this order
+    // decides only how soon the search gives up on a candidate, never what a
+    // candidate it keeps is made of. Ties break by index, so the order is at
+    // least reproducible between runs.
+    std::sort(
+        transformable.begin(),
+        transformable.end(),
+        [&plainEncoded](uint8_t a, uint8_t b) {
+          const size_t sizeA = plainEncoded[a].size();
+          const size_t sizeB = plainEncoded[b].size();
+          return sizeA != sizeB ? sizeA > sizeB : a < b;
+        });
+
+    for (const uint8_t s : transformable) {
       const auto& seg = segments[s];
       const int width = seg.bitEnd - seg.bitStart + 1;
       const uint8_t sb = sectionStorage[s];
 
       const auto& sectionU64 = sectionValues64[s];
       const std::string_view plain = plainEncoded[s];
-
-      // The key section rebuilds the order of the others, so it is never
-      // itself transformed however well it would compress. subIntSplitForceApply
-      // bypasses keyGroups the same way it bypasses the size comparison below --
-      // both are judgements about whether the transform pays, which forcing is
-      // explicitly asking to skip.
-      const bool mayTransform = transform != nullptr && s != candidateKey &&
-          (keyGroups || options.subIntSplitForceApply);
-      if (!mayTransform) {
-        attempt.sections.push_back(plain);
-        attempt.totalBytes += plain.size();
-        continue;
-      }
 
       // A transform is worth applying to a section only where it pays for
       // itself, so both candidates are priced on what they actually encode
@@ -1063,7 +1209,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
       std::vector<uint64_t> codebook;
       std::vector<uint32_t> primaryIndices;
       const size_t stateBytes = applyTransform(
-          width, keyValues, transformed, codebook, primaryIndices);
+          width,
+          keyValues,
+          std::span<const uint32_t>(keyPermutation),
+          transformed,
+          codebook,
+          primaryIndices);
       const std::string_view alternative = encodeSection(s, sb, transformed);
 
       if (alternative.size() + stateBytes < plain.size() ||
@@ -1075,11 +1226,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
             subintsplit::PositionMapping::Sequential) {
           attempt.info.blockSize = subintsplit::kTransformBlockSize;
         }
-        attempt.sections.push_back(alternative);
+        attempt.sections[s] = alternative;
         attempt.totalBytes += alternative.size() + stateBytes;
       } else {
-        attempt.sections.push_back(plain);
+        attempt.sections[s] = plain;
         attempt.totalBytes += plain.size();
+      }
+
+      if (!improvesOnBest(attempt.totalBytes, bound)) {
+        return std::nullopt;
       }
     }
     return attempt;
@@ -1089,6 +1244,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // section is tried and the one that encodes smallest wins, because guessing
   // it wrong reports that the transform does not pay when what did not pay was
   // the guess.
+  constexpr size_t kNoBound = std::numeric_limits<size_t>::max();
   std::optional<Attempt> best;
   if (transform != nullptr && transform->needsKeySection()) {
     if (keySection != detail::SubIntSplitTransformInfo::kNoKeySection) {
@@ -1096,17 +1252,23 @@ std::string_view SubIntSplitEncoding<T>::encode(
           keySection,
           splitCount,
           "SubIntSplit key section is outside the split.");
-      best = attemptWithKey(keySection);
+      best = attemptWithKey(keySection, kNoBound);
     } else {
       for (uint8_t candidate = 0; candidate < splitCount; ++candidate) {
-        auto attempt = attemptWithKey(candidate);
-        if (!best.has_value() || attempt.totalBytes < best->totalBytes) {
+        // Bounded by the incumbent, so an attempt that comes back has already
+        // beaten it on the same test that used to be applied here. There is
+        // nothing left to compare: anything that would not have displaced the
+        // incumbent was abandoned rather than finished.
+        auto attempt = attemptWithKey(
+            candidate, best.has_value() ? best->totalBytes : kNoBound);
+        if (attempt.has_value()) {
           best = std::move(attempt);
         }
       }
     }
   } else {
-    best = attemptWithKey(detail::SubIntSplitTransformInfo::kNoKeySection);
+    best = attemptWithKey(
+        detail::SubIntSplitTransformInfo::kNoKeySection, kNoBound);
   }
 
   sectionData = std::move(best->sections);

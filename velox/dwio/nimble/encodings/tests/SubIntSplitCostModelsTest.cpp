@@ -299,6 +299,129 @@ TEST(
   EXPECT_EQ(bestEncoding, EncodingType::Huffman);
 }
 
+TEST(SubIntSplitCostModelsTest, MetricCollectorScansBothWaysAlike) {
+  // The scan reaches the caller two ways: one loop that tests which metrics
+  // were asked for on every element, and a specialisation for the four the
+  // selector always wants, which drops those tests and splits the work into a
+  // vectorisable pass and a scalar histogram pass.
+  //
+  // Splitting the traversal is what this checks. The histogram now runs over
+  // its own walk of the values rather than the one that computes everything
+  // else, and the remaining accumulators reassociate, so the values are chosen
+  // to make any disagreement visible: for each bit width, the smallest value of
+  // that width, that value with a low bit set, and the largest. Bucket b covers
+  // bit widths 7b to 7b+6, so this sits on both sides of every bucket boundary
+  // and leaves none of them empty.
+  std::vector<uint64_t> values{0, 1};
+  for (int width = 1; width <= 64; ++width) {
+    const uint64_t smallest = uint64_t{1} << (width - 1);
+    values.push_back(smallest);
+    values.push_back(smallest | 1);
+    values.push_back(width == 64 ? ~uint64_t{0} : (uint64_t{1} << width) - 1);
+  }
+
+  // Any frequencies will do: the three-argument overload takes them as given
+  // and this test is about everything else it returns.
+  MetricCollector collector;
+  const SegmentMetrics counted =
+      collector.compute(values, allCostModelRequiredFlags());
+  FrequencyCounts supplied;
+  supplied.uniqueCount = counted.uniqueCount;
+  supplied.dominantCount = counted.dominantCount;
+  const SegmentMetrics scanned =
+      collector.compute(values, allCostModelRequiredFlags(), supplied);
+
+  EXPECT_EQ(scanned.min, counted.min);
+  EXPECT_EQ(scanned.max, counted.max);
+  EXPECT_EQ(scanned.range, counted.range);
+  EXPECT_EQ(scanned.runCount, counted.runCount);
+  EXPECT_EQ(scanned.avgRunLength, counted.avgRunLength);
+  EXPECT_EQ(scanned.bitWidthBuckets, counted.bitWidthBuckets);
+  EXPECT_EQ(scanned.sumAbsDelta, counted.sumAbsDelta);
+  EXPECT_EQ(scanned.monotonicCount, counted.monotonicCount);
+  EXPECT_EQ(scanned.maxDelta, counted.maxDelta);
+
+  // Every bucket carries something, or the boundaries above were not straddled
+  // and the comparison agreed about nothing.
+  for (size_t bucket = 0; bucket < scanned.bitWidthBuckets.size(); ++bucket) {
+    EXPECT_GT(scanned.bitWidthBuckets[bucket], 0u) << "bucket " << bucket;
+  }
+}
+
+TEST(SubIntSplitCostModelsTest, MetricCollectorCountsBothWaysAlike) {
+  // MetricCollector counts frequencies through a direct-indexed histogram when
+  // the values are narrow enough to index and a hash map otherwise, and the
+  // planner's choices must not be able to tell which it got. Shifting the same
+  // distribution past the histogram's reach picks the other path while leaving
+  // every frequency-derived metric invariant, since shifting is injective.
+  std::vector<uint64_t> narrow;
+  for (uint64_t value = 0; value < 200; ++value) {
+    // Skewed rather than flat, so dominant count and the coverage tiers have
+    // something to distinguish.
+    for (uint64_t repeat = 0; repeat <= value % 7; ++repeat) {
+      narrow.push_back(value);
+    }
+  }
+  std::vector<uint64_t> wide;
+  wide.reserve(narrow.size());
+  for (const uint64_t value : narrow) {
+    wide.push_back((value << 40) | 1);
+  }
+
+  MetricCollector collector;
+  const SegmentMetrics direct =
+      collector.compute(narrow, allCostModelRequiredFlags());
+  const SegmentMetrics hashed =
+      collector.compute(wide, allCostModelRequiredFlags());
+
+  EXPECT_EQ(direct.uniqueCount, hashed.uniqueCount);
+  EXPECT_FALSE(direct.uniqueCountCapped);
+  EXPECT_FALSE(hashed.uniqueCountCapped);
+  EXPECT_EQ(direct.dominantCount, hashed.dominantCount);
+  EXPECT_EQ(direct.topKCoverage, hashed.topKCoverage);
+
+  // A reused collector must not carry counts between segments, which is the
+  // failure a histogram cleared by walking what it touched would show first.
+  const SegmentMetrics again =
+      collector.compute(narrow, allCostModelRequiredFlags());
+  EXPECT_EQ(again.uniqueCount, direct.uniqueCount);
+  EXPECT_EQ(again.dominantCount, direct.dominantCount);
+  EXPECT_EQ(again.topKCoverage, direct.topKCoverage);
+}
+
+TEST(
+    SubIntSplitCostModelsTest,
+    BestCostBitsWithdrawsHuffmanWhenTheCallerDisallowsIt) {
+  // The data the test above shows Huffman winning on, so withdrawing Huffman
+  // has to change the answer here. Without this, an arm that turns Huffman off
+  // to price what its presence is worth could be silently inert and report that
+  // it costs nothing.
+  const std::vector<uint64_t> values = makePforFriendlyValues();
+  MetricCollector collector;
+  const SegmentMetrics m =
+      collector.compute(values, allCostModelRequiredFlags());
+
+  constexpr int kBitWidth = 16;
+  const AllowedEncodings allEncodings;
+  EncodingType withoutHuffman = EncodingType::Trivial;
+  const double best = bestCostBitsRestricted(
+      m,
+      values.size(),
+      kBitWidth,
+      values,
+      allEncodings,
+      /*allowHuffman=*/false,
+      withoutHuffman);
+
+  EXPECT_TRUE(std::isfinite(best));
+  EXPECT_NE(withoutHuffman, EncodingType::Huffman);
+
+  // Withdrawing a candidate can only raise the minimum, never lower it.
+  EncodingType withHuffman = EncodingType::Trivial;
+  EXPECT_GE(
+      best, bestCostBits(m, values.size(), kBitWidth, values, withHuffman));
+}
+
 TEST(
     SubIntSplitCostModelsTest,
     BestCostBitsDoesNotUseHuffmanForHighCardinalityBaselinePlusOutliers) {

@@ -214,6 +214,12 @@ class HuffmanEncoding final
     return assignCodeLengths(nodes, queue.top().node, 0, lengths);
   }
 
+  // Bits the Huffman codes over `frequencies` occupy, or nullopt when the
+  // deepest code would not fit in kMaxCodeBits. Requires at least two symbols,
+  // and sorts `frequencies` in place, so the caller must not rely on their
+  // order afterwards.
+  static std::optional<uint64_t> codeBits(std::vector<uint32_t>& frequencies);
+
   physicalType decodeValue(uint32_t row) const;
 
   Vector<physicalType> alphabet_;
@@ -324,6 +330,62 @@ void HuffmanEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
 }
 
 template <typename T>
+std::optional<uint64_t> HuffmanEncoding<T>::codeBits(
+    std::vector<uint32_t>& frequencies) {
+  const size_t symbolCount = frequencies.size();
+  std::sort(frequencies.begin(), frequencies.end());
+
+  // buildCodeLengths pops its queue in (frequency, node index) order, and two
+  // sorted sequences reproduce that order exactly: the leaves, sorted by
+  // frequency just above, and the internal nodes, which Huffman creates in
+  // nondecreasing weight order and which therefore stay sorted in creation
+  // order. Every leaf index is below every internal index, so a tie across the
+  // two sequences goes to the leaf. Merging them builds the same tree with no
+  // heap and no nodes, and carrying a height alongside each weight finds the
+  // deepest code without walking a tree that no longer exists.
+  //
+  // The merged weights are also the answer to how long the bitstream is. A
+  // merge puts one more bit on every row underneath it, so summing the weight
+  // of each internal node counts every row's count once per node standing above
+  // it, which is sum(f * l). No tree and no per-symbol lengths are needed to
+  // total it.
+  struct Subtree {
+    uint64_t weight;
+    uint8_t height;
+  };
+  std::vector<Subtree> internals;
+  internals.reserve(symbolCount - 1);
+
+  size_t leafIndex = 0;
+  size_t internalIndex = 0;
+  const auto takeSmallest = [&]() -> Subtree {
+    if (leafIndex < symbolCount &&
+        (internalIndex == internals.size() ||
+         frequencies[leafIndex] <= internals[internalIndex].weight)) {
+      return {frequencies[leafIndex++], 0};
+    }
+    return internals[internalIndex++];
+  };
+
+  uint64_t totalBits = 0;
+  for (size_t remaining = symbolCount; remaining > 1; --remaining) {
+    const auto left = takeSmallest();
+    const auto right = takeSmallest();
+    const auto height =
+        static_cast<uint8_t>(1 + std::max(left.height, right.height));
+    // Every node hangs below the root, so a subtree already past the limit is
+    // proof enough that the deepest code is too.
+    if (height > kMaxCodeBits) {
+      return std::nullopt;
+    }
+    const uint64_t weight = left.weight + right.weight;
+    totalBits += weight;
+    internals.push_back({weight, height});
+  }
+  return totalBits;
+}
+
+template <typename T>
 std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     std::span<const physicalType> values,
     const Statistics<physicalType>& statistics,
@@ -337,33 +399,42 @@ std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     return std::nullopt;
   }
 
-  folly::F14FastMap<physicalType, uint32_t> symbolByValue;
+  // Both questions left to answer -- how many bits the codes take, and whether
+  // the longest of them fits in kMaxCodeBits -- depend only on the multiset of
+  // frequencies, never on which value carries which count. Symbol identity
+  // reaches the tree solely as a tie-break between equally frequent leaves, and
+  // exchanging two equally weighted leaves moves no leaf to a different depth.
+  // So the counts Statistics is already holding answer both, and no pass over
+  // the values is needed to rebuild them.
   std::vector<uint32_t> frequencies;
   frequencies.reserve(uniqueCounts->size());
-  for (const auto value : values) {
-    auto [it, inserted] =
-        symbolByValue.emplace(value, static_cast<uint32_t>(frequencies.size()));
-    if (inserted) {
-      frequencies.push_back(0);
-    }
-    ++frequencies[it->second];
+  for (const auto& [value, count] : uniqueCounts.value()) {
+    (void)value;
+    frequencies.push_back(static_cast<uint32_t>(count));
   }
-  std::vector<TreeNode> nodes;
-  nodes.reserve(2 * frequencies.size() - 1);
-  std::vector<uint8_t> lengths(frequencies.size());
-  if (!buildCodeLengths(frequencies, nodes, lengths)) {
+
+  // CHANGES SELECTION. This used to charge Shannon lengths,
+  // count * ceil(log2(rows / count)) summed over the symbols. Those satisfy
+  // Kraft's inequality and Huffman is optimal over prefix codes, so the old
+  // number was an upper bound on what Huffman actually writes, sometimes a
+  // loose one: on {129, 64, 64} it charged 513 bits for a stream Huffman codes
+  // in 385. The estimate was therefore biased against Huffman, and selection
+  // passed over it in cases where it would have won. codeBits returns what the
+  // encoder will really write, so Huffman is priced on its own terms and gets
+  // picked more often wherever it is a candidate.
+  //
+  // SubIntSplit is no longer one of those places: its planner does not score
+  // Huffman by default any more, for reasons in
+  // Encoding::Options::subIntSplitAllowHuffman. So what this now moves is the
+  // other callers of this estimator, which is where being right is the point.
+  const auto encodedBits = codeBits(frequencies);
+  if (!encodedBits.has_value()) {
     return std::nullopt;
   }
 
-  uint64_t encodedBits = 0;
-  const uint64_t rowsMinusOne = values.size() - 1;
-  for (const auto& [value, count] : uniqueCounts.value()) {
-    (void)value;
-    encodedBits += count * velox::bits::bitsRequired(rowsMinusOne / count);
-  }
   const uint64_t checkpoints =
       velox::bits::divRoundUp(values.size(), kCheckpointStride);
-  const uint64_t bitstreamBytes = (encodedBits + 7) / 8 + 4;
+  const uint64_t bitstreamBytes = (encodedBits.value() + 7) / 8 + 4;
   return EncodingPrefix::serializedSize(
              values.size(), options.useVarintRowCount) +
       varint::varintSize(uniqueCounts->size()) + 1 +

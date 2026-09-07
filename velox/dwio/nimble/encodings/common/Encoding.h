@@ -185,6 +185,33 @@ class Encoding {
     /// false, FixedBitWidth and PFOR round to byte or bucket boundaries.
     bool fixedBitWidthUseExactBits{false};
 
+    /// Whether SubIntSplit's split planner may cost a bit range as Huffman.
+    /// False by default, which is a deliberate change from how the planner
+    /// scored ranges before.
+    ///
+    /// Huffman was never reachable as a section encoding: sections are chosen
+    /// from the default read factors, which do not include it, and the only
+    /// place it is offered to them is a SubIntSplit-specific block in
+    /// ManualEncodingSelectionPolicy::createImpl that a section's policy does
+    /// not always come from. It was nonetheless priced into where the splits
+    /// fall, because the planner minimises over per-range costs and Huffman's
+    /// was among them. So an encoding nothing could select was steering the
+    /// planner toward boundaries nothing would read well, which is not a
+    /// trade-off anyone chose and does not show up in a diff.
+    ///
+    /// Withdrawing it was measured across five columns: one paid 15.7% in
+    /// size and returned 3.78x its bulk decode, one held its size to three
+    /// decimals and returned 2.04x, and three did not move on any axis.
+    /// Encode fell 43%, since costing Huffman is the most expensive model in
+    /// the grid. Set true to price the old behaviour again.
+    ///
+    /// If a future column pays size for this the way that first one did, the
+    /// answer is more likely a cheap entropy term in the cost models than
+    /// restoring an encoding no section can use: what Huffman's cost was
+    /// really contributing is a signal that a bit range has low entropy, and
+    /// nothing else in the inventory says that.
+    bool subIntSplitAllowHuffman{false};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.
