@@ -20,10 +20,33 @@
 //
 // For every dataset this driver: samples the stream, builds an oracle grid
 // (measured bytes per [l..r] range per encoding) and a cost-model grid
-// (bestCostBits() estimates for the same ranges), runs both AutoSIS's
-// selectSplits() DP and a simple unconstrained oracle DP, and reports
-// per-cell agreement (top-1 accuracy, Spearman rho, mean |rel err|) plus
-// plan-level regret between the cost model's choice and the oracle optimum.
+// (bestCostBitsRestricted() estimates for the same ranges), runs both AutoSIS's
+// DP and a simple unconstrained oracle DP, and reports per-cell agreement
+// (top-1 accuracy, Spearman rho, mean |rel err|) plus regret between the cost
+// model's choice and the oracle optimum.
+//
+// Three properties the numbers depend on, all of them things this driver got
+// wrong before and which made its output flattering rather than merely
+// incomplete:
+//
+//  - The oracle encodes under the writer's section options, obtained from
+//    sectionEncodingOptions(). Under default options FixedBitWidth rounds to a
+//    byte boundary and the writer does not, so the ground truth was wrong for
+//    the single most-selected encoding in the system.
+//  - The model and the oracle score the same inventory. The oracle used to
+//    offer seven encodings against a model minimising over fifteen, so
+//    "top-1 accuracy" was reporting the difference between two lists.
+//  - Huffman follows what production ships (withdrawn) rather than what
+//    bestCostBits() hardcodes (allowed); --allow_huffman measures the other
+//    configuration. Its bytes are still measured either way, so the size cost
+//    of withdrawing it stays readable from the CSV.
+//
+// One parity gap remains and is deliberate: with --nested_selection, a
+// candidate's sub-streams are chosen by the default read factors rather than
+// by the SubIntSplit-augmented list a real section's children see
+// (EncodingSelectionPolicy.h's parentEncodingType == SubIntSplit block). That
+// affects grandchildren only, and closing it needs a policy built the way the
+// writer builds one.
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
@@ -34,6 +57,7 @@
 #include <numeric>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -41,12 +65,21 @@
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
 
+#include "velox/dwio/nimble/encodings/BlockBitPackingEncoding.h"
 #include "velox/dwio/nimble/encodings/ConstantEncoding.h"
+#include "velox/dwio/nimble/encodings/DeltaBlockEncoding.h"
+#include "velox/dwio/nimble/encodings/DeltaEncoding.h"
 #include "velox/dwio/nimble/encodings/DictionaryEncoding.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
+#include "velox/dwio/nimble/encodings/ForEncoding.h"
+#include "velox/dwio/nimble/encodings/FrequencyPartitionEncoding.h"
+#include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
+#include "velox/dwio/nimble/encodings/PFOREncoding.h"
 #include "velox/dwio/nimble/encodings/RLEEncoding.h"
+#include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
@@ -55,6 +88,19 @@
 
 DEFINE_bool(validate, false, "Sanity-check oracle encode calls do not throw");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
+DEFINE_bool(
+    allow_huffman,
+    false,
+    "Whether a bit range may be costed and measured as Huffman. False is what "
+    "production ships (Encoding::Options::subIntSplitAllowHuffman); pass true "
+    "to measure the withdrawn configuration.");
+DEFINE_bool(
+    nested_selection,
+    true,
+    "Whether the oracle picks a candidate's sub-stream encodings by real "
+    "cost-based selection, as the writer does. False forces every sub-stream "
+    "to Trivial, which is the test harness default and overstates the measured "
+    "size of every encoding that has children.");
 
 namespace facebook::nimble::mlidc {
 namespace {
@@ -66,47 +112,109 @@ struct CandidateEncoding {
   EncodingType type;
 };
 
-// Try to encode `sectionData` with EncodingT; return byte count, or SIZE_MAX
-// on failure (throws, e.g. Constant on non-constant data).
+// Try to encode `sectionData` with EncodingT under `options`; return byte
+// count, or SIZE_MAX on failure (throws, e.g. Constant on non-constant data).
+//
+// `options` is the writer's section options, not a default-constructed set.
+// A default set rounds FixedBitWidth up to a byte boundary while the writer
+// packs a section at its exact bit width, so measuring under defaults made the
+// ground truth wrong for the most-selected encoding in the system: a 12-bit
+// section measured 16 bits/value against a model that correctly said 12.
 template <typename EncodingT, typename Elem>
-size_t tryEncode(const Vector<Elem>& sectionData) {
+size_t tryEncode(
+    const Vector<Elem>& sectionData,
+    const facebook::nimble::Encoding::Options& options) {
   try {
     auto& pool = benchmarks::benchmarkPool();
     Buffer buf{*pool};
-    facebook::nimble::Encoding::Options opts;
+    // Sub-stream encodings are chosen by real cost-based selection, as the
+    // writer chooses them. Forcing them to Trivial -- the Encoder helper's
+    // default -- charges Dictionary four bytes per index where the writer
+    // bit-packs them, and does the same to every other candidate with
+    // children, so the oracle would report sizes the writer never produces.
     auto encoded = test::Encoder<EncodingT>::encode(
-        buf, sectionData, CompressionType::Uncompressed, opts);
+        buf,
+        sectionData,
+        CompressionType::Uncompressed,
+        options,
+        /*realNestedSelection=*/FLAGS_nested_selection);
     return encoded.size();
   } catch (...) {
     return std::numeric_limits<size_t>::max();
   }
 }
 
-// Dispatch oracle encode by EncodingType (only the 7 candidates we track).
+// Dispatch oracle encode by EncodingType, over every encoding the split
+// planner's cost models score.
+//
+// The integral-only encodings are guarded rather than listed unconditionally:
+// several of them static_assert at class scope, so naming them for a floating
+// point element type is a compile error, not a runtime incompatibility.
+// candidateEncodings() withholds the same encodings for those types, so the
+// model and the oracle always score the same inventory.
 template <typename Elem>
-size_t oracleEncodeBytes(EncodingType type, const Vector<Elem>& sectionData) {
+size_t oracleEncodeBytes(
+    EncodingType type,
+    const Vector<Elem>& sectionData,
+    const facebook::nimble::Encoding::Options& options) {
   switch (type) {
     case EncodingType::Trivial:
-      return tryEncode<TrivialEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<TrivialEncoding<Elem>, Elem>(sectionData, options);
     case EncodingType::FixedBitWidth:
-      return tryEncode<FixedBitWidthEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<FixedBitWidthEncoding<Elem>, Elem>(sectionData, options);
     case EncodingType::Constant:
-      return tryEncode<ConstantEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<ConstantEncoding<Elem>, Elem>(sectionData, options);
     case EncodingType::MainlyConstant:
-      return tryEncode<MainlyConstantEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<MainlyConstantEncoding<Elem>, Elem>(
+          sectionData, options);
     case EncodingType::Dictionary:
-      return tryEncode<DictionaryEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<DictionaryEncoding<Elem>, Elem>(sectionData, options);
     case EncodingType::RLE:
-      return tryEncode<RLEEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<RLEEncoding<Elem>, Elem>(sectionData, options);
     case EncodingType::Varint:
-      return tryEncode<VarintEncoding<Elem>, Elem>(sectionData);
+      return tryEncode<VarintEncoding<Elem>, Elem>(sectionData, options);
     default:
-      return std::numeric_limits<size_t>::max();
+      break;
   }
+  if constexpr (std::is_integral_v<Elem>) {
+    switch (type) {
+      case EncodingType::SimdForBitpack:
+        return tryEncode<SimdForBitpackEncoding<Elem>, Elem>(
+            sectionData, options);
+      case EncodingType::PFOR:
+        return tryEncode<PFOREncoding<Elem>, Elem>(sectionData, options);
+      case EncodingType::BlockBitPacking:
+        return tryEncode<BlockBitPackingEncoding<Elem>, Elem>(
+            sectionData, options);
+      case EncodingType::Delta:
+        return tryEncode<DeltaEncoding<Elem>, Elem>(sectionData, options);
+      case EncodingType::FOR:
+        return tryEncode<ForEncoding<Elem>, Elem>(sectionData, options);
+      case EncodingType::FrequencyPartition:
+        return tryEncode<FrequencyPartitionEncoding<Elem>, Elem>(
+            sectionData, options);
+      case EncodingType::Huffman:
+        return tryEncode<HuffmanEncoding<Elem>, Elem>(sectionData, options);
+      case EncodingType::DeltaBlock:
+        return tryEncode<DeltaBlockEncoding<Elem>, Elem>(sectionData, options);
+      default:
+        break;
+    }
+  }
+  return std::numeric_limits<size_t>::max();
 }
 
+// Every encoding bestCostBitsRestricted scores, so that "the model's pick" and
+// "the oracle's pick" range over the same inventory.
+//
+// They did not before: the oracle offered seven encodings while the model
+// minimised over fifteen, so every range the model awarded to one of the other
+// eight counted as a disagreement whatever the model had estimated. The
+// reported top-1 accuracy was measuring the gap between the two lists at least
+// as much as it was measuring the model.
+template <typename Elem>
 std::vector<CandidateEncoding> candidateEncodings() {
-  return {
+  std::vector<CandidateEncoding> candidates{
       {"Trivial", EncodingType::Trivial},
       {"FixedBitWidth", EncodingType::FixedBitWidth},
       {"Constant", EncodingType::Constant},
@@ -115,6 +223,21 @@ std::vector<CandidateEncoding> candidateEncodings() {
       {"RLE", EncodingType::RLE},
       {"Varint", EncodingType::Varint},
   };
+  if constexpr (std::is_integral_v<Elem>) {
+    candidates.insert(
+        candidates.end(),
+        {
+            {"SimdForBitpack", EncodingType::SimdForBitpack},
+            {"PFOR", EncodingType::PFOR},
+            {"BlockBitPacking", EncodingType::BlockBitPacking},
+            {"Delta", EncodingType::Delta},
+            {"FOR", EncodingType::FOR},
+            {"FrequencyPartition", EncodingType::FrequencyPartition},
+            {"Huffman", EncodingType::Huffman},
+            {"DeltaBlock", EncodingType::DeltaBlock},
+        });
+  }
+  return candidates;
 }
 
 struct OracleResult {
@@ -236,7 +359,26 @@ int runBenchmark() {
   const uint64_t seed = static_cast<uint64_t>(FLAGS_mlidc_seed);
 
   auto datasets = defaultDatasets<Elem>();
-  auto candidates = candidateEncodings();
+  auto candidates = candidateEncodings<Elem>();
+
+  // The options the writer encodes a section under, taken from the writer's
+  // own derivation rather than restated here so the two cannot drift.
+  const facebook::nimble::Encoding::Options sectionOptions =
+      sectionEncodingOptions(facebook::nimble::Encoding::Options{});
+
+  // The inventory both the model and the oracle score. Built from the
+  // candidate list so the two are matched by construction, minus Huffman
+  // unless it was asked for: production withdraws Huffman from the planner
+  // (Encoding::Options::subIntSplitAllowHuffman), and an oracle that keeps
+  // scoring it would charge the model for passing over a range Huffman wins
+  // when passing over it is exactly what production does.
+  AllowedEncodings allowed;
+  for (const auto& candidate : candidates) {
+    if (candidate.type == EncodingType::Huffman && !FLAGS_allow_huffman) {
+      continue;
+    }
+    allowed.insert(candidate.type);
+  }
 
   std::cout << "bench_costmodel_oracle: " << datasets.size()
             << " datasets, N=" << n << ", kBits=" << kBits << "\n\n";
@@ -277,6 +419,9 @@ int runBenchmark() {
       "plan_type",
       "plan_segment_count",
       "plan_total_sample_bytes",
+      "oracle_total_sample_bytes",
+      "plan_unresolved_segments",
+      "allow_huffman",
       "top1_accuracy",
       "spearman_rho",
       "mean_abs_rel_err",
@@ -294,6 +439,7 @@ int runBenchmark() {
 
   SamplerConfig samplerCfg = defaultSamplerConfig();
   SelectorConfig selectorCfg = defaultSelectorConfig();
+  selectorCfg.allowHuffman = FLAGS_allow_huffman;
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
 
   for (const auto& ds : datasets) {
@@ -356,13 +502,35 @@ int runBenchmark() {
         const SegmentMetrics metrics =
             collector.compute(sectionU64, requiredFlags);
         EncodingType modelBestEnc = EncodingType::Trivial;
-        const double modelBestBits =
-            bestCostBits(metrics, sampleSize, width, sectionU64, modelBestEnc);
+        const double modelBestBits = bestCostBitsRestricted(
+            metrics,
+            sampleSize,
+            width,
+            sectionU64,
+            allowed,
+            FLAGS_allow_huffman,
+            modelBestEnc);
 
         ModelCell& mc = modelGrid[l][r];
         mc.bestBits = modelBestBits;
         mc.bestEncoding = modelBestEnc;
         mc.estBits.resize(candidates.size());
+        // The viability gates bestCostBitsRestricted applies before it
+        // considers an encoding at all. Repeated here so a per-encoding
+        // estimate agrees with the pick taken from the same models: without
+        // them a gated-out Dictionary would report the lowest est_bits in the
+        // row while is_model_pick stayed zero, which reads as a bug in the
+        // driver rather than as the model declining to offer it.
+        const bool dictionaryViable = metrics.uniqueCount > 0 &&
+            (metrics.uniqueCountCapped ||
+             metrics.uniqueCount < sampleSize / 2);
+        const bool frequencyPartitionViable = metrics.uniqueCount > 0 &&
+            !metrics.uniqueCountCapped && metrics.uniqueCount <= 1024;
+        const bool huffmanViable = FLAGS_allow_huffman &&
+            metrics.uniqueCount > 0 && !metrics.uniqueCountCapped &&
+            metrics.uniqueCount <= HuffmanEncoding<uint64_t>::kMaxSymbols;
+        constexpr double kUnavailable =
+            std::numeric_limits<double>::infinity();
         for (size_t ci = 0; ci < candidates.size(); ++ci) {
           double bits;
           switch (candidates[ci].type) {
@@ -379,7 +547,9 @@ int runBenchmark() {
               bits = mainlyConstantCostBits(metrics, sampleSize, width);
               break;
             case EncodingType::Dictionary:
-              bits = dictionaryCostBits(metrics, sampleSize, width);
+              bits = dictionaryViable
+                  ? dictionaryCostBits(metrics, sampleSize, width)
+                  : kUnavailable;
               break;
             case EncodingType::RLE:
               bits = rleCostBits(metrics, sampleSize, width);
@@ -387,8 +557,35 @@ int runBenchmark() {
             case EncodingType::Varint:
               bits = varintCostBits(metrics, sampleSize, width);
               break;
+            case EncodingType::SimdForBitpack:
+              bits = simdForBitpackCostBits(metrics, sampleSize, width);
+              break;
+            case EncodingType::PFOR:
+              bits = pforCostBits(metrics, sampleSize, width);
+              break;
+            case EncodingType::BlockBitPacking:
+              bits = blockBitPackingCostBits(sectionU64, sampleSize);
+              break;
+            case EncodingType::Delta:
+              bits = deltaCostBits(metrics, sampleSize, width);
+              break;
+            case EncodingType::FOR:
+              bits = forCostBits(metrics, sampleSize, width);
+              break;
+            case EncodingType::FrequencyPartition:
+              bits = frequencyPartitionViable
+                  ? frequencyPartitionCostBits(metrics, sampleSize, width)
+                  : kUnavailable;
+              break;
+            case EncodingType::Huffman:
+              bits = huffmanViable ? huffmanCostBits(sectionU64, sampleSize)
+                                   : kUnavailable;
+              break;
+            case EncodingType::DeltaBlock:
+              bits = deltaBlockCostBits(sectionU64, sampleSize);
+              break;
             default:
-              bits = std::numeric_limits<double>::infinity();
+              bits = kUnavailable;
           }
           mc.estBits[ci] = bits;
         }
@@ -397,10 +594,14 @@ int runBenchmark() {
         OracleCell& oc = oracleGrid[l][r];
         oc.results.resize(candidates.size());
         for (size_t ci = 0; ci < candidates.size(); ++ci) {
-          const size_t bytes =
-              oracleEncodeBytes(candidates[ci].type, sectionData);
+          const size_t bytes = oracleEncodeBytes(
+              candidates[ci].type, sectionData, sectionOptions);
+          // Measured for every candidate, so the size an encoding would have
+          // reached stays in the CSV even where the inventory withholds it --
+          // that number is what the cost of withholding it is read from.
           oc.results[ci].bytes = bytes;
-          if (bytes < oc.bestBytes) {
+          if (bytes < oc.bestBytes &&
+              allowed.count(candidates[ci].type) > 0) {
             oc.bestBytes = bytes;
             oc.bestEncoding = candidates[ci].type;
           }
@@ -538,14 +739,23 @@ int runBenchmark() {
     // -----------------------------------------------------------------
     // Plan comparison: AutoSIS DP (cost-model driven) vs oracle DP.
     // -----------------------------------------------------------------
-    SelectorResult autoResult =
-        selectSplits(samples, kBits, sampleSize, selectorCfg);
+    SelectorResult autoResult = selectSplitsRestricted(
+        samples, kBits, sampleSize, allowed, selectorCfg);
     OracleDpResult oracleResult = oracleDp(oracleGrid, kBits);
 
     // Regret: sum over AutoSIS's chosen segments of (measured bytes for the
     // AutoSIS pick) minus (oracle's best bytes for that same [l..r] range).
+    //
+    // A segment whose measured bytes cannot be obtained is counted, not
+    // skipped. Skipping it left plan_total_sample_bytes summing a subset of
+    // the plan while the oracle total summed all of its own, so the two
+    // numbers printed side by side were not totals of the same thing, and a
+    // plan could look cheaper than the oracle by having had segments dropped
+    // out of it. Now the count travels with the totals, and a nonzero one says
+    // outright that the AutoSIS total is not comparable.
     size_t autoTotalSampleBytes = 0;
     size_t regretBytes = 0;
+    size_t autoUnresolvedSegments = 0;
     for (const auto& seg : autoResult.segments) {
       const auto& cell = oracleGrid[seg.bitStart][seg.bitEnd];
       size_t autoBytesForPick = std::numeric_limits<size_t>::max();
@@ -555,13 +765,16 @@ int runBenchmark() {
           break;
         }
       }
-      if (autoBytesForPick == std::numeric_limits<size_t>::max()) {
-        continue;
-      }
-      autoTotalSampleBytes += autoBytesForPick;
-      if (cell.bestBytes != std::numeric_limits<size_t>::max() &&
-          autoBytesForPick > cell.bestBytes) {
-        regretBytes += (autoBytesForPick - cell.bestBytes);
+      const bool resolved =
+          autoBytesForPick != std::numeric_limits<size_t>::max();
+      if (resolved) {
+        autoTotalSampleBytes += autoBytesForPick;
+        if (cell.bestBytes != std::numeric_limits<size_t>::max() &&
+            autoBytesForPick > cell.bestBytes) {
+          regretBytes += (autoBytesForPick - cell.bestBytes);
+        }
+      } else {
+        ++autoUnresolvedSegments;
       }
 
       csv.beginRow();
@@ -580,12 +793,14 @@ int runBenchmark() {
           break;
         }
       }
-      csv.set("actual_bytes", static_cast<int64_t>(autoBytesForPick));
+      if (resolved) {
+        csv.set("actual_bytes", static_cast<int64_t>(autoBytesForPick));
+      }
       csv.set("plan_type", "autosis");
       csv.set(
           "plan_segment_count",
           static_cast<int64_t>(autoResult.segments.size()));
-      csv.set("skipped", int64_t{0});
+      csv.set("skipped", resolved ? int64_t{0} : int64_t{1});
       csv.endRow();
     }
 
@@ -628,6 +843,13 @@ int runBenchmark() {
     csv.set("plan_type", "summary");
     csv.set(
         "plan_total_sample_bytes", static_cast<int64_t>(autoTotalSampleBytes));
+    csv.set(
+        "oracle_total_sample_bytes",
+        static_cast<int64_t>(oracleResult.totalBytes));
+    csv.set(
+        "plan_unresolved_segments",
+        static_cast<int64_t>(autoUnresolvedSegments));
+    csv.set("allow_huffman", FLAGS_allow_huffman ? int64_t{1} : int64_t{0});
     csv.set("top1_accuracy", top1Accuracy);
     csv.set("spearman_rho", meanRho);
     csv.set("mean_abs_rel_err", meanAbsRelErr);
@@ -641,6 +863,12 @@ int runBenchmark() {
     std::cout << "  Oracle plan:  " << oracleResult.segments.size()
               << " segments, sample_bytes=" << oracleResult.totalBytes
               << "  regret=" << regretBytes << "\n";
+    if (autoUnresolvedSegments > 0) {
+      std::cout << "  [WARN] AutoSIS plan totals exclude "
+                << autoUnresolvedSegments
+                << " segment(s) whose chosen encoding could not be measured; "
+                   "the two plan totals above are not comparable\n";
+    }
   }
 
   std::cout << "\nResults written to: " << csvPath << "\n";

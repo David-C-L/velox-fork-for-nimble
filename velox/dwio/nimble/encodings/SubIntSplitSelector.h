@@ -365,16 +365,8 @@ inline SelectorResult selectSplitsImpl(
   return result;
 }
 
-inline SelectorResult selectSplits(
-    const std::vector<uint64_t>& samples,
-    int kBits,
-    size_t fullCount,
-    const SelectorConfig& cfg = defaultSelectorConfig()) {
-  return selectSplitsImpl(samples, kBits, fullCount, cfg, bestCostBits);
-}
-
-// Selects splits costing segments against `allowed` only. An empty set behaves
-// exactly like selectSplits, so a caller can pass one through unconditionally.
+// Selects splits costing segments against `allowed` only. An empty set costs
+// every encoding, so a caller can pass one through unconditionally.
 inline SelectorResult selectSplitsRestricted(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -395,6 +387,24 @@ inline SelectorResult selectSplitsRestricted(
         return bestCostBitsRestricted(
             m, numValues, bitWidth, segValues, allowed, allowHuffman, bestEnc);
       });
+}
+
+// Selects splits over the full encoding inventory.
+//
+// Forwards to selectSplitsRestricted with an empty allowed set rather than
+// calling bestCostBits, which hardcodes allowHuffman. Calling bestCostBits
+// here dropped cfg.allowHuffman on the floor: a caller that withdrew Huffman
+// still got splits planned with Huffman priced, silently, while the same
+// caller going through selectSplitsRestricted got what it asked for. The
+// default config allows Huffman, so this changes nothing for a caller that
+// never set the field.
+inline SelectorResult selectSplits(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const SelectorConfig& cfg = defaultSelectorConfig()) {
+  static const AllowedEncodings kAll;
+  return selectSplitsRestricted(samples, kBits, fullCount, kAll, cfg);
 }
 
 } // namespace facebook::nimble::detail::subintsplit
