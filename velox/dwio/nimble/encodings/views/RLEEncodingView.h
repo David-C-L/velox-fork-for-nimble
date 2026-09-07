@@ -143,10 +143,46 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     runValues.resize(runCount);
     values_->read(firstRun, runCount, runValues.data());
 
+    // std::fill over a run costs two mispredicting branches: its own
+    // vectorised body is guarded on the element count, and the count here is
+    // whatever the run happened to be. The section this path exists for has
+    // been grouped by a key, so its runs are short -- the gate below admits
+    // only sections averaging kMaxAverageRunLength or less, and the shape that
+    // motivated this averages about four rows. Measured on it: 51.3M branch
+    // mispredicts against 18.2M for the untransformed read of the same rows,
+    // an extra 1.27 per run, with IPC at 1.24 against 1.99.
+    //
+    // So store a fixed width unconditionally and advance by the run length
+    // instead. A short run overshoots into the next run's output, which the
+    // next store then overwrites, and the loop below stops early enough that
+    // the overshoot never leaves the caller's buffer.
+    constexpr uint32_t kLanes = 32 / sizeof(physicalType);
+
     uint32_t outputOffset{0};
     uint32_t run{0};
+    while (outputOffset + kLanes <= length) {
+      const uint32_t count =
+          std::min(length - outputOffset, runEnds_[firstRun + run] - offset);
+      physicalType* out = output + outputOffset;
+      const physicalType value = runValues[run];
+      // Fixed trip count, so this compiles to stores with no guard on it.
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        out[lane] = value;
+      }
+      // Only a run longer than one store needs the rest, which on a section
+      // this path accepts is the minority of runs.
+      if (count > kLanes) {
+        std::fill(out + kLanes, out + count, value);
+      }
+      outputOffset += count;
+      offset += count;
+      ++run;
+    }
+
+    // Within one store of the end, where overshooting would write past the
+    // caller's buffer.
     while (outputOffset < length) {
-      const auto count =
+      const uint32_t count =
           std::min(length - outputOffset, runEnds_[firstRun + run] - offset);
       std::fill(
           output + outputOffset, output + outputOffset + count, runValues[run]);
