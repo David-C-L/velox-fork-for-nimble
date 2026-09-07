@@ -18,7 +18,6 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "velox/common/memory/RawVector.h"
@@ -694,6 +693,18 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // what turns a constant per-read cost into one proportional to what was
   // asked for. A workload that opens a view, reads one small range and
   // closes it will not see the win -- it pays the map build every time.
+  // One requested row's source index, paired with where in the request it
+  // belongs. Not std::pair<uint32_t, uint32_t>: libstdc++ 11 (the container's
+  // compiler, gcc 11) does not treat std::pair as trivially copyable even
+  // when both members are, so it fails raw_vector's static_assert there
+  // despite compiling fine against a newer libstdc++. A plain struct is
+  // trivially copyable on every compiler this project builds with, and
+  // named fields read better than .first/.second in the loops below.
+  struct SourceRow {
+    uint32_t source;
+    uint32_t row;
+  };
+
   void readPermutedSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
     const auto& positions = positionMap();
@@ -721,12 +732,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // found and removed from decode's other scratch buffers. Every element
     // here is overwritten by the loop directly below, so that fill was pure
     // loss on any call whose length exceeds the largest one seen so far.
-    thread_local velox::raw_vector<std::pair<uint32_t, uint32_t>> order;
+    thread_local velox::raw_vector<SourceRow> order;
     order.resize(length);
     for (uint32_t i = 0; i < length; ++i) {
       order[i] = {positions[offset + i], i};
     }
-    std::sort(order.begin(), order.end());
+    std::sort(order.begin(), order.end(), [](const SourceRow& a, const SourceRow& b) {
+      return a.source < b.source;
+    });
 
     // Sized to the whole range rather than chunked: this path already pays
     // for a heap scratch buffer for its permuted sections, so a plain
@@ -795,7 +808,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   static void readPermutedSpanSection(
       const Section& section,
       uint32_t length,
-      const velox::raw_vector<std::pair<uint32_t, uint32_t>>& order,
+      const velox::raw_vector<SourceRow>& order,
       physicalType* output,
       bool isFirst,
       velox::raw_vector<uint8_t>& scratch) {
@@ -809,14 +822,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     while (j < length) {
       uint32_t blockEnd = j + 1;
       while (blockEnd < length &&
-             order[blockEnd].first == order[blockEnd - 1].first + 1) {
+             order[blockEnd].source == order[blockEnd - 1].source + 1) {
         ++blockEnd;
       }
       const uint32_t blockLength = blockEnd - j;
       block.resize(blockLength);
-      section.view->read(order[j].first, blockLength, block.data());
+      section.view->read(order[j].source, blockLength, block.data());
       for (uint32_t k = 0; k < blockLength; ++k) {
-        gathered[order[j + k].second] = block[k];
+        gathered[order[j + k].row] = block[k];
       }
       j = blockEnd;
     }
