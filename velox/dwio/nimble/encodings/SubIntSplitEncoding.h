@@ -798,12 +798,20 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
     // An empty allowed set costs every encoding, so this is the production
     // path unless a caller has deliberately narrowed the inventory.
+    //
+    // Huffman is withdrawn by default: it was priced into where these
+    // boundaries fall while being unselectable for the sections they produce,
+    // so its cost model steered the planner toward splits nothing would read
+    // well. See Encoding::Options::subIntSplitAllowHuffman for what that cost
+    // and what withdrawing it bought.
+    auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
+    selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
         valueCount,
         options.subIntSplitAllowedEncodings,
-        detail::subintsplit::defaultSelectorConfig());
+        selectorConfig);
 
     segments = std::move(selectorResult.segments);
   }

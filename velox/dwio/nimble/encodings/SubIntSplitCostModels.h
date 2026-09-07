@@ -646,6 +646,7 @@ inline double bestCostBitsRestricted(
     int bitWidth,
     const std::vector<uint64_t>& segValues,
     const AllowedEncodings& allowed,
+    bool allowHuffman,
     EncodingType& bestEncoding) noexcept {
   double best = std::numeric_limits<double>::infinity();
   auto consider = [&](double cost, EncodingType type) noexcept {
@@ -690,8 +691,10 @@ inline double bestCostBitsRestricted(
         EncodingType::FrequencyPartition);
   }
   // Huffman is only viable within its supported alphabet size; skip the
-  // Statistics<uint64_t>::create() call entirely otherwise.
-  if (m.uniqueCount > 0 && !m.uniqueCountCapped &&
+  // Statistics<uint64_t>::create() call entirely otherwise. Costing it is the
+  // most expensive model here, so a caller that has withdrawn Huffman skips
+  // the work as well as the candidate.
+  if (allowHuffman && m.uniqueCount > 0 && !m.uniqueCountCapped &&
       m.uniqueCount <= HuffmanEncoding<uint64_t>::kMaxSymbols) {
     consider(huffmanCostBits(segValues, numValues), EncodingType::Huffman);
   }
@@ -709,7 +712,13 @@ inline double bestCostBits(
     EncodingType& bestEncoding) noexcept {
   static const AllowedEncodings kAll;
   return bestCostBitsRestricted(
-      m, numValues, bitWidth, segValues, kAll, bestEncoding);
+      m,
+      numValues,
+      bitWidth,
+      segValues,
+      kAll,
+      /*allowHuffman=*/true,
+      bestEncoding);
 }
 
 } // namespace facebook::nimble::detail::subintsplit

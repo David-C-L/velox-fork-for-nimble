@@ -301,6 +301,39 @@ TEST(
 
 TEST(
     SubIntSplitCostModelsTest,
+    BestCostBitsWithdrawsHuffmanWhenTheCallerDisallowsIt) {
+  // The data the test above shows Huffman winning on, so withdrawing Huffman
+  // has to change the answer here. Without this, an arm that turns Huffman off
+  // to price what its presence is worth could be silently inert and report that
+  // it costs nothing.
+  const std::vector<uint64_t> values = makePforFriendlyValues();
+  MetricCollector collector;
+  const SegmentMetrics m =
+      collector.compute(values, allCostModelRequiredFlags());
+
+  constexpr int kBitWidth = 16;
+  const AllowedEncodings allEncodings;
+  EncodingType withoutHuffman = EncodingType::Trivial;
+  const double best = bestCostBitsRestricted(
+      m,
+      values.size(),
+      kBitWidth,
+      values,
+      allEncodings,
+      /*allowHuffman=*/false,
+      withoutHuffman);
+
+  EXPECT_TRUE(std::isfinite(best));
+  EXPECT_NE(withoutHuffman, EncodingType::Huffman);
+
+  // Withdrawing a candidate can only raise the minimum, never lower it.
+  EncodingType withHuffman = EncodingType::Trivial;
+  EXPECT_GE(
+      best, bestCostBits(m, values.size(), kBitWidth, values, withHuffman));
+}
+
+TEST(
+    SubIntSplitCostModelsTest,
     BestCostBitsDoesNotUseHuffmanForHighCardinalityBaselinePlusOutliers) {
   // Widen the baseline from 16 to 200 distinct values (bit_width <= 8),
   // still well under HuffmanEncoding's kMaxSymbols cap, with a near-uniform

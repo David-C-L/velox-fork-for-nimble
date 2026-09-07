@@ -44,10 +44,15 @@ struct SegmentPlan {
 struct SelectorConfig {
   int minSegmentWidth{1};
   double splitPenalty{10.0}; // extra bits charged per additional split boundary
+  // Whether segments may be costed as Huffman. Withdrawing it moves the
+  // boundaries the DP picks, not merely the encoding it names for a segment,
+  // since a segment's cost is what the DP minimises over.
+  bool allowHuffman{true};
 };
 
 inline SelectorConfig defaultSelectorConfig() noexcept {
-  return SelectorConfig{.minSegmentWidth = 1, .splitPenalty = 10.0};
+  return SelectorConfig{
+      .minSegmentWidth = 1, .splitPenalty = 10.0, .allowHuffman = true};
 }
 
 // Incremental bit-range value extractor.
@@ -237,14 +242,14 @@ inline SelectorResult selectSplitsRestricted(
       kBits,
       fullCount,
       cfg,
-      [&allowed](
+      [&allowed, allowHuffman = cfg.allowHuffman](
           const SegmentMetrics& m,
           size_t numValues,
           int bitWidth,
           const std::vector<uint64_t>& segValues,
           EncodingType& bestEnc) noexcept {
         return bestCostBitsRestricted(
-            m, numValues, bitWidth, segValues, allowed, bestEnc);
+            m, numValues, bitWidth, segValues, allowed, allowHuffman, bestEnc);
       });
 }
 

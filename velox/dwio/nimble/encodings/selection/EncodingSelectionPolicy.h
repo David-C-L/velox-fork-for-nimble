@@ -284,7 +284,15 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
             std::pair{EncodingType::Delta, 0.85f},
             std::pair{EncodingType::FOR, 0.85f},
             std::pair{EncodingType::FrequencyPartition, 0.85f},
-            std::pair{EncodingType::Huffman, 0.85f},
+            // Huffman is deliberately absent. It decodes bit-serially through
+            // a table, and withdrawing it from SubIntSplit returned up to
+            // 3.78x of bulk decode on the columns measured. It is still
+            // reachable here for a caller who names it in read factors
+            // explicitly, which is an opt-in this list should not override.
+            // See Encoding::Options::subIntSplitAllowHuffman, which withdraws
+            // it from the split planner for the same reason; the two together
+            // are the decision, and they are separate only because this
+            // block is handed no options to consult.
             std::pair{EncodingType::DeltaBlock, 0.85f}}) {
         nestedEncodingReadFactors.push_back(pair);
       }

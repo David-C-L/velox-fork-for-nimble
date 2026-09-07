@@ -353,6 +353,28 @@ TEST_F(HuffmanEncodingTest, estimateRejectsCodeTreePastLimit) {
       std::nullopt);
 }
 
+TEST_F(HuffmanEncodingTest, estimateSizeChargesExactHuffmanBits) {
+  // Three equally frequent symbols code as 1 + 2 + 2 bits, so the bitstream is
+  // 3 * 1 + 3 * 2 + 3 * 2 = 15 bits. Shannon lengths charge every symbol
+  // ceil(log2(9 / 3)) = 2 bits and reach 18, which is what the estimate used to
+  // return: no prefix code is that long, because the two-bit codes leave a
+  // one-bit code unused.
+  std::vector<uint32_t> values;
+  values.insert(values.end(), 3, 0);
+  values.insert(values.end(), 3, 1);
+  values.insert(values.end(), 3, 2);
+
+  const auto estimate = HuffmanEncoding<uint32_t>::estimateSize(
+      values, Statistics<uint32_t>::create(values));
+  const uint64_t bitstreamBytes = (15 + 7) / 8 + 4;
+  const uint64_t expected =
+      EncodingPrefix::serializedSize(9, /*useVarint=*/false) +
+      varint::varintSize(3) + 1 + 3 * sizeof(uint32_t) + 3 +
+      varint::varintSize(1) + 2 + varint::varintSize(bitstreamBytes) +
+      bitstreamBytes;
+  EXPECT_EQ(estimate, expected);
+}
+
 TEST_F(HuffmanEncodingTest, estimateSizeIncludesCodesAndCheckpoints) {
   std::vector<uint32_t> values;
   values.insert(values.end(), 128, 0);
@@ -372,7 +394,10 @@ TEST_F(HuffmanEncodingTest, estimateSizeIncludesCodesAndCheckpoints) {
   values.push_back(0);
   const auto estimateAcrossCheckpoint = HuffmanEncoding<uint32_t>::estimateSize(
       values, Statistics<uint32_t>::create(values));
-  const uint64_t bitstreamBytesAcrossCheckpoint = 65 + 4;
+  // {129, 64, 64} codes as 1 + 2 + 2 bits, so 129 + 256 = 385 bits. Shannon
+  // lengths charged 513 for the same stream; the counts above are dyadic and
+  // the two agree there, which is why only this half of the test moved.
+  const uint64_t bitstreamBytesAcrossCheckpoint = 49 + 4;
   const uint64_t expectedAcrossCheckpoint =
       EncodingPrefix::serializedSize(257, /*useVarint=*/false) +
       varint::varintSize(3) + 1 + 3 * sizeof(uint32_t) + 3 +
@@ -382,12 +407,19 @@ TEST_F(HuffmanEncodingTest, estimateSizeIncludesCodesAndCheckpoints) {
   EXPECT_EQ(estimateAcrossCheckpoint, expectedAcrossCheckpoint);
 }
 
-// Maximum leaf depth of the Huffman tree over `frequencies`, built the long
-// way: an explicit tree through a priority queue, then a traversal.
-// Deliberately a different algorithm from the estimator's own feasibility
-// check, so the test below compares two implementations rather than one against
-// a copy of itself.
-uint32_t maxHuffmanCodeLength(const std::vector<uint64_t>& frequencies) {
+struct HuffmanTreeShape {
+  // Length of the longest code, which is what kMaxCodeBits limits.
+  uint32_t maxCodeLength{0};
+  // sum(frequency * code length), the length of the bitstream in bits.
+  uint64_t encodedBits{0};
+};
+
+// Shape of the Huffman tree over `frequencies`, built the long way: an explicit
+// tree through a priority queue, then a traversal that reads each leaf's depth
+// off the path taken to reach it. Deliberately a different algorithm from the
+// estimator's own merge, so the test below compares two implementations rather
+// than one against a copy of itself.
+HuffmanTreeShape huffmanTreeShape(const std::vector<uint64_t>& frequencies) {
   struct Entry {
     uint64_t frequency;
     int32_t node;
@@ -419,22 +451,23 @@ uint32_t maxHuffmanCodeLength(const std::vector<uint64_t>& frequencies) {
     queue.push({left.frequency + right.frequency, node});
   }
 
-  uint32_t maxDepth = 0;
+  HuffmanTreeShape shape;
   std::vector<std::pair<int32_t, uint32_t>> pending{{queue.top().node, 0}};
   while (!pending.empty()) {
     const auto [node, depth] = pending.back();
     pending.pop_back();
     if (nodes[node].left < 0) {
-      maxDepth = std::max(maxDepth, depth);
+      shape.maxCodeLength = std::max(shape.maxCodeLength, depth);
+      shape.encodedBits += nodes[node].frequency * depth;
       continue;
     }
     pending.push_back({nodes[node].left, depth + 1});
     pending.push_back({nodes[node].right, depth + 1});
   }
-  return maxDepth;
+  return shape;
 }
 
-TEST_F(HuffmanEncodingTest, estimateFeasibilityMatchesTreeDepth) {
+TEST_F(HuffmanEncodingTest, estimateMatchesExplicitHuffmanTree) {
   std::mt19937 rng{20260907};
   size_t trialsAtLimit = 0;
   size_t trialsPastLimit = 0;
@@ -479,16 +512,33 @@ TEST_F(HuffmanEncodingTest, estimateFeasibilityMatchesTreeDepth) {
     const std::span<const uint32_t> input{values.data(), values.size()};
     const auto estimate = HuffmanEncoding<uint32_t>::estimateSize(
         input, Statistics<uint32_t>::create(input));
-    const uint32_t depth = maxHuffmanCodeLength(frequencies);
+    const auto shape = huffmanTreeShape(frequencies);
+    const bool fits =
+        shape.maxCodeLength <= HuffmanEncoding<uint32_t>::kMaxCodeBits;
 
-    EXPECT_EQ(
-        estimate.has_value(), depth <= HuffmanEncoding<uint32_t>::kMaxCodeBits)
+    EXPECT_EQ(estimate.has_value(), fits)
         << "trial " << trial << " with " << symbolCount
-        << " symbols reaching depth " << depth;
+        << " symbols reaching depth " << shape.maxCodeLength;
 
-    if (depth == HuffmanEncoding<uint32_t>::kMaxCodeBits) {
+    if (fits) {
+      // The estimator sums the weight of every node it merges instead of
+      // measuring leaf depths, so this pins that identity against depths read
+      // off a real tree.
+      const uint64_t bitstreamBytes = (shape.encodedBits + 7) / 8 + 4;
+      const uint64_t checkpoints = velox::bits::divRoundUp(
+          values.size(), HuffmanEncoding<uint32_t>::kCheckpointStride);
+      const uint64_t expected =
+          EncodingPrefix::serializedSize(values.size(), /*useVarint=*/false) +
+          varint::varintSize(symbolCount) + 1 + symbolCount * sizeof(uint32_t) +
+          symbolCount + varint::varintSize(checkpoints) + checkpoints * 2 +
+          varint::varintSize(bitstreamBytes) + bitstreamBytes;
+      EXPECT_EQ(estimate, expected) << "trial " << trial;
+    }
+
+    if (shape.maxCodeLength == HuffmanEncoding<uint32_t>::kMaxCodeBits) {
       ++trialsAtLimit;
-    } else if (depth == HuffmanEncoding<uint32_t>::kMaxCodeBits + 1) {
+    } else if (
+        shape.maxCodeLength == HuffmanEncoding<uint32_t>::kMaxCodeBits + 1) {
       ++trialsPastLimit;
     }
   }
