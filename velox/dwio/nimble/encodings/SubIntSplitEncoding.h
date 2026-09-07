@@ -45,6 +45,7 @@
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
+#include "velox/dwio/nimble/encodings/selection/Statistics.h"
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -735,21 +736,29 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
 // Judged on a sample, since this only has to separate a key that groups from
 // one that does not.
 inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
-  constexpr size_t kSample = 4096;
   // Below this, a run averages fewer than four rows and there is little to
   // gather.
   constexpr size_t kMinRowsPerRun = 4;
-  if (key.size() <= kSample) {
-    const folly::F14FastSet<uint64_t> distinct(key.begin(), key.end());
-    return distinct.size() * kMinRowsPerRun <= key.size();
+  if (key.empty()) {
+    return false;
   }
-  const size_t stride = key.size() / kSample;
-  folly::F14FastSet<uint64_t> distinct;
-  distinct.reserve(kSample);
-  for (size_t i = 0; i < key.size(); i += stride) {
-    distinct.insert(key[i]);
-  }
-  return distinct.size() * kMinRowsPerRun <= kSample;
+  // Counted exactly rather than estimated from a sample. The sample this used
+  // to take compared the distinct count of 4096 strided rows against 4096
+  // instead of against the column, so it asked a different question of a long
+  // column than of a short one: a key with 16 rows per group was refused
+  // because a 4096-row sample of it holds about 2590 distinct values, which is
+  // most of the sample. Cardinality is also the wrong statistic to sample at
+  // all, since it cannot be estimated from a small sample within a constant
+  // factor however the arithmetic is arranged.
+  //
+  // Statistics already builds the unique-value map during selection, so this
+  // is the count that machinery already has. It costs a pass and a hash entry
+  // per distinct value, against an encode that will read this section several
+  // times over.
+  const auto statistics = Statistics<uint64_t>::create(
+      std::span<const uint64_t>(key.data(), key.size()));
+  const size_t distinct = statistics.uniqueCounts().value().size();
+  return distinct * kMinRowsPerRun <= key.size();
 }
 
 template <typename T>

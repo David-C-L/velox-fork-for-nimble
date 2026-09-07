@@ -18,8 +18,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <numeric>
+#include <random>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -27,6 +30,7 @@
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
@@ -542,6 +546,40 @@ TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {
 // stream arrives as arbitrary bytes. Each of these used to walk off the end of
 // the buffer, resize a vector by an attacker-chosen count, or shift by a
 // negative width, none of which reports anything.
+// The gate that decides whether a section is worth keying a permutation on
+// asks whether sorting by it would produce groups of at least four rows. It
+// answered that question from a 4096-row strided sample, and compared the
+// distinct count of the sample against the sample size rather than against the
+// column. The two are not the same question: a 4096-row sample of a column
+// with 4096 distinct values holds about 2590 of them, so the sampled statistic
+// saturates near the sample size long before the column reaches the density
+// the threshold is written in terms of.
+//
+// The key below has 16 rows per distinct value, four times what the gate asks
+// for, and the sampled form refuses it.
+TEST(SubIntSplitEncodingTests, keyWithLargeGroupsIsNotRefusedByCardinality) {
+  constexpr size_t kRows = 65536;
+  constexpr uint64_t kDistinct = 4096;
+
+  std::mt19937_64 rng{7};
+  std::vector<uint64_t> key(kRows);
+  for (auto& v : key) {
+    v = rng() % kDistinct;
+  }
+
+  // 65536 rows over 4096 distinct values is 16 rows per group.
+  EXPECT_TRUE(nimble::groupsEnoughToKey(key));
+}
+
+// The other side of the same threshold, so a fix cannot simply return true.
+// One distinct value per row groups nothing, whatever the column length.
+TEST(SubIntSplitEncodingTests, keyWithNoRepeatsIsRefused) {
+  constexpr size_t kRows = 65536;
+  std::vector<uint64_t> key(kRows);
+  std::iota(key.begin(), key.end(), uint64_t{0});
+  EXPECT_FALSE(nimble::groupsEnoughToKey(key));
+}
+
 TEST(SubIntSplitEncodingTests, truncatedStreamThrowsRatherThanReadingPastEnd) {
   const std::vector<uint64_t> values{
       0x1234567890000000ULL,
