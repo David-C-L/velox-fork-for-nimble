@@ -15,8 +15,10 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "velox/common/memory/RawVector.h"
@@ -470,29 +472,43 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
 
-    // A stream whose transforms can all address a row directly has three ways
-    // to be read.
+    // A stream whose transforms can all address a row directly has two ways
+    // to be read, and which one depends on whether the mapping is Permuted.
     //
     // A key-derived permutation is a stable sort by the key, so the position
     // map's cursor for a given run advances by exactly one on each of that
-    // run's occurrences: consecutive output rows drawn from the same run,
-    // uninterrupted by another run, sit at consecutive source indices. A
-    // partial range therefore decomposes into a handful of contiguous spans
-    // -- one per uninterrupted run of a run -- each readable in one bulk call,
-    // rather than one point probe per row. readPermutedSpan does that whenever
-    // the section is actually Permuted and the request is not the whole
-    // column (which already has a cheaper path below and must keep it, so
-    // this change does not touch bulk decode at all).
+    // run's occurrences, wherever in row order they fall: two occurrences of
+    // the same run sit at consecutive source indices even when other runs'
+    // rows come between them in the request. readPermutedSpan finds those
+    // runs by sorting the requested rows' source indices -- which brings a
+    // run's scattered occurrences together, since they are exactly a block
+    // of consecutive integers -- then reads each block in one bulk call and
+    // scatters the results back into row order. The first version of this
+    // only merged rows already adjacent in the request, which misses a run
+    // whose occurrences are spread through it and was most of the reason it
+    // measured worse than expected: 1024 calls averaging 32 rows apiece
+    // where the sorted version issues close to one call per distinct run.
     //
-    // Everything else -- InPlace transforms, and any range that is the whole
-    // column -- keeps the two-way choice this file has used since 556894e55:
-    // gathering row by row wins for a short range, where decoding rows nobody
-    // asked for would dominate; decoding the whole span in order and undoing
-    // the transform across it wins once enough of it is wanted.
+    // Below kSpanAdvantage, spans still beat decoding the column whole,
+    // because most of the whole column's cost is the O(rowCount_) map build
+    // this path also pays -- but not the per-row work on top of it. Above
+    // it, decoding the column in order and keeping the slice wins, the same
+    // choice this file has made since 556894e55. There is no separate
+    // row-by-row gather option for a Permuted stream any more: a span of
+    // length one is a point probe, so the span path already subsumes it.
+    //
+    // An InPlace transform has no run structure to sort by -- each row is
+    // already independently addressable -- so it keeps the older two-way
+    // choice: gathering row by row wins for a short range, where decoding
+    // rows nobody asked for would dominate, and decoding the whole span
+    // wins once enough of it is wanted.
     if (!blockedSection_ && transformInfo_.anyTransform()) {
-      if (permutedSection_ &&
-          !(offset == 0 && length == this->rowCount_)) {
-        readPermutedSpan(offset, length, output);
+      if (permutedSection_) {
+        if (length * kSpanAdvantage < this->rowCount_) {
+          readPermutedSpan(offset, length, output);
+          return;
+        }
+        readWholeSpan(offset, length, output);
         return;
       }
       if (length * kGatherAdvantage < this->rowCount_) {
@@ -629,8 +645,20 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // How much cheaper a gathered row is than a decoded one. Below this ratio of
   // wanted rows to total rows, gathering only what was asked for wins; above
   // it, decoding the span in order and undoing it wholesale wins even though
-  // it decodes rows nobody wanted.
+  // it decodes rows nobody wanted. Only reached by an InPlace transform now;
+  // see kSpanAdvantage for the Permuted equivalent.
   static constexpr uint32_t kGatherAdvantage = 8;
+
+  // The Permuted equivalent of kGatherAdvantage: below this ratio of wanted
+  // rows to total rows, reading spans wins; above it, decoding the whole
+  // column wins. Set equal to kGatherAdvantage as a starting point, since
+  // that was the empirically observed break-even point of the first,
+  // unmerged version of the span path (regression measured above roughly
+  // rowCount_/9, close to /8) -- and the merged version below should only
+  // need less of the column to win, not more, so this is deliberately
+  // conservative rather than tuned. Revisit once the merged path's own
+  // per-element cost is measured.
+  static constexpr uint32_t kSpanAdvantage = 8;
 
   // Decodes every section in order across the whole column, undoes the
   // transforms over that span, and keeps the requested rows.
@@ -674,6 +702,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       std::fill(output, output + length, constantBits_);
     }
 
+    // A run's occurrences within [offset, offset+length) are exactly a block
+    // of consecutive source indices, but they are not necessarily adjacent
+    // IN THE REQUEST: another run's rows can fall between two occurrences of
+    // this one. Merging only rows already adjacent in the request therefore
+    // finds a new "span" every time a different run interrupts, which on an
+    // interleaved arrival order is most rows -- close to one call per row
+    // rather than one per run. Sorting (source index, request-relative row)
+    // pairs by source index brings a run's scattered occurrences together,
+    // since they are a contiguous block of integers regardless of where in
+    // the request they fall; grouping the sorted order into consecutive-value
+    // runs then finds one span per key, not per interruption. Shared across
+    // every section below, since the position map -- and so this grouping --
+    // does not depend on which section is being read.
+    thread_local std::vector<std::pair<uint32_t, uint32_t>> order;
+    order.resize(length);
+    for (uint32_t i = 0; i < length; ++i) {
+      order[i] = {positions[offset + i], i};
+    }
+    std::sort(order.begin(), order.end());
+
     // Sized to the whole range rather than chunked: this path already pays
     // for a heap scratch buffer for its permuted sections, so a plain
     // section gains nothing here from the stack-sized chunking the bulk path
@@ -713,58 +761,61 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       switch (section.storageBytes) {
         case 1:
           readPermutedSpanSection<uint8_t>(
-              section, offset, length, positions, output, isFirst, scratch);
+              section, length, order, output, isFirst, scratch);
           break;
         case 2:
           readPermutedSpanSection<uint16_t>(
-              section, offset, length, positions, output, isFirst, scratch);
+              section, length, order, output, isFirst, scratch);
           break;
         case 4:
           readPermutedSpanSection<uint32_t>(
-              section, offset, length, positions, output, isFirst, scratch);
+              section, length, order, output, isFirst, scratch);
           break;
         default:
           readPermutedSpanSection<uint64_t>(
-              section, offset, length, positions, output, isFirst, scratch);
+              section, length, order, output, isFirst, scratch);
           break;
       }
     }
   }
 
-  // Groups [offset, offset+length) into contiguous spans of source indices
-  // -- consecutive output rows whose position map entries are themselves
-  // consecutive, which is exactly an uninterrupted run of one key -- and
-  // reads each span in one bulk call, rather than probing every row. Spans
-  // are read directly into `scratch` at their own output-relative position,
-  // so the buffer ends up holding the range in output order despite each
-  // span being read from a different, unrelated place in the section.
+  // Reads one section's values for a range already grouped into
+  // (source index, request-relative row) pairs sorted by source index, one
+  // bulk call per consecutive-value block -- one call per key touched,
+  // rather than one per row that survives interleaving. Each block's values
+  // come back in source order, not request order, so they are scattered into
+  // `scratch` at their recorded row rather than appended.
   template <typename SectionT>
   static void readPermutedSpanSection(
       const Section& section,
-      uint32_t offset,
       uint32_t length,
-      const velox::raw_vector<uint32_t>& positions,
+      const std::vector<std::pair<uint32_t, uint32_t>>& order,
       physicalType* output,
       bool isFirst,
       velox::raw_vector<uint8_t>& scratch) {
-    auto* values = reinterpret_cast<SectionT*>(scratch.data());
-    uint32_t spanStart = 0;
-    while (spanStart < length) {
-      uint32_t spanEnd = spanStart + 1;
-      while (spanEnd < length &&
-             positions[offset + spanEnd] == positions[offset + spanEnd - 1] + 1) {
-        ++spanEnd;
+    auto* gathered = reinterpret_cast<SectionT*>(scratch.data());
+    thread_local std::vector<SectionT> block;
+    uint32_t j = 0;
+    while (j < length) {
+      uint32_t blockEnd = j + 1;
+      while (blockEnd < length &&
+             order[blockEnd].first == order[blockEnd - 1].first + 1) {
+        ++blockEnd;
       }
-      const uint32_t sourceStart = positions[offset + spanStart];
-      section.view->read(sourceStart, spanEnd - spanStart, values + spanStart);
-      spanStart = spanEnd;
+      const uint32_t blockLength = blockEnd - j;
+      block.resize(blockLength);
+      section.view->read(order[j].first, blockLength, block.data());
+      for (uint32_t k = 0; k < blockLength; ++k) {
+        gathered[order[j + k].second] = block[k];
+      }
+      j = blockEnd;
     }
     if (isFirst) {
       detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(
-          values, output, length, section.mask, section.bitStart);
+          gathered, output, length, section.mask, section.bitStart);
     } else {
       detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
-          values, output, length, section.mask, section.bitStart);
+          gathered, output, length, section.mask, section.bitStart);
     }
   }
 
