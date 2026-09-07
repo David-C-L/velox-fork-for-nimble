@@ -663,21 +663,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   static constexpr uint32_t kGatherAdvantage = 8;
 
   // The Permuted equivalent of kGatherAdvantage, retuned once the radix
-  // sort replaced the comparison sort: spans now cost about 30 ns/element
-  // (0.98 ms for 32768 rows on a 524288-row column), where the whole-column
-  // fallback costs a fixed amount that depends on the column -- about
-  // 7.14 ms on NPI, about 13 ms on h3_r9. Spans win until length * 30 ns
-  // exceeds that fixed cost, which is a different ratio-to-rowCount_ on each
-  // column: roughly 11/5 on NPI, roughly 6/5 on h3_r9. A single constant
-  // cannot be exactly right on both, so this is set to h3_r9's ratio rather
-  // than NPI's, because h3_r9's fallback is the more expensive of the two:
-  // being wrong in NPI's favour costs some throughput in the band between
-  // the two breakeven points, where being wrong in h3_r9's favour would
-  // leave most of its larger win unclaimed. Expressed as a fraction rather
-  // than folded into one integer so retuning does not lose precision to
-  // integer division.
-  static constexpr uint32_t kSpanAdvantageNumerator = 5;
-  static constexpr uint32_t kSpanAdvantageDenominator = 6;
+  // sort replaced the comparison sort.
+  //
+  // A ratio below 1 (5/6, the first retune) is not just a bad guess -- it is
+  // structurally broken, because length * numerator < rowCount_ * denominator
+  // is true at length == rowCount_ whenever numerator < denominator. That
+  // sent the whole-column request down the span path, which sorts the
+  // position map against itself to rediscover that the section should be
+  // read sequentially -- exactly the O(n) waste flagged as a reason not to
+  // reuse this path for bulk decode in the first place, and it cost 3.3x on
+  // both bulk decode and whole-column ranged reads before anyone connected
+  // the two. A ratio at or above 1 cannot make this mistake: at length ==
+  // rowCount_, numerator >= denominator makes the comparison false
+  // unconditionally, so the whole-column case always falls through to
+  // readWholeSpan regardless of how the ratio is tuned from here.
+  //
+  // 2/1 is set from where spans and the fallback were measured level: at
+  // B = rowCount_/2 on NPI's 524288 rows, spans read 7.31 ms against the
+  // fallback's 7.05, and past that point spans lose by a growing margin.
+  static constexpr uint32_t kSpanAdvantageNumerator = 2;
+  static constexpr uint32_t kSpanAdvantageDenominator = 1;
 
   // Below this many rows, the radix sort's own fixed cost -- four passes,
   // each clearing a 256-entry count table -- has too little to amortise
