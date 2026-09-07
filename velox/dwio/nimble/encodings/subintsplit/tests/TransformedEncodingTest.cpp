@@ -23,7 +23,9 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Vector.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
+#include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
@@ -113,6 +115,52 @@ TEST_F(TransformedEncodingTest, roundTripsThroughTheEncoding) {
           << toString(id) << " differs at row " << i;
     }
   }
+}
+
+// Layout capture is a third reader of this header, after the encoding and the
+// view. It used to walk the header itself and treat the byte after splitCount
+// as reserved, which is the byte that now says whether a transform block
+// follows, so a reordered stream was captured from the wrong offset. The type
+// was not in its switch either, and the switch has no default, so the capture
+// came back childless and carrying no boundaries, reporting nothing wrong.
+TEST_F(TransformedEncodingTest, capturesTheLayoutOfAReorderedStream) {
+  const auto values = packedIdentifiers(4096);
+
+  Buffer plainBuffer{*pool_};
+  const auto plain = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      plainBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+  const auto plainLayout =
+      EncodingLayoutCapture::capture(plain, Encoding::Options{});
+
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitTransform =
+      static_cast<uint8_t>(subintsplit::TransformId::KeyDerived);
+  options.subIntSplitKeySection = 1;
+  options.subIntSplitForceApply = true;
+  const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, values, CompressionType::Uncompressed, options);
+
+  detail::SubIntSplitTransformInfo info;
+  const auto sections =
+      detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+  ASSERT_TRUE(info.anyTransform());
+
+  const auto captured = EncodingLayoutCapture::capture(encoded, options);
+
+  EXPECT_EQ(captured.encodingType(), EncodingType::SubIntSplitReordered);
+  // One child per section, which is what a childless capture failed to give.
+  EXPECT_EQ(captured.childrenCount(), sections.size());
+  EXPECT_GT(captured.childrenCount(), 0u);
+  // The split is a property of the values, and the permutation reorders rows
+  // rather than changing which bits a section covers, so the boundaries match
+  // the untransformed capture of the same data.
+  EXPECT_EQ(captured.childrenCount(), plainLayout.childrenCount());
+  EXPECT_EQ(
+      captured.config().get(
+          std::string(detail::subintsplit::kSplitBoundariesConfigKey)),
+      plainLayout.config().get(
+          std::string(detail::subintsplit::kSplitBoundariesConfigKey)));
 }
 
 // A stream that chose no transform must be byte-identical to one written

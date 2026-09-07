@@ -21,6 +21,7 @@
 #include "velox/dwio/nimble/common/Varint.h"
 #include "velox/dwio/nimble/encodings/ALPEncoding.h"
 #include "velox/dwio/nimble/encodings/FsstEncoding.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
@@ -206,51 +207,40 @@ EncodingLayout EncodingLayoutCapture::capture(
       // stream, and the layout tree describes how data is encoded, not how a
       // slice was deferred. Reported as childless.
       break;
-    case EncodingType::SubIntSplit: {
+    case EncodingType::SubIntSplit:
+    case EncodingType::SubIntSplitReordered: {
       // SubIntSplit decomposes its input into per-section bit-range
-      // sub-streams. Read the section headers, recursively capture each
-      // section's nested encoding as a child, and preserve the recovered
-      // bit boundaries in the encoding config so the same split layout can
-      // be replayed (see ReplayedEncodingSelectionPolicy).
-      const char* pos = encoding.data() + prefixSize;
-      const uint8_t splitCount = encoding::read<uint8_t>(pos);
-      encoding::read<uint8_t>(pos); // reserved
+      // sub-streams. Capture each section's nested encoding as a child, and
+      // preserve the recovered bit boundaries in the encoding config so the
+      // same split layout can be replayed (see
+      // ReplayedEncodingSelectionPolicy).
+      //
+      // Walked by the shared parser rather than by a header walk written here.
+      // This used to have its own, which read the byte after splitCount as
+      // reserved; that byte now says whether a transform block follows, so on
+      // a reordered stream a local walk would take the section headers from
+      // the wrong offset and capture nonsense. A third reader of this header
+      // is exactly what the shared one exists to prevent.
+      const auto sections =
+          detail::parseSubIntSplitSections(encoding, prefixSize);
 
-      struct SectionMeta {
-        uint8_t bitStart;
-        uint8_t bitEnd;
-        uint32_t encodedSize;
-      };
-
-      std::vector<SectionMeta> sectionMeta;
-      sectionMeta.reserve(splitCount);
-      for (uint8_t s = 0; s < splitCount; ++s) {
-        SectionMeta meta{};
-        meta.bitStart = encoding::read<uint8_t>(pos);
-        meta.bitEnd = encoding::read<uint8_t>(pos);
-        meta.encodedSize = encoding::readUint32(pos);
-        sectionMeta.push_back(meta);
-      }
-
-      children.reserve(splitCount);
-      for (uint8_t s = 0; s < splitCount; ++s) {
-        children.emplace_back(
-            EncodingLayoutCapture::capture(
-                {pos, sectionMeta[s].encodedSize}, options));
-        pos += sectionMeta[s].encodedSize;
-      }
-
+      children.reserve(sections.size());
       std::vector<detail::subintsplit::SegmentPlan> boundaryPlans;
-      boundaryPlans.reserve(splitCount);
-      for (uint8_t s = 0; s < splitCount; ++s) {
+      boundaryPlans.reserve(sections.size());
+      for (const auto& section : sections) {
+        children.emplace_back(
+            EncodingLayoutCapture::capture(section.stream, options));
         detail::subintsplit::SegmentPlan segment{};
-        segment.bitStart = static_cast<int>(sectionMeta[s].bitStart);
-        segment.bitEnd = static_cast<int>(sectionMeta[s].bitEnd);
+        segment.bitStart = section.bitStart;
+        segment.bitEnd = section.bitEnd;
         boundaryPlans.push_back(segment);
       }
 
+      // The captured type is the one the stream carries. Reporting a reordered
+      // stream as plain SubIntSplit would describe a layout that decodes to
+      // different values than the stream it came from.
       return {
-          EncodingType::SubIntSplit,
+          encodingType,
           EncodingLayout::Config{
               detail::subintsplit::makePreserveSplitConfig(boundaryPlans)},
           compressionType,
