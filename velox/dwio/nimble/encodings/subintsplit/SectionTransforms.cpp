@@ -19,6 +19,7 @@
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 
 #include <algorithm>
+#include <memory>
 #include <numeric>
 #include <utility>
 
@@ -40,8 +41,19 @@ namespace facebook::nimble::subintsplit {
 // taken from the section's bit range, which bounds no tighter and would have
 // to be plumbed here.
 std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
-  std::vector<uint32_t> order(key.size());
-  std::iota(order.begin(), order.end(), 0u);
+  // Appended rather than sized and then overwritten, so no row is written
+  // twice: once as a zero and once as itself.
+  const auto rowCount = static_cast<uint32_t>(key.size());
+  std::vector<uint32_t> order;
+  order.reserve(rowCount);
+  for (uint32_t row = 0; row < rowCount; ++row) {
+    order.push_back(row);
+  }
+  // Constructed per call. Keeping one between calls avoids reallocating a
+  // column-sized scratch for every candidate the key search tries, but a
+  // thread_local one measured 5.9 ms slower on a five-section column, so the
+  // reuse has to come from threading a sorter through the call rather than
+  // from storage duration.
   RadixSort<uint32_t> sorter;
   sorter.sortStable(
       std::span<uint32_t>(order),
@@ -52,12 +64,22 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
 
 namespace {
 
+// Every element of the scratch is written before it is read, so it is
+// allocated without being cleared: a std::vector would zero a section-sized
+// buffer that the loop below overwrites in full, which is the same traffic
+// again for nothing.
+//
+// The copy back stays. Removing it would mean gathering out of the plain values
+// into a separate destination rather than permuting a copy of them in place,
+// and the transform interface has no way to say that today, so it belongs in
+// its own change rather than being smuggled into this one.
 void gather(std::span<uint64_t> values, std::span<const uint32_t> order) {
-  std::vector<uint64_t> scratch(values.size());
+  const size_t count = values.size();
+  const auto scratch = std::make_unique_for_overwrite<uint64_t[]>(count);
   for (size_t i = 0; i < order.size(); ++i) {
     scratch[i] = values[order[i]];
   }
-  std::copy(scratch.begin(), scratch.end(), values.begin());
+  std::copy(scratch.get(), scratch.get() + count, values.begin());
 }
 
 void scatter(std::span<uint64_t> values, const std::vector<uint32_t>& order) {

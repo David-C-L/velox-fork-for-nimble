@@ -927,11 +927,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
     const int width = seg.bitEnd - seg.bitStart + 1;
     const uint64_t mask =
         (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
-    std::vector<uint64_t> out(valueCount);
+    // Appended rather than sized and then overwritten. Sizing it first would
+    // clear a buffer as long as the column, once per section, that the loop
+    // below writes over completely.
+    std::vector<uint64_t> out;
+    out.reserve(valueCount);
     for (uint32_t i = 0; i < valueCount; ++i) {
       uint64_t v = 0;
       __builtin_memcpy(&v, &values[i], sizeof(physicalType));
-      out[i] = (v >> seg.bitStart) & mask;
+      out.push_back((v >> seg.bitStart) & mask);
     }
     return out;
   };
