@@ -958,6 +958,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // needs a bounded span to address a row.
   const auto applyTransform = [&](int width,
                                   const std::vector<uint64_t>& keyValues,
+                                  std::span<const uint32_t> keyOrder,
                                   std::vector<uint64_t>& sectionU64,
                                   std::vector<uint64_t>& codebook,
                                   std::vector<uint32_t>& primaryIndices) {
@@ -970,7 +971,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
       subintsplit::TransformState state;
       state.codebook = sharedState.codebook;
       subintsplit::TransformContext context{
-          .keySection = keyValues, .width = width};
+          .keySection = keyValues, .width = width, .keyOrder = keyOrder};
       transform->apply(sectionU64, context, state);
       if (codebook.empty()) {
         codebook = std::move(state.codebook);
@@ -982,6 +983,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::min<uint32_t>(blockSize, valueCount - start);
         subintsplit::TransformState state;
         state.codebook = sharedState.codebook;
+        // No keyOrder: this branch hands the transform one block of the key
+        // at a time, and a permutation of the whole section does not describe
+        // the order within a block.
         subintsplit::TransformContext context{
             .keySection = keyValues.empty()
                 ? std::span<const uint64_t>{}
@@ -1043,6 +1047,22 @@ std::string_view SubIntSplitEncoding<T>::encode(
       keyGroups = groupsEnoughToKey(keyValues);
     }
 
+    // The permutation a key-derived transform gathers by is a property of the
+    // candidate key and of nothing else, so every section in the loop below
+    // was rebuilding the same one. Built once here instead, which makes the
+    // sorting cost of a key search linear in the split count rather than
+    // quadratic. This is the same hoist that took the section extraction and
+    // the untransformed encode out of this loop.
+    //
+    // Local to the attempt on purpose. A permutation left over from a previous
+    // candidate key would reorder rows by a key the stream does not name, so
+    // the lifetime is the one thing here that must not be shared or reused.
+    std::vector<uint32_t> keyPermutation;
+    if (hasKey && transform != nullptr && transform->needsKeySection() &&
+        (keyGroups || options.subIntSplitForceApply)) {
+      keyPermutation = subintsplit::buildKeyOrder(keyValues);
+    }
+
     for (uint8_t s = 0; s < splitCount; ++s) {
       const auto& seg = segments[s];
       const int width = seg.bitEnd - seg.bitStart + 1;
@@ -1071,7 +1091,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
       std::vector<uint64_t> codebook;
       std::vector<uint32_t> primaryIndices;
       const size_t stateBytes = applyTransform(
-          width, keyValues, transformed, codebook, primaryIndices);
+          width,
+          keyValues,
+          std::span<const uint32_t>(keyPermutation),
+          transformed,
+          codebook,
+          primaryIndices);
       const std::string_view alternative = encodeSection(s, sb, transformed);
 
       if (alternative.size() + stateBytes < plain.size() ||

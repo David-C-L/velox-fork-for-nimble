@@ -129,6 +129,41 @@ TEST(SectionTransformTest, keyDerivedOnItsOwnKeyIsIdentityOrder) {
   EXPECT_EQ(values, key);
 }
 
+// A caller holding one key across several sections builds the permutation once
+// and hands it back, which is only sound if what it hands back is exactly the
+// permutation the transform would have built for itself. Pinned rather than
+// trusted: an order belonging to some other key would reorder rows by a key the
+// stream does not name, and the result would look like ordinary data.
+TEST(SectionTransformTest, suppliedKeyOrderMatchesTheOneItWouldBuild) {
+  constexpr size_t kCount = 4'000;
+  constexpr int kWidth = 18;
+  std::mt19937_64 rng(11);
+  std::vector<uint64_t> key(kCount);
+  for (auto& value : key) {
+    value = rng() % 37;
+  }
+  const auto original = makeSection(kCount, kWidth, Shape::Uniform, 5);
+  const auto* transform = transformFor(TransformId::KeyDerived);
+
+  TransformContext derivedContext{.keySection = key, .width = kWidth};
+  TransformState state;
+  std::vector<uint64_t> derived = original;
+  transform->apply(derived, derivedContext, state);
+
+  const auto order = buildKeyOrder(key);
+  TransformContext suppliedContext{
+      .keySection = key, .width = kWidth, .keyOrder = order};
+  std::vector<uint64_t> supplied = original;
+  transform->apply(supplied, suppliedContext, state);
+
+  EXPECT_EQ(supplied, derived);
+
+  // The decoder is never handed an order, so a supplied one still has to leave
+  // a stream the derived path can undo.
+  transform->invert(supplied, derivedContext, state);
+  EXPECT_EQ(supplied, original);
+}
+
 // Undoing the permutation walks one cursor per distinct key, so how many keys
 // there are decides both what it costs and how much bookkeeping there is to get
 // wrong. Every other round-trip test here uses low-cardinality keys, so this

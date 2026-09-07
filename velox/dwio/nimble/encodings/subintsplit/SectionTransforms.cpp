@@ -27,21 +27,19 @@
 #include "velox/dwio/nimble/common/RadixSort.h"
 
 namespace facebook::nimble::subintsplit {
-namespace {
 
-// Stable sort of row indices by key, ties keeping original order. The decoder
-// reproduces exactly this permutation by re-sorting the key section, which is
-// why nothing needs storing.
+// The decoder reproduces exactly this permutation by re-sorting the key
+// section, which is why nothing needs storing.
 //
-// Radix rather than comparison, and stable radix over the whole key gives the
-// same permutation a stable comparison sort does, so the encoded bytes do not
-// move. What it costs is set by how wide the key is rather than by how many
-// rows there are: a key narrow enough to be worth keying on -- and this
+// Radix rather than comparison, and a stable radix over the whole key gives
+// the same permutation a stable comparison sort does, so the encoded bytes do
+// not move. What it costs is set by how wide the key is rather than by how
+// many rows there are: a key narrow enough to be worth keying on -- and this
 // transform only pays where the key groups rows, which needs few distinct
 // values -- sorts in one pass. The width is read off the keys rather than
 // taken from the section's bit range, which bounds no tighter and would have
 // to be plumbed here.
-std::vector<uint32_t> keyOrder(std::span<const uint64_t> key) {
+std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
   std::vector<uint32_t> order(key.size());
   std::iota(order.begin(), order.end(), 0u);
   RadixSort<uint32_t> sorter;
@@ -52,7 +50,9 @@ std::vector<uint32_t> keyOrder(std::span<const uint64_t> key) {
   return order;
 }
 
-void gather(std::span<uint64_t> values, const std::vector<uint32_t>& order) {
+namespace {
+
+void gather(std::span<uint64_t> values, std::span<const uint32_t> order) {
   std::vector<uint64_t> scratch(values.size());
   for (size_t i = 0; i < order.size(); ++i) {
     scratch[i] = values[order[i]];
@@ -151,7 +151,16 @@ class KeyDerivedTransform : public SectionTransform {
     NIMBLE_CHECK(
         context.keySection.size() == values.size(),
         "Key-derived transform needs a key section covering the same rows.");
-    gather(values, keyOrder(context.keySection));
+    if (!context.keyOrder.empty()) {
+      NIMBLE_CHECK_EQ(
+          context.keyOrder.size(),
+          values.size(),
+          "Key-derived transform needs an order covering the same rows.");
+      gather(values, context.keyOrder);
+      return;
+    }
+    const auto order = buildKeyOrder(context.keySection);
+    gather(values, order);
   }
 
   void invert(
