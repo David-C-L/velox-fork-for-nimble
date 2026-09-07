@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -732,9 +733,6 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
 // whole apparatus for it, sorting as many runs as there are rows and probing a
 // table that large once per row, which profiling found dominating decode on a
 // column whose first section is a 19-bit identifier.
-//
-// Judged on a sample, since this only has to separate a key that groups from
-// one that does not.
 inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
   // Below this, a run averages fewer than four rows and there is little to
   // gather.
@@ -742,6 +740,8 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
   if (key.empty()) {
     return false;
   }
+  const size_t rowCount = key.size();
+
   // Counted exactly rather than estimated from a sample. The sample this used
   // to take compared the distinct count of 4096 strided rows against 4096
   // instead of against the column, so it asked a different question of a long
@@ -751,14 +751,59 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key) {
   // all, since it cannot be estimated from a small sample within a constant
   // factor however the arithmetic is arranged.
   //
-  // Statistics already builds the unique-value map during selection, so this
-  // is the count that machinery already has. It costs a pass and a hash entry
-  // per distinct value, against an encode that will read this section several
-  // times over.
-  const auto statistics = Statistics<uint64_t>::create(
-      std::span<const uint64_t>(key.data(), key.size()));
-  const size_t distinct = statistics.uniqueCounts().value().size();
-  return distinct * kMinRowsPerRun <= key.size();
+  // Counted, but only up to the point where the answer stops being in doubt.
+  // The test is distinct * kMinRowsPerRun <= rowCount, so a key is refused the
+  // moment its distinct count passes a quarter of the rows, and nothing after
+  // that can bring it back. Stopping there matters more than it looks: the
+  // keys that run longest are the ones with the most distinct values, which
+  // are exactly the ones this refuses, so the early exit fires where the work
+  // would otherwise be largest.
+  //
+  // This used to ask Statistics for the count, which builds a map holding an
+  // entry per distinct value in order to return its size. The map was never
+  // read.
+  const size_t distinctLimit = rowCount / kMinRowsPerRun;
+
+  // These are one section's bit range, so they start at zero and their OR
+  // bounds them all: every value is below 1 << bit_width(orOfKeys).
+  uint64_t orOfKeys = 0;
+  for (const uint64_t value : key) {
+    orOfKeys |= value;
+  }
+  const int significantBits = std::bit_width(orOfKeys);
+
+  size_t distinct = 0;
+
+  // One bit per value the section can hold, which needs no hashing at all and
+  // for a key narrow enough to be worth keying on stays in cache. Taken only
+  // while the bitmap costs no more bytes than the key has rows, so it can
+  // never be the expensive half of this function.
+  if (significantBits < 64 && (size_t{1} << significantBits) <= rowCount * 8) {
+    std::vector<uint64_t> seen(
+        ((size_t{1} << significantBits) + 63) / 64, uint64_t{0});
+    for (const uint64_t value : key) {
+      uint64_t& word = seen[value >> 6];
+      const uint64_t bit = uint64_t{1} << (value & 63);
+      if ((word & bit) == 0) {
+        word |= bit;
+        if (++distinct > distinctLimit) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Wide keys still hash, but the set is reserved for what the early exit
+  // allows rather than for the whole column, and it stops at the same point.
+  folly::F14FastSet<uint64_t> seen;
+  seen.reserve(std::min(rowCount, distinctLimit + 1));
+  for (const uint64_t value : key) {
+    if (seen.insert(value).second && ++distinct > distinctLimit) {
+      return false;
+    }
+  }
+  return true;
 }
 
 template <typename T>

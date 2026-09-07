@@ -580,6 +580,50 @@ TEST(SubIntSplitEncodingTests, keyWithNoRepeatsIsRefused) {
   EXPECT_FALSE(nimble::groupsEnoughToKey(key));
 }
 
+// The same two answers reached through the other counting path. A key whose
+// values span the whole word is too wide for a bitmap to address, so it falls
+// back to hashing, and the early exit has to hold there too.
+TEST(SubIntSplitEncodingTests, wideKeysAreJudgedTheSameWayAsNarrowOnes) {
+  constexpr size_t kRows = 65536;
+  constexpr size_t kDistinct = 4096;
+  std::mt19937_64 rng{11};
+
+  // Every value carries the top bit, so the range covers the whole word and no
+  // bitmap can hold one entry per value.
+  std::vector<uint64_t> alphabet(kDistinct);
+  for (auto& v : alphabet) {
+    v = rng() | (uint64_t{1} << 63);
+  }
+  std::vector<uint64_t> grouping(kRows);
+  for (size_t i = 0; i < kRows; ++i) {
+    grouping[i] = alphabet[i % kDistinct];
+  }
+  EXPECT_TRUE(nimble::groupsEnoughToKey(grouping));
+
+  std::vector<uint64_t> distinctPerRow(kRows);
+  for (auto& v : distinctPerRow) {
+    v = rng() | (uint64_t{1} << 63);
+  }
+  EXPECT_FALSE(nimble::groupsEnoughToKey(distinctPerRow));
+}
+
+// The gate accepts a quarter of the rows as distinct values and refuses one
+// more. Counting now stops as soon as the limit is passed rather than running
+// to the end, so the boundary is where an off-by-one in the stopping condition
+// would show and nowhere else.
+TEST(SubIntSplitEncodingTests, keyIsRefusedExactlyPastAQuarterOfTheRows) {
+  constexpr size_t kRows = 65536;
+  const auto keyWithDistinct = [](size_t distinct) {
+    std::vector<uint64_t> key(kRows);
+    for (size_t i = 0; i < kRows; ++i) {
+      key[i] = i % distinct;
+    }
+    return key;
+  };
+  EXPECT_TRUE(nimble::groupsEnoughToKey(keyWithDistinct(kRows / 4)));
+  EXPECT_FALSE(nimble::groupsEnoughToKey(keyWithDistinct(kRows / 4 + 1)));
+}
+
 TEST(SubIntSplitEncodingTests, truncatedStreamThrowsRatherThanReadingPastEnd) {
   const std::vector<uint64_t> values{
       0x1234567890000000ULL,
