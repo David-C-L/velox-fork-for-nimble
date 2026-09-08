@@ -88,9 +88,13 @@ extractEncodingProperties(
   std::unordered_map<EncodingPropertyType, EncodingProperty> properties{};
   extractCompressionType(
       encodingType, dataType, stream, useVarintRowCount, properties);
+  // `data` carries the node's own encoded bytes. Nothing needed them while the
+  // only consumers were printing labels, but recomputing what a node's
+  // selection was quoted means decoding that node, and the traversal is the
+  // only thing that knows where each node begins and ends.
   properties.insert(
       {EncodingPropertyType::EncodedSize,
-       {.value = folly::to<std::string>(stream.size())}});
+       {.value = folly::to<std::string>(stream.size()), .data = stream}});
   return properties;
 }
 

@@ -45,6 +45,7 @@ velox_add_test_headers(
   CachePolicy.h
   DriverSweep.h
   ElemType.h
+  EncodingNodeEstimates.h
   GatherTraceGen.h
   MeasureLoop.h
   OpenZLBenchTarget.h

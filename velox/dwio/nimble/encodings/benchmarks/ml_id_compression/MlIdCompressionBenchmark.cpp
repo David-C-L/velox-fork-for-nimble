@@ -120,6 +120,14 @@ int runBenchmark() {
           std::cout << "  --- " << enc.name << " encoding nodes ---\n"
                     << nodes;
         }
+        // Each node's cost against what its selection was quoted. Kept
+        // separate from the tree above because it decodes every node to
+        // recompute the estimate, which the plain tree does not need to do.
+        auto estimates = target->describeNodeEstimates();
+        if (!estimates.empty()) {
+          std::cout << "  --- " << enc.name << " node estimates ---\n"
+                    << estimates;
+        }
       }
 
       const size_t payloadBytes = target->payloadSize();

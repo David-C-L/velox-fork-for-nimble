@@ -51,6 +51,7 @@
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
 #include "velox/dwio/nimble/tools/EncodingUtilities.h"
 
 // ---------------------------------------------------------------------------
@@ -204,6 +205,12 @@ struct NimbleBenchTargetBase {
   virtual std::string describeTree() {
     return {};
   }
+
+  /// Per node, what it cost against what its selection was quoted. Dumped
+  /// under default options, which is what the drivers encode with.
+  virtual std::string describeNodeEstimates() {
+    return {};
+  }
 };
 
 template <typename EncodingT>
@@ -245,6 +252,18 @@ struct NimbleBenchTargetImpl
     }
     return nimble::tools::getEncodingTreeLabel(std::string_view(
         reinterpret_cast<const char*>(payload.data()), payload.size()));
+  }
+
+  std::string describeNodeEstimates() override {
+    const auto payload = target.payloadBytes();
+    if (payload.empty()) {
+      return {};
+    }
+    return describeEncodingNodeEstimates(
+        std::string_view(
+            reinterpret_cast<const char*>(payload.data()), payload.size()),
+        *benchmarks::benchmarkPool(),
+        Encoding::Options{});
   }
 };
 
@@ -348,6 +367,14 @@ class NimbleViewBenchTargetImpl
     return encoded_.empty()
         ? std::string{}
         : nimble::tools::getEncodingTreeLabel(std::string_view(encoded_));
+  }
+
+  std::string describeNodeEstimates() override {
+    return encoded_.empty() ? std::string{}
+                            : describeEncodingNodeEstimates(
+                                  std::string_view(encoded_),
+                                  *pool_,
+                                  options_);
   }
 
  private:
@@ -468,6 +495,10 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
 
   std::string describeTree() override {
     return inner_->describeTree();
+  }
+
+  std::string describeNodeEstimates() override {
+    return inner_->describeNodeEstimates();
   }
 
   std::string describe() override {
