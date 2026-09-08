@@ -66,6 +66,44 @@
 // by construction -- cost_scale is 1 -- so the two pairs of plans should agree
 // exactly there, and it is a bug if they do not.
 //
+// Three quantities, and they bound different things:
+//
+//   oracle_cell_sum_bytes   sum over a plan's ranges of the smallest bytes any
+//                           one encoding reached on that range, measured on its
+//                           own. What the inventory could deliver if selection
+//                           were perfect. Minimised by the oracle_dp plan.
+//   plan_total_sample_bytes the same sum, but for the encoding each plan names.
+//   full_column_bytes       the assembled plan encoded over the whole column by
+//                           the writer. What is actually delivered.
+//
+// The first is NOT a lower bound on the last, and oracle_dp is not a bound on
+// what a plan can encode to. A cell records the minimum over every candidate,
+// while an assembled section is encoded with whatever nested selection picks --
+// estimateSize times readFactor, not smallest measured bytes. So a plan chosen
+// on cell minima has been optimised for an encoder that does not turn up. The
+// sharpest statement of that: SimdForBitpack wins more cells than any other
+// encoding and selection picks it zero times, because FixedBitWidth's estimate
+// omits the seven-byte FixedBitArray slop its encode always writes while the
+// two are otherwise byte-identical. The assembled encode also carries a
+// SubIntSplit header and section directory no cell sum contains.
+//
+// oracle_dp_selection exists for that reason. It minimises the bytes of the
+// candidate selection will really choose, so it is the plan a model plan should
+// be held against, and the gap between it and oracle_dp is the cost of
+// selection's mis-estimates -- the quantity this branch exists to reduce.
+//
+// A prediction worth checking rather than remembering: correcting the
+// FixedBitWidth slop should shrink the gap between oracle_dp and
+// oracle_dp_selection, because it removes the largest single case where argmin
+// bytes and argmin estimate-times-read-factor disagree. If the gap survives
+// that fix, there is a second source and it has not been found yet.
+//
+// So compare model against oracle on full_column_bytes, which is like-for-like,
+// and read full_column_vs_cell_sum as the size of the objective mismatch. A
+// model plan encoding smaller than the oracle_dp plan is not a contradiction
+// and not evidence of a bug; it means the model's boundaries happened to suit
+// the encoder the writer actually runs.
+//
 // What no sample size reveals: whether the true optimum is a partition neither
 // DP can express. Both search contiguous bit ranges of at least
 // min_segment_width, so a better partition outside that shape leaves them
@@ -133,6 +171,7 @@
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
+#include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 
 DEFINE_bool(validate, false, "Sanity-check oracle encode calls do not throw");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
@@ -201,6 +240,40 @@ inline bool encodingAvailableAtWidth(EncodingType type, int storageBytes) {
   return true;
 }
 
+// The candidates a SubIntSplit section is chosen from, and their read factors.
+//
+// A section sits under a SubIntSplit parent, so this is exactly what the writer
+// hands one: the default factors with the parent type removed and the
+// SubIntSplit-specific integer encodings added. Taken from
+// nestedEncodingReadFactors rather than restated, so it cannot drift from the
+// writer's own list.
+//
+// Measuring a section standalone does not give it this list by itself. The
+// policy chain of a standalone encode has the candidate encoding as its parent,
+// never SubIntSplit, so its children would be offered SubIntSplit -- which a
+// real section's children cannot be, because SubIntSplit is already gone one
+// level up. Seeding the top-level policy here is what puts a standalone section
+// in the position a real one occupies.
+inline const std::vector<std::pair<EncodingType, float>>&
+sectionCandidateReadFactors() {
+  static const std::vector<std::pair<EncodingType, float>> kFactors =
+      nestedEncodingReadFactors(
+          ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+          EncodingType::SubIntSplit);
+  return kFactors;
+}
+
+// The read factor selection would weigh `type` by, or nullopt when selection
+// would not consider it for a section at all.
+inline std::optional<float> sectionReadFactor(EncodingType type) {
+  for (const auto& [candidate, factor] : sectionCandidateReadFactors()) {
+    if (candidate == type) {
+      return factor;
+    }
+  }
+  return std::nullopt;
+}
+
 // Try to encode `sectionData` with EncodingT under `options`; return byte
 // count, or SIZE_MAX on failure (throws, e.g. Constant on non-constant data).
 //
@@ -209,6 +282,11 @@ inline bool encodingAvailableAtWidth(EncodingType type, int storageBytes) {
 // packs a section at its exact bit width, so measuring under defaults made the
 // ground truth wrong for the most-selected encoding in the system: a 12-bit
 // section measured 16 bits/value against a model that correctly said 12.
+//
+// Sub-stream encodings are chosen by real cost-based selection, as the writer
+// chooses them, from the list a section really gets. Forcing them to Trivial
+// charges Dictionary four bytes per index where the writer bit-packs them, and
+// does the same to every candidate with children.
 template <typename EncodingT, typename Storage>
 size_t tryEncode(
     const Vector<Storage>& sectionData,
@@ -216,18 +294,26 @@ size_t tryEncode(
   try {
     auto& pool = benchmarks::benchmarkPool();
     Buffer buf{*pool};
-    // Sub-stream encodings are chosen by real cost-based selection, as the
-    // writer chooses them. Forcing them to Trivial -- the Encoder helper's
-    // default -- charges Dictionary four bytes per index where the writer
-    // bit-packs them, and does the same to every other candidate with
-    // children, so the oracle would report sizes the writer never produces.
-    auto encoded = test::Encoder<EncodingT>::encode(
-        buf,
-        sectionData,
-        CompressionType::Uncompressed,
-        options,
-        /*realNestedSelection=*/FLAGS_nested_selection);
-    return encoded.size();
+    if (!FLAGS_nested_selection) {
+      // Diagnostic only: every sub-stream forced to Trivial, which is what the
+      // Encoder helper does by default and what this driver used to measure.
+      return test::Encoder<EncodingT>::encode(
+                 buf,
+                 sectionData,
+                 CompressionType::Uncompressed,
+                 options,
+                 /*realNestedSelection=*/false)
+          .size();
+    }
+    const auto values =
+        std::span<const Storage>(sectionData.data(), sectionData.size());
+    EncodingSelection<Storage> selection{
+        {.encodingType = test::EncodingTypeTraits<EncodingT>::encodingType},
+        Statistics<Storage>::create(values),
+        ManualEncodingSelectionPolicyFactory{
+            sectionCandidateReadFactors(), std::nullopt}
+            .createPolicy(TypeTraits<Storage>::dataType)};
+    return EncodingT::encode(selection, values, buf, options).size();
   } catch (...) {
     return std::numeric_limits<size_t>::max();
   }
@@ -399,8 +485,21 @@ struct OracleResult {
 };
 
 struct OracleCell {
+  // Smallest bytes any one candidate reached on this range.
   size_t bestBytes{std::numeric_limits<size_t>::max()};
   EncodingType bestEncoding{EncodingType::Trivial};
+  // Bytes of the candidate nested selection would actually pick for this range
+  // -- argmin of estimateSize times readFactor, not argmin of measured bytes.
+  //
+  // These two differ, and the difference is the point of measuring both. A plan
+  // chosen on bestBytes has been optimised for an encoder that does not turn
+  // up: SimdForBitpack wins more cells than any other encoding and selection
+  // picks it zero times, because FixedBitWidth's estimate omits the seven-byte
+  // FixedBitArray slop its encode always writes while the two are otherwise
+  // byte-identical. bestBytes is what the inventory could deliver under perfect
+  // selection; selectionBytes is what the writer will deliver.
+  size_t selectionBytes{std::numeric_limits<size_t>::max()};
+  EncodingType selectionEncoding{EncodingType::Trivial};
   std::vector<OracleResult> results; // parallel to candidateEncodings()
 };
 
@@ -465,23 +564,42 @@ struct OracleDpResult {
   size_t totalBytes{0};
 };
 
+/// Which per-cell cost the oracle DP minimises.
+enum class OracleObjective {
+  /// The smallest bytes any candidate reached. Optimal for an inventory whose
+  /// selection is perfect, which is not the selection the writer runs.
+  kCellMinimum,
+  /// The bytes of the candidate selection will actually choose. Optimal for
+  /// what the writer delivers, and so the plan to hold a model plan against.
+  kSelectionRealistic,
+};
+
 OracleDpResult oracleDp(
     const std::vector<std::vector<OracleCell>>& grid,
     int sz,
     double costScale,
-    double splitPenaltyBytes) {
+    double splitPenaltyBytes,
+    OracleObjective objective = OracleObjective::kCellMinimum) {
+  const auto cellBytes = [objective](const OracleCell& cell) {
+    return objective == OracleObjective::kCellMinimum ? cell.bestBytes
+                                                      : cell.selectionBytes;
+  };
+  const auto cellEncoding = [objective](const OracleCell& cell) {
+    return objective == OracleObjective::kCellMinimum ? cell.bestEncoding
+                                                      : cell.selectionEncoding;
+  };
   std::vector<double> dp(sz + 1, std::numeric_limits<double>::infinity());
   std::vector<int> prev(sz + 1, -1);
   dp[0] = 0.0;
   for (int i = 1; i <= sz; ++i) {
     for (int j = 0; j < i; ++j) {
       const auto& cell = grid[j][i - 1];
-      if (cell.bestBytes == std::numeric_limits<size_t>::max()) {
+      if (cellBytes(cell) == std::numeric_limits<size_t>::max()) {
         continue;
       }
       const double splitCost = (j == 0) ? 0.0 : splitPenaltyBytes;
       const double candidate =
-          dp[j] + static_cast<double>(cell.bestBytes) * costScale + splitCost;
+          dp[j] + static_cast<double>(cellBytes(cell)) * costScale + splitCost;
       if (candidate < dp[i]) {
         dp[i] = candidate;
         prev[i] = j;
@@ -500,10 +618,10 @@ OracleDpResult oracleDp(
     }
     const auto& cell = grid[start][idx - 1];
     result.segments.push_back(
-        {start, idx - 1, cell.bestEncoding, cell.bestBytes});
+        {start, idx - 1, cellEncoding(cell), cellBytes(cell)});
     // Reported unscaled, so the number stays a count of bytes the oracle
     // actually measured rather than a projection of them.
-    result.totalBytes += cell.bestBytes;
+    result.totalBytes += cellBytes(cell);
     idx = start;
   }
   std::reverse(result.segments.begin(), result.segments.end());
@@ -704,6 +822,8 @@ int runBenchmark() {
       "plan_type",
       "plan_segment_count",
       "plan_total_sample_bytes",
+      "oracle_cell_sum_bytes",
+      "full_column_vs_cell_sum",
       "plan_unresolved_segments",
       "full_column_bytes",
       "full_column_rows",
@@ -1012,6 +1132,16 @@ int runBenchmark() {
           oc.results.resize(candidates.size());
           withNarrowedSection(
               width, sectionU64, *pool, [&](const auto& sectionData) {
+                using Storage =
+                    std::decay_t<decltype(sectionData.data()[0])>;
+                const auto values = std::span<const Storage>(
+                    sectionData.data(), sectionData.size());
+                // Selection reads its estimates off Statistics, so build it
+                // once for the range rather than per candidate.
+                const auto statistics = Statistics<Storage>::create(values);
+                double bestSelectionCost =
+                    std::numeric_limits<double>::infinity();
+
                 for (size_t ci = 0; ci < candidates.size(); ++ci) {
                   if (!encodingAvailableAtWidth(
                           candidates[ci].type, storageBytes)) {
@@ -1028,6 +1158,36 @@ int runBenchmark() {
                       allowed.count(candidates[ci].type) > 0) {
                     oc.bestBytes = bytes;
                     oc.bestEncoding = candidates[ci].type;
+                  }
+
+                  // What nested selection would pick for this range: the same
+                  // estimateSize times readFactor comparison
+                  // ManualEncodingSelectionPolicy::select runs, over the same
+                  // candidate list a section is offered. No extra encode -- the
+                  // bytes are the ones just measured, and only the argmin
+                  // changes.
+                  const auto readFactor =
+                      sectionReadFactor(candidates[ci].type);
+                  if (!readFactor.has_value() ||
+                      bytes == std::numeric_limits<size_t>::max()) {
+                    continue;
+                  }
+                  const auto estimate =
+                      facebook::nimble::detail::EncodingSizeEstimation<
+                          Storage>::estimateSize(candidates[ci].type,
+                                                 values,
+                                                 statistics,
+                                                 sectionOptions);
+                  if (!estimate.has_value()) {
+                    continue;
+                  }
+                  const double selectionCost =
+                      static_cast<double>(estimate.value()) *
+                      static_cast<double>(readFactor.value());
+                  if (selectionCost < bestSelectionCost) {
+                    bestSelectionCost = selectionCost;
+                    oc.selectionBytes = bytes;
+                    oc.selectionEncoding = candidates[ci].type;
                   }
                 }
               });
@@ -1214,6 +1374,18 @@ int runBenchmark() {
           oracleDp(oracleGrid, kBits, /*costScale=*/1.0, splitPenaltyBytes);
       const OracleDpResult oracleFullScale =
           oracleDp(oracleGrid, kBits, fullCostScale, splitPenaltyBytes);
+      // The oracle for the cost the writer actually delivers. oracle_dp above
+      // minimises the smallest bytes any candidate reached, which no assembled
+      // plan receives, so it is a bound on the inventory rather than on any
+      // plan. This one minimises the bytes of the candidate selection will pick
+      // and is therefore the plan a model plan should be held against on
+      // full_column_bytes.
+      const OracleDpResult selectionOracle = oracleDp(
+          oracleGrid,
+          kBits,
+          fullCostScale,
+          splitPenaltyBytes,
+          OracleObjective::kSelectionRealistic);
 
       // Scores one plan: its measured bytes on the sample, its regret against
       // the best each of its own ranges could have reached, and what the whole
@@ -1221,6 +1393,7 @@ int runBenchmark() {
       const auto scorePlan = [&](const std::string& planType,
                                  const std::vector<SegmentPlan>& segments) {
         size_t planSampleBytes = 0;
+        size_t cellBestSum = 0;
         size_t regretBytes = 0;
         size_t unresolvedSegments = 0;
 
@@ -1242,9 +1415,11 @@ int runBenchmark() {
               bytesForPick != std::numeric_limits<size_t>::max();
           if (resolved) {
             planSampleBytes += bytesForPick;
-            if (cell.bestBytes != std::numeric_limits<size_t>::max() &&
-                bytesForPick > cell.bestBytes) {
-              regretBytes += (bytesForPick - cell.bestBytes);
+            if (cell.bestBytes != std::numeric_limits<size_t>::max()) {
+              cellBestSum += cell.bestBytes;
+              if (bytesForPick > cell.bestBytes) {
+                regretBytes += (bytesForPick - cell.bestBytes);
+              }
             }
           } else {
             ++unresolvedSegments;
@@ -1289,6 +1464,29 @@ int runBenchmark() {
         csv.set("plan_segment_count", static_cast<int64_t>(segments.size()));
         csv.set(
             "plan_total_sample_bytes", static_cast<int64_t>(planSampleBytes));
+        // The sum over this plan's ranges of the smallest bytes any single
+        // encoding reached on each range measured on its own.
+        //
+        // This is what oracleDp minimises, and it is NOT a bound on
+        // full_column_bytes. Two different things separate them, both in the
+        // same direction. The assembled encode charges a SubIntSplit header and
+        // a section directory that no cell sum contains, so it is larger. And a
+        // cell records the minimum over every candidate, while an assembled
+        // section is encoded with whatever nested selection picks --
+        // estimateSize times readFactor, not smallest measured bytes -- so a
+        // plan gets the encoding selection names, never the one the cell
+        // recorded. SimdForBitpack is the sharp case: it wins the most cells of
+        // any encoding and selection never picks it, so a plan optimised on
+        // cell minima is optimised for an encoder that will not turn up.
+        //
+        // That is why a model plan can encode smaller than the oracle plan
+        // without anything being wrong: the oracle's boundaries are optimal for
+        // the cell sum, and the cell sum is not the cost the writer delivers.
+        // Compare model against oracle on full_column_bytes, which is
+        // like-for-like; do not read the difference between these two columns
+        // as regret.
+        csv.set(
+            "oracle_cell_sum_bytes", static_cast<int64_t>(cellBestSum));
         csv.set(
             "plan_unresolved_segments",
             static_cast<int64_t>(unresolvedSegments));
@@ -1308,6 +1506,18 @@ int runBenchmark() {
               "full_column_bits_per_elem",
               static_cast<double>(fullColumnBytes.value()) * 8.0 /
                   static_cast<double>(data.size()));
+          // How far the assembled encode sits from the cell sum this plan was
+          // scored on, with the cell sum lifted to the column's row count so
+          // the two are in the same units. Above 1 is the normal direction --
+          // header plus selection not picking the cell winner. Emitted rather
+          // than left to be inferred, because its size is the size of the
+          // objective mismatch between the two grids.
+          if (cellBestSum > 0) {
+            csv.set(
+                "full_column_vs_cell_sum",
+                static_cast<double>(fullColumnBytes.value()) /
+                    (static_cast<double>(cellBestSum) * fullCostScale));
+          }
         }
         csv.set("skipped", int64_t{0});
         csv.endRow();
@@ -1337,6 +1547,8 @@ int runBenchmark() {
       scorePlan(
           "oracle_dp_sample_scale", toSegmentPlans(oracleSampleScale.segments));
       scorePlan("oracle_dp", toSegmentPlans(oracleFullScale.segments));
+      scorePlan(
+          "oracle_dp_selection", toSegmentPlans(selectionOracle.segments));
 
       // Per-cell accuracy summary for this dataset. Kept separate from the plan
       // rows: it describes the models, not any one plan.
