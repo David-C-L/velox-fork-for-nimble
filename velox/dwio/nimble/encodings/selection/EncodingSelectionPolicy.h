@@ -98,70 +98,6 @@ using EncodingSelectionPolicyCreator =
 #define UNIQUE_PTR_FACTORY(data_type, class, ...) \
   UNIQUE_PTR_FACTORY_EXTRA(data_type, class, , __VA_ARGS__)
 
-/// The encodings a nested stream may be chosen from, given the candidates its
-/// parent was chosen from and the encoding the parent settled on.
-///
-/// This is the one place that decision is made. It is a free function rather
-/// than a method because two callers need it and only one of them is a policy:
-/// the writer's ManualEncodingSelectionPolicy below, and the benchmark policy
-/// in SubstreamCompression.h, which stands in for a writer and has to reach the
-/// same answer. A second copy there is what let the drivers offer a SubIntSplit
-/// section eight encodings where the writer offers fifteen, and a divergence of
-/// that shape does not announce itself: both sides encode, both produce
-/// plausible sizes, and only the sizes differ.
-inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
-    const std::vector<std::pair<EncodingType, float>>& parentReadFactors,
-    EncodingType parentEncodingType) {
-  std::vector<std::pair<EncodingType, float>> nested;
-  nested.reserve(parentReadFactors.size());
-  // In each sub-level of the encoding selection, we exclude the encodings
-  // selected in parent levels. Although this is not required (as hopefully,
-  // the model will not pick a nested encoding of the same type as the parent),
-  // it provides an additional safety net, making sure the encoding selection
-  // will eventually converge, and also slightly speeds up nested encoding
-  // selection.
-  // TODO: validate the assumptions here compared to brute forcing, to see if
-  // the same encoding is selected multiple times in the tree (for example,
-  // should we allow trivial string lengths to be encoded using trivial
-  // encoding?)
-  for (const auto& entry : parentReadFactors) {
-    if (entry.first != parentEncodingType) {
-      nested.emplace_back(entry);
-    }
-  }
-#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  // SubIntSplit decomposes its input into bit-range segments, each
-  // independently re-encoded via encodeNested(). Segments often look very
-  // different from the original column (narrow, possibly skewed residuals), so
-  // offer additional integer-compression candidates here that aren't part of
-  // the global default read factors. This only affects direct children of a
-  // SubIntSplit node: recursion is bounded because a child's own encodingType
-  // (e.g. PFOR) -- not SubIntSplit -- is what gets passed to *its* children.
-  if (parentEncodingType == EncodingType::SubIntSplit) {
-    for (const auto& pair :
-         {std::pair{EncodingType::PFOR, 0.9f},
-          std::pair{EncodingType::SimdForBitpack, 0.9f},
-          std::pair{EncodingType::BlockBitPacking, 0.9f},
-          std::pair{EncodingType::Delta, 0.85f},
-          std::pair{EncodingType::FOR, 0.85f},
-          std::pair{EncodingType::FrequencyPartition, 0.85f},
-          // Huffman is deliberately absent. It decodes bit-serially through a
-          // table, and withdrawing it from SubIntSplit returned up to 3.78x of
-          // bulk decode on the columns measured. It is still reachable for a
-          // caller who names it in read factors explicitly, which is an opt-in
-          // this list should not override. See
-          // Encoding::Options::subIntSplitAllowHuffman, which withdraws it from
-          // the split planner for the same reason; the two together are the
-          // decision, and they are separate only because this function is
-          // handed no options to consult.
-          std::pair{EncodingType::DeltaBlock, 0.85f}}) {
-      nested.push_back(pair);
-    }
-  }
-#endif
-  return nested;
-}
-
 /// Manual encoding selection implementation.
 /// Uses a manually crafted model to choose the most appropriate encoding based
 /// on the provided statistics.
@@ -310,15 +246,58 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       EncodingType parentEncodingType,
       NestedEncodingIdentifier nestedEncodingIdentifier,
       DataType nestedDataType) override {
-    // The candidate list is decided by nestedEncodingReadFactors above, not
-    // here, so that a benchmark policy standing in for this one reaches the
-    // same list through the same code rather than through a copy of it.
+    // In each sub-level of the encoding selection, we exclude the encodings
+    // selected in parent levels. Although this is not required (as hopefully,
+    // the model will not pick a nested encoding of the same type as the
+    // parent), it provides an additional safety net, making sure the encoding
+    // selection will eventually converge, and also slightly speeds up nested
+    // encoding selection.
+    // TODO: validate the assumptions here compared to brute forcing, to see if
+    // the same encoding is selected multiple times in the tree (for example,
+    // should we allow trivial string lengths to be encoded using trivial
+    // encoding?)
+    std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors;
     const auto& sourceEncodingReadFactors =
         nestedEncodingReadFactorsOverride_.has_value()
         ? nestedEncodingReadFactorsOverride_.value()
         : candidateEncodingReadFactors_;
-    auto nestedEncodingReadFactors = nimble::nestedEncodingReadFactors(
-        sourceEncodingReadFactors, parentEncodingType);
+    nestedEncodingReadFactors.reserve(sourceEncodingReadFactors.size());
+    for (const auto& entry : sourceEncodingReadFactors) {
+      if (entry.first != parentEncodingType) {
+        nestedEncodingReadFactors.emplace_back(entry);
+      }
+    }
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+    // SubIntSplit decomposes its input into bit-range segments, each
+    // independently re-encoded via encodeNested(). Segments often look very
+    // different from the original column (narrow, possibly skewed
+    // residuals), so offer additional integer-compression candidates here
+    // that aren't part of the global default read factors. This only affects
+    // direct children of a SubIntSplit node: recursion is bounded because a
+    // child's own encodingType (e.g. PFOR) -- not SubIntSplit -- is what gets
+    // passed to *its* children's createImpl.
+    if (parentEncodingType == EncodingType::SubIntSplit) {
+      for (const auto& pair :
+           {std::pair{EncodingType::PFOR, 0.9f},
+            std::pair{EncodingType::SimdForBitpack, 0.9f},
+            std::pair{EncodingType::BlockBitPacking, 0.9f},
+            std::pair{EncodingType::Delta, 0.85f},
+            std::pair{EncodingType::FOR, 0.85f},
+            std::pair{EncodingType::FrequencyPartition, 0.85f},
+            // Huffman is deliberately absent. It decodes bit-serially through
+            // a table, and withdrawing it from SubIntSplit returned up to
+            // 3.78x of bulk decode on the columns measured. It is still
+            // reachable here for a caller who names it in read factors
+            // explicitly, which is an opt-in this list should not override.
+            // See Encoding::Options::subIntSplitAllowHuffman, which withdraws
+            // it from the split planner for the same reason; the two together
+            // are the decision, and they are separate only because this
+            // block is handed no options to consult.
+            std::pair{EncodingType::DeltaBlock, 0.85f}}) {
+        nestedEncodingReadFactors.push_back(pair);
+      }
+    }
+#endif
     UNIQUE_PTR_FACTORY(
         nestedDataType,
         ManualEncodingSelectionPolicy,

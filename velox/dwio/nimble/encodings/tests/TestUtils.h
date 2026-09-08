@@ -249,30 +249,27 @@ class Encoder {
     }
 
     std::unique_ptr<nimble::EncodingSelectionPolicyBase> createImpl(
-        nimble::EncodingType parentEncodingType,
+        nimble::EncodingType /* encodingType */,
         nimble::NestedEncodingIdentifier /* identifier */,
         nimble::DataType type) override {
       // When realNestedSelection_ is set, nested (sub-stream) encodings are
       // chosen by the normal cost-based factory instead of being forced to
       // Trivial -- e.g. so SubIntSplit exercises its diverse per-section
-      // encoders.
-      //
-      // The candidate list comes from nestedEncodingReadFactors, the same
-      // function the writer's policy uses, with parentEncodingType forwarded
-      // rather than discarded. Discarding it meant a SubIntSplit section was
-      // offered eight encodings where the writer offers fifteen, so a test
-      // asking for real nested selection got a narrower encoder than the one
-      // it meant to exercise. The generic rule also drops the parent encoding
-      // from the candidates, which is where the hand-rolled SubIntSplit erase
-      // has gone: for a SubIntSplit parent it removes exactly what the erase
-      // did, and it keeps the recursion bounded the same way.
+      // encoders. SubIntSplit is removed from the candidates to avoid infinite
+      // recursion (it is also not registered in EncodingFactory dispatch).
       if (realNestedSelection_) {
+        auto readFactors = nimble::ManualEncodingSelectionPolicyFactory::
+            defaultEncodingReadFactors();
+        readFactors.erase(
+            std::remove_if(
+                readFactors.begin(),
+                readFactors.end(),
+                [](const auto& factor) {
+                  return factor.first == nimble::EncodingType::SubIntSplit;
+                }),
+            readFactors.end());
         return nimble::ManualEncodingSelectionPolicyFactory{
-            nimble::nestedEncodingReadFactors(
-                nimble::ManualEncodingSelectionPolicyFactory::
-                    defaultEncodingReadFactors(),
-                parentEncodingType),
-            std::nullopt}
+            std::move(readFactors), std::nullopt}
             .createPolicy(type);
       }
       UNIQUE_PTR_FACTORY(
