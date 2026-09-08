@@ -921,6 +921,7 @@ int runBenchmark() {
           const double modelBestBits = bestCostBitsRestricted(
               metrics,
               sampleSize,
+              n,
               width,
               sectionU64,
               allowed,
@@ -938,8 +939,8 @@ int runBenchmark() {
           // row while is_model_pick stayed zero, which reads as a bug in the
           // driver rather than as the model declining to offer it.
           const bool dictionaryViable = metrics.uniqueCount > 0 &&
-              (metrics.uniqueCountCapped ||
-               metrics.uniqueCount < sampleSize / 2);
+              estimatedStreamUniqueCount(metrics, sampleSize, width, n) <
+                  static_cast<double>(n) / 2.0;
           const bool frequencyPartitionViable = metrics.uniqueCount > 0 &&
               !metrics.uniqueCountCapped && metrics.uniqueCount <= 1024;
           const bool huffmanViable = FLAGS_allow_huffman &&
@@ -964,7 +965,7 @@ int runBenchmark() {
                 break;
               case EncodingType::Dictionary:
                 bits = dictionaryViable
-                    ? dictionaryCostBits(metrics, sampleSize, width)
+                    ? dictionaryCostBits(metrics, sampleSize, n, width)
                     : kUnavailable;
                 break;
               case EncodingType::RLE:

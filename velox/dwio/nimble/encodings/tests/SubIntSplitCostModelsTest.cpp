@@ -293,7 +293,8 @@ TEST(
   constexpr int kBitWidth = 16;
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::Huffman);
@@ -407,6 +408,7 @@ TEST(
   const double best = bestCostBitsRestricted(
       m,
       values.size(),
+      values.size(),
       kBitWidth,
       values,
       allEncodings,
@@ -419,7 +421,9 @@ TEST(
   // Withdrawing a candidate can only raise the minimum, never lower it.
   EncodingType withHuffman = EncodingType::Trivial;
   EXPECT_GE(
-      best, bestCostBits(m, values.size(), kBitWidth, values, withHuffman));
+      best,
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, withHuffman));
 }
 
 TEST(
@@ -450,7 +454,8 @@ TEST(
   constexpr int kBitWidth = 16;
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::Dictionary);
@@ -467,7 +472,8 @@ TEST(
   constexpr int kBitWidth = 20;
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::BlockBitPacking);
@@ -533,7 +539,8 @@ TEST(
   constexpr int kBitWidth = 28; // bit_width(199800000) == 28
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::DeltaBlock);
@@ -552,7 +559,8 @@ TEST(
   constexpr int kBitWidth = 10; // bit_width(999) == 10
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::DeltaBlock);
@@ -582,7 +590,8 @@ TEST(
   constexpr int kBitWidth = 10; // bit_width(999) == 10
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::Delta);
@@ -620,7 +629,8 @@ TEST(
   constexpr int kBitWidth = 7; // bit_width(67) == 7
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::FrequencyPartition);
@@ -655,7 +665,8 @@ TEST(
   constexpr int kBitWidth = 8; // bit_width(227) == 8
   EncodingType bestEncoding = EncodingType::Trivial;
   const double best =
-      bestCostBits(m, values.size(), kBitWidth, values, bestEncoding);
+      bestCostBits(
+          m, values.size(), values.size(), kBitWidth, values, bestEncoding);
 
   EXPECT_TRUE(std::isfinite(best));
   EXPECT_EQ(bestEncoding, EncodingType::MainlyConstant);

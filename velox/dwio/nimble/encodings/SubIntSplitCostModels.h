@@ -16,6 +16,7 @@
 #pragma once
 
 #include <bit>
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,58 @@ inline MetricFlags allCostModelRequiredFlags() noexcept {
   return MetricFlag::MinMax | MetricFlag::RunStats | MetricFlag::UniqueCount |
       MetricFlag::DominantValue | MetricFlag::BitWidthHistogram |
       MetricFlag::DeltaStats | MetricFlag::FrequencyTiers;
+}
+
+/// Estimated number of distinct values in the *stream* a segment was sampled
+/// from, rather than the number the sample happened to contain.
+///
+/// The sample's distinct count is a lower bound on the stream's and nothing
+/// more, and the cost models were reading it as the answer. That is harmless
+/// while the sample holds every value the stream does, and badly wrong as soon
+/// as it cannot: past MetricCollector::kUniqueCountCap the count stops dead at
+/// the cap, so a segment holding a million distinct values reports 16385
+/// however many it really has.
+///
+/// Chao's estimator recovers the count from the repetition the sample saw. A
+/// value seen exactly once suggests others like it went unseen; a value seen
+/// exactly twice says the sample is beginning to saturate. It needs no
+/// assumption about the distribution's shape and it degrades correctly at both
+/// ends: with no singletons it returns the observed count, which is right when
+/// the sample held the whole alphabet, and it grows without bound as the sample
+/// approaches all-distinct, which is the case where the stream's cardinality
+/// genuinely cannot be inferred from the sample.
+///
+/// Clamped to what the segment can hold, which is what makes that unbounded end
+/// safe. A `bitWidth`-bit segment has at most 2^bitWidth distinct values and a
+/// stream of `fullCount` rows has at most `fullCount` of them, so an
+/// all-distinct sample lands on the smaller bound -- "as many as there could
+/// be", which is the honest reading of a sample that saw no repetition at all.
+inline double estimatedStreamUniqueCount(
+    const SegmentMetrics& m,
+    size_t numValues,
+    int bitWidth,
+    size_t fullCount) noexcept {
+  const double observed = static_cast<double>(m.uniqueCount);
+  const double rows = static_cast<double>(std::max<size_t>(fullCount, 1));
+  const double capacity = bitWidth >= 63
+      ? rows
+      : std::min(static_cast<double>(uint64_t{1} << bitWidth), rows);
+
+  // The sample is the stream, so there is nothing to extrapolate -- except
+  // where capping truncated the count, which is the one case where even a full
+  // scan does not know its own answer and the estimator still has work to do.
+  if (numValues >= fullCount && !m.uniqueCountCapped) {
+    return std::min(observed, capacity);
+  }
+
+  const auto f1 = static_cast<double>(m.singletonCount);
+  const auto f2 = static_cast<double>(m.doubletonCount);
+  double estimate = observed;
+  if (f1 > 0.0) {
+    estimate = f2 > 0.0 ? observed + (f1 * f1) / (2.0 * f2)
+                        : observed + f1 * (f1 - 1.0) / 2.0;
+  }
+  return std::clamp(estimate, observed, capacity);
 }
 
 // Trivial: store each value at its native storage width.
@@ -190,22 +243,37 @@ inline double mainlyConstantCostBits(
 // min(TrivialEncoding, FixedBitWidthEncoding)::estimateSize(uniqueCount, min,
 // max). Only the numeric path is modeled; SIS operates on raw uint64_t
 // bit-range slices, never strings.
-// Uses observed uniqueCount directly (no HLL blending). Directionally correct
-// for the DP's purposes.
+// The index width comes from the stream's estimated distinct count, not the
+// sample's. An index has to address every value in the alphabet the encoder
+// will actually build, and that alphabet belongs to the stream: sizing it from
+// the sample charged 16 bits per index for a segment whose real alphabet needs
+// 24, which made a wide high-cardinality segment look like a bargain and cost
+// the planner its splits.
+//
+// The alphabet term is still sized from the sample, which is wrong in the same
+// way and is deliberately left alone here. It is a fixed cost, and the selector
+// scales a model's whole result by fullCount/numValues, so a corrected alphabet
+// would be multiplied by the sampling ratio and swing Dictionary from far too
+// cheap to far too expensive. Two errors currently cancel there. Separating
+// fixed from per-value cost is what makes that term fixable, and it is a
+// different change from this one.
 // Required: UniqueCount, MinMax
 inline double dictionaryCostBits(
     const SegmentMetrics& m,
     size_t numValues,
+    size_t fullCount,
     int bitWidth) noexcept {
   if (m.uniqueCount == 0 || numValues == 0) {
     return 0.0;
   }
   const uint64_t uniques = static_cast<uint64_t>(m.uniqueCount);
+  const auto streamUniques = static_cast<uint64_t>(std::max(
+      1.0, estimatedStreamUniqueCount(m, numValues, bitWidth, fullCount)));
   const auto rowCount = static_cast<uint64_t>(numValues);
   const Encoding::Options options{};
 
   const uint64_t indicesBytes = FixedBitWidthEncoding<uint32_t>::estimateSize(
-      rowCount, /*minValue=*/0, uniques - 1, options);
+      rowCount, /*minValue=*/0, streamUniques - 1, options);
 
   uint64_t alphabetBytes;
   switch (storageWidthBits(bitWidth)) {
@@ -643,6 +711,7 @@ using AllowedEncodings = std::unordered_set<EncodingType>;
 inline double bestCostBitsRestricted(
     const SegmentMetrics& m,
     size_t numValues,
+    size_t fullCount,
     int bitWidth,
     const std::vector<uint64_t>& segValues,
     const AllowedEncodings& allowed,
@@ -669,11 +738,24 @@ inline double bestCostBitsRestricted(
       EncodingType::MainlyConstant);
   consider(rleCostBits(m, numValues, bitWidth), EncodingType::RLE);
   consider(varintCostBits(m, numValues, bitWidth), EncodingType::Varint);
-  // Dictionary only when cardinality << numValues
+  // Dictionary only where the stream's alphabet is small enough against the
+  // stream's rows for indices to beat values.
+  //
+  // Both sides of that test used to be sample quantities, and the capped case
+  // inverted it outright: `uniqueCountCapped ||` admitted a segment *because*
+  // its cardinality had proved too large to count, which is the one condition
+  // under which Dictionary certainly does not pay. Past
+  // MetricCollector::kUniqueCountCap every wide segment took that branch and
+  // was then priced on a 16385-value alphabet, so the widest and least
+  // compressible ranges came out cheapest and the planner stopped splitting
+  // them. It grew worse with more evidence, which is how it was found.
+  const double streamUniques =
+      estimatedStreamUniqueCount(m, numValues, bitWidth, fullCount);
   if (m.uniqueCount > 0 &&
-      (m.uniqueCountCapped || m.uniqueCount < numValues / 2)) {
+      streamUniques < static_cast<double>(fullCount) / 2.0) {
     consider(
-        dictionaryCostBits(m, numValues, bitWidth), EncodingType::Dictionary);
+        dictionaryCostBits(m, numValues, fullCount, bitWidth),
+        EncodingType::Dictionary);
   }
   consider(
       simdForBitpackCostBits(m, numValues, bitWidth),
@@ -707,6 +789,7 @@ inline double bestCostBitsRestricted(
 inline double bestCostBits(
     const SegmentMetrics& m,
     size_t numValues,
+    size_t fullCount,
     int bitWidth,
     const std::vector<uint64_t>& segValues,
     EncodingType& bestEncoding) noexcept {
@@ -714,6 +797,7 @@ inline double bestCostBits(
   return bestCostBitsRestricted(
       m,
       numValues,
+      fullCount,
       bitWidth,
       segValues,
       kAll,

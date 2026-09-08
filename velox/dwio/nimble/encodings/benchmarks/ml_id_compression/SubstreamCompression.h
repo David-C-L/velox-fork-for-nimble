@@ -137,28 +137,33 @@ class BenchEncodingSelectionPolicy
   }
 
   std::unique_ptr<nimble::EncodingSelectionPolicyBase> createImpl(
-      nimble::EncodingType /* encodingType */,
+      nimble::EncodingType parentEncodingType,
       nimble::NestedEncodingIdentifier /* identifier */,
       nimble::DataType type) override {
-    // Mirrors test::Encoder's nested path: when realNestedSelection is set the
-    // sub-stream encodings are chosen by the normal cost-based factory rather
-    // than forced to Trivial, so SubIntSplit exercises its per-section
-    // encoders. SubIntSplit is removed from the candidates to avoid infinite
-    // recursion. The one difference is that the chosen compressor is passed
-    // down instead of std::nullopt.
+    // With realNestedSelection set, a sub-stream's encodings are chosen by the
+    // writer's own cost-based factory rather than forced to Trivial, so
+    // SubIntSplit exercises its per-section encoders. The one difference from
+    // the writer is that the chosen compressor is passed down instead of
+    // std::nullopt.
+    //
+    // The candidate list comes from nestedEncodingReadFactors, the same
+    // function ManualEncodingSelectionPolicy::createImpl uses, and
+    // parentEncodingType is forwarded to it rather than discarded. Discarding
+    // it is what made this policy differ from the writer: the augmented list a
+    // SubIntSplit section gets is keyed on the parent type, so dropping the
+    // parent silently offered a section eight encodings where the writer offers
+    // fifteen, and every SubIntSplit figure this suite produced described an
+    // encoder nothing ships. Forwarding it also removes the parent encoding
+    // from the candidates, which is where the hand-rolled SubIntSplit erase
+    // this used to do has gone -- for a SubIntSplit parent the generic rule
+    // removes exactly what the erase did.
     if (realNestedSelection_) {
-      auto readFactors = nimble::ManualEncodingSelectionPolicyFactory::
-          defaultEncodingReadFactors();
-      readFactors.erase(
-          std::remove_if(
-              readFactors.begin(),
-              readFactors.end(),
-              [](const auto& factor) {
-                return factor.first == nimble::EncodingType::SubIntSplit;
-              }),
-          readFactors.end());
       return nimble::ManualEncodingSelectionPolicyFactory{
-          std::move(readFactors), compressionOptionsFor(compressionType_)}
+          nimble::nestedEncodingReadFactors(
+              nimble::ManualEncodingSelectionPolicyFactory::
+                  defaultEncodingReadFactors(),
+              parentEncodingType),
+          compressionOptionsFor(compressionType_)}
           .createPolicy(type);
     }
     UNIQUE_PTR_FACTORY(
