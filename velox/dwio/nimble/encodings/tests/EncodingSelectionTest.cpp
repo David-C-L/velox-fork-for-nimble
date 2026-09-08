@@ -40,20 +40,41 @@ nimble::Encoding::Options exactBitWidthOptions() {
   return bitWidthOptions(true);
 }
 
+// The candidates and read factors every test in this file selects against.
+//
+// Named rather than written inline because selectMainlyConst has to reproduce
+// select()'s comparison, and a second copy of these numbers would drift. Note
+// they are not the production factors: FixedBitWidth is 1.05 here against
+// production's 0.90, which changes which side of a close comparison wins.
+const std::vector<std::pair<nimble::EncodingType, float>>& rootReadFactors() {
+  static const std::vector<std::pair<nimble::EncodingType, float>> kFactors{
+      {nimble::EncodingType::Constant, 1.0},
+      {nimble::EncodingType::Trivial, 0.7},
+      {nimble::EncodingType::FixedBitWidth, 1.05},
+      {nimble::EncodingType::MainlyConstant, 1.05},
+      {nimble::EncodingType::SparseBool, 1.05},
+      {nimble::EncodingType::Dictionary, 1.05},
+      {nimble::EncodingType::RLE, 1.05},
+      {nimble::EncodingType::Varint, 1.1},
+  };
+  return kFactors;
+}
+
+float rootReadFactor(nimble::EncodingType encodingType) {
+  for (const auto& [candidate, factor] : rootReadFactors()) {
+    if (candidate == encodingType) {
+      return factor;
+    }
+  }
+  ADD_FAILURE() << "no read factor for " << encodingType;
+  return 1.0f;
+}
+
 template <typename T>
 std::unique_ptr<nimble::ManualEncodingSelectionPolicy<T>>
 getRootManualSelectionPolicy() {
   return std::make_unique<nimble::ManualEncodingSelectionPolicy<T>>(
-      std::vector<std::pair<nimble::EncodingType, float>>{
-          {nimble::EncodingType::Constant, 1.0},
-          {nimble::EncodingType::Trivial, 0.7},
-          {nimble::EncodingType::FixedBitWidth, 1.05},
-          {nimble::EncodingType::MainlyConstant, 1.05},
-          {nimble::EncodingType::SparseBool, 1.05},
-          {nimble::EncodingType::Dictionary, 1.05},
-          {nimble::EncodingType::RLE, 1.05},
-          {nimble::EncodingType::Varint, 1.1},
-      },
+      rootReadFactors(),
       nimble::CompressionOptions{
           .compressionAcceptRatio = 0.9,
           .internalCompressionLevel = 9,
@@ -453,57 +474,105 @@ TYPED_TEST(EncodingSelectionNumericTests, selectMainlyConst) {
       }
     }
 
-    if constexpr (nimble::isFloatingPointType<T>() || sizeof(T) < 4) {
-      // Floating point types and small types use Trivial encoding to encode
-      // the exception values.
-      test<T>(
-          values,
-          {
-              {.encodingType = nimble::EncodingType::MainlyConstant,
-               .dataType = nimble::TypeTraits<T>::dataType,
-               .level = 0,
-               .nestedEncodingName = ""},
-              {.encodingType = nimble::EncodingType::SparseBool,
-               .dataType = nimble::DataType::Bool,
-               .level = 1,
-               .nestedEncodingName = "IsCommon"},
-              {.encodingType = nimble::EncodingType::FixedBitWidth,
-               .dataType = nimble::DataType::Uint32,
-               .level = 2,
-               .nestedEncodingName = "Indices"},
-              {.encodingType = nimble::EncodingType::Trivial,
-               .dataType = nimble::isFloatingPointType<T>()
-                   ? nimble::TypeTraits<T>::dataType
-                   : nimble::TypeTraits<typename nimble::EncodingPhysicalType<
-                         T>::type>::dataType,
-               .level = 1,
-               .nestedEncodingName = "OtherValues"},
-          });
-    } else {
-      // All other numeric types use FixedBitWidth encoding to encode the
-      // exception values.
-      test<T>(
-          values,
-          {
-              {.encodingType = nimble::EncodingType::MainlyConstant,
-               .dataType = nimble::TypeTraits<T>::dataType,
-               .level = 0,
-               .nestedEncodingName = ""},
-              {.encodingType = nimble::EncodingType::SparseBool,
-               .dataType = nimble::DataType::Bool,
-               .level = 1,
-               .nestedEncodingName = "IsCommon"},
-              {.encodingType = nimble::EncodingType::FixedBitWidth,
-               .dataType = nimble::DataType::Uint32,
-               .level = 2,
-               .nestedEncodingName = "Indices"},
-              {.encodingType = nimble::EncodingType::FixedBitWidth,
-               .dataType = nimble::TypeTraits<
-                   typename nimble::EncodingPhysicalType<T>::type>::dataType,
-               .level = 1,
-               .nestedEncodingName = "OtherValues"},
-          });
+    // Which encoding the exception stream lands on is a size comparison, not a
+    // property of T.
+    //
+    // MainlyConstant sends its non-common values to a nested stream, and
+    // ManualEncodingSelectionPolicy::select lets Trivial keep its 0.70 read
+    // factor there only where Trivial is no larger than FixedBitWidth.
+    // Otherwise the discount buys decode speed with compression, which is what
+    // it used to do.
+    //
+    // This used to assert "floating point and types under four bytes get
+    // Trivial", a type-shaped proxy for that comparison: true while the
+    // discount was unconditional, false now. uint8_t is what shows the two
+    // apart -- its exception values span exactly eight bits, so Trivial costs
+    // no more than FixedBitWidth and keeps the discount, while int8_t's span
+    // seven and it does not. No predicate on T separates those two, so assert
+    // the comparison itself, through the same estimator select() consults.
+    using PhysicalT = typename nimble::EncodingPhysicalType<T>::type;
+    std::vector<T> exceptions;
+    for (const T candidate : values) {
+      if (candidate != value) {
+        exceptions.push_back(candidate);
+      }
     }
+    ASSERT_FALSE(exceptions.empty())
+        << "test precondition: the data must have values other than the common "
+        << "one, or there is no exception stream to assert about";
+
+    const auto exceptionSpan =
+        nimble::EncodingPhysicalType<T>::asEncodingPhysicalTypeSpan(
+            std::span<const T>{exceptions.data(), exceptions.size()});
+    const auto exceptionStatistics =
+        nimble::Statistics<PhysicalT>::create(exceptionSpan);
+    const auto estimateOptions = exactBitWidthOptions();
+    const auto trivialSize =
+        nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+            nimble::EncodingType::Trivial,
+            exceptionSpan,
+            exceptionStatistics,
+            estimateOptions);
+    const auto fixedBitWidthSize =
+        nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+            nimble::EncodingType::FixedBitWidth,
+            exceptionSpan,
+            exceptionStatistics,
+            estimateOptions);
+    ASSERT_TRUE(trivialSize.has_value());
+
+    // Reproduce select()'s comparison rather than assume its outcome.
+    //
+    // Withholding Trivial's discount does not on its own hand the stream to
+    // FixedBitWidth -- it only stops Trivial being credited for a size it does
+    // not have. Whether FixedBitWidth then wins depends on its own read factor,
+    // which in this file is 1.05, so a withheld Trivial at 1.0 still beats a
+    // FixedBitWidth that is smaller by less than 5%. That is exactly the float
+    // case: its exception values pack to 31 bits, making FixedBitWidth smaller
+    // by one byte in 207, which withholds the discount and still loses. Under
+    // the production factors, where FixedBitWidth is 0.90, the same stream
+    // would go the other way.
+    const bool trivialCostsNoMore = !fixedBitWidthSize.has_value() ||
+        trivialSize.value() <= fixedBitWidthSize.value();
+    const float trivialCost = static_cast<float>(trivialSize.value()) *
+        (trivialCostsNoMore ? rootReadFactor(nimble::EncodingType::Trivial)
+                            : 1.0f);
+    // select() keeps the first candidate on a tie and Trivial precedes
+    // FixedBitWidth in the list, so equal costs go to Trivial.
+    const bool expectTrivial = !fixedBitWidthSize.has_value() ||
+        trivialCost <=
+            static_cast<float>(fixedBitWidthSize.value()) *
+                rootReadFactor(nimble::EncodingType::FixedBitWidth);
+
+    // MainlyConstant re-encodes a floating point exception stream logically, so
+    // it keeps T's own data type there; every other type is handed to the
+    // nested stream already in its physical form.
+    const auto exceptionDataType = nimble::isFloatingPointType<T>()
+        ? nimble::TypeTraits<T>::dataType
+        : nimble::TypeTraits<PhysicalT>::dataType;
+
+    test<T>(
+        values,
+        {
+            {.encodingType = nimble::EncodingType::MainlyConstant,
+             .dataType = nimble::TypeTraits<T>::dataType,
+             .level = 0,
+             .nestedEncodingName = ""},
+            {.encodingType = nimble::EncodingType::SparseBool,
+             .dataType = nimble::DataType::Bool,
+             .level = 1,
+             .nestedEncodingName = "IsCommon"},
+            {.encodingType = nimble::EncodingType::FixedBitWidth,
+             .dataType = nimble::DataType::Uint32,
+             .level = 2,
+             .nestedEncodingName = "Indices"},
+            {.encodingType = expectTrivial
+                 ? nimble::EncodingType::Trivial
+                 : nimble::EncodingType::FixedBitWidth,
+             .dataType = exceptionDataType,
+             .level = 1,
+             .nestedEncodingName = "OtherValues"},
+        });
   }
 }
 

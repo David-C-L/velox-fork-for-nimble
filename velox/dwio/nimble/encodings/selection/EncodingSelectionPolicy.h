@@ -221,6 +221,21 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       };
     }
 
+    // FixedBitWidth's size, when it is a candidate, so that Trivial's read
+    // factor can be withheld where taking it would cost compression. See
+    // trivialKeepsItsDiscount below for why this is needed and what it costs
+    // to compute.
+    std::optional<uint64_t> fixedBitWidthSize;
+    if (std::any_of(
+            candidateEncodingReadFactors.begin(),
+            candidateEncodingReadFactors.end(),
+            [](const auto& entry) {
+              return entry.first == EncodingType::FixedBitWidth;
+            })) {
+      fixedBitWidthSize = detail::EncodingSizeEstimation<T>::estimateSize(
+          EncodingType::FixedBitWidth, values, statistics, options);
+    }
+
     float minCost = std::numeric_limits<float>::max();
     EncodingType selectedEncoding = EncodingType::Trivial;
     std::optional<uint64_t> selectedEstimatedSize;
@@ -238,7 +253,43 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
 
       // We use read factor weights to raise/lower the favorability of each
       // encoding.
-      const auto readFactor = entry.second;
+      //
+      // Trivial's is withheld where taking it would cost compression. Its
+      // factor is 0.70 against FixedBitWidth's 0.90, so it can be up to 28.6%
+      // larger and still win, and against a stream it does not fit exactly it
+      // always is larger: Trivial stores at the storage type's width while
+      // FixedBitWidth stores at the value width. A 29-bit section becomes
+      // Trivial<Uint32> at 32 bits against FixedBitWidth's 29, and
+      // 32 * 0.70 = 22.4 beats 29 * 0.90 = 26.1, so three bits per row are
+      // spent on decode speed with nothing reporting it. On one Snowflake
+      // column that section held 72% of the encoded bytes.
+      //
+      // The discount is only free where Trivial is no larger, so that is the
+      // condition, stated directly rather than as the set of widths that
+      // happen to satisfy it today. "A multiple of 8 bits" is the wrong test:
+      // a 24-bit section is a multiple of 8 and still becomes Trivial<Uint32>
+      // at 32 bits, losing a byte per row. The two are equal only where the
+      // bit width equals the storage width, which is 8, 16, 32 or 64 -- but
+      // comparing the estimates says why rather than which, and keeps holding
+      // if storage-width selection ever changes.
+      //
+      // Withheld means competing at 1.0, not at some other discount: whenever
+      // Trivial is at least as large as FixedBitWidth, 1.0 is enough to let
+      // FixedBitWidth win, and no more than that is intended here.
+      //
+      // A floating point stream can sit either side of this by a byte or two
+      // and it is not a bug. Bit patterns whose exponents vary need close to
+      // the full storage width, so Trivial usually stays free and keeps the
+      // discount; a narrow synthetic range -- small integers cast to float,
+      // say -- packs to about 31 bits and tips the comparison the other way on
+      // a margin of a single byte. Both outcomes are the rule working. The
+      // margin is that narrow only where the range is, which is rare in real
+      // float data.
+      const bool trivialKeepsItsDiscount = encodingType !=
+              EncodingType::Trivial ||
+          !fixedBitWidthSize.has_value() ||
+          estimatedSize.value() <= fixedBitWidthSize.value();
+      const auto readFactor = trivialKeepsItsDiscount ? entry.second : 1.0f;
       const auto cost = estimatedSize.value() * readFactor;
       NIMBLE_SELECTION_LOG(
           "Encoding: " << encodingType << ", Size: "
