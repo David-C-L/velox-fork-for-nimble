@@ -137,6 +137,13 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
   // the global default read factors. This only affects direct children of a
   // SubIntSplit node: recursion is bounded because a child's own encodingType
   // (e.g. PFOR) -- not SubIntSplit -- is what gets passed to *its* children.
+  //
+  // Note this list reaches the whole subtree, not only the direct children.
+  // createImpl builds a child's policy from the vector returned here, so a
+  // child's own candidate list already carries these entries, and passing its
+  // encoding type as the parent only removes that one entry. Recursion is
+  // still bounded, but by each encoding dropping itself rather than by the
+  // additions stopping one level down.
   if (parentEncodingType == EncodingType::SubIntSplit) {
     for (const auto& pair :
          {// PFOR, SimdForBitpack and BlockBitPacking are held at 0.9 rather

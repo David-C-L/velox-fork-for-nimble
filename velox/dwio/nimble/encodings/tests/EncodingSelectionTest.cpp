@@ -60,6 +60,58 @@ const std::vector<std::pair<nimble::EncodingType, float>>& rootReadFactors() {
   return kFactors;
 }
 
+// The encoding select() would choose for `values`, given the candidates its
+// parent was chosen from and the encoding the parent settled on.
+//
+// Reproduces select()'s comparison rather than predicting its outcome, through
+// the same three pieces it uses: nestedEncodingReadFactors for the candidate
+// list, EncodingSizeEstimation for each estimate, and effectiveReadFactor for
+// the weighting. Ties go to the earlier candidate, as select()'s strict `<`
+// does. A test written this way tracks a change to any of the three instead of
+// having to be re-derived after it.
+template <typename T>
+nimble::EncodingType predictSelected(
+    std::span<const typename nimble::TypeTraits<T>::physicalType> values,
+    const std::vector<std::pair<nimble::EncodingType, float>>& parentFactors,
+    nimble::EncodingType parentEncoding,
+    const nimble::Encoding::Options& options) {
+  using PhysicalT = typename nimble::TypeTraits<T>::physicalType;
+  const auto candidates =
+      nimble::nestedEncodingReadFactors(parentFactors, parentEncoding);
+  const auto statistics = nimble::Statistics<PhysicalT>::create(values);
+
+  // effectiveReadFactor withholds Trivial's discount by comparing against
+  // FixedBitWidth, so that estimate has to be in hand before the loop, exactly
+  // as select() computes it.
+  std::optional<uint64_t> fixedBitWidthSize;
+  for (const auto& [encodingType, factor] : candidates) {
+    if (encodingType == nimble::EncodingType::FixedBitWidth) {
+      fixedBitWidthSize =
+          nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+              encodingType, values, statistics, options);
+      break;
+    }
+  }
+
+  float minCost = std::numeric_limits<float>::max();
+  auto selected = nimble::EncodingType::Trivial;
+  for (const auto& [encodingType, factor] : candidates) {
+    const auto size = nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+        encodingType, values, statistics, options);
+    if (!size.has_value()) {
+      continue;
+    }
+    const float cost = static_cast<float>(size.value()) *
+        nimble::effectiveReadFactor(
+            encodingType, factor, size.value(), fixedBitWidthSize);
+    if (cost < minCost) {
+      minCost = cost;
+      selected = encodingType;
+    }
+  }
+  return selected;
+}
+
 float rootReadFactor(nimble::EncodingType encodingType) {
   for (const auto& [candidate, factor] : rootReadFactors()) {
     if (candidate == encodingType) {
@@ -693,60 +745,96 @@ TYPED_TEST(EncodingSelectionNumericTests, selectRunLength) {
     ++index;
   }
 
-  if constexpr (
-      nimble::isFloatingPointType<T>() || std::is_same_v<int32_t, T> ||
-      std::is_same_v<uint32_t, T> || sizeof(T) > 4) {
-    // Floating point, 32-bit range-spanning, and wider types prefer storing the
-    // run values as dictionary.
-    test<T>(
-        values,
-        {
-            {.encodingType = nimble::EncodingType::RLE,
-             .dataType = nimble::TypeTraits<T>::dataType,
-             .level = 0,
-             .nestedEncodingName = ""},
-            {.encodingType = nimble::EncodingType::FixedBitWidth,
-             .dataType = nimble::DataType::Uint32,
-             .level = 1,
-             .nestedEncodingName = "Lengths"},
-            {.encodingType = nimble::EncodingType::Dictionary,
-             .dataType = nimble::isFloatingPointType<T>()
-                 ? nimble::TypeTraits<T>::dataType
-                 : nimble::TypeTraits<typename nimble::EncodingPhysicalType<
-                       T>::type>::dataType,
-             .level = 1,
-             .nestedEncodingName = "Values"},
-            {.encodingType = nimble::EncodingType::Trivial,
-             .dataType = nimble::isFloatingPointType<T>()
-                 ? nimble::TypeTraits<T>::dataType
-                 : nimble::TypeTraits<typename nimble::EncodingPhysicalType<
-                       T>::type>::dataType,
-             .level = 2,
-             .nestedEncodingName = "Alphabet"},
-            {.encodingType = nimble::EncodingType::FixedBitWidth,
-             .dataType = nimble::DataType::Uint32,
-             .level = 2,
-             .nestedEncodingName = "Indices"},
-        });
-  } else {
-    test<T>(
-        values,
-        {
-            {.encodingType = nimble::EncodingType::RLE,
-             .dataType = nimble::TypeTraits<T>::dataType,
-             .level = 0,
-             .nestedEncodingName = ""},
-            {.encodingType = nimble::EncodingType::FixedBitWidth,
-             .dataType = nimble::DataType::Uint32,
-             .level = 1,
-             .nestedEncodingName = "Lengths"},
-            {.encodingType = nimble::EncodingType::Trivial,
-             .dataType = nimble::TypeTraits<
-                 typename nimble::EncodingPhysicalType<T>::type>::dataType,
-             .level = 1,
-             .nestedEncodingName = "Values"},
-        });
+  // Which encodings RLE's two children land on is a size comparison, not a
+  // property of T, so both are recomputed through the same estimators select()
+  // consults rather than branched on the type.
+  //
+  // This used to assert "floating point, 32-bit range-spanning, and wider types
+  // prefer dictionary" -- a type-shaped proxy for that comparison. What
+  // actually separates the types here is uniqueValues, which is
+  // {min(), 0, max()}: three distinct values for a signed type, and only two
+  // for an unsigned one, because min() is 0 there.
+  //
+  // That same fact means the children must be derived from `values` by the
+  // run-splitting RLE itself performs, not from the `runLengths` the loop above
+  // generated. With min() == 0 the runs carrying uniqueValues[0] and
+  // uniqueValues[1] hold the same value, so RLE merges them: the nominal run
+  // lengths describe a child stream that is never encoded, on exactly the
+  // unsigned types this test was failing on.
+  std::vector<uint32_t> actualRunLengths;
+  std::vector<T> actualRunValues;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i == 0 || values[i] != values[i - 1]) {
+      actualRunValues.push_back(values[i]);
+      actualRunLengths.push_back(1);
+    } else {
+      ++actualRunLengths.back();
+    }
   }
+
+  const auto options = exactBitWidthOptions();
+  // The run lengths are a uint32 stream whatever T is, and they are where the
+  // FixedBitArray slop decides the outcome: seven bytes on a twenty-element
+  // stream is enough to move FixedBitWidth behind Varint, which is immune to
+  // it, so the gap closes from both sides at once.
+  const auto lengthsEncoding = predictSelected<uint32_t>(
+      std::span<const uint32_t>{
+          actualRunLengths.data(), actualRunLengths.size()},
+      rootReadFactors(),
+      nimble::EncodingType::RLE,
+      options);
+  const auto runValuesEncoding = predictSelected<T>(
+      nimble::EncodingPhysicalType<T>::asEncodingPhysicalTypeSpan(
+          std::span<const T>{actualRunValues.data(), actualRunValues.size()}),
+      rootReadFactors(),
+      nimble::EncodingType::RLE,
+      options);
+
+  // MainlyConstant and RLE re-encode a floating point child logically, so it
+  // keeps T's own data type; every other type reaches the nested stream in its
+  // physical form.
+  const auto runValuesDataType = nimble::isFloatingPointType<T>()
+      ? nimble::TypeTraits<T>::dataType
+      : nimble::TypeTraits<
+            typename nimble::EncodingPhysicalType<T>::type>::dataType;
+
+  std::vector<EncodingDetails> expected{
+      {.encodingType = nimble::EncodingType::RLE,
+       .dataType = nimble::TypeTraits<T>::dataType,
+       .level = 0,
+       .nestedEncodingName = ""},
+      {.encodingType = lengthsEncoding,
+       .dataType = nimble::DataType::Uint32,
+       .level = 1,
+       .nestedEncodingName = "Lengths"},
+      {.encodingType = runValuesEncoding,
+       .dataType = runValuesDataType,
+       .level = 1,
+       .nestedEncodingName = "Values"}};
+
+  // A Dictionary brings its own two children. These are asserted as constants
+  // rather than recomputed: reproducing them would mean rebuilding
+  // Dictionary's alphabet and index streams here, which duplicates the
+  // encoding's own logic in a test, and neither is near a boundary -- the
+  // alphabet is two or three values, where Trivial wins by a wide margin, and
+  // the indices are one small value per run, where FixedBitWidth does. If
+  // either ever flips, this fails loudly and says so, which is the outcome
+  // worth having. The tree dump and node audit are the instruments for nested
+  // encodings generally; this test is for RLE being selected at all.
+  if (runValuesEncoding == nimble::EncodingType::Dictionary) {
+    expected.push_back(
+        {.encodingType = nimble::EncodingType::Trivial,
+         .dataType = runValuesDataType,
+         .level = 2,
+         .nestedEncodingName = "Alphabet"});
+    expected.push_back(
+        {.encodingType = nimble::EncodingType::FixedBitWidth,
+         .dataType = nimble::DataType::Uint32,
+         .level = 2,
+         .nestedEncodingName = "Indices"});
+  }
+
+  test<T>(values, std::move(expected));
 }
 
 TYPED_TEST(EncodingSelectionNumericTests, selectVarint) {

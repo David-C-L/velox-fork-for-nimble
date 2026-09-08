@@ -152,13 +152,45 @@ class MainlyConstantEncodingBase
       return outerEncodingSize + otherValuesSize + isCommonEncodingSize;
     } else {
       const uint64_t commonValueSize = sizeof(physicalType);
-      // Other values are encoded as a FixedBitWidth child.
-      // TODO(nimble): restore precise other-values estimation (materialize the
-      // non-common values and compare Dictionary / Constant / nested-ALP
-      // candidates), bounded so it stays cheap on dense columns.
-      const uint64_t otherValuesSize =
-          FixedBitWidthEncoding<physicalType>::estimateSize(
-              uncommonCount, statistics.min(), statistics.max(), options);
+      // The other-values child holds every value except the common one, so it
+      // is priced over the range of those values rather than over the whole
+      // stream's. The distinction is the point of the encoding: MainlyConstant
+      // is chosen precisely when one value dominates, and that dominant value
+      // is very often an out-of-band sentinel -- a zero, or a max-int null
+      // marker -- sitting at one end of the range. Including it stretched
+      // min..max across a gap that no value in the child ever occupies, and the
+      // resulting bit width was charged to every uncommon row.
+      //
+      // uniqueCounts is already built, and this walks it rather than the rows,
+      // so the cost is one pass over the distinct values.
+      physicalType uncommonMin{};
+      physicalType uncommonMax{};
+      bool hasUncommonValue{false};
+      for (const auto& uniqueCount : uniqueCounts) {
+        if (uniqueCount.first == maxUniqueCount->first) {
+          continue;
+        }
+        if (!hasUncommonValue) {
+          uncommonMin = uniqueCount.first;
+          uncommonMax = uniqueCount.first;
+          hasUncommonValue = true;
+          continue;
+        }
+        uncommonMin = std::min(uncommonMin, uniqueCount.first);
+        uncommonMax = std::max(uncommonMax, uniqueCount.first);
+      }
+
+      // Trivial is added alongside FixedBitWidth because a child whose values
+      // span the full width of the type gains nothing from bit packing and
+      // pays a header for it. Dictionary and nested ALP are still missing:
+      // both need a Statistics over the uncommon values, which cannot be
+      // derived from the parent's and would cost a pass over the rows.
+      const uint64_t otherValuesSize = hasUncommonValue
+          ? std::min(
+                TrivialEncoding<physicalType>::estimateSize(uncommonCount),
+                FixedBitWidthEncoding<physicalType>::estimateSize(
+                    uncommonCount, uncommonMin, uncommonMax, options))
+          : EncodingPrefix::kFixedPrefixSize;
       const uint64_t outerEncodingSize = EncodingPrefix::kFixedPrefixSize +
           2 * sizeof(uint32_t) + commonValueSize;
       return outerEncodingSize + otherValuesSize + isCommonEncodingSize;

@@ -655,15 +655,43 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
       return DictionaryEncoding<std::string_view>::estimateSize(
           runCount, statistics, options);
     } else {
-      uint64_t bestSize = FixedBitWidthEncoding<physicalType>::estimateSize(
-          runCount, statistics, options);
+      // Priced over the run values themselves, which statistics already holds,
+      // rather than over the parent's statistics. The two differ in the way
+      // that decides the pick: the parent's uniqueCounts describe how often
+      // each value occurs in the *input*, where a long run makes a value look
+      // common, while in the run values stream every run contributes exactly
+      // one entry. A stream of few long runs is high-cardinality once
+      // collapsed, and a stream of many short alternating runs is a small
+      // repeating alphabet -- neither is visible from the parent.
+      //
+      // min/max survive the collapse, so the previous FixedBitWidth quote was
+      // not wrong; it was just the only candidate. Trivial and Dictionary are
+      // added because they are what wins when the collapsed cardinality is at
+      // either extreme. RLE and Constant are not: adjacent run values differ by
+      // construction, so neither can apply to more than a single run.
+      const auto& runValues = statistics.runValues();
+      const std::span<const physicalType> runValuesSpan{
+          runValues.data(), runValues.size()};
+      const auto runValuesStatistics =
+          Statistics<physicalType>::create(runValuesSpan);
+      uint64_t bestSize = std::min(
+          TrivialEncoding<physicalType>::estimateSize(runCount),
+          FixedBitWidthEncoding<physicalType>::estimateSize(
+              runCount, runValuesStatistics, options));
+      // Guarded because uniqueCounts is optional: Statistics declines to build
+      // it above a cardinality cap, and DictionaryEncoding::estimateSize reads
+      // it unconditionally. Absent means the alphabet is too large for a
+      // Dictionary to win anyway, so skipping it costs nothing.
+      if (runValuesStatistics.uniqueCounts().has_value()) {
+        bestSize = std::min(
+            bestSize,
+            DictionaryEncoding<physicalType>::estimateSize(
+                runCount, runValuesStatistics, options));
+      }
       if constexpr (isFloatingPointType<T>()) {
         if (options.allowNestedAlpSelection) {
-          const auto& runValues = statistics.runValues();
-          if (const auto alpEncodingSize = detail::nestedAlpSize<T>(
-                  std::span<const physicalType>{
-                      runValues.data(), runValues.size()},
-                  options)) {
+          if (const auto alpEncodingSize =
+                  detail::nestedAlpSize<T>(runValuesSpan, options)) {
             bestSize = std::min(bestSize, *alpEncodingSize);
           }
         }

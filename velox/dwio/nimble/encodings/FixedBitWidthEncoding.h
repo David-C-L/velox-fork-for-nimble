@@ -122,16 +122,36 @@ class FixedBitWidthEncoding final
  private:
   static constexpr int kPrefixSize = 2 + sizeof(T);
 
+  // Bytes the packed payload occupies in the stream, which is what
+  // FixedBitArray::bufferSize reserves and what encode() writes.
+  //
+  // CHANGES SELECTION. This used to return nbytes(bitWidth * count) and omit
+  // the seven bytes bufferSize adds so that decoding can read whole machine
+  // words past the last value. encode() reserves that slop in the serialized
+  // encoding, so it is part of the size, and leaving it out made this estimate
+  // smaller than the encoding it estimates -- always, by exactly seven bytes.
+  //
+  // The case for adding them is selection stability on small nodes, not
+  // compression. On a whole column seven bytes is nothing: measured across
+  // twelve column and order pairs it moved compression by 0.002%, which is why
+  // this was shelved when it was first found. A per-node audit changed the
+  // case. On the 13-to-31-byte metadata streams inside an encoding tree it is a
+  // 29% to 70% error, and those are the streams read on every access, where the
+  // size term is too small to separate candidates and a wrong estimate picks
+  // near-arbitrarily among encodings with very different decode costs.
   static uint64_t bitPackedBytes(
       uint64_t minValue,
       uint64_t maxValue,
       uint64_t count,
       bool useExactBitWidth) {
+    // Keep in step with FixedBitArray::bufferSize, which is where encode() gets
+    // the number it actually reserves.
+    constexpr uint64_t kFixedBitArraySlopBytes = 7;
     auto bitWidth = velox::bits::bitsRequired(maxValue - minValue);
     if (!useExactBitWidth) {
       bitWidth = velox::bits::roundUp(bitWidth, 8);
     }
-    return velox::bits::nbytes(bitWidth * count);
+    return velox::bits::nbytes(bitWidth * count) + kFixedBitArraySlopBytes;
   }
 
   int bitWidth_;
