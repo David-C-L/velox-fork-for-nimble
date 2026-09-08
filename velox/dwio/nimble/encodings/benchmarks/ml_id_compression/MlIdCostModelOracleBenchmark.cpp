@@ -816,6 +816,12 @@ int runBenchmark() {
       "selection_est_ratio",
       "selection_encoding",
       "selection_bytes",
+      "planner_encoding",
+      "planner_cell_bits",
+      "planner_selection_agree",
+      "planner_cell_ratio",
+      "planner_agreement_rate",
+      "planner_cell_ratio_median",
       "available_at_width",
       "max_delta",
       "sample_seam_count",
@@ -1029,6 +1035,22 @@ int runBenchmark() {
       // taking no cells at 2048 and many at full column is the seam distortion
       // lifting rather than the data changing.
       std::vector<int> oracleWinCounts(candidates.size(), 0);
+      // How far the split planner's own cost models sit from what the writer
+      // delivers for the same bit range.
+      //
+      // The planner minimises its per-cell cost to choose boundaries, and the
+      // writer then encodes each section with whatever nested selection picks.
+      // Those are two independent sets of models: the planner's are hand-rolled
+      // in SubIntSplitCostModels.h, selection's are the encodings' own
+      // estimateSize. Where the planner's cell cost tracks what selection
+      // delivers, its models are earning their place. Where it does not, the
+      // boundaries are being chosen against a cost nothing pays, and the
+      // question stops being which model to correct and becomes whether the
+      // planner should score ranges with its own models at all.
+      int plannerAgreeCount = 0;
+      int plannerComparableCells = 0;
+      std::vector<double> plannerCellRatios;
+      plannerCellRatios.reserve(static_cast<size_t>(kBits) * kBits);
       double spearmanSum = 0.0;
       int spearmanCount = 0;
       double relErrSum = 0.0;
@@ -1220,6 +1242,23 @@ int runBenchmark() {
             ++agreeCount;
           }
 
+          // Planner against selection, on the same range.
+          double plannerCellRatio = std::numeric_limits<double>::quiet_NaN();
+          const bool plannerComparable =
+              oc.selectionBytes != std::numeric_limits<size_t>::max() &&
+              std::isfinite(mc.bestBits) && mc.bestBits > 0.0;
+          if (plannerComparable) {
+            ++plannerComparableCells;
+            if (mc.bestEncoding == oc.selectionEncoding) {
+              ++plannerAgreeCount;
+            }
+            // Actual over quoted, the same convention as the per-encoding
+            // ratios: above one means the planner under-quoted the range.
+            plannerCellRatio =
+                static_cast<double>(oc.selectionBytes) * 8.0 / mc.bestBits;
+            plannerCellRatios.push_back(plannerCellRatio);
+          }
+
           // Rank vectors over usable candidates (finite model estimate AND
           // successful oracle encode) for Spearman rho.
           std::vector<double> modelVals;
@@ -1355,6 +1394,24 @@ int runBenchmark() {
             if (std::isfinite(rho) && ci == 0) {
               csv.set("spearman_rho", rho);
             }
+            if (ci == 0) {
+              for (const auto& candidate : candidates) {
+                if (candidate.type == mc.bestEncoding) {
+                  csv.set("planner_encoding", candidate.name);
+                  break;
+                }
+              }
+              if (std::isfinite(mc.bestBits)) {
+                csv.set("planner_cell_bits", mc.bestBits);
+              }
+              if (plannerComparable) {
+                csv.set(
+                    "planner_selection_agree",
+                    mc.bestEncoding == oc.selectionEncoding ? int64_t{1}
+                                                            : int64_t{0});
+                csv.set("planner_cell_ratio", plannerCellRatio);
+              }
+            }
             csv.set("skipped", int64_t{0});
             csv.endRow();
           }
@@ -1369,9 +1426,30 @@ int runBenchmark() {
       const double meanAbsRelErr =
           relErrCount > 0 ? relErrSum / relErrCount : 0.0;
 
+      // Median rather than mean: these ratios have a heavy right tail, and a
+      // mean over them says more about the worst cell than about the typical
+      // one. The per-encoding figures this is read beside are medians for the
+      // same reason.
+      double plannerRatioMedian = std::numeric_limits<double>::quiet_NaN();
+      if (!plannerCellRatios.empty()) {
+        const size_t middle = plannerCellRatios.size() / 2;
+        std::nth_element(
+            plannerCellRatios.begin(),
+            plannerCellRatios.begin() + middle,
+            plannerCellRatios.end());
+        plannerRatioMedian = plannerCellRatios[middle];
+      }
+      const double plannerAgreementRate = plannerComparableCells > 0
+          ? static_cast<double>(plannerAgreeCount) /
+              static_cast<double>(plannerComparableCells)
+          : 0.0;
+
       std::cout << "  top1_accuracy=" << top1Accuracy
                 << " mean_spearman_rho=" << meanRho
                 << " mean_abs_rel_err=" << meanAbsRelErr << "\n";
+      std::cout << "  planner_vs_selection: agree=" << plannerAgreementRate
+                << " cell_ratio_median=" << plannerRatioMedian << " over "
+                << plannerComparableCells << " cells\n";
 
       // -----------------------------------------------------------------
       // Plan comparison.
@@ -1639,6 +1717,10 @@ int runBenchmark() {
       csv.set("top1_accuracy", top1Accuracy);
       csv.set("spearman_rho", meanRho);
       csv.set("mean_abs_rel_err", meanAbsRelErr);
+      csv.set("planner_agreement_rate", plannerAgreementRate);
+      if (std::isfinite(plannerRatioMedian)) {
+        csv.set("planner_cell_ratio_median", plannerRatioMedian);
+      }
       csv.set(
           "unavailable_model_picks",
           static_cast<int64_t>(unavailablePickCount));
