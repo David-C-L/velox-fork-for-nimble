@@ -229,6 +229,38 @@ class Statistics {
     uint64_t max;
   };
 
+  /// Aggregates over adjacent value pairs, in input order.
+  ///
+  /// Grouped because they come from one pass over consecutive pairs: asking
+  /// for any of them costs the same walk, so splitting them into separate
+  /// lazily-populated fields would only buy the chance to walk twice.
+  ///
+  /// Named for what it measures rather than for its first caller. Delta needs
+  /// all three, FOR's frame reasoning starts from the same pass, and anything
+  /// else reasoning about consecutive values wants exactly this shape.
+  struct AdjacentPairStats {
+    /// Pairs where the later value is not below the earlier one, i.e. steps an
+    /// encoding storing non-negative deltas can represent without restating.
+    uint64_t nonDecreasingCount{0};
+    /// Largest step over a non-decreasing pair. A fixed-width delta array has
+    /// to cover the widest delta it stores, so this and not the average is what
+    /// sizes one.
+    uint64_t maxIncrease{0};
+    /// Sum of |v[i] - v[i-1]| over every pair, from which an average step
+    /// follows for a caller that wants one.
+    uint64_t sumAbsoluteDelta{0};
+  };
+
+  /// See AdjacentPairStats. Empty for a stream of fewer than two values, where
+  /// there are no pairs to measure.
+  const AdjacentPairStats& adjacentPairStats() const noexcept {
+    static_assert(nimble::isIntegralType<T>());
+    if (!adjacentPairStats_.has_value()) {
+      populateAdjacentPairStats();
+    }
+    return adjacentPairStats_.value();
+  }
+
   const std::vector<BlockStats>& minMaxBlocks(
       uint16_t blockSize = kBlockBitPackingBlockSize) const noexcept {
     static_assert(nimble::isNumericType<T>());
@@ -302,6 +334,7 @@ class Statistics {
   void populateMinMaxBlocks(uint16_t blockSize) const;
   void populateStringLength() const;
   void populateBitFlipProfile() const;
+  void populateAdjacentPairStats() const;
 
   mutable std::optional<uint64_t> consecutiveRepeatCount_;
   mutable std::optional<uint64_t> minRepeat_;
@@ -317,6 +350,7 @@ class Statistics {
       uniqueCounts_;
   mutable std::optional<std::vector<T>> runValues_;
   mutable std::optional<BitFlipProfile> bitFlipProfile_;
+  mutable std::optional<AdjacentPairStats> adjacentPairStats_;
 };
 
 } // namespace facebook::nimble

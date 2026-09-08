@@ -294,6 +294,30 @@ void Statistics<T, InputType>::populateBitFlipProfile() const {
 }
 
 template <typename T, typename InputType>
+void Statistics<T, InputType>::populateAdjacentPairStats() const {
+  static_assert(nimble::isIntegralType<T>());
+  static_assert(std::is_same_v<T, InputType>);
+  AdjacentPairStats stats;
+  // Compared in the unsigned physical domain, which is the domain the encodings
+  // that read this store their deltas in. A signed comparison here would report
+  // steps no delta stream can hold.
+  using unsignedType = typename std::make_unsigned<T>::type;
+  for (size_t i = 1; i < data_.size(); ++i) {
+    const auto previous = static_cast<unsignedType>(data_[i - 1]);
+    const auto value = static_cast<unsignedType>(data_[i]);
+    const bool rising = value >= previous;
+    const uint64_t delta = rising ? static_cast<uint64_t>(value - previous)
+                                  : static_cast<uint64_t>(previous - value);
+    stats.sumAbsoluteDelta += delta;
+    if (rising) {
+      ++stats.nonDecreasingCount;
+      stats.maxIncrease = std::max(stats.maxIncrease, delta);
+    }
+  }
+  adjacentPairStats_ = stats;
+}
+
+template <typename T, typename InputType>
 void Statistics<T, InputType>::populateStringLength() const {
   uint64_t totalBytes = 0;
   std::string_view minString = data_[0];
@@ -440,5 +464,15 @@ template void Statistics<int32_t>::populateBitFlipProfile() const;
 template void Statistics<uint32_t>::populateBitFlipProfile() const;
 template void Statistics<int64_t>::populateBitFlipProfile() const;
 template void Statistics<uint64_t>::populateBitFlipProfile() const;
+
+// populateAdjacentPairStats works on integral types only
+template void Statistics<int8_t>::populateAdjacentPairStats() const;
+template void Statistics<uint8_t>::populateAdjacentPairStats() const;
+template void Statistics<int16_t>::populateAdjacentPairStats() const;
+template void Statistics<uint16_t>::populateAdjacentPairStats() const;
+template void Statistics<int32_t>::populateAdjacentPairStats() const;
+template void Statistics<uint32_t>::populateAdjacentPairStats() const;
+template void Statistics<int64_t>::populateAdjacentPairStats() const;
+template void Statistics<uint64_t>::populateAdjacentPairStats() const;
 
 } // namespace facebook::nimble
