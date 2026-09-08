@@ -1269,8 +1269,6 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         {subintsplit::TransformId::RelabelFrequency, "relabel_frequency"},
         {subintsplit::TransformId::RelabelDense, "relabel_dense"},
         {subintsplit::TransformId::RelabelGray, "relabel_gray"},
-        {subintsplit::TransformId::BurrowsWheeler, "bwt"},
-        {subintsplit::TransformId::BurrowsWheelerMoveToFront, "bwt_mtf"},
         {subintsplit::TransformId::BitPlane, "bitplane"},
     };
     for (const auto& [transformId, name] : arms) {

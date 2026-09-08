@@ -62,10 +62,10 @@ enum class TransformId : uint8_t {
   RelabelDense = 3,
   /// Gray code. Carries no codebook.
   RelabelGray = 4,
-  /// Burrows-Wheeler transform.
-  BurrowsWheeler = 5,
-  /// Burrows-Wheeler followed by move-to-front.
-  BurrowsWheelerMoveToFront = 6,
+  // 5 and 6 were the Burrows-Wheeler and Burrows-Wheeler-plus-move-to-front
+  // transforms, removed because point access through them had to rebuild a
+  // whole block. Left as a gap rather than reused: transformForRaw rejects
+  // them, which is what a reader should do with a transform it cannot invert.
   /// Bit-plane transposition.
   BitPlane = 7,
 };
@@ -92,6 +92,23 @@ enum class PositionMapping : uint8_t {
   Gathered,
   /// Undoing one row means undoing the rows around it. Only these need to be
   /// applied in blocks, because the block is what bounds the undoing.
+  ///
+  /// No transform is currently Sequential. The Burrows-Wheeler pair was, and
+  /// was removed: a point read through this class rebuilds its whole block,
+  /// so with kTransformBlockSize rows at the ~5.6ns/row an untransformed
+  /// section decodes at, a probe costs ~23us against ~490ns for the same
+  /// column untransformed. That is a floor set by the class, not by the
+  /// implementation -- it holds even for an inversion that costs nothing --
+  /// and shrinking the block to escape it gives back the compression the
+  /// transform was adopted for. Weigh that before adding another one.
+  ///
+  /// If one is added: build any rank/select structure it needs with a
+  /// counting sort over the alphabet, O(n + sigma), not a comparison sort.
+  /// Burrows-Wheeler inversion here used std::stable_sort, and that single
+  /// line was 55-61% of decode time; replacing it measured 2.3x on both bulk
+  /// and point. The cost is easy to reintroduce and hard to see in a profile
+  /// without call-graph attribution, since it shows up as libstdc++ frames
+  /// rather than as anything named after the transform.
   Sequential,
 };
 
@@ -147,13 +164,15 @@ struct TransformContext {
 std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key);
 
 /// State a transform produces at encode and needs back at decode. What it
-/// holds depends on the transform: a relabelling carries its codebook, a
-/// Burrows-Wheeler transform carries the rotation it started from.
+/// holds depends on the transform: a relabelling carries its codebook.
 struct TransformState {
-  /// Rotation index for the Burrows-Wheeler transform.
+  /// Rotation index, which only the removed Burrows-Wheeler transforms ever
+  /// set. No remaining transform writes it, so it is always zero and costs
+  /// nothing to store; it stays because the stream layout reserves room for
+  /// it per block, and dropping it is a wire-format change rather than a
+  /// cleanup. Remove it whenever that layout is next revised.
   uint32_t primaryIndex{0};
-  /// Codebook for a relabelling, or the move-to-front alphabet. Entry i is the
-  /// original value for code i.
+  /// Codebook for a relabelling. Entry i is the original value for code i.
   std::vector<uint64_t> codebook;
 
   /// Bits this state costs to store, which section selection charges against
@@ -257,8 +276,12 @@ inline const SectionTransform* transformForRaw(uint8_t rawId) {
   // A file-format check rather than an internal one: the byte came off the
   // wire, and a reader that cannot recognise it must refuse the data rather
   // than decode without the inverse and hand back wrong values.
+  // 5 and 6 name transforms this reader no longer implements, so they are
+  // rejected here alongside ids past the end. Catching them as a file error
+  // rather than letting transformFor fall through to an internal one keeps
+  // the diagnosis pointing at the data, which is where the problem is.
   NIMBLE_CHECK_FILE(
-      rawId < kTransformIdCount,
+      rawId < kTransformIdCount && rawId != 5 && rawId != 6,
       fmt::format("Unsupported SubIntSplit transform id: {}", rawId));
   return transformFor(static_cast<TransformId>(rawId));
 }

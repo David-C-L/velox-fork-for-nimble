@@ -74,8 +74,6 @@ std::vector<TransformId> transformsUnderTest() {
       TransformId::RelabelFrequency,
       TransformId::RelabelDense,
       TransformId::RelabelGray,
-      TransformId::BurrowsWheeler,
-      TransformId::BurrowsWheelerMoveToFront,
       TransformId::BitPlane,
   };
 }
@@ -683,95 +681,6 @@ TEST_F(TransformedEncodingTest, positionCacheDoesNotLeakAcrossViewsAtTheSameAddr
   viewB->read(0, valuesB.size(), bulkB.data());
   for (size_t i = 0; i < valuesB.size(); ++i) {
     ASSERT_EQ(bulkB[i], valuesB[i]) << "stream B row " << i;
-  }
-  viewB->~ViewType();
-}
-
-// Same address-reuse hazard for BlockCache, which readThroughBlock uses for
-// any blocked (Sequential-mapped) transform. Its hit path returns
-// cache.values[index - blockStart] without resizing, so reusing the address
-// of a view whose block was smaller is an out-of-bounds read, not just a
-// wrong answer -- stream A here is smaller than kTransformBlockSize, so its
-// whole column is one short block, and stream B is large enough that its
-// first block runs past the end of that short one.
-//
-// packedIdentifiers with keySection=1 is the shape every passing transform
-// test in this file uses, for all seven families including BurrowsWheeler --
-// pinning the key section is what lets the opt-in gate keep it, the same
-// fix that closed positionCacheDoesNotLeakAcrossViewsAtTheSameAddress.
-TEST_F(TransformedEncodingTest, blockCacheDoesNotLeakAcrossViewsAtTheSameAddress) {
-  using ViewType = SubIntSplitEncodingView<uint64_t>;
-
-  Buffer bufferA{*pool_};
-  const auto valuesA = packedIdentifiers(3000, /*seed=*/333);
-  Encoding::Options optionsA;
-  optionsA.subIntSplitTransform =
-      static_cast<uint8_t>(TransformId::BurrowsWheeler);
-
-  // Read before pinning, same reasoning as the position-cache test above:
-  // subIntSplitKeySection = 1 throws rather than declining if the column
-  // does not actually split into at least two sections.
-  Buffer probeBufferA{*pool_};
-  const auto probeEncodedA = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      probeBufferA, valuesA, CompressionType::Uncompressed, Encoding::Options{});
-  detail::SubIntSplitTransformInfo probeInfoA;
-  const auto sectionsA = detail::parseSubIntSplitSections(
-      probeEncodedA, Encoding::kPrefixSize, &probeInfoA);
-  ASSERT_GE(sectionsA.size(), 2u)
-      << "test needs a multi-section column so keySection=1 is valid; "
-      << "packedIdentifiers produced only one section";
-  optionsA.subIntSplitKeySection = 1;
-  optionsA.subIntSplitForceApply = true;
-
-  const auto encodedA = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      bufferA, valuesA, CompressionType::Uncompressed, optionsA);
-  detail::SubIntSplitTransformInfo infoA;
-  detail::parseSubIntSplitSections(encodedA, Encoding::kPrefixSize, &infoA);
-  ASSERT_NE(infoA.blockSize, 0u)
-      << "test precondition: BurrowsWheeler must be selected (blocked) for "
-      << "stream A, or this test exercises nothing";
-
-  Buffer bufferB{*pool_};
-  const auto valuesB = packedIdentifiers(9000, /*seed=*/444);
-  Encoding::Options optionsB;
-  optionsB.subIntSplitTransform =
-      static_cast<uint8_t>(TransformId::BurrowsWheeler);
-
-  Buffer probeBufferB{*pool_};
-  const auto probeEncodedB = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      probeBufferB, valuesB, CompressionType::Uncompressed, Encoding::Options{});
-  detail::SubIntSplitTransformInfo probeInfoB;
-  const auto sectionsB = detail::parseSubIntSplitSections(
-      probeEncodedB, Encoding::kPrefixSize, &probeInfoB);
-  ASSERT_GE(sectionsB.size(), 2u)
-      << "test needs a multi-section column so keySection=1 is valid; "
-      << "packedIdentifiers produced only one section";
-  optionsB.subIntSplitKeySection = 1;
-  optionsB.subIntSplitForceApply = true;
-
-  const auto encodedB = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      bufferB, valuesB, CompressionType::Uncompressed, optionsB);
-  detail::SubIntSplitTransformInfo infoB;
-  detail::parseSubIntSplitSections(encodedB, Encoding::kPrefixSize, &infoB);
-  ASSERT_NE(infoB.blockSize, 0u)
-      << "test precondition: BurrowsWheeler must be selected (blocked) for "
-      << "stream B, or this test exercises nothing";
-
-  alignas(ViewType) unsigned char storage[sizeof(ViewType)];
-
-  auto* viewA = new (storage) ViewType(encodedA, pool_.get(), optionsA);
-  // Populates BlockCache with stream A's one short block (blockIndex 0,
-  // blockCount == valuesA.size()).
-  ASSERT_EQ(viewA->readAt(0), valuesA[0]);
-  viewA->~ViewType();
-
-  // Stream B's first block is also blockIndex 0 (both columns are smaller
-  // than kTransformBlockSize's reach for row 4095), so the stale cache looks
-  // like a hit. If it is served without resizing, this reads past the end of
-  // a 3000-row cache.
-  auto* viewB = new (storage) ViewType(encodedB, pool_.get(), optionsB);
-  for (uint32_t i : {0u, 2999u, 4095u}) {
-    ASSERT_EQ(viewB->readAt(i), valuesB[i]) << "stream B row " << i;
   }
   viewB->~ViewType();
 }

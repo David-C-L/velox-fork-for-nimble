@@ -98,66 +98,6 @@ std::vector<uint64_t> sortedAlphabet(std::span<const uint64_t> values) {
   return alphabet;
 }
 
-// Sorts the cyclic rotations of `values` by prefix doubling, O(n log^2 n),
-// returning the rotation start offsets in sorted order.
-std::vector<uint32_t> cyclicRotationOrder(std::span<const uint64_t> values) {
-  const auto count = static_cast<uint32_t>(values.size());
-  std::vector<uint32_t> order(count);
-  std::iota(order.begin(), order.end(), 0u);
-  if (count <= 1) {
-    return order;
-  }
-
-  const auto alphabet = sortedAlphabet(values);
-  std::vector<uint32_t> rank(count);
-  for (uint32_t i = 0; i < count; ++i) {
-    rank[i] = static_cast<uint32_t>(
-        std::lower_bound(alphabet.begin(), alphabet.end(), values[i]) -
-        alphabet.begin());
-  }
-
-  std::vector<uint32_t> nextRank(count);
-  for (uint32_t offset = 1; offset < count; offset *= 2) {
-    const auto key = [&](uint32_t i) {
-      return std::pair<uint32_t, uint32_t>{rank[i], rank[(i + offset) % count]};
-    };
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-      return key(a) < key(b);
-    });
-    nextRank[order[0]] = 0;
-    for (uint32_t i = 1; i < count; ++i) {
-      nextRank[order[i]] =
-          nextRank[order[i - 1]] + (key(order[i - 1]) < key(order[i]) ? 1 : 0);
-    }
-    rank = nextRank;
-    if (rank[order[count - 1]] == count - 1) {
-      break;
-    }
-  }
-  return order;
-}
-
-void inverseBurrowsWheeler(std::span<uint64_t> values, uint32_t primaryIndex) {
-  const auto count = static_cast<uint32_t>(values.size());
-  if (count == 0) {
-    return;
-  }
-  std::vector<uint32_t> order(count);
-  std::iota(order.begin(), order.end(), 0u);
-  std::stable_sort(
-      order.begin(), order.end(), [values](uint32_t a, uint32_t b) {
-        return values[a] < values[b];
-      });
-
-  std::vector<uint64_t> scratch(count);
-  uint32_t position = order[primaryIndex];
-  for (uint32_t i = 0; i < count; ++i) {
-    scratch[i] = values[position];
-    position = order[position];
-  }
-  std::copy(scratch.begin(), scratch.end(), values.begin());
-}
-
 // --------------------------------------------------------------------------
 
 class KeyDerivedTransform : public SectionTransform {
@@ -439,128 +379,6 @@ class RelabelTransform : public SectionTransform {
   const TransformId id_;
 };
 
-class BurrowsWheelerTransform : public SectionTransform {
- public:
-  // Distinct values past which move-to-front is not applied. Chosen so the
-  // alphabet stays cheap to scan and cheap to store; beyond it the transform
-  // is a loss on both counts.
-  static constexpr size_t kMoveToFrontAlphabetLimit = 256;
-
-  explicit BurrowsWheelerTransform(bool moveToFront)
-      : moveToFront_{moveToFront} {}
-
-  TransformId id() const override {
-    return moveToFront_ ? TransformId::BurrowsWheelerMoveToFront
-                        : TransformId::BurrowsWheeler;
-  }
-
-  void apply(
-      std::span<uint64_t> values,
-      const TransformContext& /*context*/,
-      TransformState& state) const override {
-    const auto count = static_cast<uint32_t>(values.size());
-    if (count == 0) {
-      return;
-    }
-    const auto order = cyclicRotationOrder(values);
-    std::vector<uint64_t> scratch(count);
-    state.primaryIndex = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-      scratch[i] = values[(order[i] + count - 1) % count];
-      if (order[i] == 0) {
-        state.primaryIndex = i;
-      }
-    }
-    std::copy(scratch.begin(), scratch.end(), values.begin());
-
-    if (!moveToFront_ || state.codebook.empty()) {
-      return;
-    }
-    // Replace each value by how recently it was last seen. Clustered values
-    // become small numbers, which the cheap encoders handle well. The alphabet
-    // comes from prepareSection, so it covers the section rather than this
-    // block and is stored once instead of once per block.
-    std::vector<uint64_t> alphabet = state.codebook;
-    for (auto& value : values) {
-      const auto it = std::find(alphabet.begin(), alphabet.end(), value);
-      NIMBLE_CHECK(
-          it != alphabet.end(),
-          "Move-to-front alphabet does not cover the block; "
-          "prepareSection must run over the whole section first.");
-      const auto rank = static_cast<uint64_t>(it - alphabet.begin());
-      alphabet.erase(it);
-      alphabet.insert(alphabet.begin(), value);
-      value = rank;
-    }
-  }
-
-  void prepareSection(std::span<const uint64_t> section, TransformState& shared)
-      const override {
-    if (!moveToFront_) {
-      return;
-    }
-    // Move-to-front's premise is that a value recurs soon after it was last
-    // seen, which only holds for a small alphabet: it costs a scan of the
-    // alphabet per value, and stores the alphabet outright. Past the limit it
-    // pays for neither, so the section keeps the plain Burrows-Wheeler
-    // transform instead.
-    //
-    // An empty codebook is how that decision reaches the decoder. It needs no
-    // separate wire field, and it cannot disagree with what encode did, since
-    // both sides read the same absence.
-    auto alphabet = sortedAlphabet(section);
-    if (alphabet.size() > kMoveToFrontAlphabetLimit) {
-      return;
-    }
-    shared.codebook = std::move(alphabet);
-  }
-
-  void invert(
-      std::span<uint64_t> values,
-      const TransformContext& /*context*/,
-      const TransformState& state) const override {
-    if (values.empty()) {
-      return;
-    }
-    if (moveToFront_ && !state.codebook.empty()) {
-      std::vector<uint64_t> alphabet = state.codebook;
-      for (auto& value : values) {
-        NIMBLE_CHECK(
-            value < alphabet.size(), "Move-to-front rank outside the alphabet.");
-        const auto rank = static_cast<size_t>(value);
-        const uint64_t original = alphabet[rank];
-        // erase(begin()+rank) then insert(begin(), original) leaves indices
-        // past `rank` untouched and shifts only the prefix ahead of it right
-        // by one -- but pays for two full-vector memmoves (one per call) to
-        // get there. Shifting just that prefix directly is the same result
-        // for a fraction of the moves, and profiling put this pair of calls,
-        // not the sort in inverseBurrowsWheeler, as move-to-front's dominant
-        // cost.
-        for (size_t j = rank; j > 0; --j) {
-          alphabet[j] = alphabet[j - 1];
-        }
-        alphabet[0] = original;
-        value = original;
-      }
-    }
-    inverseBurrowsWheeler(values, state.primaryIndex);
-  }
-
-  // Undoing it is a chain of lookups from one position to the next, so one row
-  // cannot be read without rebuilding the block. This is the transform that
-  // blocking exists for.
-  PositionMapping positionMapping() const override {
-    return PositionMapping::Sequential;
-  }
-
-  bool supportsPointAccess() const override {
-    return false;
-  }
-
- private:
-  const bool moveToFront_;
-};
-
 class BitPlaneTransform : public SectionTransform {
  public:
   TransformId id() const override {
@@ -666,8 +484,6 @@ const KeyDerivedTransform kKeyDerived;
 const RelabelTransform kRelabelFrequency{TransformId::RelabelFrequency};
 const RelabelTransform kRelabelDense{TransformId::RelabelDense};
 const RelabelTransform kRelabelGray{TransformId::RelabelGray};
-const BurrowsWheelerTransform kBurrowsWheeler{/*moveToFront=*/false};
-const BurrowsWheelerTransform kBurrowsWheelerMoveToFront{/*moveToFront=*/true};
 const BitPlaneTransform kBitPlane;
 
 } // namespace
@@ -716,10 +532,6 @@ std::string toString(TransformId id) {
       return "RelabelDense";
     case TransformId::RelabelGray:
       return "RelabelGray";
-    case TransformId::BurrowsWheeler:
-      return "BurrowsWheeler";
-    case TransformId::BurrowsWheelerMoveToFront:
-      return "BurrowsWheelerMoveToFront";
     case TransformId::BitPlane:
       return "BitPlane";
   }
@@ -747,10 +559,6 @@ const SectionTransform* transformFor(TransformId id) {
       return &kRelabelDense;
     case TransformId::RelabelGray:
       return &kRelabelGray;
-    case TransformId::BurrowsWheeler:
-      return &kBurrowsWheeler;
-    case TransformId::BurrowsWheelerMoveToFront:
-      return &kBurrowsWheelerMoveToFront;
     case TransformId::BitPlane:
       return &kBitPlane;
   }

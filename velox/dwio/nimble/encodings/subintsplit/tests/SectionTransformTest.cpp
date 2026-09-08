@@ -63,8 +63,6 @@ std::vector<TransformId> allTransforms() {
       TransformId::RelabelFrequency,
       TransformId::RelabelDense,
       TransformId::RelabelGray,
-      TransformId::BurrowsWheeler,
-      TransformId::BurrowsWheelerMoveToFront,
       TransformId::BitPlane,
   };
 }
@@ -257,13 +255,15 @@ TEST(SectionTransformTest, reportsHowItMapsPositions) {
       PositionMapping::Gathered);
   EXPECT_TRUE(transformFor(TransformId::BitPlane)->supportsPointAccess());
 
-  // Undoing one row means undoing its neighbours, which is what blocking is
-  // for, and the only case that needs it.
-  for (auto id :
-       {TransformId::BurrowsWheeler, TransformId::BurrowsWheelerMoveToFront}) {
-    EXPECT_EQ(transformFor(id)->positionMapping(), PositionMapping::Sequential)
+  // Nothing is Sequential any more: the Burrows-Wheeler pair was the only
+  // such transform and was removed because a probe through that class has to
+  // rebuild a whole block. Asserted rather than left implicit, so that adding
+  // a transform that cannot answer a point read on its own has to change this
+  // test and account for the cost.
+  for (auto id : allTransforms()) {
+    EXPECT_NE(transformFor(id)->positionMapping(), PositionMapping::Sequential)
         << toString(id);
-    EXPECT_FALSE(transformFor(id)->supportsPointAccess()) << toString(id);
+    EXPECT_TRUE(transformFor(id)->supportsPointAccess()) << toString(id);
   }
 }
 
@@ -341,7 +341,17 @@ TEST(SectionTransformTest, unknownTransformIdThrows) {
   EXPECT_NO_THROW(transformForRaw(kTransformIdCount - 1));
 }
 
-// Only the relabellings and move-to-front carry a codebook; the rest must not
+// 5 and 6 were the Burrows-Wheeler pair. They sit inside the id range rather
+// than past its end, so rejecting them is a separate check from the bounds
+// one above and would not be caught by it. A reader must refuse them for the
+// same reason it refuses an unknown id: without the inverse it would hand
+// back plausible-looking wrong values.
+TEST(SectionTransformTest, removedBurrowsWheelerIdsThrow) {
+  EXPECT_THROW(transformForRaw(5), NimbleUserError);
+  EXPECT_THROW(transformForRaw(6), NimbleUserError);
+}
+
+// Only the relabellings carry a codebook; the rest must not
 // silently cost anything to restore.
 TEST(SectionTransformTest, statePricesOnlyWhatItStores) {
   const auto values = makeSection(256, 8, Shape::LowCardinality, 3);
