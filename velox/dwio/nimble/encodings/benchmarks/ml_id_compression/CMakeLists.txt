@@ -71,6 +71,9 @@ function(nimble_add_ml_id_benchmark NAME SOURCE)
     nimble_ml_id_benchmark_common
     nimble_encodings
     nimble_common
+    # For tools::getEncodingTreeLabel, which BenchCommon's describeTree uses to
+    # dump a machine-readable encoding tree under --mlidc_dump_encoding.
+    nimble_tools_common
     Folly::folly
     velox_memory
     gflags

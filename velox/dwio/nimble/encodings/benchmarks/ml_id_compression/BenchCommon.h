@@ -51,6 +51,7 @@
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/tools/EncodingUtilities.h"
 
 // ---------------------------------------------------------------------------
 // CLI flags shared across benchmark binaries
@@ -193,6 +194,16 @@ struct NimbleBenchTargetBase {
   virtual std::string describe() {
     return {};
   }
+
+  /// The same tree as describe(), one node per line and keyed by path.
+  ///
+  /// describe() nests children inside their parent's line, which reads well
+  /// and parses badly -- a node's position in that text depends on its
+  /// siblings, and two scripts have already misread it. See
+  /// tools::getEncodingTreeLabel.
+  virtual std::string describeTree() {
+    return {};
+  }
 };
 
 template <typename EncodingT>
@@ -225,6 +236,15 @@ struct NimbleBenchTargetImpl
   std::string describe() override {
     auto* encoding = target.encoding();
     return encoding != nullptr ? encoding->debugString(0) : std::string{};
+  }
+
+  std::string describeTree() override {
+    const auto payload = target.payloadBytes();
+    if (payload.empty()) {
+      return {};
+    }
+    return nimble::tools::getEncodingTreeLabel(std::string_view(
+        reinterpret_cast<const char*>(payload.data()), payload.size()));
   }
 };
 
@@ -320,6 +340,14 @@ class NimbleViewBenchTargetImpl
         benchmarks::nullFactory(),
         options_};
     return encoding.debugString(0);
+  }
+
+  // Unlike describe(), this needs no Encoding at all: the tree is read
+  // straight off the encoded bytes this target already holds.
+  std::string describeTree() override {
+    return encoded_.empty()
+        ? std::string{}
+        : nimble::tools::getEncodingTreeLabel(std::string_view(encoded_));
   }
 
  private:
@@ -436,6 +464,10 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     return {
         {reinterpret_cast<const std::byte*>(compressed_.data()),
          compressed_.size()}};
+  }
+
+  std::string describeTree() override {
+    return inner_->describeTree();
   }
 
   std::string describe() override {
