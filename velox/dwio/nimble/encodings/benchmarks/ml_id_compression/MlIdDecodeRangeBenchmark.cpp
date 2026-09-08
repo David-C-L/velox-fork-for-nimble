@@ -36,6 +36,16 @@ DEFINE_int32(grid, 16, "Grid resolution per axis; ~grid^2/2 cells in triangle");
 DEFINE_string(cache_state, "hot", "hot | cold-payload | cold-all");
 DEFINE_bool(validate, false, "Round-trip check before measuring");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
+DEFINE_string(
+    range_sizes,
+    "",
+    "Comma-separated range lengths in elements, e.g. 1,8,64,512. Empty keeps "
+    "the fraction grid, which cannot reach lengths below N/grid. When set, "
+    "offsets are drawn uniformly instead of taken from the grid.");
+DEFINE_int32(
+    range_offsets,
+    32,
+    "Random offsets sampled per range length when --range_sizes is set.");
 
 namespace facebook::nimble::mlidc {
 namespace {
@@ -43,10 +53,14 @@ namespace {
 struct Cell {
   size_t a{};
   size_t b{};
+  double aFrac{};
+  double bFrac{};
 };
 
 Cell resolveCell(double aFrac, double bFrac, size_t n) {
   Cell c;
+  c.aFrac = aFrac;
+  c.bFrac = bFrac;
   c.a = static_cast<size_t>(std::llround(aFrac * static_cast<double>(n)));
   c.b = std::max<size_t>(
       1, static_cast<size_t>(std::llround(bFrac * static_cast<double>(n))));
@@ -59,6 +73,9 @@ Cell resolveCell(double aFrac, double bFrac, size_t n) {
 
 } // namespace
 } // namespace facebook::nimble::mlidc
+
+#include <random>
+#include <sstream>
 
 constexpr std::string_view kDriver = "bench_decode_range";
 
@@ -93,6 +110,17 @@ int runBenchmark() {
     for (double b : bFracs)
       if (a + b <= 1.0 + 1e-9)
         ++cellCount;
+
+  std::vector<size_t> rangeSizes;
+  {
+    std::stringstream ss(FLAGS_range_sizes);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (!item.empty()) {
+        rangeSizes.push_back(static_cast<size_t>(std::stoull(item)));
+      }
+    }
+  }
 
   auto contextOrNull =
       makeSweepContext<Elem>(/*withOpenZL=*/true, cacheState, n);
@@ -158,6 +186,38 @@ int runBenchmark() {
   if (!FLAGS_mlidc_output_manifest.empty())
     writeRunManifest(FLAGS_mlidc_output_manifest);
 
+  // One cell list for the whole run. Built before the encoder loop on
+  // purpose: a random offset drawn per encoder would compare encoders on
+  // different work, and the point of this sweep is the ratio between them.
+  std::vector<Cell> cells;
+  if (rangeSizes.empty()) {
+    for (double a : aFracs) {
+      for (double b : bFracs) {
+        if (a + b > 1.0 + 1e-9) {
+          continue;
+        }
+        cells.push_back(resolveCell(a, b, n));
+      }
+    }
+  } else {
+    std::mt19937_64 rng(seed);
+    for (size_t b : rangeSizes) {
+      if (b == 0 || b > n) {
+        continue;
+      }
+      std::uniform_int_distribution<size_t> pick(0, n - b);
+      for (int i = 0; i < std::max(1, FLAGS_range_offsets); ++i) {
+        Cell c;
+        c.a = pick(rng);
+        c.b = b;
+        c.aFrac = static_cast<double>(c.a) / static_cast<double>(n);
+        c.bFrac = static_cast<double>(b) / static_cast<double>(n);
+        cells.push_back(c);
+      }
+    }
+  }
+  cellCount = cells.size();
+
   std::vector<Elem> sink(n, Elem{});
   int validateFailures = 0;
   MeasureSpec spec;
@@ -190,8 +250,8 @@ int runBenchmark() {
       if (FLAGS_validate && enc.variant != "fpe_noindex") {
         bool ok = true;
         std::vector<Elem> check;
-        for (double aFrac : aFracs) {
-          Cell c = resolveCell(aFrac, bFracs.front(), n);
+        for (size_t ci = 0; ci < cells.size() && ok; ++ci) {
+          const Cell c = cells[ci];
           check.assign(c.b, Elem{});
           target->materializeRange(
               static_cast<uint32_t>(c.a),
@@ -219,12 +279,8 @@ int runBenchmark() {
               reinterpret_cast<std::byte*>(sink.data()),
               static_cast<size_t>(n) * kElemSize));
 
-      for (double aFrac : aFracs) {
-        for (double bFrac : bFracs) {
-          if (aFrac + bFrac > 1.0 + 1e-9)
-            continue;
-          const Cell c = resolveCell(aFrac, bFrac, n);
-
+      {
+        for (const Cell& c : cells) {
           auto result = measure(encSpec, cell.controller, cell.targets, [&]() {
             target->materializeRange(
                 static_cast<uint32_t>(c.a),
@@ -252,8 +308,8 @@ int runBenchmark() {
           setPayloadColumns(csv, payloadBytes, context.rawBytes());
           setMeasureColumns(csv, encSpec);
           csv.set("contract", std::string("range_into"));
-          csv.set("A_frac", aFrac);
-          csv.set("B_frac", bFrac);
+          csv.set("A_frac", c.aFrac);
+          csv.set("B_frac", c.bFrac);
           csv.set("A", static_cast<int64_t>(c.a));
           csv.set("B", static_cast<int64_t>(c.b));
           setTimingColumns(csv, result);
