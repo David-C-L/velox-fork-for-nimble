@@ -212,6 +212,39 @@ class Encoding {
     /// nothing else in the inventory says that.
     bool subIntSplitAllowHuffman{false};
 
+    /// Allows the SubIntSplit split planner to cost segments as DeltaBlock.
+    /// False by default, matching subIntSplitAllowHuffman above and for the
+    /// same three reasons.
+    ///
+    /// Decode: DeltaBlock reconstructs values with a serial prefix sum that
+    /// does not vectorize, and withholding it returned 85.95 against 73.94
+    /// Meps on the columns measured. Its per-block baselines, which are what
+    /// justify the format, do no work on a contiguous scan.
+    ///
+    /// Size: withholding it also improved compression, to 40.46 bits per
+    /// element from 41.49. Both axes moving the same way is unusual enough to
+    /// state plainly -- this was not a trade.
+    ///
+    /// Encode: deltaBlockCostBits walks the sample values rather than pricing
+    /// from statistics, so it costs a pass per grid cell. That is the property
+    /// that made Huffman worth withdrawing from the grid, and it is measured
+    /// separately here rather than assumed from the parallel.
+    ///
+    /// This flag and the absence of DeltaBlock from the SubIntSplit nested
+    /// candidate list in nestedEncodingReadFactors are one decision, not two:
+    /// the planner and section selection have to agree, or the DP places
+    /// boundaries around an encoding selection cannot then use. They are
+    /// separate fields only because that function is handed no options.
+    ///
+    /// The evidence has a known limit. It was gathered on bulk and point
+    /// access, neither of which can see what a per-block baseline is for,
+    /// which is reaching row i without replaying the stream before it. So
+    /// DeltaBlock loses on the access patterns measured so far and its
+    /// advantage is unmeasured, not absent; a gather or low-selectivity
+    /// workload is what would change this answer. Set true to price the old
+    /// behaviour again.
+    bool subIntSplitAllowDeltaBlock{false};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -31,6 +32,8 @@
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
+#include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
+#include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
@@ -92,53 +95,157 @@ class ForEncoding final
       const Encoding::Options& options = {});
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Statistics-only size estimate for general encoding selection (e.g. as a
-  /// SubIntSplit segment candidate), where only `Statistics<physicalType>` --
-  /// not the raw values -- is available. The local (per-frame) bit width is
-  /// estimated from the average step size scaled to the frame size -- a
-  /// random-walk heuristic where the local range over a frame of
-  /// `kFrameSize` steps grows roughly with avgAbsDelta -- capped by the
-  /// overall range. Per-frame metadata streams are estimated as Trivial,
-  /// matching encode()'s frame size of 128.
+  /// Size estimate measured over the values, walking the frames encode() will
+  /// build.
+  ///
+  /// CHANGES SELECTION. The statistics-only estimate below derived a frame's
+  /// local range from range / (rowCount - 1) scaled by the frame size, which
+  /// assumes values are spread evenly across [min, max] in row order. Unsorted
+  /// data does not do that, and a frame of it spans close to the whole range,
+  /// so the packed payload -- the term that dominates -- came out about half
+  /// what it costs. Measured against real encodes the quote was 1.67x under at
+  /// the median, enough for FOR to win sections it then made larger.
+  ///
+  /// A frame's local range cannot be recovered from any global adjacent-pair
+  /// statistic: small steps and a wide local span are compatible, and so are
+  /// large steps and a narrow one. Framing is a property of the values in
+  /// position, so the only way to price it is to look. That is the shape the
+  /// evidence endorses -- the estimators that walk their data measure exactly
+  /// right, while every one that infers from a summary is at least 1.5x under.
   static uint64_t estimateSize(
-      uint64_t rowCount,
-      const Statistics<physicalType>& statistics) {
+      std::span<const physicalType> values,
+      const Encoding::Options& options = {}) {
+    const uint64_t rowCount = values.size();
     if (rowCount == 0) {
       return EncodingPrefix::kFixedPrefixSize;
     }
     constexpr uint32_t kFrameSize = 128;
-    const auto numFrames =
-        static_cast<uint32_t>(velox::bits::divRoundUp(rowCount, kFrameSize));
+    const auto firstFrameRows =
+        static_cast<uint32_t>(std::min<uint64_t>(rowCount, kFrameSize));
+    const Header header{
+        static_cast<uint32_t>(rowCount),
+        kFrameSize,
+        ForEncoding<T>::numFrames(
+            static_cast<uint32_t>(rowCount), kFrameSize, firstFrameRows),
+        firstFrameRows};
+
+    uint64_t totalBits = 0;
+    uint8_t minFrameBitWidth = std::numeric_limits<uint8_t>::max();
+    uint8_t maxFrameBitWidth = 0;
+    auto minReference = values[0];
+    auto maxReference = values[0];
+
+    for (uint32_t frameIdx = 0; frameIdx < header.numFrames; ++frameIdx) {
+      const uint32_t frameStart = frameRowOffset(header, frameIdx);
+      const uint32_t frameLength = frameRowCount(header, frameIdx);
+      const uint32_t frameEnd = frameStart + frameLength;
+
+      auto minValue = values[frameStart];
+      auto maxValue = values[frameStart];
+      for (uint32_t i = frameStart; i < frameEnd; ++i) {
+        minValue = std::min(minValue, values[i]);
+        maxValue = std::max(maxValue, values[i]);
+      }
+
+      uint64_t maxException = 0;
+      if constexpr (std::is_signed_v<physicalType>) {
+        maxException = static_cast<uint64_t>(
+            static_cast<int64_t>(maxValue) - static_cast<int64_t>(minValue));
+      } else {
+        maxException = static_cast<uint64_t>(maxValue - minValue);
+      }
+      const uint8_t bitWidth = minBitWidth(maxException);
+
+      totalBits += static_cast<uint64_t>(bitWidth) * frameLength;
+      minFrameBitWidth = std::min(minFrameBitWidth, bitWidth);
+      maxFrameBitWidth = std::max(maxFrameBitWidth, bitWidth);
+      minReference = std::min(minReference, minValue);
+      maxReference = std::max(maxReference, minValue);
+    }
+
+    return frameMetadataSize(
+               header.numFrames,
+               minFrameBitWidth,
+               maxFrameBitWidth,
+               minReference,
+               maxReference,
+               totalBits,
+               options) +
+        velox::bits::nbytes(totalBits);
+  }
+
+  /// Size estimate for a caller holding only statistics.
+  ///
+  /// Deliberately conservative: without the values there is no way to know how
+  /// much a frame's local range narrows against the column's, so this assumes
+  /// it does not narrow at all. That over-states FOR on data framing would
+  /// help, which costs a candidate it might have won; the alternative is the
+  /// assumption this replaced, which under-stated it on data framing does not
+  /// help and cost the section it then inflated. An estimator that cannot
+  /// measure should decline to sell.
+  static uint64_t estimateSize(
+      uint64_t rowCount,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options = {}) {
+    if (rowCount == 0) {
+      return EncodingPrefix::kFixedPrefixSize;
+    }
+    constexpr uint32_t kFrameSize = 128;
+    const auto firstFrameRows =
+        static_cast<uint32_t>(std::min<uint64_t>(rowCount, kFrameSize));
+    const uint32_t frames = ForEncoding<T>::numFrames(
+        static_cast<uint32_t>(rowCount), kFrameSize, firstFrameRows);
 
     const auto fullRange =
         static_cast<uint64_t>(statistics.max() - statistics.min());
-    const double avgAbsDelta = rowCount > 1
-        ? static_cast<double>(fullRange) / static_cast<double>(rowCount - 1)
-        : 0.0;
-    const double localRange = std::min(
-        static_cast<double>(fullRange),
-        avgAbsDelta * static_cast<double>(kFrameSize) / 2.0);
-    const uint8_t localBits = localRange < 1.0
-        ? uint8_t{0}
-        : static_cast<uint8_t>(
-              velox::bits::bitsRequired(static_cast<uint64_t>(localRange)));
+    const uint8_t localBits = minBitWidth(fullRange);
+    const uint64_t totalBits = static_cast<uint64_t>(localBits) * rowCount;
 
-    const uint64_t packedSize = FixedBitArray::bufferSize(rowCount, localBits);
-    const uint64_t bitWidthsSize =
-        TrivialEncoding<uint8_t>::estimateSize(numFrames);
-    const uint64_t referencesSize =
-        TrivialEncoding<physicalType>::estimateSize(numFrames);
-    const uint64_t bitOffsetsSize =
-        TrivialEncoding<uint64_t>::estimateSize(numFrames);
+    return frameMetadataSize(
+               frames,
+               localBits,
+               localBits,
+               statistics.min(),
+               statistics.max(),
+               totalBits,
+               options) +
+        velox::bits::nbytes(totalBits);
+  }
+
+ private:
+  /// The three per-frame metadata streams plus the fixed header, priced by the
+  /// estimators nested selection would apply to each. Shared by both
+  /// estimateSize overloads so they cannot describe different layouts.
+  static uint64_t frameMetadataSize(
+      uint32_t frames,
+      uint8_t minFrameBitWidth,
+      uint8_t maxFrameBitWidth,
+      physicalType minReference,
+      physicalType maxReference,
+      uint64_t totalBits,
+      const Encoding::Options& options) {
+    const uint64_t bitWidthsSize = std::min(
+        TrivialEncoding<uint8_t>::estimateSize(frames),
+        FixedBitWidthEncoding<uint8_t>::estimateSize(
+            frames, minFrameBitWidth, maxFrameBitWidth, options));
+    const uint64_t referencesSize = std::min(
+        TrivialEncoding<physicalType>::estimateSize(frames),
+        FixedBitWidthEncoding<physicalType>::estimateSize(
+            frames, minReference, maxReference, options));
+    const uint64_t bitOffsetsSize = std::min(
+        TrivialEncoding<uint64_t>::estimateSize(frames),
+        FixedBitWidthEncoding<uint64_t>::estimateSize(
+            frames, /*minValue=*/0, totalBits, options));
 
     // EncodingPrefix::kFixedPrefixSize(6) + FOR-specific fixed fields
-    // (compressionType + frameSize + numFrames + enableBitOffsets = 10),
-    // plus each of the four sub-streams' 4-byte size prefix.
+    // (compressionType + frameSize + numFrames + enableBitOffsets = 10), plus
+    // each of the four sub-streams' 4-byte size prefix.
     constexpr uint64_t kForSpecificFixedFieldsSize = 10;
     return EncodingPrefix::kFixedPrefixSize + kForSpecificFixedFieldsSize + 4 +
-        bitWidthsSize + 4 + referencesSize + 4 + bitOffsetsSize + 4 +
-        packedSize;
+        bitWidthsSize + 4 + referencesSize + 4 + bitOffsetsSize + 4;
   }
+
+ public:
 #endif
 
   std::string debugString(int offset) const final;

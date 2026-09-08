@@ -98,6 +98,157 @@ using EncodingSelectionPolicyCreator =
 #define UNIQUE_PTR_FACTORY(data_type, class, ...) \
   UNIQUE_PTR_FACTORY_EXTRA(data_type, class, , __VA_ARGS__)
 
+/// The encodings a nested stream may be chosen from, given the candidates its
+/// parent was chosen from and the encoding the parent settled on.
+///
+/// This is the one place that decision is made. It is a free function rather
+/// than a method because two callers need it and only one of them is a policy:
+/// the writer's ManualEncodingSelectionPolicy below, and the benchmark policy
+/// in SubstreamCompression.h, which stands in for a writer and has to reach the
+/// same answer. A second copy there is what let the drivers offer a SubIntSplit
+/// section eight encodings where the writer offers fifteen, and a divergence of
+/// that shape does not announce itself: both sides encode, both produce
+/// plausible sizes, and only the sizes differ.
+inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
+    const std::vector<std::pair<EncodingType, float>>& parentReadFactors,
+    EncodingType parentEncodingType) {
+  std::vector<std::pair<EncodingType, float>> nested;
+  nested.reserve(parentReadFactors.size());
+  // In each sub-level of the encoding selection, we exclude the encodings
+  // selected in parent levels. Although this is not required (as hopefully,
+  // the model will not pick a nested encoding of the same type as the parent),
+  // it provides an additional safety net, making sure the encoding selection
+  // will eventually converge, and also slightly speeds up nested encoding
+  // selection.
+  // TODO: validate the assumptions here compared to brute forcing, to see if
+  // the same encoding is selected multiple times in the tree (for example,
+  // should we allow trivial string lengths to be encoded using trivial
+  // encoding?)
+  for (const auto& entry : parentReadFactors) {
+    if (entry.first != parentEncodingType) {
+      nested.emplace_back(entry);
+    }
+  }
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+  // SubIntSplit decomposes its input into bit-range segments, each
+  // independently re-encoded via encodeNested(). Segments often look very
+  // different from the original column (narrow, possibly skewed residuals), so
+  // offer additional integer-compression candidates here that aren't part of
+  // the global default read factors. This only affects direct children of a
+  // SubIntSplit node: recursion is bounded because a child's own encodingType
+  // (e.g. PFOR) -- not SubIntSplit -- is what gets passed to *its* children.
+  //
+  // Note this list reaches the whole subtree, not only the direct children.
+  // createImpl builds a child's policy from the vector returned here, so a
+  // child's own candidate list already carries these entries, and passing its
+  // encoding type as the parent only removes that one entry. Recursion is
+  // still bounded, but by each encoding dropping itself rather than by the
+  // additions stopping one level down.
+  if (parentEncodingType == EncodingType::SubIntSplit) {
+    for (const auto& pair :
+         {// PFOR, SimdForBitpack and BlockBitPacking are held at 0.9 rather
+          // than the 0.85 the delta family carries, and the gap is load
+          // bearing. Levelling them to 0.85 was measured: it buys 1.27% of
+          // compression and costs 42% of bulk decode throughput and 23% of
+          // point latency, because the lower factor lets them displace far more
+          // than the delta sections it was aimed at, FixedBitWidth included.
+          // The 2.06% of compression this gap costs is the price of that
+          // throughput, not an error in the table.
+          std::pair{EncodingType::PFOR, 0.9f},
+          std::pair{EncodingType::SimdForBitpack, 0.9f},
+          std::pair{EncodingType::BlockBitPacking, 0.9f},
+          std::pair{EncodingType::Delta, 0.85f},
+          std::pair{EncodingType::FOR, 0.85f},
+          // Huffman is deliberately absent. It decodes bit-serially through a
+          // table, and withdrawing it from SubIntSplit returned up to 3.78x of
+          // bulk decode on the columns measured. It is still reachable for a
+          // caller who names it in read factors explicitly, which is an opt-in
+          // this list should not override. See
+          // Encoding::Options::subIntSplitAllowHuffman, which withdraws it from
+          // the split planner for the same reason; the two together are the
+          // decision, and they are separate only because this function is
+          // handed no options to consult.
+          //
+          // DeltaBlock is deliberately absent for the same kind of reason,
+          // measured separately. Withholding it beat the shipped baseline on
+          // both axes at once -- 85.95 against 73.94 Meps and 40.46 against
+          // 41.49 bits per element -- which is unusual enough to be worth
+          // stating: it was not a trade. When it is chosen it costs 56% of bulk
+          // decode throughput, because decoding runs a serial prefix sum over
+          // every element that does not vectorize, while the per-block
+          // baselines that justify the format sit unused on a contiguous scan.
+          //
+          // The honest limit of that evidence: it was measured on bulk and
+          // point access, and neither can see what per-block baselines are for,
+          // which is arriving at row i without replaying the stream before it.
+          // So DeltaBlock loses on the access patterns we measure and its
+          // advantage is unmeasured, not absent. A gather or low-selectivity
+          // workload where a block baseline avoids a replay is what would
+          // change this answer, and it is the reason to revisit rather than to
+          // treat the withdrawal as settled.
+          //
+          // Neither the encoding nor its read factor is removed. It stays
+          // reachable for a caller who names it in read factors explicitly,
+          // which is an opt-in this list should not override.
+          std::pair{EncodingType::FrequencyPartition, 0.85f}}) {
+      nested.push_back(pair);
+    }
+  }
+#endif
+  return nested;
+}
+
+/// The read factor select() weighs `encodingType` by, which is the table's
+/// factor except where Trivial's would be unearned.
+///
+/// Trivial's is withheld where taking it would cost compression. Its factor is
+/// 0.70 against FixedBitWidth's 0.90, so it can be up to 28.6% larger and still
+/// win, and against a stream it does not fit exactly it always is larger:
+/// Trivial stores at the storage type's width while FixedBitWidth stores at the
+/// value width. A 29-bit section becomes Trivial<Uint32> at 32 bits against
+/// FixedBitWidth's 29, and 32 * 0.70 = 22.4 beats 29 * 0.90 = 26.1, so three
+/// bits per row are spent on decode speed with nothing reporting it. On one
+/// Snowflake column that section held 72% of the encoded bytes.
+///
+/// The discount is only free where Trivial is no larger, so that is the
+/// condition, stated directly rather than as the set of widths that happen to
+/// satisfy it today. "A multiple of 8 bits" is the wrong test: a 24-bit section
+/// is a multiple of 8 and still becomes Trivial<Uint32> at 32 bits, losing a
+/// byte per row. The two are equal only where the bit width equals the storage
+/// width, which is 8, 16, 32 or 64 -- but comparing the estimates says why
+/// rather than which, and keeps holding if storage-width selection ever
+/// changes.
+///
+/// Withheld means competing at 1.0, not at some other discount: whenever
+/// Trivial is at least as large as FixedBitWidth, 1.0 is enough to let
+/// FixedBitWidth win, and no more than that is intended here. Note that this
+/// alone does not hand the stream to FixedBitWidth -- that depends on
+/// FixedBitWidth's own factor, and where it is above 1.0 a withheld Trivial
+/// still wins.
+///
+/// A floating point stream can sit either side of this by a byte or two and it
+/// is not a bug. Bit patterns whose exponents vary need close to the full
+/// storage width, so Trivial usually stays free and keeps the discount; a
+/// narrow synthetic range -- small integers cast to float, say -- packs to
+/// about 31 bits and tips the comparison the other way on a margin of a single
+/// byte. Both outcomes are the rule working. The margin is that narrow only
+/// where the range is, which is rare in real float data.
+///
+/// A free function because anything modelling selection has to reach the same
+/// answer: the oracle harness reproduces this comparison to report what a
+/// section will be given, and a second copy of the rule there would drift from
+/// this one silently, which is how the driver policy came to offer a section
+/// eight encodings where the writer offers fifteen.
+inline float effectiveReadFactor(
+    EncodingType encodingType,
+    float tableReadFactor,
+    uint64_t estimatedSize,
+    const std::optional<uint64_t>& fixedBitWidthSize) {
+  const bool trivialKeepsItsDiscount = encodingType != EncodingType::Trivial ||
+      !fixedBitWidthSize.has_value() || estimatedSize <= *fixedBitWidthSize;
+  return trivialKeepsItsDiscount ? tableReadFactor : 1.0f;
+}
+
 /// Manual encoding selection implementation.
 /// Uses a manually crafted model to choose the most appropriate encoding based
 /// on the provided statistics.
@@ -157,6 +308,21 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       };
     }
 
+    // FixedBitWidth's size, when it is a candidate, so that Trivial's read
+    // factor can be withheld where taking it would cost compression. See
+    // trivialKeepsItsDiscount below for why this is needed and what it costs
+    // to compute.
+    std::optional<uint64_t> fixedBitWidthSize;
+    if (std::any_of(
+            candidateEncodingReadFactors.begin(),
+            candidateEncodingReadFactors.end(),
+            [](const auto& entry) {
+              return entry.first == EncodingType::FixedBitWidth;
+            })) {
+      fixedBitWidthSize = detail::EncodingSizeEstimation<T>::estimateSize(
+          EncodingType::FixedBitWidth, values, statistics, options);
+    }
+
     float minCost = std::numeric_limits<float>::max();
     EncodingType selectedEncoding = EncodingType::Trivial;
     std::optional<uint64_t> selectedEstimatedSize;
@@ -173,8 +339,10 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       }
 
       // We use read factor weights to raise/lower the favorability of each
-      // encoding.
-      const auto readFactor = entry.second;
+      // encoding, except where Trivial's would be unearned. See
+      // effectiveReadFactor above for the rule and why it lives there.
+      const auto readFactor = effectiveReadFactor(
+          encodingType, entry.second, estimatedSize.value(), fixedBitWidthSize);
       const auto cost = estimatedSize.value() * readFactor;
       NIMBLE_SELECTION_LOG(
           "Encoding: " << encodingType << ", Size: "
@@ -246,58 +414,15 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       EncodingType parentEncodingType,
       NestedEncodingIdentifier nestedEncodingIdentifier,
       DataType nestedDataType) override {
-    // In each sub-level of the encoding selection, we exclude the encodings
-    // selected in parent levels. Although this is not required (as hopefully,
-    // the model will not pick a nested encoding of the same type as the
-    // parent), it provides an additional safety net, making sure the encoding
-    // selection will eventually converge, and also slightly speeds up nested
-    // encoding selection.
-    // TODO: validate the assumptions here compared to brute forcing, to see if
-    // the same encoding is selected multiple times in the tree (for example,
-    // should we allow trivial string lengths to be encoded using trivial
-    // encoding?)
-    std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors;
+    // The candidate list is decided by nestedEncodingReadFactors above, not
+    // here, so that a benchmark policy standing in for this one reaches the
+    // same list through the same code rather than through a copy of it.
     const auto& sourceEncodingReadFactors =
         nestedEncodingReadFactorsOverride_.has_value()
         ? nestedEncodingReadFactorsOverride_.value()
         : candidateEncodingReadFactors_;
-    nestedEncodingReadFactors.reserve(sourceEncodingReadFactors.size());
-    for (const auto& entry : sourceEncodingReadFactors) {
-      if (entry.first != parentEncodingType) {
-        nestedEncodingReadFactors.emplace_back(entry);
-      }
-    }
-#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    // SubIntSplit decomposes its input into bit-range segments, each
-    // independently re-encoded via encodeNested(). Segments often look very
-    // different from the original column (narrow, possibly skewed
-    // residuals), so offer additional integer-compression candidates here
-    // that aren't part of the global default read factors. This only affects
-    // direct children of a SubIntSplit node: recursion is bounded because a
-    // child's own encodingType (e.g. PFOR) -- not SubIntSplit -- is what gets
-    // passed to *its* children's createImpl.
-    if (parentEncodingType == EncodingType::SubIntSplit) {
-      for (const auto& pair :
-           {std::pair{EncodingType::PFOR, 0.9f},
-            std::pair{EncodingType::SimdForBitpack, 0.9f},
-            std::pair{EncodingType::BlockBitPacking, 0.9f},
-            std::pair{EncodingType::Delta, 0.85f},
-            std::pair{EncodingType::FOR, 0.85f},
-            std::pair{EncodingType::FrequencyPartition, 0.85f},
-            // Huffman is deliberately absent. It decodes bit-serially through
-            // a table, and withdrawing it from SubIntSplit returned up to
-            // 3.78x of bulk decode on the columns measured. It is still
-            // reachable here for a caller who names it in read factors
-            // explicitly, which is an opt-in this list should not override.
-            // See Encoding::Options::subIntSplitAllowHuffman, which withdraws
-            // it from the split planner for the same reason; the two together
-            // are the decision, and they are separate only because this
-            // block is handed no options to consult.
-            std::pair{EncodingType::DeltaBlock, 0.85f}}) {
-        nestedEncodingReadFactors.push_back(pair);
-      }
-    }
-#endif
+    auto nestedEncodingReadFactors = nimble::nestedEncodingReadFactors(
+        sourceEncodingReadFactors, parentEncodingType);
     UNIQUE_PTR_FACTORY(
         nestedDataType,
         ManualEncodingSelectionPolicy,

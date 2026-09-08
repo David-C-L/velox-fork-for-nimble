@@ -75,6 +75,38 @@
 // Sections are stored in LSB-first order (section 0 covers the lowest bits).
 // Section identifiers equal the section index (0, 1, …, splitCount-1).
 
+namespace facebook::nimble::detail::subintsplit {
+
+/// Options one SubIntSplit section is encoded under, derived from the options
+/// the enclosing column is encoded under.
+///
+/// A section is not encoded under its column's options: two of them are
+/// overridden, and both change encoded size. Anything reasoning about what a
+/// section will cost -- the split planner's cost models, or a driver measuring
+/// those models against a real encode -- has to derive the options from here
+/// rather than restate them, or it prices a section the encoder will never
+/// produce.
+inline Encoding::Options sectionEncodingOptions(
+    const Encoding::Options& options) {
+  Encoding::Options sectionOptions = options;
+  // Pack each section at its exact bit width instead of rounding up to a byte,
+  // so e.g. a 12-bit section costs 12 bits/value rather than 16. Sections
+  // dominate the encoded size for multi-field values, where byte rounding
+  // wasted up to 7 bits/value per section. FixedBitWidth records its own bit
+  // width, so the decode path is unaffected.
+  sectionOptions.fixedBitWidthUseExactBits = true;
+  // FrequencyPartitionEncoding with NoIndex (frequencyPartitionIndex == 0)
+  // outputs values in tier-reordered order, which would desync this section
+  // from sibling sections at decode time. PerTierBitmaps (1) keeps
+  // materialize() in original row order for every sub-encoding that reads this
+  // field.
+  sectionOptions.frequencyPartitionIndex =
+      1u; // FreqPartIndexType::PerTierBitmaps
+  return sectionOptions;
+}
+
+} // namespace facebook::nimble::detail::subintsplit
+
 namespace facebook::nimble {
 
 template <typename T>
@@ -873,13 +905,23 @@ std::string_view SubIntSplitEncoding<T>::encode(
     // An empty allowed set costs every encoding, so this is the production
     // path unless a caller has deliberately narrowed the inventory.
     //
-    // Huffman is withdrawn by default: it was priced into where these
-    // boundaries fall while being unselectable for the sections they produce,
-    // so its cost model steered the planner toward splits nothing would read
-    // well. See Encoding::Options::subIntSplitAllowHuffman for what that cost
-    // and what withdrawing it bought.
+    // Huffman and DeltaBlock are both withdrawn by default, for the same
+    // reason: each was priced into where these boundaries fall while being
+    // unselectable for the sections they produce, so their cost models steered
+    // the planner toward splits nothing would read well. Both also cost a pass
+    // over the sample per grid cell, so withdrawing either buys encode time as
+    // well as better plans. See Encoding::Options::subIntSplitAllowHuffman and
+    // subIntSplitAllowDeltaBlock for what each cost and what withdrawing it
+    // bought.
+    //
+    // Each of these has to stay in step with nestedEncodingReadFactors, which
+    // decides what a section may actually be encoded as. A gate set here
+    // without the matching absence there gives the planner an encoding
+    // selection will not use; the reverse leaves the planner carving
+    // boundaries around one that is no longer available.
     auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
     selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
+    selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
@@ -905,20 +947,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
   sectionData.reserve(splitCount);
   detail::SubIntSplitTransformInfo transformInfo;
 
-  // Pack each section at its exact bit width instead of rounding up to a byte,
-  // so e.g. a 12-bit section costs 12 bits/value rather than 16. Sections
-  // dominate the encoded size for multi-field values, where byte rounding
-  // wasted up to 7 bits/value per section. FixedBitWidth records its own bit
-  // width, so the decode path is unaffected.
-  Encoding::Options sectionOptions = options;
-  sectionOptions.fixedBitWidthUseExactBits = true;
-  // FrequencyPartitionEncoding with NoIndex (options.frequencyPartitionIndex
-  // == 0) outputs values in tier-reordered order, which would desync this
-  // segment from sibling segments at decode time. Override to PerTierBitmaps
-  // (1) so materialize() preserves original row order for all sub-encodings
-  // that read this field.
-  sectionOptions.frequencyPartitionIndex =
-      1u; // FreqPartIndexType::PerTierBitmaps
+  // What these options override, and why, is documented on
+  // sectionEncodingOptions. Derived there rather than here so that a driver
+  // measuring section costs can ask for the same options instead of restating
+  // them.
+  const Encoding::Options sectionOptions =
+      detail::subintsplit::sectionEncodingOptions(options);
 
   // A section is extracted once into 64-bit form, transformed there, and only
   // then narrowed to its storage width, so a transform never has to know which

@@ -111,6 +111,23 @@ int runBenchmark() {
           std::cout << "  --- " << enc.name << " encoding tree ---\n"
                     << tree << "\n";
         }
+        // The same tree again, one node per line and keyed by path. Emitted
+        // beside the readable form rather than instead of it: the two have
+        // different readers, and a script keying on path cannot misread this
+        // one the way a positional parse of the form above has twice.
+        auto nodes = target->describeTree();
+        if (!nodes.empty()) {
+          std::cout << "  --- " << enc.name << " encoding nodes ---\n"
+                    << nodes;
+        }
+        // Each node's cost against what its selection was quoted. Kept
+        // separate from the tree above because it decodes every node to
+        // recompute the estimate, which the plain tree does not need to do.
+        auto estimates = target->describeNodeEstimates();
+        if (!estimates.empty()) {
+          std::cout << "  --- " << enc.name << " node estimates ---\n"
+                    << estimates;
+        }
       }
 
       const size_t payloadBytes = target->payloadSize();

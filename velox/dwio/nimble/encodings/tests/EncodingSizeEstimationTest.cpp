@@ -64,8 +64,20 @@ uint64_t fixedBitWidthEstimate(
   if (roundBitWidthToByte) {
     bitWidth = velox::bits::roundUp(bitWidth, 8);
   }
+  // Mirrors FixedBitWidthEncoding::bitPackedBytes, including the seven bytes
+  // FixedBitArray::bufferSize reserves past the packed values and encode()
+  // writes into the stream. Without them this helper describes an encoding
+  // smaller than the one the encoder produces, and the exact-equality
+  // assertions below fail in a way that reads as the estimator being wrong
+  // rather than as this copy being stale.
+  //
+  // NOTE: this file is not in the add_executable list in CMakeLists.txt, so it
+  // is not compiled and these assertions do not run. It is updated here so that
+  // registering it does not immediately fail; see the test-registration work
+  // for why eighteen files in this directory are in that state.
+  constexpr uint64_t kFixedBitArraySlopBytes = 7;
   return EncodingPrefix::kFixedPrefixSize + 2 + sizeof(T) +
-      velox::bits::nbytes(bitWidth * rowCount);
+      velox::bits::nbytes(bitWidth * rowCount) + kFixedBitArraySlopBytes;
 }
 
 } // namespace

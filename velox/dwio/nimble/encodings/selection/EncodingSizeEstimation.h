@@ -171,7 +171,7 @@ struct EncodingSizeEstimation {
       case EncodingType::Delta: {
         if constexpr (isIntegralType<physicalType>()) {
           return DeltaEncoding<physicalType>::estimateSize(
-              entryCount, statistics);
+              entryCount, statistics, options);
         } else {
           return std::nullopt;
         }
@@ -188,8 +188,10 @@ struct EncodingSizeEstimation {
       // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
       case EncodingType::FrequencyPartition: {
         if constexpr (isIntegralType<physicalType>()) {
+          // Options carry the index type, which is a large part of what a
+          // FrequencyPartition encode costs and is not visible from statistics.
           return FrequencyPartitionEncoding<physicalType>::estimateSize(
-              entryCount, statistics);
+              entryCount, statistics, options);
         } else {
           return std::nullopt;
         }
@@ -231,6 +233,20 @@ struct EncodingSizeEstimation {
           return std::nullopt;
         }
       }
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+      case EncodingType::FOR: {
+        // Measured over the values rather than inferred from statistics: a
+        // frame's local range is a property of the values in position and does
+        // not follow from any summary of them. The statistics-only overload
+        // still exists for callers holding no values, and is deliberately
+        // conservative there.
+        if constexpr (isIntegralType<physicalType>()) {
+          return ForEncoding<physicalType>::estimateSize(values, options);
+        } else {
+          return std::nullopt;
+        }
+      }
+#endif
       default: {
         return estimateNumericSize(
             encodingType, values.size(), statistics, options);

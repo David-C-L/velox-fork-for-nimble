@@ -59,6 +59,14 @@ DEFINE_int32(
     "probes would take hours. Per-probe cost is constant, so a small sample "
     "gives the same ns_per_probe.");
 DEFINE_bool(
+    mlidc_allow_delta_block,
+    false,
+    "Whether SubIntSplit may cost and select DeltaBlock. False is what "
+    "production ships (Encoding::Options::subIntSplitAllowDeltaBlock); pass "
+    "true to measure the withdrawn configuration on any driver. It is one flag "
+    "rather than a second arm because crossing it with the Huffman arms would "
+    "double every SubIntSplit target for a comparison that is run once.");
+DEFINE_bool(
     mlidc_dump_encoding,
     false,
     "Print the encoding tree each encoder selected, including the bit ranges "

@@ -49,11 +49,20 @@ struct SelectorConfig {
   // boundaries the DP picks, not merely the encoding it names for a segment,
   // since a segment's cost is what the DP minimises over.
   bool allowHuffman{true};
+  // Whether segments may be costed as DeltaBlock. Same blast radius as
+  // allowHuffman above: withdrawing it moves the boundaries the DP picks, not
+  // only the encoding named for a segment. See
+  // Encoding::Options::subIntSplitAllowDeltaBlock, which is what production
+  // sets this from and which defaults the other way.
+  bool allowDeltaBlock{true};
 };
 
 inline SelectorConfig defaultSelectorConfig() noexcept {
   return SelectorConfig{
-      .minSegmentWidth = 1, .splitPenalty = 10.0, .allowHuffman = true};
+      .minSegmentWidth = 1,
+      .splitPenalty = 10.0,
+      .allowHuffman = true,
+      .allowDeltaBlock = true};
 }
 
 // Incremental bit-range value extractor.
@@ -205,6 +214,12 @@ class BitRangePartition {
       if (size > dominant) {
         dominant = size;
       }
+      // A group of one is a value seen once, and of two a value seen twice.
+      // The partition already knows every group's size, so the frequencies the
+      // cardinality estimate needs cost two comparisons in a loop that runs
+      // anyway.
+      counts_.singletonCount += (size == 1) ? 1 : 0;
+      counts_.doubletonCount += (size == 2) ? 1 : 0;
       largest.offer(size);
     }
     counts_.dominantCount = dominant;
@@ -234,9 +249,16 @@ struct SelectorResult {
 // scores are scaled from the sample size to the full stream so the DP
 // produces estimates in the right units.
 //
-// `costFn` scores a single segment: given (metrics, numValues, bitWidth,
-// segValues, outBestEncoding), return the per-sample cost in bits and write
-// the best encoding into the output parameter.  Defaults to `bestCostBits`.
+// `costFn` scores a single segment: given (metrics, numValues, fullCount,
+// bitWidth, segValues, outBestEncoding), return the per-sample cost in bits and
+// write the best encoding into the output parameter. Defaults to
+// `bestCostBits`.
+//
+// `fullCount` reaches the cost models as well as scaling their result. A model
+// needs it to tell a sample apart from the stream it came from: the count of
+// distinct values in a sample is a lower bound on the stream's and nothing
+// more, and without knowing how much larger the stream is there is no way to
+// say how much of one the sample saw.
 template <typename CostFn>
 inline SelectorResult selectSplitsImpl(
     const std::vector<uint64_t>& samples,
@@ -298,7 +320,7 @@ inline SelectorResult selectSplitsImpl(
 
       EncodingType bestEnc = EncodingType::Trivial;
       const double perSampleCost =
-          costFn(metrics, numSamples, bitWidth, segValues, bestEnc);
+          costFn(metrics, numSamples, fullCount, bitWidth, segValues, bestEnc);
 
       const double fullCost = perSampleCost * static_cast<double>(fullCount) /
           static_cast<double>(numSamples);
@@ -365,16 +387,8 @@ inline SelectorResult selectSplitsImpl(
   return result;
 }
 
-inline SelectorResult selectSplits(
-    const std::vector<uint64_t>& samples,
-    int kBits,
-    size_t fullCount,
-    const SelectorConfig& cfg = defaultSelectorConfig()) {
-  return selectSplitsImpl(samples, kBits, fullCount, cfg, bestCostBits);
-}
-
-// Selects splits costing segments against `allowed` only. An empty set behaves
-// exactly like selectSplits, so a caller can pass one through unconditionally.
+// Selects splits costing segments against `allowed` only. An empty set costs
+// every encoding, so a caller can pass one through unconditionally.
 inline SelectorResult selectSplitsRestricted(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -386,15 +400,45 @@ inline SelectorResult selectSplitsRestricted(
       kBits,
       fullCount,
       cfg,
-      [&allowed, allowHuffman = cfg.allowHuffman](
+      [&allowed,
+       allowHuffman = cfg.allowHuffman,
+       allowDeltaBlock = cfg.allowDeltaBlock](
           const SegmentMetrics& m,
           size_t numValues,
+          size_t streamCount,
           int bitWidth,
           const std::vector<uint64_t>& segValues,
           EncodingType& bestEnc) noexcept {
         return bestCostBitsRestricted(
-            m, numValues, bitWidth, segValues, allowed, allowHuffman, bestEnc);
+            m,
+            numValues,
+            streamCount,
+            bitWidth,
+            segValues,
+            allowed,
+            allowHuffman,
+            allowDeltaBlock,
+            bestEnc);
       });
+}
+
+// Selects splits over the full encoding inventory.
+//
+// Forwards to selectSplitsRestricted with an empty allowed set rather than
+// calling bestCostBits, which hardcodes both gates. Calling bestCostBits here
+// dropped cfg.allowHuffman on the floor: a caller that withdrew Huffman still
+// got splits planned with Huffman priced, silently, while the same caller
+// going through selectSplitsRestricted got what it asked for.
+// cfg.allowDeltaBlock would be lost the same way, which is why it is threaded
+// through the same path rather than given its own. The default config allows
+// both, so this changes nothing for a caller that never set either field.
+inline SelectorResult selectSplits(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const SelectorConfig& cfg = defaultSelectorConfig()) {
+  static const AllowedEncodings kAll;
+  return selectSplitsRestricted(samples, kBits, fullCount, kAll, cfg);
 }
 
 } // namespace facebook::nimble::detail::subintsplit

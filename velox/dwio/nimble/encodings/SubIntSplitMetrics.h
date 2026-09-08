@@ -94,6 +94,21 @@ struct SegmentMetrics {
   // required bit width whenever the delta distribution is right-skewed.
   uint64_t maxDelta{0};
 
+  // How many distinct values were seen exactly once, and exactly twice, over
+  // the rows that were actually counted (the whole segment, or the prefix
+  // scanned before the unique cap stopped the counting).
+  //
+  // These are what lets the stream's distinct count be estimated rather than
+  // read off the sample. A value seen once suggests others like it went
+  // unseen; a value seen twice says the sample is starting to saturate. See
+  // estimatedStreamUniqueCount in SubIntSplitCostModels.h, the only consumer.
+  size_t singletonCount{0};
+  size_t doubletonCount{0};
+  // Rows counted into singletonCount/doubletonCount. Equal to the segment
+  // length unless capping stopped the count early, which is exactly when the
+  // estimate matters most, so the two must travel together.
+  size_t countedRows{0};
+
   // Cumulative fraction of values covered by the top-1/2/4/8 most-frequent
   // distinct values. Only valid when FrequencyTiers was requested AND
   // uniqueCountCapped == false (i.e. uniqueCount <= kUniqueCountCap).
@@ -110,6 +125,10 @@ struct FrequencyCounts {
   uint32_t dominantCount{0};
   // The eight largest frequencies, descending, zero-padded.
   std::array<uint32_t, 8> largest{};
+  // Distinct values seen exactly once and exactly twice. See the fields of the
+  // same name on SegmentMetrics.
+  size_t singletonCount{0};
+  size_t doubletonCount{0};
 };
 
 // Keeps the eight largest frequencies offered to it, descending and
@@ -446,6 +465,36 @@ class MetricCollector {
           ? touched_.size()
           : (capped ? (kUniqueCountCap + 1) : freqMap_.size());
       out.uniqueCountCapped = capped;
+
+      // Frequencies of one and two, for the stream cardinality estimate.
+      //
+      // Taken even when the count was capped. Capping stops new keys being
+      // inserted, so what the map holds afterwards describes the rows scanned
+      // up to that point -- a prefix of the segment, which is still a sample of
+      // the same stream and still carries the repetition signal. Discarding it
+      // would leave the estimate with nothing but the cap itself, which is the
+      // number that caused the trouble in the first place.
+      if (supplied != nullptr) {
+        out.singletonCount = supplied->singletonCount;
+        out.doubletonCount = supplied->doubletonCount;
+        out.countedRows = n;
+      } else if (useDirectHistogram) {
+        for (const uint32_t value : touched_) {
+          const uint32_t count = counts_[value];
+          out.singletonCount += (count == 1) ? 1 : 0;
+          out.doubletonCount += (count == 2) ? 1 : 0;
+        }
+        out.countedRows = n;
+      } else {
+        size_t counted = 0;
+        for (const auto& [value, count] : freqMap_) {
+          (void)value;
+          counted += count;
+          out.singletonCount += (count == 1) ? 1 : 0;
+          out.doubletonCount += (count == 2) ? 1 : 0;
+        }
+        out.countedRows = counted;
+      }
     }
     if (doDominant) {
       out.dominantCount =

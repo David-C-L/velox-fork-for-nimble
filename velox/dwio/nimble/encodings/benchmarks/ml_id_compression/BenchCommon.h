@@ -51,6 +51,8 @@
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
+#include "velox/dwio/nimble/tools/EncodingUtilities.h"
 
 // ---------------------------------------------------------------------------
 // CLI flags shared across benchmark binaries
@@ -72,6 +74,7 @@ DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
 DECLARE_bool(mlidc_dump_encoding);
+DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
 
@@ -193,6 +196,22 @@ struct NimbleBenchTargetBase {
   virtual std::string describe() {
     return {};
   }
+
+  /// The same tree as describe(), one node per line and keyed by path.
+  ///
+  /// describe() nests children inside their parent's line, which reads well
+  /// and parses badly -- a node's position in that text depends on its
+  /// siblings, and two scripts have already misread it. See
+  /// tools::getEncodingTreeLabel.
+  virtual std::string describeTree() {
+    return {};
+  }
+
+  /// Per node, what it cost against what its selection was quoted. Dumped
+  /// under default options, which is what the drivers encode with.
+  virtual std::string describeNodeEstimates() {
+    return {};
+  }
 };
 
 template <typename EncodingT>
@@ -225,6 +244,27 @@ struct NimbleBenchTargetImpl
   std::string describe() override {
     auto* encoding = target.encoding();
     return encoding != nullptr ? encoding->debugString(0) : std::string{};
+  }
+
+  std::string describeTree() override {
+    const auto payload = target.payloadBytes();
+    if (payload.empty()) {
+      return {};
+    }
+    return nimble::tools::getEncodingTreeLabel(std::string_view(
+        reinterpret_cast<const char*>(payload.data()), payload.size()));
+  }
+
+  std::string describeNodeEstimates() override {
+    const auto payload = target.payloadBytes();
+    if (payload.empty()) {
+      return {};
+    }
+    return describeEncodingNodeEstimates(
+        std::string_view(
+            reinterpret_cast<const char*>(payload.data()), payload.size()),
+        *benchmarks::benchmarkPool(),
+        Encoding::Options{});
   }
 };
 
@@ -320,6 +360,22 @@ class NimbleViewBenchTargetImpl
         benchmarks::nullFactory(),
         options_};
     return encoding.debugString(0);
+  }
+
+  // Unlike describe(), this needs no Encoding at all: the tree is read
+  // straight off the encoded bytes this target already holds.
+  std::string describeTree() override {
+    return encoded_.empty()
+        ? std::string{}
+        : nimble::tools::getEncodingTreeLabel(std::string_view(encoded_));
+  }
+
+  std::string describeNodeEstimates() override {
+    return encoded_.empty() ? std::string{}
+                            : describeEncodingNodeEstimates(
+                                  std::string_view(encoded_),
+                                  *pool_,
+                                  options_);
   }
 
  private:
@@ -436,6 +492,14 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     return {
         {reinterpret_cast<const std::byte*>(compressed_.data()),
          compressed_.size()}};
+  }
+
+  std::string describeTree() override {
+    return inner_->describeTree();
+  }
+
+  std::string describeNodeEstimates() override {
+    return inner_->describeNodeEstimates();
   }
 
   std::string describe() override {
@@ -1302,7 +1366,11 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
           entry.name = std::move(name);
           entry.family = "SubIntSplit";
           entry.variant = view ? "real_nested_view" : "real_nested";
-          entry.inventory = allowHuffman ? "full" : "no_huffman";
+          // DeltaBlock is withdrawn by default too, so "full" would name an
+          // inventory no arm here actually runs unless the flag is set.
+          entry.inventory = FLAGS_mlidc_allow_delta_block
+              ? (allowHuffman ? "full" : "no_huffman")
+              : (allowHuffman ? "no_delta_block" : "no_huffman_no_delta_block");
           entry.transform = transformName;
           entry.isSequential = false;
           entry.fastSkip = view;
@@ -1312,6 +1380,7 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
                               const Encoding::Options& opts) {
             Encoding::Options o = opts;
             o.subIntSplitAllowHuffman = allowHuffman;
+            o.subIntSplitAllowDeltaBlock = FLAGS_mlidc_allow_delta_block;
             if (rawId != 0) {
               o.subIntSplitTransform = rawId;
               // 0xFF: let the encoder find the section worth keying on

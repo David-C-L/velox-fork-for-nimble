@@ -137,28 +137,33 @@ class BenchEncodingSelectionPolicy
   }
 
   std::unique_ptr<nimble::EncodingSelectionPolicyBase> createImpl(
-      nimble::EncodingType /* encodingType */,
+      nimble::EncodingType parentEncodingType,
       nimble::NestedEncodingIdentifier /* identifier */,
       nimble::DataType type) override {
-    // Mirrors test::Encoder's nested path: when realNestedSelection is set the
-    // sub-stream encodings are chosen by the normal cost-based factory rather
-    // than forced to Trivial, so SubIntSplit exercises its per-section
-    // encoders. SubIntSplit is removed from the candidates to avoid infinite
-    // recursion. The one difference is that the chosen compressor is passed
-    // down instead of std::nullopt.
+    // With realNestedSelection set, a sub-stream's encodings are chosen by the
+    // writer's own cost-based factory rather than forced to Trivial, so
+    // SubIntSplit exercises its per-section encoders. The one difference from
+    // the writer is that the chosen compressor is passed down instead of
+    // std::nullopt.
+    //
+    // The candidate list comes from nestedEncodingReadFactors, the same
+    // function ManualEncodingSelectionPolicy::createImpl uses, and
+    // parentEncodingType is forwarded to it rather than discarded. Discarding
+    // it is what made this policy differ from the writer: the augmented list a
+    // SubIntSplit section gets is keyed on the parent type, so dropping the
+    // parent silently offered a section eight encodings where the writer offers
+    // fifteen, and every SubIntSplit figure this suite produced described an
+    // encoder nothing ships. Forwarding it also removes the parent encoding
+    // from the candidates, which is where the hand-rolled SubIntSplit erase
+    // this used to do has gone -- for a SubIntSplit parent the generic rule
+    // removes exactly what the erase did.
     if (realNestedSelection_) {
-      auto readFactors = nimble::ManualEncodingSelectionPolicyFactory::
-          defaultEncodingReadFactors();
-      readFactors.erase(
-          std::remove_if(
-              readFactors.begin(),
-              readFactors.end(),
-              [](const auto& factor) {
-                return factor.first == nimble::EncodingType::SubIntSplit;
-              }),
-          readFactors.end());
       return nimble::ManualEncodingSelectionPolicyFactory{
-          std::move(readFactors), compressionOptionsFor(compressionType_)}
+          nimble::nestedEncodingReadFactors(
+              nimble::ManualEncodingSelectionPolicyFactory::
+                  defaultEncodingReadFactors(),
+              parentEncodingType),
+          compressionOptionsFor(compressionType_)}
           .createPolicy(type);
     }
     UNIQUE_PTR_FACTORY(
@@ -175,13 +180,23 @@ class BenchEncodingSelectionPolicy
 
 // Encodes values with the given encoding, applying compressionType to the
 // encoding's own stream and to any sub-streams it creates.
+//
+// `encodingConfig` is the encoding-specific configuration a selection policy
+// would have attached. Empty for an ordinary encode; a caller measuring what
+// one SubIntSplit split plan costs passes preserve-mode boundaries here, which
+// is the only way to encode a *given* plan rather than one the encoder
+// re-derives for itself. Routing that through this function instead of a
+// second copy of it is deliberate: a copy drifts from the policy and
+// compression wiring below, and a plan measured against a drifted copy is not
+// being measured against the same encoder the drivers report.
 template <typename E, typename T>
 std::string_view encodeWithCompression(
     nimble::Buffer& buffer,
     const nimble::Vector<T>& values,
     CompressionType compressionType,
     const nimble::Encoding::Options& options,
-    bool realNestedSelection) {
+    bool realNestedSelection,
+    nimble::EncodingLayout::Config encodingConfig = {}) {
   using physicalType = typename nimble::TypeTraits<T>::physicalType;
 
   auto physicalValues = std::span<const physicalType>(
@@ -189,6 +204,7 @@ std::string_view encodeWithCompression(
 
   nimble::EncodingSelection<physicalType> selection{
       {.encodingType = test::EncodingTypeTraits<E>::encodingType,
+       .encodingConfig = std::move(encodingConfig),
        .compressionPolicyFactory =
            [compressionType]() {
              return std::make_unique<BenchCompressPolicy>(compressionType);
