@@ -1171,6 +1171,18 @@ int runBenchmark() {
                 // Selection reads its estimates off Statistics, so build it
                 // once for the range rather than per candidate.
                 const auto statistics = Statistics<Storage>::create(values);
+                // FixedBitWidth's estimate for this range, which is what
+                // effectiveReadFactor needs to decide whether Trivial's
+                // discount is earned. Computed once, as select() does.
+                const auto fixedBitWidthEstimate =
+                    encodingAvailableAtWidth(
+                        EncodingType::FixedBitWidth, storageBytes)
+                    ? facebook::nimble::detail::EncodingSizeEstimation<
+                          Storage>::estimateSize(EncodingType::FixedBitWidth,
+                                                 values,
+                                                 statistics,
+                                                 sectionOptions)
+                    : std::optional<uint64_t>{};
                 double bestSelectionCost =
                     std::numeric_limits<double>::infinity();
 
@@ -1214,9 +1226,19 @@ int runBenchmark() {
                     continue;
                   }
                   oc.results[ci].estimateBytes = estimate.value();
+                  // Weighted through effectiveReadFactor rather than by the
+                  // table value directly, so this tracks select()'s rule for
+                  // withholding Trivial's discount instead of keeping a second
+                  // copy of it. Without that, selection_encoding disagrees with
+                  // the writer on exactly the cells where the rule fires --
+                  // which are the cells anyone reads this column to study.
                   const double selectionCost =
                       static_cast<double>(estimate.value()) *
-                      static_cast<double>(readFactor.value());
+                      static_cast<double>(effectiveReadFactor(
+                          candidates[ci].type,
+                          readFactor.value(),
+                          estimate.value(),
+                          fixedBitWidthEstimate));
                   if (selectionCost < bestSelectionCost) {
                     bestSelectionCost = selectionCost;
                     oc.selectionBytes = bytes;
