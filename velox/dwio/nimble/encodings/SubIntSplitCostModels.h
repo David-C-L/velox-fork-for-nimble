@@ -716,6 +716,7 @@ inline double bestCostBitsRestricted(
     const std::vector<uint64_t>& segValues,
     const AllowedEncodings& allowed,
     bool allowHuffman,
+    bool allowDeltaBlock,
     EncodingType& bestEncoding) noexcept {
   double best = std::numeric_limits<double>::infinity();
   auto consider = [&](double cost, EncodingType type) noexcept {
@@ -780,7 +781,14 @@ inline double bestCostBitsRestricted(
       m.uniqueCount <= HuffmanEncoding<uint64_t>::kMaxSymbols) {
     consider(huffmanCostBits(segValues, numValues), EncodingType::Huffman);
   }
-  consider(deltaBlockCostBits(segValues, numValues), EncodingType::DeltaBlock);
+  // DeltaBlock is gated for the same reason as Huffman above: costing it walks
+  // segValues rather than reading the metrics, so a caller that has withdrawn
+  // it skips a pass over the sample per grid cell as well as the candidate.
+  // See Encoding::Options::subIntSplitAllowDeltaBlock.
+  if (allowDeltaBlock) {
+    consider(
+        deltaBlockCostBits(segValues, numValues), EncodingType::DeltaBlock);
+  }
   return best;
 }
 
@@ -802,6 +810,7 @@ inline double bestCostBits(
       segValues,
       kAll,
       /*allowHuffman=*/true,
+      /*allowDeltaBlock=*/true,
       bestEncoding);
 }
 

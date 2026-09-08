@@ -905,13 +905,23 @@ std::string_view SubIntSplitEncoding<T>::encode(
     // An empty allowed set costs every encoding, so this is the production
     // path unless a caller has deliberately narrowed the inventory.
     //
-    // Huffman is withdrawn by default: it was priced into where these
-    // boundaries fall while being unselectable for the sections they produce,
-    // so its cost model steered the planner toward splits nothing would read
-    // well. See Encoding::Options::subIntSplitAllowHuffman for what that cost
-    // and what withdrawing it bought.
+    // Huffman and DeltaBlock are both withdrawn by default, for the same
+    // reason: each was priced into where these boundaries fall while being
+    // unselectable for the sections they produce, so their cost models steered
+    // the planner toward splits nothing would read well. Both also cost a pass
+    // over the sample per grid cell, so withdrawing either buys encode time as
+    // well as better plans. See Encoding::Options::subIntSplitAllowHuffman and
+    // subIntSplitAllowDeltaBlock for what each cost and what withdrawing it
+    // bought.
+    //
+    // Each of these has to stay in step with nestedEncodingReadFactors, which
+    // decides what a section may actually be encoded as. A gate set here
+    // without the matching absence there gives the planner an encoding
+    // selection will not use; the reverse leaves the planner carving
+    // boundaries around one that is no longer available.
     auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
     selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
+    selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,

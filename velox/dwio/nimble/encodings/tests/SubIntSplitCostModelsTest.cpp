@@ -413,6 +413,7 @@ TEST(
       values,
       allEncodings,
       /*allowHuffman=*/false,
+      /*allowDeltaBlock=*/true,
       withoutHuffman);
 
   EXPECT_TRUE(std::isfinite(best));

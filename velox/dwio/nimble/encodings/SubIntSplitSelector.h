@@ -49,11 +49,20 @@ struct SelectorConfig {
   // boundaries the DP picks, not merely the encoding it names for a segment,
   // since a segment's cost is what the DP minimises over.
   bool allowHuffman{true};
+  // Whether segments may be costed as DeltaBlock. Same blast radius as
+  // allowHuffman above: withdrawing it moves the boundaries the DP picks, not
+  // only the encoding named for a segment. See
+  // Encoding::Options::subIntSplitAllowDeltaBlock, which is what production
+  // sets this from and which defaults the other way.
+  bool allowDeltaBlock{true};
 };
 
 inline SelectorConfig defaultSelectorConfig() noexcept {
   return SelectorConfig{
-      .minSegmentWidth = 1, .splitPenalty = 10.0, .allowHuffman = true};
+      .minSegmentWidth = 1,
+      .splitPenalty = 10.0,
+      .allowHuffman = true,
+      .allowDeltaBlock = true};
 }
 
 // Incremental bit-range value extractor.
@@ -391,7 +400,9 @@ inline SelectorResult selectSplitsRestricted(
       kBits,
       fullCount,
       cfg,
-      [&allowed, allowHuffman = cfg.allowHuffman](
+      [&allowed,
+       allowHuffman = cfg.allowHuffman,
+       allowDeltaBlock = cfg.allowDeltaBlock](
           const SegmentMetrics& m,
           size_t numValues,
           size_t streamCount,
@@ -406,6 +417,7 @@ inline SelectorResult selectSplitsRestricted(
             segValues,
             allowed,
             allowHuffman,
+            allowDeltaBlock,
             bestEnc);
       });
 }
@@ -413,12 +425,13 @@ inline SelectorResult selectSplitsRestricted(
 // Selects splits over the full encoding inventory.
 //
 // Forwards to selectSplitsRestricted with an empty allowed set rather than
-// calling bestCostBits, which hardcodes allowHuffman. Calling bestCostBits
-// here dropped cfg.allowHuffman on the floor: a caller that withdrew Huffman
-// still got splits planned with Huffman priced, silently, while the same
-// caller going through selectSplitsRestricted got what it asked for. The
-// default config allows Huffman, so this changes nothing for a caller that
-// never set the field.
+// calling bestCostBits, which hardcodes both gates. Calling bestCostBits here
+// dropped cfg.allowHuffman on the floor: a caller that withdrew Huffman still
+// got splits planned with Huffman priced, silently, while the same caller
+// going through selectSplitsRestricted got what it asked for.
+// cfg.allowDeltaBlock would be lost the same way, which is why it is threaded
+// through the same path rather than given its own. The default config allows
+// both, so this changes nothing for a caller that never set either field.
 inline SelectorResult selectSplits(
     const std::vector<uint64_t>& samples,
     int kBits,

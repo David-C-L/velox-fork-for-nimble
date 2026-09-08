@@ -74,6 +74,7 @@ DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
 DECLARE_bool(mlidc_dump_encoding);
+DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
 
@@ -1365,7 +1366,11 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
           entry.name = std::move(name);
           entry.family = "SubIntSplit";
           entry.variant = view ? "real_nested_view" : "real_nested";
-          entry.inventory = allowHuffman ? "full" : "no_huffman";
+          // DeltaBlock is withdrawn by default too, so "full" would name an
+          // inventory no arm here actually runs unless the flag is set.
+          entry.inventory = FLAGS_mlidc_allow_delta_block
+              ? (allowHuffman ? "full" : "no_huffman")
+              : (allowHuffman ? "no_delta_block" : "no_huffman_no_delta_block");
           entry.transform = transformName;
           entry.isSequential = false;
           entry.fastSkip = view;
@@ -1375,6 +1380,7 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
                               const Encoding::Options& opts) {
             Encoding::Options o = opts;
             o.subIntSplitAllowHuffman = allowHuffman;
+            o.subIntSplitAllowDeltaBlock = FLAGS_mlidc_allow_delta_block;
             if (rawId != 0) {
               o.subIntSplitTransform = rawId;
               // 0xFF: let the encoder find the section worth keying on

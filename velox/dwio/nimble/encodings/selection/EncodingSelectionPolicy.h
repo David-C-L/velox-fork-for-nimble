@@ -159,7 +159,6 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
           std::pair{EncodingType::BlockBitPacking, 0.9f},
           std::pair{EncodingType::Delta, 0.85f},
           std::pair{EncodingType::FOR, 0.85f},
-          std::pair{EncodingType::FrequencyPartition, 0.85f},
           // Huffman is deliberately absent. It decodes bit-serially through a
           // table, and withdrawing it from SubIntSplit returned up to 3.78x of
           // bulk decode on the columns measured. It is still reachable for a
@@ -169,7 +168,29 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
           // the split planner for the same reason; the two together are the
           // decision, and they are separate only because this function is
           // handed no options to consult.
-          std::pair{EncodingType::DeltaBlock, 0.85f}}) {
+          //
+          // DeltaBlock is deliberately absent for the same kind of reason,
+          // measured separately. Withholding it beat the shipped baseline on
+          // both axes at once -- 85.95 against 73.94 Meps and 40.46 against
+          // 41.49 bits per element -- which is unusual enough to be worth
+          // stating: it was not a trade. When it is chosen it costs 56% of bulk
+          // decode throughput, because decoding runs a serial prefix sum over
+          // every element that does not vectorize, while the per-block
+          // baselines that justify the format sit unused on a contiguous scan.
+          //
+          // The honest limit of that evidence: it was measured on bulk and
+          // point access, and neither can see what per-block baselines are for,
+          // which is arriving at row i without replaying the stream before it.
+          // So DeltaBlock loses on the access patterns we measure and its
+          // advantage is unmeasured, not absent. A gather or low-selectivity
+          // workload where a block baseline avoids a replay is what would
+          // change this answer, and it is the reason to revisit rather than to
+          // treat the withdrawal as settled.
+          //
+          // Neither the encoding nor its read factor is removed. It stays
+          // reachable for a caller who names it in read factors explicitly,
+          // which is an opt-in this list should not override.
+          std::pair{EncodingType::FrequencyPartition, 0.85f}}) {
       nested.push_back(pair);
     }
   }

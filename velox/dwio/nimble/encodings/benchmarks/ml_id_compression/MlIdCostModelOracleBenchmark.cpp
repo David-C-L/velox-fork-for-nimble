@@ -182,6 +182,14 @@ DEFINE_bool(
     "production ships (Encoding::Options::subIntSplitAllowHuffman); pass true "
     "to measure the withdrawn configuration.");
 DEFINE_bool(
+    allow_delta_block,
+    false,
+    "Whether a bit range may be costed and measured as DeltaBlock. False is "
+    "what production ships (Encoding::Options::subIntSplitAllowDeltaBlock); "
+    "pass true to measure the withdrawn configuration. Costing DeltaBlock "
+    "walks the sample per grid cell, so this flag moves encode time as well as "
+    "the plans chosen.");
+DEFINE_bool(
     ignore_writer_mismatch,
     false,
     "Continue after the writer-reproduction check fails. That check compares a "
@@ -710,6 +718,7 @@ std::vector<SegmentPlan> writerDerivedPlan(
   sampleIntoU64<Phys>(physical, writerSample, defaultSamplerConfig());
   auto writerCfg = defaultSelectorConfig();
   writerCfg.allowHuffman = columnOptions.subIntSplitAllowHuffman;
+  writerCfg.allowDeltaBlock = columnOptions.subIntSplitAllowDeltaBlock;
   return selectSplitsRestricted(
              writerSample,
              kBits,
@@ -763,6 +772,7 @@ int runBenchmark() {
   // derives its own.
   facebook::nimble::Encoding::Options columnOptions;
   columnOptions.subIntSplitAllowHuffman = FLAGS_allow_huffman;
+  columnOptions.subIntSplitAllowDeltaBlock = FLAGS_allow_delta_block;
   const facebook::nimble::Encoding::Options sectionOptions =
       sectionEncodingOptions(columnOptions);
 
@@ -873,6 +883,7 @@ int runBenchmark() {
       !sampleSizes.empty(), "No usable sample sizes: {}", FLAGS_sample_sizes);
   SelectorConfig selectorCfg = defaultSelectorConfig();
   selectorCfg.allowHuffman = FLAGS_allow_huffman;
+  selectorCfg.allowDeltaBlock = FLAGS_allow_delta_block;
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
 
   for (const auto& ds : datasets) {
@@ -1078,6 +1089,7 @@ int runBenchmark() {
               sectionU64,
               allowed,
               FLAGS_allow_huffman,
+              FLAGS_allow_delta_block,
               modelBestEnc);
 
           ModelCell& mc = modelGrid[l][r];
