@@ -175,13 +175,23 @@ class BenchEncodingSelectionPolicy
 
 // Encodes values with the given encoding, applying compressionType to the
 // encoding's own stream and to any sub-streams it creates.
+//
+// `encodingConfig` is the encoding-specific configuration a selection policy
+// would have attached. Empty for an ordinary encode; a caller measuring what
+// one SubIntSplit split plan costs passes preserve-mode boundaries here, which
+// is the only way to encode a *given* plan rather than one the encoder
+// re-derives for itself. Routing that through this function instead of a
+// second copy of it is deliberate: a copy drifts from the policy and
+// compression wiring below, and a plan measured against a drifted copy is not
+// being measured against the same encoder the drivers report.
 template <typename E, typename T>
 std::string_view encodeWithCompression(
     nimble::Buffer& buffer,
     const nimble::Vector<T>& values,
     CompressionType compressionType,
     const nimble::Encoding::Options& options,
-    bool realNestedSelection) {
+    bool realNestedSelection,
+    nimble::EncodingLayout::Config encodingConfig = {}) {
   using physicalType = typename nimble::TypeTraits<T>::physicalType;
 
   auto physicalValues = std::span<const physicalType>(
@@ -189,6 +199,7 @@ std::string_view encodeWithCompression(
 
   nimble::EncodingSelection<physicalType> selection{
       {.encodingType = test::EncodingTypeTraits<E>::encodingType,
+       .encodingConfig = std::move(encodingConfig),
        .compressionPolicyFactory =
            [compressionType]() {
              return std::make_unique<BenchCompressPolicy>(compressionType);
