@@ -481,7 +481,13 @@ inline std::vector<CandidateEncoding> candidateEncodings() {
 }
 
 struct OracleResult {
+  // What this encoding really costs on this range.
   size_t bytes{std::numeric_limits<size_t>::max()};
+  // What EncodingSizeEstimation told selection it would cost, before the read
+  // factor. The pair is the whole diagnosis: an encoding is chosen on the
+  // estimate and paid for in the bytes, so wherever the two diverge selection
+  // is buying something other than what it was quoted.
+  size_t estimateBytes{std::numeric_limits<size_t>::max()};
 };
 
 struct OracleCell {
@@ -806,6 +812,10 @@ int runBenchmark() {
       "r",
       "width",
       "encoding",
+      "selection_est_bytes",
+      "selection_est_ratio",
+      "selection_encoding",
+      "selection_bytes",
       "available_at_width",
       "max_delta",
       "sample_seam_count",
@@ -1181,6 +1191,7 @@ int runBenchmark() {
                   if (!estimate.has_value()) {
                     continue;
                   }
+                  oc.results[ci].estimateBytes = estimate.value();
                   const double selectionCost =
                       static_cast<double>(estimate.value()) *
                       static_cast<double>(readFactor.value());
@@ -1291,7 +1302,25 @@ int runBenchmark() {
               csv.set("est_bits", mc.estBits[ci]);
             }
             if (oracleOk) {
-              csv.set("actual_bytes", static_cast<int64_t>(oc.results[ci].bytes));
+              csv.set(
+                  "actual_bytes", static_cast<int64_t>(oc.results[ci].bytes));
+              // What nested selection was quoted for this encoding on this
+              // range, and how far off it was. selection_est_ratio above 1
+              // means the encoding costs more than selection was told, which is
+              // the direction that lets a mispriced encoding win a section and
+              // then blow it up.
+              if (oc.results[ci].estimateBytes !=
+                  std::numeric_limits<size_t>::max()) {
+                csv.set(
+                    "selection_est_bytes",
+                    static_cast<int64_t>(oc.results[ci].estimateBytes));
+                if (oc.results[ci].estimateBytes > 0) {
+                  csv.set(
+                      "selection_est_ratio",
+                      static_cast<double>(oc.results[ci].bytes) /
+                          static_cast<double>(oc.results[ci].estimateBytes));
+                }
+              }
               const double bitsPerElem = sampleSize > 0
                   ? static_cast<double>(oc.results[ci].bytes) * 8.0 /
                       static_cast<double>(sampleSize)
@@ -1443,6 +1472,38 @@ int runBenchmark() {
           }
           if (resolved) {
             csv.set("actual_bytes", static_cast<int64_t>(bytesForPick));
+          }
+          // What nested selection actually gives this section, beside what it
+          // was quoted for it. For the autosis plan these rows are the
+          // production per-section breakdown: the encoding each section lands
+          // on, what it costs, and what selection was told it would cost.
+          for (const auto& c : candidates) {
+            if (c.type == cell.selectionEncoding) {
+              csv.set("selection_encoding", c.name);
+              break;
+            }
+          }
+          if (cell.selectionBytes != std::numeric_limits<size_t>::max()) {
+            csv.set(
+                "selection_bytes", static_cast<int64_t>(cell.selectionBytes));
+          }
+          for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            if (candidates[ci].type != cell.selectionEncoding) {
+              continue;
+            }
+            const auto estimated = cell.results[ci].estimateBytes;
+            if (estimated != std::numeric_limits<size_t>::max()) {
+              csv.set(
+                  "selection_est_bytes", static_cast<int64_t>(estimated));
+              if (estimated > 0 &&
+                  cell.selectionBytes != std::numeric_limits<size_t>::max()) {
+                csv.set(
+                    "selection_est_ratio",
+                    static_cast<double>(cell.selectionBytes) /
+                        static_cast<double>(estimated));
+              }
+            }
+            break;
           }
           csv.set("plan_type", planType);
           csv.set("plan_segment_count", static_cast<int64_t>(segments.size()));
