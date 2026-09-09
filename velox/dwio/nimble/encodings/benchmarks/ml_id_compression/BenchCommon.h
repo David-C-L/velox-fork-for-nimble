@@ -49,6 +49,7 @@
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
+#include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
@@ -1083,6 +1084,17 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   encoders.push_back(
       makeEncoderEntry<RLEEncoding<T>>(
           "RLE", "Baseline", "rle", true, true, false));
+  // Top value plus exceptions: a dominant value, a boolean vector marking the
+  // rows that hold it, and a child encoding for the rest. This is the arm that
+  // corresponds to BtrBlocks' FREQUENCY64 and FastLanes' frequency, both of
+  // which store a dominant value plus a positional exception set. It was in
+  // the default candidate list (EncodingSelectionPolicy.cpp's
+  // defaultEncodingReadFactors) but had no top-level bench arm, so the
+  // cross-format comparison had an empty cell on our side for a codec we
+  // implement. FPE is not this encoding -- it partitions into frequency tiers.
+  encoders.push_back(
+      makeEncoderEntry<MainlyConstantEncoding<T>>(
+          "MainlyConstant", "Baseline", "mainly_constant", true, false, false));
 
   // Read-path variants. Each encodes byte-for-byte identically to the entry it
   // shadows and differs only in reading by index rather than by cursor, so the
@@ -1116,6 +1128,23 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
       auto impl = std::make_unique<
           NimbleViewBenchTargetImpl<FixedBitWidthEncoding<T>>>();
+      impl->encode(data, opts);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
+    EncoderEntry<T> entry;
+    entry.name = "MainlyConstant/view";
+    entry.family = "Baseline";
+    entry.variant = "mainly_constant_view";
+    entry.isSequential = false;
+    entry.fastSkip = true;
+    entry.randomAccess = true;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl = std::make_unique<
+          NimbleViewBenchTargetImpl<MainlyConstantEncoding<T>>>();
       impl->encode(data, opts);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
