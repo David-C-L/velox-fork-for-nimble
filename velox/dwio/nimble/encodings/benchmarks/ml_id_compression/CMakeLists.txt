@@ -153,6 +153,11 @@ nimble_add_ml_id_benchmark(
 nimble_add_ml_id_benchmark(
   nimble_ml_id_selection_policy_benchmark MlIdSelectionPolicyBenchmark.cpp)
 
+# MlIdSplitGridBenchmark: prices SubIntSplit's split search on a profile-
+# narrowed grid, and on the profile's boundaries alone, against the full grid.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_split_grid_benchmark MlIdSplitGridBenchmark.cpp)
+
 # Correctness tests for the block-codec arms. The benchmark drivers report
 # numbers rather than assert them, so the block indexing -- which decides both
 # what a read returns and how much it decompresses -- is pinned here instead.

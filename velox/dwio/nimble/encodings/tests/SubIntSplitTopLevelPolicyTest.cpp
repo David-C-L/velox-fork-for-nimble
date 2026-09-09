@@ -17,12 +17,15 @@
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "velox/dwio/nimble/encodings/SubIntSplitCandidateBoundaries.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEstimator.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 
@@ -56,6 +59,47 @@ std::vector<uint64_t> makeConcatenatedFieldsStream(size_t n) {
     v = midField(rng) << 10;
   }
   return values;
+}
+
+// A flat profile carries no boundary information, so a narrowed grid built on
+// it would be guessing. The fallback hands back the full grid instead, which
+// makes the narrowing cost the columns where the signal is absent rather than
+// the columns where it is present.
+TEST(SubIntSplitTopLevelPolicyTest, FlatProfileFallsBackToTheFullGrid) {
+  BitFlipProfile profile;
+  profile.numBits = 32;
+  for (int bit = 0; bit < 32; ++bit) {
+    profile.flipProbability[bit] = 0.5;
+  }
+
+  CandidateBoundaryConfig config;
+  config.policy = CandidateBoundaryPolicy::kTopGradient;
+  config.maxBoundaries = 4;
+  EXPECT_EQ(candidateSplitBoundaries(profile, config).size(), 33u);
+
+  config.fallBackToFullGrid = false;
+  EXPECT_EQ(candidateSplitBoundaries(profile, config).size(), 2u);
+}
+
+// kTopGradient keeps exactly the offsets with the largest gradient, plus the
+// two outer edges.
+TEST(SubIntSplitTopLevelPolicyTest, TopGradientKeepsTheLargestSteps) {
+  BitFlipProfile profile;
+  profile.numBits = 16;
+  for (int bit = 0; bit < 16; ++bit) {
+    profile.flipProbability[bit] = bit < 4 ? 0.9 : (bit < 10 ? 0.4 : 0.01);
+  }
+  for (int bit = 1; bit < 16; ++bit) {
+    profile.gradient[bit] = std::abs(
+        profile.flipProbability[bit] - profile.flipProbability[bit - 1]);
+  }
+
+  CandidateBoundaryConfig config;
+  config.policy = CandidateBoundaryPolicy::kTopGradient;
+  config.maxBoundaries = 2;
+  EXPECT_THAT(
+      candidateSplitBoundaries(profile, config),
+      testing::ElementsAre(0, 4, 10, 16));
 }
 
 } // namespace

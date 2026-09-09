@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "velox/dwio/nimble/encodings/SubIntSplitCandidateBoundaries.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
@@ -171,6 +172,148 @@ TEST(SubIntSplitSelectorTest, PartitionHandlesASegmentOfOneValue) {
   EXPECT_EQ(partition.counts().uniqueCount, 1u);
   EXPECT_EQ(partition.counts().dominantCount, samples.size());
   expectPartitionMatchesCounting(samples, 24);
+}
+
+// A three-field composite: a 6-bit counter that changes every row, a 10-bit
+// field that changes every 64 rows, and 16 constant high bits. The DP is
+// expected to find edges at 6 and 16 on a shape this clean, which makes it a
+// usable fixture for what a restricted grid does to a plan the full grid gets
+// right.
+std::vector<uint64_t> compositeSamples(size_t count) {
+  std::vector<uint64_t> samples(count);
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t low = i & 0x3F;
+    const uint64_t mid = (i / 64) & 0x3FF;
+    samples[i] = low | (mid << 6) | (uint64_t{0xBEEF} << 16);
+  }
+  return samples;
+}
+
+// Every edge of a plan built on a restricted grid is one of the offsets the
+// caller allowed. This is the property the whole narrowing rests on, and the
+// way it breaks is silent: a plan with an edge off the set is still a valid
+// encode, just one whose cost was never priced under the restriction.
+TEST(SubIntSplitSelectorTest, RestrictedGridSplitsOnlyOnCandidateBoundaries) {
+  const auto samples = compositeSamples(2'048);
+  auto config = defaultSelectorConfig();
+  config.candidateBoundaries = {0, 6, 16, 32};
+
+  const auto result = selectSplits(samples, 32, samples.size(), config);
+  ASSERT_FALSE(result.segments.empty());
+  for (const auto& segment : result.segments) {
+    EXPECT_NE(
+        std::find(
+            config.candidateBoundaries.begin(),
+            config.candidateBoundaries.end(),
+            segment.bitStart),
+        config.candidateBoundaries.end());
+    EXPECT_NE(
+        std::find(
+            config.candidateBoundaries.begin(),
+            config.candidateBoundaries.end(),
+            segment.bitEnd + 1),
+        config.candidateBoundaries.end());
+  }
+}
+
+// A candidate set holding every offset is the full grid, so it has to produce
+// the plan the unrestricted search produces -- bit for bit, not merely a plan
+// of the same cost. Without this the restriction could be changing the DP for
+// every caller rather than only for one that narrowed it.
+TEST(SubIntSplitSelectorTest, FullCandidateSetReproducesTheUnrestrictedPlan) {
+  const auto samples = compositeSamples(2'048);
+  const auto unrestricted = selectSplits(samples, 32, samples.size());
+
+  auto config = defaultSelectorConfig();
+  config.candidateBoundaries.resize(33);
+  std::iota(
+      config.candidateBoundaries.begin(), config.candidateBoundaries.end(), 0);
+  const auto restricted = selectSplits(samples, 32, samples.size(), config);
+
+  ASSERT_EQ(restricted.segments.size(), unrestricted.segments.size());
+  for (size_t i = 0; i < restricted.segments.size(); ++i) {
+    EXPECT_EQ(
+        restricted.segments[i].bitStart, unrestricted.segments[i].bitStart);
+    EXPECT_EQ(restricted.segments[i].bitEnd, unrestricted.segments[i].bitEnd);
+    EXPECT_EQ(
+        restricted.segments[i].encoding, unrestricted.segments[i].encoding);
+  }
+  EXPECT_DOUBLE_EQ(restricted.totalCost, unrestricted.totalCost);
+}
+
+// The outer edges are members of the candidate set whether or not the caller
+// listed them: a set that omitted them would admit no partition of the bit
+// space at all.
+TEST(SubIntSplitSelectorTest, RestrictedGridAlwaysCoversTheWholeBitSpace) {
+  const auto samples = compositeSamples(1'024);
+  auto config = defaultSelectorConfig();
+  config.candidateBoundaries = {6, 16};
+
+  const auto result = selectSplits(samples, 32, samples.size(), config);
+  ASSERT_FALSE(result.segments.empty());
+  EXPECT_EQ(result.segments.front().bitStart, 0);
+  EXPECT_EQ(result.segments.back().bitEnd, 31);
+}
+
+// planFromBoundaries takes the boundaries as the answer: every one of them
+// becomes a section edge, and no section is dropped for failing to pay.
+TEST(SubIntSplitSelectorTest, PlanFromBoundariesKeepsEveryBoundary) {
+  const auto samples = compositeSamples(1'024);
+  static const AllowedEncodings kAll;
+  const std::vector<int> boundaries = {0, 6, 16, 32};
+
+  const auto plan = planFromBoundaries(
+      samples, 32, samples.size(), kAll, boundaries, /*admitByRepay=*/false);
+
+  ASSERT_EQ(plan.segments.size(), 3u);
+  EXPECT_EQ(plan.segments[0].bitStart, 0);
+  EXPECT_EQ(plan.segments[1].bitStart, 6);
+  EXPECT_EQ(plan.segments[2].bitStart, 16);
+  EXPECT_EQ(plan.segments[2].bitEnd, 31);
+}
+
+// The repay pass is the one judgement a profile cannot make. A boundary drawn
+// through the middle of a homogeneous field creates two sections that cost
+// more apart than together, and the pass has to take it back out.
+TEST(
+    SubIntSplitSelectorTest,
+    PlanFromBoundariesRepayDropsABoundaryThatDoesNotPay) {
+  const auto samples = compositeSamples(1'024);
+  static const AllowedEncodings kAll;
+  // 3 and 10 fall inside the counter and the mid field respectively; neither
+  // separates anything.
+  const std::vector<int> boundaries = {0, 3, 6, 10, 16, 32};
+
+  const auto kept = planFromBoundaries(
+      samples, 32, samples.size(), kAll, boundaries, /*admitByRepay=*/false);
+  const auto admitted = planFromBoundaries(
+      samples, 32, samples.size(), kAll, boundaries, /*admitByRepay=*/true);
+
+  EXPECT_EQ(kept.segments.size(), 5u);
+  EXPECT_LT(admitted.segments.size(), kept.segments.size());
+  EXPECT_LT(admitted.totalCost, kept.totalCost);
+}
+
+// A boundary the candidate set omits is a split the plan cannot contain. This
+// is the failure mode of the narrowing stated as a test rather than as a
+// comment: the encode still succeeds, and the plan is simply worse.
+TEST(SubIntSplitSelectorTest, RestrictedGridCannotRecoverAnOmittedBoundary) {
+  const auto samples = compositeSamples(2'048);
+  const auto unrestricted = selectSplits(samples, 32, samples.size());
+
+  auto config = defaultSelectorConfig();
+  config.candidateBoundaries = {0, 16, 32};
+  const auto restricted = selectSplits(samples, 32, samples.size(), config);
+
+  bool unrestrictedSplitsAtSix = false;
+  for (const auto& segment : unrestricted.segments) {
+    unrestrictedSplitsAtSix |= segment.bitStart == 6;
+  }
+  ASSERT_TRUE(unrestrictedSplitsAtSix);
+  for (const auto& segment : restricted.segments) {
+    EXPECT_NE(segment.bitStart, 6);
+  }
+  EXPECT_GE(restricted.totalCost, unrestricted.totalCost);
 }
 
 } // namespace

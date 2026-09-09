@@ -55,6 +55,18 @@ struct SelectorConfig {
   // Encoding::Options::subIntSplitAllowDeltaBlock, which is what production
   // sets this from and which defaults the other way.
   bool allowDeltaBlock{true};
+  // Bit offsets a section edge may fall on. Empty means every offset, which is
+  // the full w(w+1)/2 grid. A non-empty set restricts both the ranges that get
+  // priced and the transitions the DP may take, so it shrinks the dominant
+  // term of split selection; see SubIntSplitCandidateBoundaries.h for how a
+  // set is derived from the bit-flip profile. 0 and the bit width are always
+  // treated as members whether or not the caller listed them, since without
+  // them no partition of the bit space exists.
+  //
+  // A boundary the set omits is a split the DP cannot find, and it will not
+  // say so: the encode still succeeds, just with a worse plan. That is the
+  // failure mode a caller is accepting by setting this.
+  std::vector<int> candidateBoundaries;
 };
 
 inline SelectorConfig defaultSelectorConfig() noexcept {
@@ -282,6 +294,22 @@ inline SelectorResult selectSplitsImpl(
   const int sz = kBits;
   std::vector<SegmentChoice> bestCost(sz * sz);
 
+  // isEdge[b] is whether a section may start at bit b (and, at b == sz, whether
+  // one may end there). An empty candidate set leaves every offset open, which
+  // is the unrestricted grid.
+  std::array<bool, 65> isEdge{};
+  if (cfg.candidateBoundaries.empty()) {
+    std::fill(isEdge.begin(), isEdge.begin() + sz + 1, true);
+  } else {
+    for (const int boundary : cfg.candidateBoundaries) {
+      if (boundary >= 0 && boundary <= sz) {
+        isEdge[boundary] = true;
+      }
+    }
+    isEdge[0] = true;
+    isEdge[sz] = true;
+  }
+
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
 
@@ -299,6 +327,9 @@ inline SelectorResult selectSplitsImpl(
   BitRangePartition partition;
 
   for (int l = 0; l < sz; ++l) {
+    if (!isEdge[l]) {
+      continue;
+    }
     extractor.reset(l);
     if (partitionCounts) {
       partition.reset(samples, l);
@@ -311,6 +342,15 @@ inline SelectorResult selectSplitsImpl(
       // this pairing, so they are stepped side by side rather than apart.
       if (partitionCounts && r > l) {
         partition.extend(r);
+      }
+      // Both structures are stepped through every bit even when the cell is
+      // not priced: each refines the previous bit's state, so a skipped bit
+      // would leave the partition describing a bit range the extractor is not
+      // in. Stepping them is a pass over the sample per bit; pricing a cell is
+      // that plus every cost model, which is why skipping the pricing is what
+      // buys the time.
+      if (!isEdge[r + 1]) {
+        continue;
       }
       const std::vector<uint64_t>& segValues = extractor.values();
       const SegmentMetrics metrics = partitionCounts
@@ -335,7 +375,13 @@ inline SelectorResult selectSplitsImpl(
   dp[0] = 0.0;
 
   for (int i = 1; i <= sz; ++i) {
+    if (!isEdge[i]) {
+      continue;
+    }
     for (int j = 0; j < i; ++j) {
+      if (!isEdge[j]) {
+        continue;
+      }
       const int width = i - j;
       if (width < cfg.minSegmentWidth) {
         continue;
@@ -385,6 +431,195 @@ inline SelectorResult selectSplitsImpl(
 
   std::reverse(result.segments.begin(), result.segments.end());
   return result;
+}
+
+// Prices one bit range of a sample, standalone.
+//
+// The grid search reuses work across a whole row of ranges sharing a left
+// edge, which is what makes an exhaustive grid affordable at all. A planner
+// that prices a handful of unrelated ranges cannot reuse anything, and paying
+// a fresh extraction per range costs it O(width) passes rather than the
+// O(kBits) the grid pays per left edge -- which for a few ranges totalling one
+// bit space is a single pass over the sample, not a grid's worth.
+class BitRangePricer {
+ public:
+  BitRangePricer(const std::vector<uint64_t>& samples, size_t fullCount)
+      : samples_(samples),
+        fullCount_(fullCount),
+        extractor_(samples),
+        requiredFlags_(allCostModelRequiredFlags()),
+        partitionCounts_(samples.size() <= MetricCollector::kUniqueCountCap) {}
+
+  // Cost in bits of encoding [bitStart..bitEnd] over the full stream, with the
+  // winning encoding written to `bestEncoding`.
+  template <typename CostFn>
+  double
+  price(int bitStart, int bitEnd, CostFn&& costFn, EncodingType& bestEncoding) {
+    extractor_.reset(bitStart);
+    if (partitionCounts_) {
+      partition_.reset(samples_, bitStart);
+    }
+    for (int bit = bitStart + 1; bit <= bitEnd; ++bit) {
+      extractor_.extend(bit);
+      if (partitionCounts_) {
+        partition_.extend(bit);
+      }
+    }
+    const std::vector<uint64_t>& segValues = extractor_.values();
+    const SegmentMetrics metrics = partitionCounts_
+        ? collector_.compute(segValues, requiredFlags_, partition_.counts())
+        : collector_.compute(segValues, requiredFlags_);
+    const double perSampleCost = costFn(
+        metrics,
+        samples_.size(),
+        fullCount_,
+        bitEnd - bitStart + 1,
+        segValues,
+        bestEncoding);
+    return perSampleCost * static_cast<double>(fullCount_) /
+        static_cast<double>(samples_.size());
+  }
+
+ private:
+  const std::vector<uint64_t>& samples_;
+  const size_t fullCount_;
+  BitRangeExtractor extractor_;
+  BitRangePartition partition_;
+  MetricCollector collector_;
+  const MetricFlags requiredFlags_;
+  const bool partitionCounts_;
+};
+
+// Builds a plan from `boundaries` directly: the sections are the consecutive
+// pairs of boundaries, and the only thing costed is which encoding each one
+// gets. No grid, and no partition search -- the boundaries are the answer.
+//
+// What this gives up against the DP is not the ability to find a boundary but
+// the ability to refuse one. The DP charges cfg.splitPenalty per boundary and
+// keeps a split only where the sections it creates repay it; a plan taken
+// straight from a profile splits wherever the profile stepped, including where
+// the two constant bits it isolated are worth less than the boundary costs.
+//
+// `admitByRepay` restores exactly that one judgement and nothing else: while
+// some adjacent pair of sections costs more apart than together, the pair that
+// gains most is merged. It prices at most one range per adjacent pair per
+// merge, so it is a linear-ish pass rather than a second grid, and it cannot
+// recover a boundary that is not in `boundaries` -- only decline one that is.
+template <typename CostFn>
+inline SelectorResult planFromBoundariesImpl(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const SelectorConfig& cfg,
+    const std::vector<int>& boundaries,
+    bool admitByRepay,
+    CostFn&& costFn) {
+  SelectorResult result;
+  if (samples.empty() || kBits <= 0) {
+    return result;
+  }
+  kBits = std::min(kBits, 64);
+
+  std::vector<int> edges;
+  edges.push_back(0);
+  for (const int boundary : boundaries) {
+    if (boundary > 0 && boundary < kBits) {
+      edges.push_back(boundary);
+    }
+  }
+  edges.push_back(kBits);
+  std::sort(edges.begin(), edges.end());
+  edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+  BitRangePricer pricer(samples, fullCount);
+  std::vector<SegmentPlan> segments;
+  segments.reserve(edges.size() - 1);
+  for (size_t i = 0; i + 1 < edges.size(); ++i) {
+    SegmentPlan plan;
+    plan.bitStart = edges[i];
+    plan.bitEnd = edges[i + 1] - 1;
+    plan.cost = pricer.price(plan.bitStart, plan.bitEnd, costFn, plan.encoding);
+    segments.push_back(plan);
+  }
+
+  if (admitByRepay) {
+    bool merged = true;
+    while (merged && segments.size() > 1) {
+      merged = false;
+      double bestGain = 0.0;
+      size_t bestIndex = 0;
+      SegmentPlan bestMerge;
+      for (size_t i = 0; i + 1 < segments.size(); ++i) {
+        SegmentPlan candidate;
+        candidate.bitStart = segments[i].bitStart;
+        candidate.bitEnd = segments[i + 1].bitEnd;
+        candidate.cost = pricer.price(
+            candidate.bitStart, candidate.bitEnd, costFn, candidate.encoding);
+        const double apart =
+            segments[i].cost + segments[i + 1].cost + cfg.splitPenalty;
+        const double gain = apart - candidate.cost;
+        if (gain > bestGain) {
+          bestGain = gain;
+          bestIndex = i;
+          bestMerge = candidate;
+        }
+      }
+      if (bestGain > 0.0) {
+        segments[bestIndex] = bestMerge;
+        segments.erase(segments.begin() + bestIndex + 1);
+        merged = true;
+      }
+    }
+  }
+
+  double total = 0.0;
+  for (const auto& segment : segments) {
+    total += segment.cost;
+  }
+  total += cfg.splitPenalty * static_cast<double>(segments.size() - 1);
+  result.segments = std::move(segments);
+  result.totalCost = total;
+  return result;
+}
+
+// Builds a plan from `boundaries` alone, costing each section against
+// `allowed` only. See planFromBoundariesImpl for what taking boundaries as
+// given costs and what `admitByRepay` restores.
+inline SelectorResult planFromBoundaries(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const AllowedEncodings& allowed,
+    const std::vector<int>& boundaries,
+    bool admitByRepay,
+    const SelectorConfig& cfg = defaultSelectorConfig()) {
+  return planFromBoundariesImpl(
+      samples,
+      kBits,
+      fullCount,
+      cfg,
+      boundaries,
+      admitByRepay,
+      [&allowed,
+       allowHuffman = cfg.allowHuffman,
+       allowDeltaBlock = cfg.allowDeltaBlock](
+          const SegmentMetrics& m,
+          size_t numValues,
+          size_t streamCount,
+          int bitWidth,
+          const std::vector<uint64_t>& segValues,
+          EncodingType& bestEnc) noexcept {
+        return bestCostBitsRestricted(
+            m,
+            numValues,
+            streamCount,
+            bitWidth,
+            segValues,
+            allowed,
+            allowHuffman,
+            allowDeltaBlock,
+            bestEnc);
+      });
 }
 
 // Selects splits costing segments against `allowed` only. An empty set costs
