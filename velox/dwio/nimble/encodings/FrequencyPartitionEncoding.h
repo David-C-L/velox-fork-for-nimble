@@ -104,6 +104,12 @@ class FrequencyPartitionEncoding
   static const int kNumPartitionsOffset = Encoding::kPrefixSize;
   static constexpr uint8_t kFormatVersion = 1;
   static constexpr uint32_t kRankSampleStride = 256;
+  // Upper bound on tiers: one per entry of the key-bit table
+  // {1, 2, 4, 8, 16, 32}, which is what encode() fills.
+  static constexpr uint32_t kMaxTiers = 6;
+  // Run length below which the per-row path beats the cursor walk.
+  // Set above kMaxTiers so the crossover is never the marginal case.
+  static constexpr uint32_t kSequentialThreshold = 8;
 
   FrequencyPartitionEncoding(
       velox::memory::MemoryPool& pool,
@@ -905,14 +911,103 @@ T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(uint32_t u) const {
 // materializeImpl
 // ---------------------------------------------------------------------------
 
+// Walks [start, start + count) once, carrying a per-tier cursor instead of
+// ranking every row.
+//
+// Each tier's key stream is written in ascending original-row order: encode()
+// fills tierRows by scanning rows 0..N-1 forward, then emits that tier's keys
+// in that order. So over a forward scan the rank of a row within its tier is
+// just how many rows of that tier have already been seen, and the rank query
+// the point path needs per row collapses to one increment. The ranks are still
+// paid once per tier at `start`, which is what lets a ranged read begin
+// anywhere without replaying the stream before it.
+//
+// decodeAtOriginalIndexImpl is deliberately left alone: it remains the point
+// path, where there is no previous row to carry a cursor from.
 template <typename T>
 template <FreqPartIndexType I>
 void FrequencyPartitionEncoding<T>::materializeImpl(
     T* dst,
     uint32_t start,
     uint32_t count) const {
+  const uint32_t numTiers = static_cast<uint32_t>(tiers_.size());
+  NIMBLE_CHECK(numTiers <= kMaxTiers, "tier count exceeds cursor capacity");
+
+  // Seeding the cursors costs one rank per tier, while carrying them saves one
+  // rank per row, so the walk only pays for itself once the run is longer than
+  // the tier count. Below that -- a single-row materialize being the case that
+  // matters, since that is how a point read arrives here -- rank the one tier
+  // the row actually lands in and skip the seeding entirely.
+  if (count <= kSequentialThreshold) {
+    for (uint32_t i = 0; i < count; ++i) {
+      dst[i] = decodeAtOriginalIndexImpl<I>(start + i);
+    }
+    return;
+  }
+
+  // cursor[t] is the number of tier-t rows strictly before the current row.
+  // For EliasFano it doubles as the index into efPositions, which is the same
+  // quantity: efPositions[t][k] is the row of the k-th tier-t element.
+  uint32_t cursor[kMaxTiers] = {};
+  uint32_t fallbackCursor = 0;
+  const bool hasFallback = !unencodedValues_.empty();
+
+  for (uint32_t t = 0; t < numTiers; ++t) {
+    const auto& tier = tiers_[t];
+    if constexpr (I == FreqPartIndexType::PerTierBitmaps) {
+      cursor[t] = tier.bitmap.empty() ? 0 : popcountPrefixFast(tier, start);
+    } else if constexpr (I == FreqPartIndexType::TierTagArray) {
+      cursor[t] = tierRankAtForTag(t, start);
+    } else if constexpr (I == FreqPartIndexType::EliasFano) {
+      cursor[t] = static_cast<uint32_t>(
+          std::lower_bound(
+              tier.efPositions.begin(), tier.efPositions.end(), start) -
+          tier.efPositions.begin());
+    }
+  }
+  if (hasFallback) {
+    if constexpr (I == FreqPartIndexType::TierTagArray) {
+      fallbackCursor = tierRankAtForTag(numTiers, start);
+    } else {
+      fallbackCursor = fallbackRankAt(start);
+    }
+  }
+
   for (uint32_t i = 0; i < count; ++i) {
-    dst[i] = decodeAtOriginalIndexImpl<I>(start + i);
+    const uint32_t u = start + i;
+
+    if constexpr (I == FreqPartIndexType::TierTagArray) {
+      const uint8_t tag = unpackTagAt(tagArray_.data(), u, tagBits_);
+      if (tag < numTiers) {
+        const auto& tier = tiers_[tag];
+        dst[i] = tier.dictionary[tier.indices[cursor[tag]++]];
+      } else {
+        dst[i] = unencodedValues_[fallbackCursor++];
+      }
+      continue;
+    }
+
+    bool matched = false;
+    for (uint32_t t = 0; t < numTiers; ++t) {
+      const auto& tier = tiers_[t];
+      if constexpr (I == FreqPartIndexType::PerTierBitmaps) {
+        if (tier.bitmap.empty() ||
+            !(tier.bitmap[u >> 6] & (uint64_t{1} << (u & 63)))) {
+          continue;
+        }
+      } else if constexpr (I == FreqPartIndexType::EliasFano) {
+        if (cursor[t] >= tier.efPositions.size() ||
+            tier.efPositions[cursor[t]] != u) {
+          continue;
+        }
+      }
+      dst[i] = tier.dictionary[tier.indices[cursor[t]++]];
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      dst[i] = unencodedValues_[fallbackCursor++];
+    }
   }
 }
 
