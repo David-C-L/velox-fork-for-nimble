@@ -45,6 +45,7 @@
 #include "velox/dwio/nimble/compression/Compression.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
@@ -74,6 +75,7 @@ DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
 DECLARE_bool(mlidc_dump_encoding);
+DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
@@ -95,21 +97,33 @@ class NimbleBenchTarget {
   NimbleBenchTarget() : pool_(benchmarks::benchmarkPool()) {}
 
   // Encode data.  Destroys any previously encoded state.
+  //
+  // kZigzag routes to the folded-residual entry point of the same class, for
+  // the forced DeltaZigzag arm. It is a template parameter rather than a
+  // runtime flag so that an encoding without encodeZigzag never instantiates
+  // the branch.
+  template <bool kZigzag = false>
   void encode(
       const Vector<T>& data,
       const Encoding::Options& options = {},
       bool realNestedSelection = false) {
     Buffer buf{*pool_};
-    // Not test::Encoder::encode: its policy silently redirects any compressor
-    // other than Zstd, and leaves nested sub-streams on the default one. See
-    // SubstreamCompression.h.
-    encoded_ = std::string(
-        encodeWithCompression<EncodingT, T>(
-            buf,
-            data,
-            parseCompressionType(FLAGS_mlidc_substream_compression),
-            options,
-            realNestedSelection));
+    constexpr auto kType = declaredEncodingType<EncodingT, kZigzag>();
+    const auto armId = cacheArmIdentity(options, realNestedSelection);
+    const auto key = encodeCacheKey<T>(data.data(), data.size(), armId, kType);
+    if (!loadCached(key, armId, kType, encoded_)) {
+      // Not test::Encoder::encode: its policy silently redirects any compressor
+      // other than Zstd, and leaves nested sub-streams on the default one. See
+      // SubstreamCompression.h.
+      encoded_ = std::string(
+          encodeWithCompression<EncodingT, T, kZigzag>(
+              buf,
+              data,
+              parseCompressionType(FLAGS_mlidc_substream_compression),
+              options,
+              realNestedSelection));
+      storeCached(key, armId, kType, encoded_);
+    }
     // Construct the Encoding directly from the encoded bytes rather than
     // re-encoding via createEncoding(), which would silently drop
     // realNestedSelection and produce different encoded data.
@@ -214,7 +228,7 @@ struct NimbleBenchTargetBase {
   }
 };
 
-template <typename EncodingT>
+template <typename EncodingT, bool kZigzag = false, bool kRealNested = false>
 struct NimbleBenchTargetImpl
     : NimbleBenchTargetBase<typename EncodingT::cppDataType> {
   using T = typename EncodingT::cppDataType;
@@ -222,7 +236,7 @@ struct NimbleBenchTargetImpl
   NimbleBenchTarget<EncodingT> target;
 
   void encode(const Vector<T>& data, const Encoding::Options& opts) override {
-    target.encode(data, opts);
+    target.template encode<kZigzag>(data, opts, kRealNested);
   }
   void materializeAll(T* dst, uint32_t n) override {
     target.materializeAll(dst, n);
@@ -410,8 +424,15 @@ struct EncoderEntry {
       factory;
 };
 
+
 // Convenience builder for a concrete EncodingT.
-template <typename EncodingT>
+// kRealNested decides whether the encoding's own sub-streams get selection.
+// It matters only for a composite encoding: Delta stores its residuals,
+// restatements and bitmap as three child streams, and with selection off all
+// three are written Trivial -- 64 raw bits per residual, which makes the
+// measurement independent of the data and of the encoding's actual merit.
+// The simple baselines above are unaffected either way.
+template <typename EncodingT, bool kZigzag = false, bool kRealNested = false>
 EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
     std::string name,
     std::string family,
@@ -428,7 +449,8 @@ EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
   entry.fastSkip = fastSkip;
   entry.randomAccess = randomAccess;
   entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
-    auto impl = std::make_unique<NimbleBenchTargetImpl<EncodingT>>();
+    auto impl =
+        std::make_unique<NimbleBenchTargetImpl<EncodingT, kZigzag, kRealNested>>();
     impl->encode(data, opts);
     return impl;
   };
@@ -1047,6 +1069,24 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   encoders.push_back(
       makeEncoderEntry<RLEEncoding<T>>(
           "RLE", "Baseline", "rle", true, true, false));
+  // Whole-column Delta, forced. Not reachable through selection: Delta is
+  // absent from defaultEncodingReadFactors, so it only ever appears nested
+  // inside a SubIntSplit section. This arm is the control for a top-level
+  // DeltaZigzag -- without it, a zigzag result cannot be separated into "the
+  // fold helps" and "delta at whole-column scale helps". Sequential and no
+  // fast skip: it reconstructs by prefix sum and restates on every descending
+  // pair, so a seek replays from the last restatement.
+  encoders.push_back(
+      makeEncoderEntry<DeltaEncoding<T>, /*kZigzag=*/false, /*kRealNested=*/true>(
+          "Delta", "Baseline", "delta", true, false, false));
+  // Whole-column DeltaZigzag, forced, and the treatment to Delta's control.
+  // Same class, folded-residual entry point; the stream is labelled
+  // DeltaZigzag rather than Delta, see encodeWithCompression's kDeclaredType.
+  // An anchor every stride rows bounds a seek, so fastSkip is still false but
+  // for a different reason than Delta's: bounded replay rather than unbounded.
+  encoders.push_back(
+      makeEncoderEntry<DeltaEncoding<T>, /*kZigzag=*/true, /*kRealNested=*/true>(
+          "DeltaZigzag", "Baseline", "dzz", true, false, false));
 
   // Read-path variants. Each encodes byte-for-byte identically to the entry it
   // shadows and differs only in reading by index rather than by cursor, so the

@@ -189,7 +189,21 @@ class BenchEncodingSelectionPolicy
 // second copy of it is deliberate: a copy drifts from the policy and
 // compression wiring below, and a plan measured against a drifted copy is not
 // being measured against the same encoder the drivers report.
-template <typename E, typename T>
+// The declared type follows the encode call, not the class: one class serves
+// Delta and DeltaZigzag, so taking it from the traits alone would label a
+// folded stream as plain Delta. Defined once because the encode path and the
+// encode cache both need it, and a second copy could drift into keying a
+// stream as one type while writing it as another.
+template <typename E, bool kZigzag>
+constexpr nimble::EncodingType declaredEncodingType() {
+  if constexpr (kZigzag) {
+    return nimble::EncodingType::DeltaZigzag;
+  } else {
+    return test::EncodingTypeTraits<E>::encodingType;
+  }
+}
+
+template <typename E, typename T, bool kZigzag = false>
 std::string_view encodeWithCompression(
     nimble::Buffer& buffer,
     const nimble::Vector<T>& values,
@@ -202,8 +216,17 @@ std::string_view encodeWithCompression(
   auto physicalValues = std::span<const physicalType>(
       reinterpret_cast<const physicalType*>(values.data()), values.size());
 
+  // The declared type has to follow the encode call, not the class. One class
+  // serves Delta and DeltaZigzag, so taking the label from EncodingTypeTraits
+  // alone would stamp a folded stream as plain Delta -- the tree dumps and
+  // every per-node analysis downstream would then attribute zigzag streams to
+  // Delta and nothing would say otherwise. Deriving both from the same flag is
+  // what stops the two disagreeing.
+  static constexpr nimble::EncodingType kDeclaredType =
+      declaredEncodingType<E, kZigzag>();
+
   nimble::EncodingSelection<physicalType> selection{
-      {.encodingType = test::EncodingTypeTraits<E>::encodingType,
+      {.encodingType = kDeclaredType,
        .encodingConfig = std::move(encodingConfig),
        .compressionPolicyFactory =
            [compressionType]() {
@@ -213,7 +236,11 @@ std::string_view encodeWithCompression(
       std::make_unique<BenchEncodingSelectionPolicy<T>>(
           compressionType, realNestedSelection)};
 
-  return E::encode(selection, physicalValues, buffer, options);
+  if constexpr (kZigzag) {
+    return E::encodeZigzag(selection, physicalValues, buffer, options);
+  } else {
+    return E::encode(selection, physicalValues, buffer, options);
+  }
 }
 
 } // namespace facebook::nimble::mlidc

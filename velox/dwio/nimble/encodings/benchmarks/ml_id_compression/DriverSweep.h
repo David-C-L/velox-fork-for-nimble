@@ -175,9 +175,16 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
     std::string_view driver,
     const std::string& dataset) {
   facebook::nimble::Encoding::Options options;
+  // Which arm is being built is known here and nowhere below, so the encode
+  // cache reads it from here rather than every encode signature growing an
+  // argument it would only pass through.
+  setCacheContext(encoder.name);
   try {
-    return encoder.factory(data, options);
+    auto target = encoder.factory(data, options);
+    clearCacheContext();
+    return target;
   } catch (const std::exception& ex) {
+    clearCacheContext();
     std::cerr << "  [SKIP] " << encoder.name << ": " << ex.what() << "\n";
     writeSkipRow(csv, driver, dataset, encoder);
     return nullptr;
