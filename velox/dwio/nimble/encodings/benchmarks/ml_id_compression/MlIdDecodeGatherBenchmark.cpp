@@ -36,6 +36,22 @@ DEFINE_int32(run_length_steps, 6, "Steps in the run-length axis");
 DEFINE_string(cache_state, "hot", "hot | cold-payload | cold-all");
 DEFINE_bool(validate, false, "Round-trip check before measuring");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
+DEFINE_string(
+    selectivity_values,
+    "",
+    "Explicit selectivity ladder, comma separated, e.g. "
+    "0.001,0.01,0.05,0.10,0.33,0.66,1.0. Empty keeps the linear axis built "
+    "from --selectivity_steps.\n"
+    "A linear axis spends most of its cells where nothing happens. Measured "
+    "on snowflake, the run-length axis spans 60.45x at selectivity 0.05 (1.8 "
+    "to 107.0 Meps) and 1.01x at selectivity 1.0: small gathers carry all the "
+    "nuance and large ones coalesce, so the ladder wants to be dense at the "
+    "bottom rather than evenly spaced.");
+DEFINE_string(
+    run_length_values,
+    "",
+    "Explicit run-length ladder, comma separated. Empty keeps the log axis "
+    "built from --run_length_steps.");
 
 namespace facebook::nimble::mlidc {
 namespace {
@@ -51,6 +67,8 @@ std::vector<std::pair<uint32_t, uint32_t>> toRanges(const GatherTrace& t) {
 
 } // namespace
 } // namespace facebook::nimble::mlidc
+
+#include <sstream>
 
 constexpr std::string_view kDriver = "bench_decode_gather";
 
@@ -74,12 +92,44 @@ int runBenchmark() {
     return 1;
   }
 
-  const auto selectivityAxis =
-      linSpaced(0.05, 1.0, static_cast<size_t>(FLAGS_selectivity_steps));
-  const auto runLengthAxis = logSpaced(
-      1,
-      std::max<size_t>(1, n / 4),
-      static_cast<size_t>(FLAGS_run_length_steps));
+  // An explicit ladder overrides the generated axis. Kept as an override
+  // rather than a new default so that a run without the flags reproduces every
+  // earlier sweep exactly.
+  const auto parseDoubles = [](const std::string& text) {
+    std::vector<double> out;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (!item.empty()) {
+        out.push_back(std::stod(item));
+      }
+    }
+    return out;
+  };
+  const auto parseSizes = [](const std::string& text) {
+    std::vector<size_t> out;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (!item.empty()) {
+        out.push_back(static_cast<size_t>(std::stoull(item)));
+      }
+    }
+    return out;
+  };
+
+  auto selectivityAxis = parseDoubles(FLAGS_selectivity_values);
+  if (selectivityAxis.empty()) {
+    selectivityAxis =
+        linSpaced(0.05, 1.0, static_cast<size_t>(FLAGS_selectivity_steps));
+  }
+  auto runLengthAxis = parseSizes(FLAGS_run_length_values);
+  if (runLengthAxis.empty()) {
+    runLengthAxis = logSpaced(
+        1,
+        std::max<size_t>(1, n / 4),
+        static_cast<size_t>(FLAGS_run_length_steps));
+  }
 
   auto contextOrNull =
       makeSweepContext<Elem>(/*withOpenZL=*/true, cacheState, n);

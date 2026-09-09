@@ -45,7 +45,21 @@ DEFINE_string(
 DEFINE_int32(
     range_offsets,
     32,
-    "Random offsets sampled per range length when --range_sizes is set.");
+    "Random offsets sampled per range length when --range_sizes is set. One "
+    "count for every size; --range_offsets_by_size overrides it.");
+DEFINE_string(
+    range_offsets_by_size,
+    "",
+    "Per-size offset counts, comma separated and positionally matched to "
+    "--range_sizes, e.g. 8,8,16,32,32,16,8,1. Empty uses --range_offsets for "
+    "every size.\n"
+    "How much the offset matters depends on the size. Measured spread across "
+    "offsets at fixed B: 1.03x at B=1, 1.54x at B=8, 1.86x at B=64, 7.44x at "
+    "B=512, 3.06x at B=4096, 1.62x at B=32768. A handful of offsets is enough "
+    "at either end -- one row lands the same way wherever it is, and a large "
+    "span averages over its own placement -- but the middle needs about 32 "
+    "before the median settles. A flat 32 buys nothing at the ends; a flat 8 "
+    "leaves the middle untrustworthy.");
 
 namespace facebook::nimble::mlidc {
 namespace {
@@ -122,6 +136,54 @@ int runBenchmark() {
     }
   }
 
+  // One cell list for the whole run. Built before the encoder loop on
+  // purpose: a random offset drawn per encoder would compare encoders on
+  // different work, and the point of this sweep is the ratio between them.
+  std::vector<Cell> cells;
+  if (rangeSizes.empty()) {
+    for (double a : aFracs) {
+      for (double b : bFracs) {
+        if (a + b > 1.0 + 1e-9) {
+          continue;
+        }
+        cells.push_back(resolveCell(a, b, n));
+      }
+    }
+  } else {
+    std::vector<int> offsetsBySize;
+    {
+      std::stringstream ss(FLAGS_range_offsets_by_size);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        if (!item.empty()) {
+          offsetsBySize.push_back(std::stoi(item));
+        }
+      }
+    }
+    NIMBLE_CHECK(
+        offsetsBySize.empty() || offsetsBySize.size() == rangeSizes.size(),
+        "--range_offsets_by_size must have one entry per --range_sizes entry.");
+    std::mt19937_64 rng(seed);
+    for (size_t sizeIndex = 0; sizeIndex < rangeSizes.size(); ++sizeIndex) {
+      const size_t b = rangeSizes[sizeIndex];
+      if (b == 0 || b > n) {
+        continue;
+      }
+      const int offsetCount =
+          offsetsBySize.empty() ? FLAGS_range_offsets : offsetsBySize[sizeIndex];
+      std::uniform_int_distribution<size_t> pick(0, n - b);
+      for (int i = 0; i < std::max(1, offsetCount); ++i) {
+        Cell c;
+        c.a = pick(rng);
+        c.b = b;
+        c.aFrac = static_cast<double>(c.a) / static_cast<double>(n);
+        c.bFrac = static_cast<double>(b) / static_cast<double>(n);
+        cells.push_back(c);
+      }
+    }
+  }
+  cellCount = cells.size();
+
   auto contextOrNull =
       makeSweepContext<Elem>(/*withOpenZL=*/true, cacheState, n);
   if (!contextOrNull.has_value()) {
@@ -186,37 +248,6 @@ int runBenchmark() {
   if (!FLAGS_mlidc_output_manifest.empty())
     writeRunManifest(FLAGS_mlidc_output_manifest);
 
-  // One cell list for the whole run. Built before the encoder loop on
-  // purpose: a random offset drawn per encoder would compare encoders on
-  // different work, and the point of this sweep is the ratio between them.
-  std::vector<Cell> cells;
-  if (rangeSizes.empty()) {
-    for (double a : aFracs) {
-      for (double b : bFracs) {
-        if (a + b > 1.0 + 1e-9) {
-          continue;
-        }
-        cells.push_back(resolveCell(a, b, n));
-      }
-    }
-  } else {
-    std::mt19937_64 rng(seed);
-    for (size_t b : rangeSizes) {
-      if (b == 0 || b > n) {
-        continue;
-      }
-      std::uniform_int_distribution<size_t> pick(0, n - b);
-      for (int i = 0; i < std::max(1, FLAGS_range_offsets); ++i) {
-        Cell c;
-        c.a = pick(rng);
-        c.b = b;
-        c.aFrac = static_cast<double>(c.a) / static_cast<double>(n);
-        c.bFrac = static_cast<double>(b) / static_cast<double>(n);
-        cells.push_back(c);
-      }
-    }
-  }
-  cellCount = cells.size();
 
   std::vector<Elem> sink(n, Elem{});
   int validateFailures = 0;

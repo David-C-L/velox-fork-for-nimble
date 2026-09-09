@@ -48,6 +48,26 @@ int runBenchmark() {
   const size_t iters = static_cast<size_t>(FLAGS_mlidc_iters);
   const uint64_t seed = static_cast<uint64_t>(FLAGS_mlidc_seed);
 
+  // The encode cache is switched off here, whatever was asked for.
+  //
+  // This driver times enc.factory(), and the cache sits inside it: with a
+  // cache directory set, the first iteration would encode and store, and every
+  // iteration after it would load. measure() reports the median, so the number
+  // would be a cache read rather than an encode -- wrong, and wrong by a
+  // consistent factor across every arm, which is the hardest kind of error to
+  // notice. Refused in code rather than left to whoever writes the launcher,
+  // because the failure is silent and the flag is one every other driver wants
+  // set.
+  {
+    std::string cacheDir;
+    gflags::GetCommandLineOption("mlidc_encode_cache_dir", &cacheDir);
+    if (!cacheDir.empty()) {
+      std::cout << "  [encode] ignoring --mlidc_encode_cache_dir: this driver "
+                   "measures the encode it would otherwise load\n";
+      gflags::SetCommandLineOption("mlidc_encode_cache_dir", "");
+    }
+  }
+
   // No cache sweep here, so the state is fixed at hot.
   auto contextOrNull =
       makeSweepContext<Elem>(/*withOpenZL=*/true, CacheState::Hot, n);
