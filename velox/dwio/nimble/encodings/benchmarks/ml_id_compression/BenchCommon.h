@@ -1205,27 +1205,40 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
-  // fpe_tagtag is dropped: dominated on every axis it could have won on --
-  // worst on point in 39 of 42 cells, worst on bulk in 42 of 42, and only
-  // mid-table on size. An arm that is never the answer still costs sweep time
-  // and still has to be ruled out by whoever reads the table.
+  // All four index types are carried. fpe_tagtag was dropped once on the
+  // grounds that it was "dominated on every axis it could have won on ... only
+  // mid-table on size"; that was measured before the arms encoded with real
+  // nested selection, and it is false. On Corporations/score, where frequency
+  // partitioning does real work rather than degenerating to a dictionary,
+  // TierTagArray is the cheapest correct index by 21.6%, and by 29.7% on
+  // num_employees. The earlier reading came from identifier columns where all
+  // tiers are sparse and Elias-Fano wins instead -- right about its own inputs,
+  // wrong as a generalisation.
   //
-  // fpe_pertier stays, and is why this list is not cut further on size alone.
-  // It is worst on compression in 26 of 26 cells, which makes it look like the
-  // obvious next cut, but it is competitive on point access at 76.9ns against
-  // fpe_noindex's 74.7ns. Cutting on one axis would have removed the wrong arm.
+  // It is still not usable as a default, on speed rather than size: 7.2 Meps
+  // bulk against PerTierBitmaps' 120.3, a 16.7x gap that is the same 16.0x the
+  // old build measured, so the fixes did not move it. The cause is in
+  // materializeImpl, which is a per-row random-access loop for every indexed
+  // mode; tagtag rescans up to kRankSampleStride tags per row where a bitmap
+  // reads one superblock and a few popcounts.
+  //
+  // fpe_noindex is not a candidate at all. It materializes in tier-reordered
+  // space -- it encodes the multiset, not the sequence -- which is why every
+  // driver skips its validation. It is carried only as the floor the correct
+  // modes are paying above, and it must never enter a comparison as an option.
+  //
   // The index type is carried explicitly rather than derived from the loop
   // position. Dropping fpe_tagtag from the names left the position-derived
   // form silently mislabelling: index 2 is EliasFano in FreqPartIndexType but
   // became the third surviving name, so the arm reporting itself as
   // fpe_elias was encoding TierTagArray and EliasFano was unreachable.
-  const std::array<std::string, 3> fpeNames = {
-      "fpe_noindex", "fpe_pertier", "fpe_elias"};
-  const std::array<uint8_t, 3> fpeIndexType = {0, 1, 3};
-  const std::array<bool, 3> fpeRA = {false, true, true};
-  const std::array<bool, 3> fpeSkip = {false, true, true};
+  const std::array<std::string, 4> fpeNames = {
+      "fpe_noindex", "fpe_pertier", "fpe_tagtag", "fpe_elias"};
+  const std::array<uint8_t, 4> fpeIndexType = {0, 1, 2, 3};
+  const std::array<bool, 4> fpeRA = {false, true, true, true};
+  const std::array<bool, 4> fpeSkip = {false, true, true, true};
 
-  for (int idx = 0; idx < 3; ++idx) {
+  for (int idx = 0; idx < 4; ++idx) {
     EncoderEntry<T> entry;
     entry.name = "FPE/" + fpeNames[idx];
     entry.family = "FrequencyPartition";
