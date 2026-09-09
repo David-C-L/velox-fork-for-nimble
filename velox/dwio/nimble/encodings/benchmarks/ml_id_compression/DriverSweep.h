@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BlockCodecTarget.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/MeasureLoop.h"
@@ -78,10 +79,22 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
   context.cacheState = cacheState;
   context.rows = rows;
   context.encoders = buildDefaultEncoders<T>();
+  // Zstd as an arm in its own right rather than as a sub-stream codec, in
+  // fixed-size blocks. Needs no OpenZL, so every driver gets it.
+  for (auto& entry : buildZstdBlockEncoders<T>()) {
+    context.encoders.push_back(std::move(entry));
+  }
   if (withOpenZL) {
     // Serves partial reads by decompressing the whole column, which is the
     // comparison the decode drivers exist to make.
     context.encoders.push_back(buildOpenZLEncoder<T>());
+    // The same codec deployed the way a columnar format deploys one. Against
+    // openzl/auto these separate the codec from the granularity it is shipped
+    // at, which is what makes "just use smaller blocks" a measured answer
+    // rather than an argued one.
+    for (auto& entry : buildOpenZLBlockEncoders<T>()) {
+      context.encoders.push_back(std::move(entry));
+    }
   }
   // Applied last so it can select an OpenZL entry too. Mirrors
   // --mlidc_datasets: comma-separated names matched against the same name

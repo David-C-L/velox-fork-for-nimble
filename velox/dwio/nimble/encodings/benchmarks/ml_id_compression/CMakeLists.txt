@@ -42,6 +42,7 @@ velox_add_test_headers(
   nimble_ml_id_benchmark_common
   AblationPolicy.h
   Axes.h
+  BlockCodecTarget.h
   CachePolicy.h
   DriverSweep.h
   ElemType.h
@@ -151,3 +152,10 @@ nimble_add_ml_id_benchmark(
 # selection.
 nimble_add_ml_id_benchmark(
   nimble_ml_id_selection_policy_benchmark MlIdSelectionPolicyBenchmark.cpp)
+
+# Correctness tests for the block-codec arms. The benchmark drivers report
+# numbers rather than assert them, so the block indexing -- which decides both
+# what a read returns and how much it decompresses -- is pinned here instead.
+if(NIMBLE_BUILD_TESTING)
+  add_subdirectory(tests)
+endif()

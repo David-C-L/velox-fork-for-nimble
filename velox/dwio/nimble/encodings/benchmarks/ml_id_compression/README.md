@@ -126,6 +126,46 @@ decompression but discards the output, since the inner target still holds the
 payload it encoded. A real reader would also rebuild the `Encoding` from the
 decompressed bytes, so the penalty measured there is a **lower bound**.
 
+### Block-addressable codec arms
+
+`openzl/auto` compresses the whole column as one unit, which makes read cost a
+function of column length. That is one way to deploy a block codec, not the only
+one: a columnar format ships a codec in fixed-size blocks and decompresses only
+the blocks a read overlaps. `BlockCodecTarget.h` is that addressable sibling, and
+the two together separate the codec from the granularity it is shipped at.
+
+`BlockCompressedTarget` splits the column into blocks of K elements, compresses
+each independently, and serves a read of `count` elements at `begin` by
+decompressing exactly the blocks in `[begin / K, (begin + count - 1) / K]` — that
+is `floor((begin + count - 1) / K) - floor(begin / K) + 1` blocks, never more. A
+point read costs one block whatever the column length is. Within one
+`skipThenMaterialize` call the scratch block is reused, so two ranges landing in
+the same block cost one decompression; nothing is cached across calls, matching
+`OuterCompressedTarget`, which charges every call for its own decompression.
+
+The arms are `zstd/block-K` and `openzl/block-K` for K in 1024, 65536 and 262144
+elements — 8 KB, 512 KB and 2 MB at eight bytes per element. The Zstd arms need
+no OpenZL and are added by every driver; the OpenZL arms follow `openzl/auto`.
+`openzl/block-K` uses the same `select_numeric` graph as `openzl/auto`, applied
+one block at a time, so the block size is the only difference between them.
+The Zstd arms go through nimble's own compressor registry, so Zstd here is the
+same Zstd the encodings use for their sub-streams. Zstd declines an
+incompressible block, which a block of random IDs routinely is; those blocks are
+stored verbatim and the block directory records which form each one is in.
+
+`payloadSize()` includes the block directory, since a reader cannot address a
+block without it: five bytes per block (a 32-bit start offset and a stored-form
+byte), one terminating offset, and an eight-byte header of element count and
+block size. At K = 1024 and eight-byte elements that is 0.061% of the raw column,
+and it falls by 64x at K = 65536.
+
+These arms are deliberately **not** marked `wholePayloadCodec`: a read does not
+decompress the whole payload, and capping their iterations would hide the
+block-size effect they exist to measure. Their cost is bounded by K instead.
+`tests/BlockCodecTargetTest.cpp` pins both the round trip — including partial
+final blocks, single-element columns and ranges spanning block boundaries — and
+the "decompresses only what it overlaps" property itself.
+
 ### Keeping the sweeps bounded
 
 Entries where every read decompresses everything are marked
@@ -187,7 +227,9 @@ them from a scratch directory.
 ## Where the shared code lives
 
 `BenchCommon.h` holds the bench targets, the encoder and dataset suites, and
-outer compression. `ResultWriter.h` holds the CSV writer and the run manifest.
+outer compression. `BlockCodecTarget.h` holds the block-addressable codec target
+and its Zstd arms; the OpenZL codec and arms sit in `OpenZLBenchTarget.h`
+alongside the graph they share with `openzl/auto`. `ResultWriter.h` holds the CSV writer and the run manifest.
 `SubstreamCompression.h` holds the encode path described above. `ElemType.h`
 holds the element-type vocabulary: parsing `--mlidc_dtype`, the name reported in
 the `dtype` column, and the dispatch that turns the runtime choice into the
