@@ -158,15 +158,33 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
           std::pair{EncodingType::SimdForBitpack, 0.9f},
           std::pair{EncodingType::BlockBitPacking, 0.9f},
           std::pair{EncodingType::Delta, 0.85f},
-          // Held at the same 0.85 as plain Delta, which it neither displaces
-          // nor competes with on the data Delta already serves: on a
-          // mostly-ascending section Delta restates once and DeltaZigzag pays
-          // for an anchor every stride rows, so Delta wins there on size. The
-          // region this reaches is the one plain Delta refuses -- descending
-          // and oscillating sections, where deltaCostBits returns infinity and
-          // Delta is never selected at all -- so the entry adds a candidate
-          // rather than moving an existing boundary.
-          std::pair{EncodingType::DeltaZigzag, 0.85f},
+          // In the 0.9 tier with the bit-packing family, not the 0.85 delta
+          // tier, because that is who it actually competes with. It was held
+          // at 0.85 on the reasoning that it only reaches sections plain Delta
+          // refuses and so could not move an existing boundary. Measurement
+          // falsified that: it took /Section0/Deltas and /Section0/Restatements
+          // on publicbi_id1 and osm_s2_l30 away from SimdForBitpack and
+          // FixedBitWidth, and the column got larger, by 4.80% and 2.57%.
+          //
+          // The arithmetic is what sets the tier, rather than a tuned
+          // constant. Folding a residual costs exactly one bit per value --
+          // zigzag doubles the magnitude, so the packed width goes from w to
+          // w + 1 -- which on the 20-bit and 35-bit streams above is 5.05% and
+          // 2.88% more bytes. Sitting a tier below the bit-packers discounts
+          // it by 1 - 0.85/0.9, or 5.6%. The discount is larger than the fold
+          // costs, so the weighted cost preferred it on streams where it was
+          // strictly worse on the wire. Levelling the factor makes the
+          // comparison the byte count again, so it is chosen only where the
+          // extra bit pays for itself.
+          //
+          // Decode agrees with size here rather than trading against it, which
+          // is why this is not the throughput-for-compression trade the PFOR
+          // and SimdForBitpack entries above describe. DeltaZigzag
+          // reconstructs through a serial prefix sum bounded by the anchor
+          // stride and has no view, so it materialises where a bit-packed
+          // section is randomly addressable. Nothing about it decodes better
+          // than the tier it was being preferred over.
+          std::pair{EncodingType::DeltaZigzag, 0.9f},
           std::pair{EncodingType::FOR, 0.85f},
           // Huffman is deliberately absent. It decodes bit-serially through a
           // table, and withdrawing it from SubIntSplit returned up to 3.78x of
