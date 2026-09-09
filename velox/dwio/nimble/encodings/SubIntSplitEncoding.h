@@ -1063,20 +1063,35 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // values inside a section and move no row, so each section chooses its own
   // freely. Both end up in transformIds[s], which is why one section can be
   // key-derived while its neighbour is relabelled, and why no section can
-  // carry a second, different row order.
+  // carry a second, different row order. That is a property of the wire format
+  // and of the forced arms, not of the list below, which offers one candidate.
   std::vector<const subintsplit::SectionTransform*> candidates;
   if (options.subIntSplitAutoTransform) {
     NIMBLE_CHECK(
         !options.subIntSplitForceApply,
         "subIntSplitAutoTransform and subIntSplitForceApply are exclusive: "
         "one asks the encoder to choose, the other to obey.");
-    for (const auto id : {subintsplit::TransformId::KeyDerived,
-                          subintsplit::TransformId::RelabelFrequency,
-                          subintsplit::TransformId::RelabelDense,
-                          subintsplit::TransformId::RelabelGray,
-                          subintsplit::TransformId::BitPlane}) {
-      candidates.push_back(subintsplit::transformFor(id));
-    }
+    // Only the key-derived permutation is offered here. RelabelFrequency,
+    // RelabelDense, RelabelGray and BitPlane keep their implementations,
+    // their tests, their wire ids and their forced benchmark arms; this list
+    // is solely what automatic selection prices, and withholding a transform
+    // from it does not retire the transform.
+    //
+    // Measured across six real columns and six arrival orders: per-section
+    // mixing beat the best forced single transform in 5 of 26 cells, by 0.03%
+    // to 2.79%, while key-derived alone accounted for nearly all of the gain
+    // on 16 of the 21 cells that adopted anything at all. Pricing four
+    // further candidates per section bought that, and cost a trial encode
+    // each -- encode ran 2.41x to 35.52x slower than carrying no transform
+    // layer, which is what ruled selection out as a default.
+    //
+    // The unrestricted five-candidate version is preserved on the
+    // sis-transform-auto branch. Restore it from there rather than rebuilding
+    // this list by hand, and re-measure encode first: the cost scales with
+    // how many candidates a section prices, not with how many it keeps, so
+    // adding one back is not free even where it is never chosen.
+    candidates.push_back(
+        subintsplit::transformFor(subintsplit::TransformId::KeyDerived));
   } else if (transform != nullptr) {
     candidates.push_back(transform);
   }
