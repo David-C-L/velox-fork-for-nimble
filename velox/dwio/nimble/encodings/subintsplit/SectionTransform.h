@@ -181,6 +181,29 @@ struct TransformState {
 };
 
 /// Rewrites one section of one block, reversibly.
+/// What selection knows about a section before trying to transform it.
+///
+/// Cheap by construction: the row count and width are already known, and the
+/// distinct count is counted only far enough to answer the question asked of
+/// it, never to completion. Nothing here requires encoding the section.
+struct SectionProfile {
+  /// Rows in the section, which is the whole column.
+  size_t rowCount{0};
+
+  /// Bits this section occupies in the value, so its values are bounded by
+  /// 2^width.
+  int width{0};
+
+  /// Distinct values, counted up to a bound the caller chose and then
+  /// abandoned. Equal to that bound means "at least this many", not "exactly
+  /// this many", so a test may only conclude that a section has *many*
+  /// distinct values from it, never that it has few.
+  size_t distinct{0};
+
+  /// Whether `distinct` is the true count rather than the bound it stopped at.
+  bool distinctIsExact{false};
+};
+
 class SectionTransform {
  public:
   virtual ~SectionTransform() = default;
@@ -263,6 +286,24 @@ class SectionTransform {
   /// whether it must hold a section back unpermuted.
   virtual bool needsKeySection() const {
     return false;
+  }
+
+  /// Whether this transform could plausibly pay on a section with this shape,
+  /// judged from statistics the encoder already has.
+  ///
+  /// Selection prices candidates by encoding the section with each and keeping
+  /// the smallest, which is exact but costs a trial encode per candidate. Most
+  /// of those trials are decidable in advance: a relabelling cannot shrink a
+  /// section whose values are already dense in its width, whatever the data
+  /// does. Declining here skips the encode.
+  ///
+  /// The contract is one-sided on purpose. Returning false must mean the
+  /// transform genuinely could not have won, because a false negative silently
+  /// costs compression that the exact search would have found and no test of
+  /// the output can tell the difference. Returning true costs only the trial
+  /// encode the search would have done anyway, so when in doubt, say true.
+  virtual bool mightPay(const SectionProfile& profile) const {
+    return true;
   }
 };
 

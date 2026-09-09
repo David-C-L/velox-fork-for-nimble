@@ -1328,6 +1328,47 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
+  // The transform arms above each pin one transform for the whole column. This
+  // pair instead lets the encoder pick per section, which is what production
+  // would run: it is the only arm whose compression is reachable without a
+  // caller who already knows which transform the column wants. Priced against
+  // SIS/realNested, which is the same encoder with the search switched off.
+  {
+    const std::vector<std::pair<const char*, bool>> arms{
+        {"SIS/auto", false},
+        {"SIS/auto+view", true},
+    };
+    for (const auto& [name, withView] : arms) {
+      EncoderEntry<T> entry;
+      entry.name = name;
+      entry.family = "SubIntSplit";
+      entry.variant = withView ? "real_nested_view" : "real_nested";
+      entry.inventory = "full";
+      entry.transform = "auto";
+      entry.isSequential = false;
+      entry.fastSkip = withView;
+      entry.randomAccess = withView;
+      entry.factory = [withView](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitAutoTransform = true;
+        o.subIntSplitKeySection = 0xFF;
+        if (withView) {
+          auto impl = std::make_unique<
+              NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+          impl->encodeWith(data, o, /*realNestedSelection=*/true);
+          return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+        }
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
   // Whether SubIntSplit's planner may cost a bit range as Huffman. Off is now
   // the default, so huffOn is the arm that reproduces the older behaviour.
   //

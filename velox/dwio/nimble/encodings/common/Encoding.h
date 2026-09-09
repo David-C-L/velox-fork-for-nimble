@@ -140,6 +140,15 @@ class Encoding {
     /// permutation is rebuilt from it at read time.
     uint8_t subIntSplitTransform = 0;
 
+    /// Lets the encoder choose a transform per section instead of being told
+    /// one, pricing every candidate against the untransformed encoding and
+    /// keeping the cheapest. Ignores subIntSplitTransform, which names a
+    /// single transform for every section, and is exclusive with
+    /// subIntSplitForceApply, which asks the encoder to obey rather than
+    /// choose. Costs one trial encode per candidate per section, so it buys
+    /// compression with encode time.
+    bool subIntSplitAutoTransform = false;
+
     /// Section whose values order a key-derived permutation, and which is
     /// therefore stored unpermuted. 0xFF, the default, means the encoder tries
     /// every section and keeps the one that encodes smallest: which section

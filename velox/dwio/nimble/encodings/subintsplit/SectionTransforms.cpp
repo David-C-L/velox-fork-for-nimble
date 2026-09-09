@@ -29,6 +29,15 @@
 
 namespace facebook::nimble::subintsplit {
 
+namespace {
+
+// Bits needed to represent every value up to and including `maxValue`.
+int bitsToHold(uint64_t maxValue) {
+  return maxValue == 0 ? 1 : 64 - __builtin_clzll(maxValue);
+}
+
+} // namespace
+
 // The decoder reproduces exactly this permutation by re-sorting the key
 // section, which is why nothing needs storing.
 //
@@ -295,6 +304,41 @@ class RelabelTransform : public SectionTransform {
     return id_;
   }
 
+  // A relabelling replaces each value by a code in 0..distinct-1, so it can
+  // only shrink a section by narrowing it, and it must carry a codebook of one
+  // entry per distinct value to be invertible. Both sides are known before
+  // encoding anything: the section falls from width to the bits a code needs,
+  // saving rowCount * (width - codeBits), and the codebook costs
+  // distinct * width. Where the codebook cannot be recovered, no arrangement
+  // of the data rescues it.
+  //
+  // Gray coding is the exception and is deliberately not gated here: it is a
+  // reversible remapping that carries no codebook and does not narrow the
+  // section, so this arithmetic says nothing about whether it pays.
+  // `distinct` may be a lower bound rather than the true count, and that is
+  // the direction this needs: both the codebook cost and the code width grow
+  // with the distinct count, so a section proved to have *at least* this many
+  // distinct values cannot do better than the arithmetic below says. A count
+  // abandoned early is therefore still sound to decline on, while a count that
+  // finished is simply a tighter case of the same test.
+  bool mightPay(const SectionProfile& profile) const override {
+    if (id_ == TransformId::RelabelGray) {
+      return true;
+    }
+    if (profile.distinct == 0 || profile.width <= 0) {
+      return true;
+    }
+    const int codeBits = bitsToHold(profile.distinct - 1);
+    if (codeBits >= profile.width) {
+      return false;
+    }
+    const size_t saved =
+        profile.rowCount * static_cast<size_t>(profile.width - codeBits);
+    const size_t codebookBits =
+        profile.distinct * static_cast<size_t>(profile.width);
+    return saved > codebookBits;
+  }
+
   void apply(
       std::span<uint64_t> values,
       const TransformContext& /*context*/,
@@ -383,6 +427,19 @@ class BitPlaneTransform : public SectionTransform {
  public:
   TransformId id() const override {
     return TransformId::BitPlane;
+  }
+
+  // Transposition earns its keep by separating bit positions that behave
+  // differently, so a section has to be wide enough to hold positions that
+  // can differ. At one bit there is nothing to separate, and the transpose is
+  // a permutation of a single plane.
+  //
+  // The bound is deliberately loose. Anything above it is still priced by
+  // encoding it, because whether the planes actually diverge is a property of
+  // the data that no cheap statistic settles -- and declining wrongly costs
+  // compression that nothing downstream can recover.
+  bool mightPay(const SectionProfile& profile) const override {
+    return profile.width > 1;
   }
 
   void apply(

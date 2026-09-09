@@ -335,6 +335,79 @@ TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
   }
 }
 
+// Selection has to be at least as good as declining, or it is not selection.
+// Every candidate is priced against the untransformed encoding and plain is
+// the incumbent, so a chosen transform is one that was strictly smaller --
+// which makes "never larger than plain" the property, not an aspiration.
+TEST_F(TransformedEncodingTest, autoSelectionNeverCostsMoreThanNoTransform) {
+  const auto values = packedIdentifiers(16384);
+
+  Buffer plainBuffer{*pool_};
+  const auto plain = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      plainBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitAutoTransform = true;
+  const auto chosen = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, values, CompressionType::Uncompressed, options);
+
+  EXPECT_LE(chosen.size(), plain.size());
+
+  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+      *pool_, chosen, nullptr, options);
+  std::vector<uint64_t> decoded(values.size());
+  encoding->materialize(values.size(), decoded.data());
+  for (size_t i = 0; i < values.size(); ++i) {
+    ASSERT_EQ(decoded[i], values[i]) << "row " << i;
+  }
+}
+
+// Leaving the option off must change nothing at all. This is the check that
+// the wider search is opt-in rather than a behaviour change smuggled into
+// every column that already encodes with SubIntSplit, and it is the same
+// standard the Burrows-Wheeler removal was held to.
+TEST_F(TransformedEncodingTest, autoSelectionOffIsByteIdenticalToBefore) {
+  const auto values = packedIdentifiers(16384);
+
+  Buffer plainBuffer{*pool_};
+  const auto plain = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      plainBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+
+  Buffer offBuffer{*pool_};
+  Encoding::Options off;
+  off.subIntSplitAutoTransform = false;
+  const auto unchanged = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      offBuffer, values, CompressionType::Uncompressed, off);
+
+  EXPECT_EQ(unchanged, plain);
+}
+
+// Asking the encoder to choose and ordering it to obey are contradictory, and
+// silently honouring one would make the other's result a lie. A test that
+// pinned a transform alongside auto would otherwise pass while measuring
+// something nobody asked for.
+//
+// Internal rather than user: these options are set by nimble code, not by
+// whoever wrote the file being encoded, which is also what the neighbouring
+// subIntSplitForceApply validation checks against.
+TEST_F(TransformedEncodingTest, autoSelectionRefusesToAlsoBeForced) {
+  const auto values = packedIdentifiers(2048);
+
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitAutoTransform = true;
+  options.subIntSplitForceApply = true;
+  options.subIntSplitTransform =
+      static_cast<uint8_t>(TransformId::RelabelFrequency);
+  options.subIntSplitKeySection = 1;
+
+  EXPECT_THROW(
+      test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+          buffer, values, CompressionType::Uncompressed, options),
+      NimbleInternalError);
+}
+
 // Every other test here pins the key section, so none of them runs the search
 // that production actually uses: with subIntSplitKeySection unset the encoder
 // prices one attempt per candidate key and keeps the smallest. That loop is the

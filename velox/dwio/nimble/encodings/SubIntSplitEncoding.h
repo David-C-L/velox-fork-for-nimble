@@ -774,6 +774,80 @@ inline bool improvesOnBest(size_t candidateBytes, size_t bestBytes) noexcept {
   return candidateBytes < bestBytes;
 }
 
+// What the transform gates need to know about a section, counted only as far
+// as the answer stays in doubt.
+//
+// The distinct count stops the moment a relabelling is provably beaten, which
+// is a condition that only tightens as more distinct values are seen: both the
+// codebook it must store and the width of the codes it assigns grow together.
+// So the count abandoned here is a lower bound, and a lower bound is exactly
+// what licenses declining -- the true count can only make the case worse.
+//
+// Counting to the end would defeat the purpose. The sections that would cost
+// most to count are the ones with the most distinct values, which are the ones
+// this refuses first, so the early exit fires where the work is largest. This
+// is the same shape as groupsEnoughToKey above, and for the same reason.
+inline subintsplit::SectionProfile profileSection(
+    const std::vector<uint64_t>& values,
+    int width) {
+  subintsplit::SectionProfile profile;
+  profile.rowCount = values.size();
+  profile.width = width;
+  if (values.empty() || width <= 0) {
+    profile.distinctIsExact = true;
+    return profile;
+  }
+
+  // Relabelling is beaten once rowCount * (width - codeBits) stops exceeding
+  // distinct * width. Checked as it counts rather than after, so the pass ends
+  // at the first distinct value that settles it.
+  const auto beaten = [&](size_t distinct) {
+    if (distinct == 0) {
+      return false;
+    }
+    const int codeBits =
+        distinct == 1 ? 1 : 64 - __builtin_clzll(distinct - 1);
+    if (codeBits >= width) {
+      return true;
+    }
+    const size_t saved =
+        profile.rowCount * static_cast<size_t>(width - codeBits);
+    return saved <= distinct * static_cast<size_t>(width);
+  };
+
+  // One bit per value the section can hold. Affordable only where the bitmap
+  // costs no more than the section already does, so it can never be the
+  // expensive half of this function; anything wider goes to the hash.
+  if (width < 64 && (size_t{1} << width) <= profile.rowCount * 8) {
+    std::vector<bool> seen(size_t{1} << width, false);
+    size_t distinct = 0;
+    for (const uint64_t value : values) {
+      if (!seen[value]) {
+        seen[value] = true;
+        if (beaten(++distinct)) {
+          profile.distinct = distinct;
+          return profile;
+        }
+      }
+    }
+    profile.distinct = distinct;
+    profile.distinctIsExact = true;
+    return profile;
+  }
+
+  folly::F14FastSet<uint64_t> seen;
+  seen.reserve(std::min<size_t>(profile.rowCount, 1u << 16));
+  for (const uint64_t value : values) {
+    if (seen.insert(value).second && beaten(seen.size())) {
+      profile.distinct = seen.size();
+      return profile;
+    }
+  }
+  profile.distinct = seen.size();
+  profile.distinctIsExact = true;
+  return profile;
+}
+
 // Whether sorting by these values would group anything.
 //
 // A key-derived permutation earns its keep by bringing like rows together, so
@@ -978,6 +1052,42 @@ std::string_view SubIntSplitEncoding<T>::encode(
       static_cast<subintsplit::TransformId>(options.subIntSplitTransform);
   const auto* transform = subintsplit::transformFor(requestedTransform);
   const uint8_t keySection = options.subIntSplitKeySection;
+
+  // Transforms the per-section search may choose between when the caller asks
+  // for selection rather than naming one.
+  //
+  // A reordering and a value transform are not alternatives in the same sense.
+  // There is one row order per block -- every section is a bit-slice of the
+  // same rows -- so the key-derived permutation is built once per candidate
+  // key and sections opt into it individually. The value transforms rewrite
+  // values inside a section and move no row, so each section chooses its own
+  // freely. Both end up in transformIds[s], which is why one section can be
+  // key-derived while its neighbour is relabelled, and why no section can
+  // carry a second, different row order.
+  std::vector<const subintsplit::SectionTransform*> candidates;
+  if (options.subIntSplitAutoTransform) {
+    NIMBLE_CHECK(
+        !options.subIntSplitForceApply,
+        "subIntSplitAutoTransform and subIntSplitForceApply are exclusive: "
+        "one asks the encoder to choose, the other to obey.");
+    for (const auto id : {subintsplit::TransformId::KeyDerived,
+                          subintsplit::TransformId::RelabelFrequency,
+                          subintsplit::TransformId::RelabelDense,
+                          subintsplit::TransformId::RelabelGray,
+                          subintsplit::TransformId::BitPlane}) {
+      candidates.push_back(subintsplit::transformFor(id));
+    }
+  } else if (transform != nullptr) {
+    candidates.push_back(transform);
+  }
+
+  // Whether any candidate needs a key decides if the key search runs at all.
+  const bool anyCandidateNeedsKey = std::any_of(
+      candidates.begin(),
+      candidates.end(),
+      [](const subintsplit::SectionTransform* candidate) {
+        return candidate->needsKeySection();
+      });
   if (options.subIntSplitForceApply) {
     NIMBLE_CHECK_NOT_NULL(
         transform,
@@ -1068,7 +1178,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // would cost compression -- a key-derived sort clusters far better over a
   // whole section than over 4096 rows -- and buy nothing, because neither
   // needs a bounded span to address a row.
-  const auto applyTransform = [&](int width,
+  const auto applyTransform = [&](const subintsplit::SectionTransform*
+                                      transform,
+                                  int width,
                                   const std::vector<uint64_t>& keyValues,
                                   std::span<const uint32_t> keyOrder,
                                   std::vector<uint64_t>& sectionU64,
@@ -1182,7 +1294,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
     // candidate key would reorder rows by a key the stream does not name, so
     // the lifetime is the one thing here that must not be shared or reused.
     std::vector<uint32_t> keyPermutation;
-    if (hasKey && transform != nullptr && transform->needsKeySection() &&
+    if (hasKey && anyCandidateNeedsKey &&
         (keyGroups || options.subIntSplitForceApply)) {
       keyPermutation = subintsplit::buildKeyOrder(keyValues);
     }
@@ -1200,7 +1312,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
     std::vector<uint8_t> transformable;
     transformable.reserve(splitCount);
     for (uint8_t s = 0; s < splitCount; ++s) {
-      const bool mayTransform = transform != nullptr && s != candidateKey &&
+      const bool mayTransform = !candidates.empty() && s != candidateKey &&
           (keyGroups || options.subIntSplitForceApply);
       if (mayTransform) {
         transformable.push_back(s);
@@ -1239,29 +1351,70 @@ std::string_view SubIntSplitEncoding<T>::encode(
       // A transform is worth applying to a section only where it pays for
       // itself, so both candidates are priced on what they actually encode
       // to, the transform's stored state included, and the smaller is kept.
-      auto transformed = sectionU64;
-      std::vector<uint64_t> codebook;
-      std::vector<uint32_t> primaryIndices;
-      const size_t stateBytes = applyTransform(
-          width,
-          keyValues,
-          std::span<const uint32_t>(keyPermutation),
-          transformed,
-          codebook,
-          primaryIndices);
-      const std::string_view alternative = encodeSection(s, sb, transformed);
+      // Every candidate is priced against the same plain encoding and the
+      // cheapest wins, so a section takes the transform that suits it rather
+      // than the one the caller happened to name. Plain is the incumbent: a
+      // candidate has to be strictly smaller to displace it, which keeps the
+      // untransformed result the default whenever a transform does not pay.
+      size_t bestBytes = plain.size();
+      std::string_view bestEncoded = plain;
+      const subintsplit::SectionTransform* bestTransform = nullptr;
+      std::vector<uint64_t> bestCodebook;
+      std::vector<uint32_t> bestPrimaryIndices;
 
-      if (alternative.size() + stateBytes < plain.size() ||
-          options.subIntSplitForceApply) {
-        attempt.info.transformIds[s] = static_cast<uint8_t>(transform->id());
-        attempt.info.codebooks[s] = std::move(codebook);
-        attempt.info.primaryIndices[s] = std::move(primaryIndices);
-        if (transform->positionMapping() ==
+      // Profiled once per section, not once per candidate, and only where
+      // there is more than one candidate to tell apart -- a caller who named a
+      // single transform is asking for it to be priced, not screened.
+      subintsplit::SectionProfile profile;
+      if (candidates.size() > 1) {
+        profile = profileSection(sectionU64, width);
+      }
+
+      for (const auto* candidate : candidates) {
+        // A key-derived candidate has nothing to gather by when this attempt
+        // found no usable key, and pricing it would encode the section a
+        // second time to reach the same bytes as plain.
+        if (candidate->needsKeySection() && keyPermutation.empty()) {
+          continue;
+        }
+        // Skips the trial encode where the candidate could not have won it.
+        if (candidates.size() > 1 && !candidate->mightPay(profile)) {
+          continue;
+        }
+        auto transformed = sectionU64;
+        std::vector<uint64_t> codebook;
+        std::vector<uint32_t> primaryIndices;
+        const size_t stateBytes = applyTransform(
+            candidate,
+            width,
+            keyValues,
+            std::span<const uint32_t>(keyPermutation),
+            transformed,
+            codebook,
+            primaryIndices);
+        const std::string_view alternative = encodeSection(s, sb, transformed);
+        const size_t total = alternative.size() + stateBytes;
+
+        if (total < bestBytes || options.subIntSplitForceApply) {
+          bestBytes = total;
+          bestEncoded = alternative;
+          bestTransform = candidate;
+          bestCodebook = std::move(codebook);
+          bestPrimaryIndices = std::move(primaryIndices);
+        }
+      }
+
+      if (bestTransform != nullptr) {
+        attempt.info.transformIds[s] =
+            static_cast<uint8_t>(bestTransform->id());
+        attempt.info.codebooks[s] = std::move(bestCodebook);
+        attempt.info.primaryIndices[s] = std::move(bestPrimaryIndices);
+        if (bestTransform->positionMapping() ==
             subintsplit::PositionMapping::Sequential) {
           attempt.info.blockSize = subintsplit::kTransformBlockSize;
         }
-        attempt.sections[s] = alternative;
-        attempt.totalBytes += alternative.size() + stateBytes;
+        attempt.sections[s] = bestEncoded;
+        attempt.totalBytes += bestBytes;
       } else {
         attempt.sections[s] = plain;
         attempt.totalBytes += plain.size();
@@ -1280,7 +1433,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // the guess.
   constexpr size_t kNoBound = std::numeric_limits<size_t>::max();
   std::optional<Attempt> best;
-  if (transform != nullptr && transform->needsKeySection()) {
+  if (anyCandidateNeedsKey) {
     if (keySection != detail::SubIntSplitTransformInfo::kNoKeySection) {
       NIMBLE_CHECK_LT(
           keySection,
@@ -1288,6 +1441,14 @@ std::string_view SubIntSplitEncoding<T>::encode(
           "SubIntSplit key section is outside the split.");
       best = attemptWithKey(keySection, kNoBound);
     } else {
+      // Keying on nothing is a real candidate, not the absence of one: the
+      // value transforms need no key and every section is eligible for them
+      // when none is reserved as the key. Priced first so it becomes the
+      // bound the keyed attempts have to beat.
+      if (options.subIntSplitAutoTransform) {
+        best = attemptWithKey(
+            detail::SubIntSplitTransformInfo::kNoKeySection, kNoBound);
+      }
       for (uint8_t candidate = 0; candidate < splitCount; ++candidate) {
         // Bounded by the incumbent, so an attempt that comes back has already
         // beaten it on the same test that used to be applied here. There is
