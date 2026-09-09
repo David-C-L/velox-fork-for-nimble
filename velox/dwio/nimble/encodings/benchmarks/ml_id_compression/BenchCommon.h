@@ -1214,8 +1214,14 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   // It is worst on compression in 26 of 26 cells, which makes it look like the
   // obvious next cut, but it is competitive on point access at 76.9ns against
   // fpe_noindex's 74.7ns. Cutting on one axis would have removed the wrong arm.
+  // The index type is carried explicitly rather than derived from the loop
+  // position. Dropping fpe_tagtag from the names left the position-derived
+  // form silently mislabelling: index 2 is EliasFano in FreqPartIndexType but
+  // became the third surviving name, so the arm reporting itself as
+  // fpe_elias was encoding TierTagArray and EliasFano was unreachable.
   const std::array<std::string, 3> fpeNames = {
       "fpe_noindex", "fpe_pertier", "fpe_elias"};
+  const std::array<uint8_t, 3> fpeIndexType = {0, 1, 3};
   const std::array<bool, 3> fpeRA = {false, true, true};
   const std::array<bool, 3> fpeSkip = {false, true, true};
 
@@ -1227,13 +1233,22 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     entry.isSequential = true;
     entry.fastSkip = fpeSkip[idx];
     entry.randomAccess = fpeRA[idx];
-    entry.factory = [idx](
+    const uint8_t indexType = fpeIndexType[idx];
+    entry.factory = [indexType](
                         const Vector<T>& data, const Encoding::Options& opts) {
       auto impl = std::make_unique<
           NimbleBenchTargetImpl<FrequencyPartitionEncoding<T>>>();
       Encoding::Options o = opts;
-      o.frequencyPartitionIndex = static_cast<uint8_t>(idx);
-      impl->target.encode(data, o);
+      o.frequencyPartitionIndex = indexType;
+      // Real nested selection, for the same reason the baseline arms need it:
+      // FrequencyPartition is its per-tier key arrays and tier dictionaries,
+      // and with selection off those are written Trivial at 32 bits per key
+      // and 64 bits per dictionary entry, so tiering cannot pay by
+      // construction. That is why these arms reported 96.00 bits per element
+      // on four of six columns -- a 32-bit-key dictionary, byte for byte --
+      // and why every index delta came out a structural constant independent
+      // of the data.
+      impl->target.encode(data, o, /*realNestedSelection=*/true);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
     encoders.push_back(std::move(entry));
