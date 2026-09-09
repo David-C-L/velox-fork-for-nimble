@@ -293,8 +293,15 @@ class NimbleViewBenchTargetImpl
  public:
   using T = typename EncodingT::cppDataType;
 
+  // True for the same reason makeEncoderEntry defaults to it: a composite
+  // encoding is nothing but its sub-streams, and writing them Trivial reports
+  // the encoding at its worst. This half of the pair was missed when the
+  // cursor targets were corrected, which left Dictionary/view and RLE/view at
+  // 96.000 bits per element on a 64-bit column -- exactly 1.5x raw, and read
+  // as those encodings expanding the data by half when it was the harness
+  // doing it. Their cursor twins measured 64.044 and 64.000 at the same time.
   void encode(const Vector<T>& data, const Encoding::Options& opts) override {
-    encodeWith(data, opts, /*realNestedSelection=*/false);
+    encodeWith(data, opts, /*realNestedSelection=*/true);
   }
 
   void encodeWith(
@@ -1169,12 +1176,21 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
-  const std::array<std::string, 4> fpeNames = {
-      "fpe_noindex", "fpe_pertier", "fpe_tagtag", "fpe_elias"};
-  const std::array<bool, 4> fpeRA = {false, true, true, true};
-  const std::array<bool, 4> fpeSkip = {false, true, true, true};
+  // fpe_tagtag is dropped: dominated on every axis it could have won on --
+  // worst on point in 39 of 42 cells, worst on bulk in 42 of 42, and only
+  // mid-table on size. An arm that is never the answer still costs sweep time
+  // and still has to be ruled out by whoever reads the table.
+  //
+  // fpe_pertier stays, and is why this list is not cut further on size alone.
+  // It is worst on compression in 26 of 26 cells, which makes it look like the
+  // obvious next cut, but it is competitive on point access at 76.9ns against
+  // fpe_noindex's 74.7ns. Cutting on one axis would have removed the wrong arm.
+  const std::array<std::string, 3> fpeNames = {
+      "fpe_noindex", "fpe_pertier", "fpe_elias"};
+  const std::array<bool, 3> fpeRA = {false, true, true};
+  const std::array<bool, 3> fpeSkip = {false, true, true};
 
-  for (int idx = 0; idx < 4; ++idx) {
+  for (int idx = 0; idx < 3; ++idx) {
     EncoderEntry<T> entry;
     entry.name = "FPE/" + fpeNames[idx];
     entry.family = "FrequencyPartition";
@@ -1230,65 +1246,11 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
-  // The cost models SubIntSplit scored before Delta, FOR, PFOR, Huffman,
-  // DeltaBlock, BlockBitPacking, SimdForBitpack and FrequencyPartition were
-  // added. Pairing these against the entries above isolates what the richer
-  // inventory is worth, on compression and on decode, within one binary.
-  {
-    const std::unordered_set<EncodingType> legacyInventory{
-        EncodingType::Trivial,
-        EncodingType::FixedBitWidth,
-        EncodingType::Constant,
-        EncodingType::MainlyConstant,
-        EncodingType::RLE,
-        EncodingType::Varint,
-        EncodingType::Dictionary,
-    };
-
-    {
-      EncoderEntry<T> entry;
-      entry.name = "SIS/legacyCost";
-      entry.family = "SubIntSplit";
-      entry.variant = "real_nested";
-      entry.inventory = "legacy";
-      entry.isSequential = false;
-      entry.fastSkip = false;
-      entry.randomAccess = false;
-      entry.factory = [legacyInventory](
-                          const Vector<T>& data,
-                          const Encoding::Options& opts) {
-        Encoding::Options o = opts;
-        o.subIntSplitAllowedEncodings = legacyInventory;
-        auto impl =
-            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
-        impl->target.encode(data, o, /*realNestedSelection=*/true);
-        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-      };
-      encoders.push_back(std::move(entry));
-    }
-
-    {
-      EncoderEntry<T> entry;
-      entry.name = "SIS/legacyCost+view";
-      entry.family = "SubIntSplit";
-      entry.variant = "real_nested_view";
-      entry.inventory = "legacy";
-      entry.isSequential = false;
-      entry.fastSkip = true;
-      entry.randomAccess = true;
-      entry.factory = [legacyInventory](
-                          const Vector<T>& data,
-                          const Encoding::Options& opts) {
-        Encoding::Options o = opts;
-        o.subIntSplitAllowedEncodings = legacyInventory;
-        auto impl =
-            std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
-        impl->encodeWith(data, o, /*realNestedSelection=*/true);
-        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-      };
-      encoders.push_back(std::move(entry));
-    }
-  }
+  // SIS/legacyCost and SIS/legacyCost+view are dropped, together with the
+  // legacy inventory they were the only readers of. They pinned the cost
+  // models SubIntSplit scored before Delta, FOR, PFOR, Huffman, DeltaBlock,
+  // BlockBitPacking, SimdForBitpack and FrequencyPartition were added, which
+  // is a comparison nothing now proposes returning to.
 
   // One entry per transform, so the ablation is an encoder row rather than a
   // new loop in every driver: bulk, gather and point pick these up unchanged.
@@ -1417,7 +1379,15 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         {static_cast<uint8_t>(subintsplit::TransformId::KeyDerived),
          "key_derived"},
     };
-    for (const bool allowHuffman : {true, false}) {
+    // Only huffOn. The huffOff arms encoded byte-identically to
+    // SIS/realNested in 26 of 26 cells, and huffOff/key_derived to
+    // SIS/key_derived in 26 of 26, so all four were measuring something that
+    // already had a row in the table.
+    //
+    // huffOn is kept because it is not a duplicate: it differs from
+    // realNested in 9 of 26 cells, which makes it a real ablation of what
+    // costing Huffman does to where the split boundaries fall.
+    for (const bool allowHuffman : {true}) {
       for (const auto& transformArm : transformArms) {
         const uint8_t rawId = transformArm.first;
         const std::string transformName = transformArm.second;
