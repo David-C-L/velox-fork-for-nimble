@@ -104,6 +104,13 @@ DEFINE_string(
     "already sorted, which is the input a reordering transform has least to do "
     "on, so measuring only that understates the layer.");
 DEFINE_string(
+    mlidc_encode_cache_dir,
+    "",
+    "Directory holding cached encoded payloads. Empty disables the cache, "
+    "which is the default: a sweep opts in, nothing is cached behind anyone's "
+    "back. Every driver otherwise re-encodes the same targets, so a sweep pays "
+    "each encode once per driver.");
+DEFINE_string(
     mlidc_dataset_name,
     "twitter-snowflake",
     "Name reported for the --mlidc_file dataset");

@@ -45,6 +45,7 @@
 #include "velox/dwio/nimble/compression/Compression.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
@@ -74,6 +75,7 @@ DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
 DECLARE_bool(mlidc_dump_encoding);
+DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
@@ -100,16 +102,22 @@ class NimbleBenchTarget {
       const Encoding::Options& options = {},
       bool realNestedSelection = false) {
     Buffer buf{*pool_};
-    // Not test::Encoder::encode: its policy silently redirects any compressor
-    // other than Zstd, and leaves nested sub-streams on the default one. See
-    // SubstreamCompression.h.
-    encoded_ = std::string(
-        encodeWithCompression<EncodingT, T>(
-            buf,
-            data,
-            parseCompressionType(FLAGS_mlidc_substream_compression),
-            options,
-            realNestedSelection));
+    constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
+    const auto armId = cacheArmIdentity(options, realNestedSelection);
+    const auto key = encodeCacheKey<T>(data.data(), data.size(), armId, kType);
+    if (!loadCached(key, armId, kType, encoded_)) {
+      // Not test::Encoder::encode: its policy silently redirects any compressor
+      // other than Zstd, and leaves nested sub-streams on the default one. See
+      // SubstreamCompression.h.
+      encoded_ = std::string(
+          encodeWithCompression<EncodingT, T>(
+              buf,
+              data,
+              parseCompressionType(FLAGS_mlidc_substream_compression),
+              options,
+              realNestedSelection));
+      storeCached(key, armId, kType, encoded_);
+    }
     // Construct the Encoding directly from the encoded bytes rather than
     // re-encoding via createEncoding(), which would silently drop
     // realNestedSelection and produce different encoded data.
@@ -294,13 +302,19 @@ class NimbleViewBenchTargetImpl
       const Encoding::Options& opts,
       bool realNestedSelection) {
     Buffer buf{*pool_};
-    encoded_ = std::string(
-        encodeWithCompression<EncodingT, T>(
-            buf,
-            data,
-            parseCompressionType(FLAGS_mlidc_substream_compression),
-            opts,
-            realNestedSelection));
+    constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
+    const auto armId = cacheArmIdentity(opts, realNestedSelection);
+    const auto key = encodeCacheKey<T>(data.data(), data.size(), armId, kType);
+    if (!loadCached(key, armId, kType, encoded_)) {
+      encoded_ = std::string(
+          encodeWithCompression<EncodingT, T>(
+              buf,
+              data,
+              parseCompressionType(FLAGS_mlidc_substream_compression),
+              opts,
+              realNestedSelection));
+      storeCached(key, armId, kType, encoded_);
+    }
     options_ = opts;
     view_ = createEncodingView(std::string_view(encoded_), pool_.get(), opts);
     NIMBLE_CHECK_NOT_NULL(view_);
