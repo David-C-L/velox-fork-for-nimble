@@ -425,6 +425,19 @@ struct EncoderEntry {
 };
 
 // Convenience builder for a concrete EncodingT.
+//
+// realNestedSelection defaults to true because that is what a writer does.
+// An encoding built from sub-streams -- Dictionary's alphabet and indices,
+// RLE's values and lengths -- is nothing but those sub-streams, and with
+// selection off they are written Trivial, so the arm reports the encoding at
+// its worst rather than as anyone would ship it. It cost us a whole
+// measurement: a top-level Delta arm came back at 65.0006 bits/elem on every
+// column and every arrival order, identical and data-independent, because its
+// three children were unencoded while its own algorithm worked perfectly.
+//
+// Encodings with no sub-streams, Trivial and FixedBitWidth among them, encode
+// byte-identically either way, so this is a correction to the composite arms
+// and a no-op for the flat ones.
 template <typename EncodingT>
 EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
     std::string name,
@@ -432,7 +445,8 @@ EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
     std::string variant,
     bool isSequential = true,
     bool fastSkip = false,
-    bool randomAccess = false) {
+    bool randomAccess = false,
+    bool realNestedSelection = true) {
   using T = typename EncodingT::cppDataType;
   EncoderEntry<T> entry;
   entry.name = std::move(name);
@@ -441,9 +455,10 @@ EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
   entry.isSequential = isSequential;
   entry.fastSkip = fastSkip;
   entry.randomAccess = randomAccess;
-  entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+  entry.factory = [realNestedSelection](
+                      const Vector<T>& data, const Encoding::Options& opts) {
     auto impl = std::make_unique<NimbleBenchTargetImpl<EncodingT>>();
-    impl->encode(data, opts);
+    impl->target.encode(data, opts, realNestedSelection);
     return impl;
   };
   return entry;
