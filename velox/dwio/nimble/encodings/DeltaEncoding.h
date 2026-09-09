@@ -15,8 +15,10 @@
  */
 #pragma once
 
+#include <limits>
 #include <numeric>
 #include <span>
+#include <type_traits>
 
 #include <folly/Likely.h>
 
@@ -27,11 +29,11 @@
 #include "velox/dwio/nimble/common/FixedBitArray.h"
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/common/Vector.h"
-#include "velox/dwio/nimble/encodings/common/Encoding.h"
-#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/SparseBoolEncoding.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
+#include "velox/dwio/nimble/encodings/common/Encoding.h"
+#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
@@ -55,6 +57,81 @@
 // 1 1 1
 
 namespace facebook::nimble {
+
+namespace internal {
+
+// Folds a signed residual onto an unsigned one, so that a small step in either
+// direction stays small instead of a negative step wrapping to near the top of
+// the domain.
+//
+// Done entirely in the unsigned physical domain: `current - previous` wraps to
+// the two's-complement bit pattern of the signed difference, which is what the
+// fold and the matching unfold below both operate on. That is also why this
+// handles a signed column crossing zero without a special case, where the
+// plain delta path has to restate.
+template <typename U>
+inline U zigzagFold(U current, U previous) noexcept {
+  static_assert(std::is_unsigned_v<U>);
+  using S = std::make_signed_t<U>;
+  constexpr int kSignShift = static_cast<int>(sizeof(U) * 8 - 1);
+  const U difference = static_cast<U>(current - previous);
+  return static_cast<U>(
+      (difference << 1) ^
+      static_cast<U>(static_cast<S>(difference) >> kSignShift));
+}
+
+// Recovers the residual a fold produced, as the unsigned bit pattern of the
+// signed difference. A caller adds it to the running value, where wrapping
+// addition completes the inverse.
+template <typename U>
+inline U zigzagUnfold(U folded) noexcept {
+  static_assert(std::is_unsigned_v<U>);
+  return static_cast<U>((folded >> 1) ^ (U{0} - (folded & U{1})));
+}
+
+// The unfold a decode loop applies, or nothing at all on a plain delta stream.
+// Selected at compile time so that the plain path keeps the code it had.
+template <typename U, bool kZigzag>
+inline U maybeUnfold(U value) noexcept {
+  if constexpr (kZigzag) {
+    return zigzagUnfold<U>(value);
+  } else {
+    return value;
+  }
+}
+
+// An upper bound on the widest folded residual a stream will store, from the
+// adjacent-pair statistics already collected for the plain delta path.
+//
+// Deliberately an upper bound rather than the exact maximum. The statistics
+// classify a pair by unsigned comparison and report a magnitude, which agrees
+// with the signed residual's magnitude except where a step wraps the domain;
+// there the reported magnitude is at least half the domain, so doubling it
+// saturates and the bound stays safe. Underestimating here would price a delta
+// array narrower than the one that gets written, which is the direction that
+// makes an encoding look better than it is and get selected wrongly.
+inline uint64_t zigzagResidualBound(
+    uint64_t maxIncrease,
+    uint64_t maxDecrease) noexcept {
+  const uint64_t widest = std::max(maxIncrease, maxDecrease);
+  constexpr uint64_t kHalfDomain = uint64_t{1} << 63;
+  if (widest >= kHalfDomain) {
+    return ~uint64_t{0};
+  }
+  return widest << 1;
+}
+
+// Number of rows that carry an absolute value when anchors are forced every
+// `stride` rows. Row 0 always does, so this counts the multiples of `stride`
+// below `rowCount`.
+inline uint64_t anchorCount(uint64_t rowCount, uint32_t stride) noexcept {
+  if (rowCount == 0) {
+    return 0;
+  }
+  return velox::bits::divRoundUp(rowCount, static_cast<uint64_t>(stride));
+}
+
+} // namespace internal
 
 // Data layout is:
 // EncodingPrefix::kFixedPrefixSize bytes: standard Encoding prefix
@@ -97,6 +174,15 @@ class DeltaEncoding final
   std::string debugString(int offset) const final;
 
   static std::string_view encode(
+      EncodingSelection<physicalType>& selection,
+      std::span<const physicalType> values,
+      Buffer& buffer,
+      const Encoding::Options& options = {});
+
+  /// Encodes as EncodingType::DeltaZigzag: residuals are zigzag-folded, so a
+  /// decreasing step needs no restatement, and absolute values are forced
+  /// every Options::deltaZigzagAnchorStride rows to keep skip() bounded.
+  static std::string_view encodeZigzag(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
       Buffer& buffer,
@@ -162,6 +248,54 @@ class DeltaEncoding final
     return kOuterHeaderSize + deltasSize + restatementsSize +
         isRestatementsSize;
   }
+
+  /// Size estimate for the zigzag-folded, anchored variant.
+  ///
+  /// Differs from estimateSize above in the two places the format differs.
+  /// Folding removes the dependence on how many pairs descend -- every step is
+  /// storable -- so the restatement count is a property of the anchor stride
+  /// alone rather than of the data. And the delta array has to cover the
+  /// widest step in either direction once folded, not the widest rise, which
+  /// is what internal::zigzagResidualBound reports.
+  ///
+  /// The three nested streams are priced by the estimators selection would
+  /// apply to them, as estimateSize does, so the two track each other.
+  static uint64_t estimateSizeZigzag(
+      uint64_t rowCount,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options = {}) {
+    if (rowCount == 0) {
+      return EncodingPrefix::kFixedPrefixSize;
+    }
+    const uint32_t stride = options.deltaZigzagAnchorStride;
+    if (stride == 0) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+
+    const auto& pairs = statistics.adjacentPairStats();
+    const uint64_t restatementCount = internal::anchorCount(rowCount, stride);
+    const uint64_t deltaCount = rowCount - restatementCount;
+    const uint64_t residualBound =
+        internal::zigzagResidualBound(pairs.maxIncrease, pairs.maxDecrease);
+
+    const uint64_t deltasSize = deltaCount == 0
+        ? 0
+        : std::min(
+              TrivialEncoding<physicalType>::estimateSize(deltaCount),
+              FixedBitWidthEncoding<physicalType>::estimateSize(
+                  deltaCount, /*minValue=*/0, residualBound, options));
+    const uint64_t restatementsSize = std::min(
+        TrivialEncoding<physicalType>::estimateSize(restatementCount),
+        FixedBitWidthEncoding<physicalType>::estimateSize(
+            restatementCount, statistics.min(), statistics.max(), options));
+    const uint64_t isRestatementsSize = std::min(
+        SparseBoolEncoding::estimateSize(rowCount, restatementCount, options),
+        EncodingPrefix::kFixedPrefixSize + 1 + velox::bits::nbytes(rowCount));
+
+    constexpr uint64_t kOuterHeaderSize = EncodingPrefix::kFixedPrefixSize + 8;
+    return kOuterHeaderSize + deltasSize + restatementsSize +
+        isRestatementsSize;
+  }
 #endif
 
  private:
@@ -175,6 +309,32 @@ class DeltaEncoding final
     }
     return isRestatementsBitmap_->asMutable<uint64_t>();
   }
+
+  // Shared body of encode() and encodeZigzag(). `encodingType` is what goes in
+  // the prefix and is also what selects the residual form, since the two are
+  // the same decision.
+  static std::string_view encodeImpl(
+      EncodingSelection<physicalType>& selection,
+      std::span<const physicalType> values,
+      Buffer& buffer,
+      const Encoding::Options& options,
+      EncodingType encodingType);
+
+  // Walks the is-restatement bitmap, applying one delta or one absolute per
+  // row. Templated on the fold rather than branching per row so that a plain
+  // delta stream keeps the branchless inner loop it had.
+  template <bool kZigzag>
+  void materializeChunks(
+      uint32_t rowCount,
+      physicalType* output,
+      const uint64_t* bitmap,
+      const physicalType* nextRestatement,
+      const physicalType* nextDelta);
+
+  // Whether the delta stream holds zigzag-folded residuals. Set from the
+  // encoding type on the wire, not from a header field: DeltaEncoding's header
+  // is a prefix and two fixed-position offsets with no room for a flag.
+  bool zigzag_{false};
 
   physicalType currentValue_;
   std::unique_ptr<Encoding> deltas_;
@@ -199,6 +359,7 @@ DeltaEncoding<T>::DeltaEncoding(
     : TypedEncoding<T, physicalType>(pool, data, options),
       deltasBuffer_(this->template getVectorBuffer<physicalType>()),
       restatementsBuffer_(this->template getVectorBuffer<physicalType>()) {
+  zigzag_ = this->encodingType() == EncodingType::DeltaZigzag;
   auto pos = data.data() + this->dataOffset();
   const uint32_t restatementsOffset = encoding::readUint32(pos);
   const uint32_t isRestatementsOffset = encoding::readUint32(pos);
@@ -247,12 +408,26 @@ void DeltaEncoding<T>::skip(uint32_t rowCount) {
         static_cast<uint32_t>(lastRestatement) - (totalRestatements - 1);
     deltas_->skip(deltasToSkip);
   }
+  // Replayed from the anchor just found, so this is the cost that the forced
+  // anchors bound: on a DeltaZigzag stream every restatement is one, and the
+  // most that can be replayed is one stride's worth.
   const uint32_t deltasToAccumulate =
       static_cast<uint32_t>(rowCount - 1 - lastRestatement);
   deltasBuffer_.resize(deltasToAccumulate);
   deltas_->materialize(deltasToAccumulate, deltasBuffer_.data());
-  currentValue_ += std::accumulate(
-      deltasBuffer_.begin(), deltasBuffer_.end(), physicalType());
+  if (zigzag_) {
+    // Summed as wrapping unsigned arithmetic, which is what makes a run of
+    // folded residuals compose into the same value stepping through them one
+    // at a time would reach.
+    physicalType total{};
+    for (const physicalType folded : deltasBuffer_) {
+      total += internal::zigzagUnfold<physicalType>(folded);
+    }
+    currentValue_ += total;
+  } else {
+    currentValue_ += std::accumulate(
+        deltasBuffer_.begin(), deltasBuffer_.end(), physicalType());
+  }
 }
 
 template <typename T>
@@ -272,11 +447,32 @@ void DeltaEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
   const auto* nextRestatement = restatementsBuffer_.data();
   const auto* nextDelta = deltasBuffer_.data();
 
+  if (zigzag_) {
+    materializeChunks<true>(
+        rowCount, output, bitmap, nextRestatement, nextDelta);
+  } else {
+    materializeChunks<false>(
+        rowCount, output, bitmap, nextRestatement, nextDelta);
+  }
+}
+
+template <typename T>
+template <bool kZigzag>
+void DeltaEncoding<T>::materializeChunks(
+    uint32_t rowCount,
+    physicalType* output,
+    const uint64_t* bitmap,
+    const physicalType* nextRestatement,
+    const physicalType* nextDelta) {
   // Process the restatement bitmap 16 bits at a time. For all-delta
   // chunks (the common case in sorted data), runs a tight branchless
   // prefix-sum loop without per-element bit extraction or branching.
   // 16-bit chunks balance fast-path hit rate with loop overhead
   // (benchmarked vs 8/32/64-bit: 16-bit is fastest).
+  //
+  // This is what puts a floor under Options::deltaZigzagAnchorStride: anchors
+  // land in one chunk out of every stride/16, so a stride of 256 leaves 15 of
+  // 16 chunks on the fast path while a stride of 16 would leave none.
   uint32_t remaining = rowCount;
   const auto* bitmapChunks = reinterpret_cast<const uint16_t*>(bitmap);
   const uint32_t numChunks = velox::bits::divRoundUp(rowCount, 16);
@@ -286,14 +482,16 @@ void DeltaEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
 
     if (FOLLY_LIKELY(chunk == 0)) {
       for (uint32_t i = 0; i < count; ++i) {
-        currentValue_ += *nextDelta++;
+        currentValue_ +=
+            internal::maybeUnfold<physicalType, kZigzag>(*nextDelta++);
         *output++ = currentValue_;
       }
     } else {
       uint16_t restatementBits = chunk;
       for (uint32_t i = 0; i < count; ++i) {
         if (FOLLY_LIKELY(!(restatementBits & 1))) {
-          currentValue_ += *nextDelta++;
+          currentValue_ +=
+              internal::maybeUnfold<physicalType, kZigzag>(*nextDelta++);
         } else {
           currentValue_ = *nextRestatement++;
         }
@@ -322,7 +520,8 @@ void DeltaEncoding<T>::readWithVisitor(
         } else {
           physicalType delta;
           deltas_->materialize(1, &delta);
-          currentValue_ += delta;
+          currentValue_ +=
+              zigzag_ ? internal::zigzagUnfold<physicalType>(delta) : delta;
         }
         return currentValue_;
       });
@@ -362,6 +561,36 @@ void computeDeltas(
   }
 }
 
+// Builds the same three streams computeDeltas does, with two differences: a
+// residual is folded rather than restated when it decreases, and a restatement
+// is forced every `anchorStride` rows whether or not one is needed.
+//
+// The streams stay position-free and the bitmap still records exactly which
+// rows carry an absolute value, so the decoder cannot distinguish an anchor
+// from a necessity and does not need to. That is what lets the stride stay off
+// the wire.
+template <typename physicalType>
+void computeZigzagDeltas(
+    std::span<const physicalType> values,
+    uint32_t anchorStride,
+    Vector<physicalType>* deltas,
+    Vector<physicalType>* restatements,
+    Vector<bool>* isRestatements) {
+  NIMBLE_CHECK_GT(
+      anchorStride, 0u, "DeltaZigzag anchor stride must be positive.");
+  isRestatements->emplace_back(true);
+  restatements->emplace_back(values[0]);
+  for (uint32_t i = 1; i < values.size(); ++i) {
+    if (FOLLY_UNLIKELY(i % anchorStride == 0)) {
+      isRestatements->emplace_back(true);
+      restatements->emplace_back(values[i]);
+    } else {
+      isRestatements->emplace_back(false);
+      deltas->emplace_back(zigzagFold<physicalType>(values[i], values[i - 1]));
+    }
+  }
+}
+
 } // namespace internal
 
 template <typename T>
@@ -370,6 +599,26 @@ std::string_view DeltaEncoding<T>::encode(
     std::span<const physicalType> values,
     Buffer& buffer,
     const Encoding::Options& options) {
+  return encodeImpl(selection, values, buffer, options, EncodingType::Delta);
+}
+
+template <typename T>
+std::string_view DeltaEncoding<T>::encodeZigzag(
+    EncodingSelection<physicalType>& selection,
+    std::span<const physicalType> values,
+    Buffer& buffer,
+    const Encoding::Options& options) {
+  return encodeImpl(
+      selection, values, buffer, options, EncodingType::DeltaZigzag);
+}
+
+template <typename T>
+std::string_view DeltaEncoding<T>::encodeImpl(
+    EncodingSelection<physicalType>& selection,
+    std::span<const physicalType> values,
+    Buffer& buffer,
+    const Encoding::Options& options,
+    EncodingType encodingType) {
   const bool useVarint = options.useVarintRowCount;
 
   // Fail on empty input.
@@ -382,7 +631,16 @@ std::string_view DeltaEncoding<T>::encode(
   Vector<physicalType> restatements(&buffer.getMemoryPool());
   Vector<bool> isRestatements(&buffer.getMemoryPool());
 
-  internal::computeDeltas(values, &deltas, &restatements, &isRestatements);
+  if (encodingType == EncodingType::DeltaZigzag) {
+    internal::computeZigzagDeltas(
+        values,
+        options.deltaZigzagAnchorStride,
+        &deltas,
+        &restatements,
+        &isRestatements);
+  } else {
+    internal::computeDeltas(values, &deltas, &restatements, &isRestatements);
+  }
 
   ScopedEncodingBuffer tempBuffer{
       &buffer.getMemoryPool(), options.encodingBufferPool};
@@ -415,7 +673,7 @@ std::string_view DeltaEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Delta, TypeTraits<T>::dataType, rowCount, useVarint, pos);
+      encodingType, TypeTraits<T>::dataType, rowCount, useVarint, pos);
 
   // Data layout (after prefix):
   // 4 bytes: restatement relative offset (X = serializedDeltas.size())

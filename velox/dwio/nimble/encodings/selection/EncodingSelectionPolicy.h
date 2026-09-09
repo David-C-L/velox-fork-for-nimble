@@ -158,6 +158,15 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
           std::pair{EncodingType::SimdForBitpack, 0.9f},
           std::pair{EncodingType::BlockBitPacking, 0.9f},
           std::pair{EncodingType::Delta, 0.85f},
+          // Held at the same 0.85 as plain Delta, which it neither displaces
+          // nor competes with on the data Delta already serves: on a
+          // mostly-ascending section Delta restates once and DeltaZigzag pays
+          // for an anchor every stride rows, so Delta wins there on size. The
+          // region this reaches is the one plain Delta refuses -- descending
+          // and oscillating sections, where deltaCostBits returns infinity and
+          // Delta is never selected at all -- so the entry adds a candidate
+          // rather than moving an existing boundary.
+          std::pair{EncodingType::DeltaZigzag, 0.85f},
           std::pair{EncodingType::FOR, 0.85f},
           // Huffman is deliberately absent. It decodes bit-serially through a
           // table, and withdrawing it from SubIntSplit returned up to 3.78x of

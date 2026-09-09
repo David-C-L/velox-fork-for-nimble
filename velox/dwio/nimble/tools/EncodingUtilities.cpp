@@ -61,6 +61,7 @@ void extractCompressionType(
     case EncodingType::SparseBool:
     case EncodingType::Varint:
     case EncodingType::Delta:
+    case EncodingType::DeltaZigzag:
     case EncodingType::DeltaBlock:
     case EncodingType::Constant:
     case EncodingType::MainlyConstant:
@@ -378,7 +379,8 @@ void traverseEncodings(
       }
       break;
     }
-    case EncodingType::Delta: {
+    case EncodingType::Delta:
+    case EncodingType::DeltaZigzag: {
       const char* pos = stream.data() + dataOffset;
       const uint32_t deltaBytes = encoding::readUint32(pos);
       const uint32_t restatementBytes = encoding::readUint32(pos);

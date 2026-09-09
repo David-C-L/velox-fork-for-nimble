@@ -159,7 +159,10 @@ std::unique_ptr<Encoding> EncodingFactory::create(
       return std::make_unique<FsstEncoding>(
           pool, data, stringBufferFactory, options);
     }
-    case EncodingType::Delta: {
+    case EncodingType::Delta:
+    case EncodingType::DeltaZigzag: {
+      // One class reads both: the variant differs only in the residual form,
+      // which it takes from the encoding type in the prefix.
       RETURN_ENCODING_BY_NUMERIC_TYPE(DeltaEncoding, dataType);
     }
     case EncodingType::DeltaBlock: {
@@ -435,6 +438,15 @@ std::string_view EncodingFactory::encode(
       }
       NIMBLE_INCOMPATIBLE_ENCODING(
           "Delta encoding should not be selected for non-numeric data type: {}.",
+          TypeTraits<T>::dataType);
+    }
+    case EncodingType::DeltaZigzag: {
+      if constexpr (isNumericType<physicalType>()) {
+        return DeltaEncoding<T>::encodeZigzag(
+            selection, castedValues, buffer, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "DeltaZigzag encoding should not be selected for non-numeric data type: {}.",
           TypeTraits<T>::dataType);
     }
     case EncodingType::DeltaBlock: {

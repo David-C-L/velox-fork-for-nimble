@@ -153,6 +153,7 @@ auto encodingTypeDispatchNonString(Encoding& encoding, F&& f) {
     case EncodingType::MainlyConstant:
       return f(static_cast<MainlyConstantEncoding<T>&>(encoding));
     case EncodingType::Delta:
+    case EncodingType::DeltaZigzag:
       return f(static_cast<DeltaEncoding<T>&>(encoding));
     case EncodingType::DeltaBlock:
       if constexpr (isIntegralType<T>()) {

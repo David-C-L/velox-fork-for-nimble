@@ -15,8 +15,8 @@
  */
 #pragma once
 
-#include <bit>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -582,6 +582,73 @@ inline double deltaCostBits(
   return kOuterHeaderBits + deltasBits + restatementsBits + isRestatementsBits;
 }
 
+// DeltaZigzag: deltas over zigzag-folded residuals, with an absolute
+// restatement forced every kAnchorStride rows.
+//
+// No monotonicity gate, and that is the point of the model rather than an
+// omission. deltaCostBits above refuses a segment below 90% non-decreasing
+// because plain Delta restates a full value on every decrease, which is a cost
+// that grows with the number of decreases. Folding the sign into the residual
+// removes that cost entirely, so what remains is a fixed anchor overhead that
+// depends on the stride and not on the data. A segment that descends
+// throughout is priced here exactly as one that ascends throughout.
+//
+// The delta array is sized to the widest step in either direction once folded.
+// Doubling the wider magnitude is an upper bound rather than the exact
+// maximum, for the reason given on internal::zigzagResidualBound: a step that
+// wraps the segment's domain is reported by the metrics as a magnitude of at
+// least half the domain, and doubling saturates. Erring high is deliberate --
+// pricing the array narrower than the one that gets written is what would make
+// this look better than it is and take segments it should not.
+// Required: MinMax, DeltaStats
+inline double deltaZigzagCostBits(
+    const SegmentMetrics& m,
+    size_t numValues,
+    int bitWidth) noexcept {
+  if (numValues < 2) {
+    return std::numeric_limits<double>::infinity();
+  }
+  // Mirrors Encoding::Options::deltaZigzagAnchorStride. Restated rather than
+  // read from options because the cost models are handed metrics and widths
+  // and nothing else; the two must be changed together, and a segment priced
+  // at one stride and written at another is the failure this comment exists to
+  // make findable.
+  constexpr double kAnchorStride = 256.0;
+
+  const double numRestatements =
+      std::max(1.0, std::ceil(static_cast<double>(numValues) / kAnchorStride));
+  const double numDeltas = static_cast<double>(numValues) - numRestatements;
+
+  const uint64_t widest = std::max(m.maxDelta, m.maxDecrease);
+  // Saturates to the full segment width rather than overflowing the doubling.
+  const uint64_t residualBound =
+      widest >= (uint64_t{1} << 63) ? ~uint64_t{0} : (widest << 1);
+  const uint8_t residualBitWidth = residualBound == 0
+      ? uint8_t{0}
+      : static_cast<uint8_t>(std::bit_width(residualBound));
+  // A folded residual is a bijection on the segment's own width, so it can
+  // never need more bits than a raw value does however loose the bound above
+  // gets.
+  const uint8_t deltaBitWidth = std::min(
+      residualBitWidth, static_cast<uint8_t>(storageWidthBits(bitWidth)));
+
+  constexpr double kNestedHeaderBits = 7.0 * 8.0;
+  constexpr double kOuterHeaderBits = (6.0 + 4.0 + 4.0) * 8.0;
+
+  const double deltasBits =
+      kNestedHeaderBits + numDeltas * static_cast<double>(deltaBitWidth);
+  const double restatementsBits = kNestedHeaderBits +
+      numRestatements * static_cast<double>(storageWidthBits(bitWidth));
+  const double isRestatementsBits =
+      static_cast<double>(SparseBoolEncoding::estimateSize(
+          static_cast<uint64_t>(numValues),
+          static_cast<uint64_t>(numRestatements),
+          Encoding::Options{})) *
+      8.0;
+
+  return kOuterHeaderBits + deltasBits + restatementsBits + isRestatementsBits;
+}
+
 // FOR (Frame of Reference): fixed-size frames, each bit-packed against a
 // local minimum (reference). The local bit width is estimated from the
 // average step size scaled to the frame size -- a random-walk heuristic
@@ -766,6 +833,8 @@ inline double bestCostBitsRestricted(
       blockBitPackingCostBits(segValues, numValues),
       EncodingType::BlockBitPacking);
   consider(deltaCostBits(m, numValues, bitWidth), EncodingType::Delta);
+  consider(
+      deltaZigzagCostBits(m, numValues, bitWidth), EncodingType::DeltaZigzag);
   consider(forCostBits(m, numValues, bitWidth), EncodingType::FOR);
   // FrequencyPartition is only viable for low-cardinality segments.
   if (m.uniqueCount > 0 && !m.uniqueCountCapped && m.uniqueCount <= 1024) {

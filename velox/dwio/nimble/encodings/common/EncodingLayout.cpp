@@ -401,7 +401,10 @@ EncodingLayout EncodingLayoutCapture::capture(
       }
       break;
     }
-    case EncodingType::Delta: {
+    case EncodingType::Delta:
+    case EncodingType::DeltaZigzag: {
+      // Same three children in the same order: only the residual form differs,
+      // and that is carried by the encoding type rather than by the layout.
       children.reserve(3);
 
       const char* pos = encoding.data() + prefixSize;

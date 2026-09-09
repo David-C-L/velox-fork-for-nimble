@@ -174,6 +174,23 @@ enum class EncodingType {
   // EXPERIMENTAL: Not production-ready. Do not enable for production tables
   // without consulting the Nimble team (oncall: dwios).
   SubIntSplitReordered = 24,
+  // Delta over zigzag-folded residuals, with absolute restatements forced at a
+  // fixed row stride so a seek stays bounded.
+  //
+  // A distinct type rather than a flag inside Delta, for the same reason
+  // SubIntSplitReordered is distinct from SubIntSplit: DeltaEncoding's header
+  // has no spare bits, and a reader that did not know about the folding would
+  // decode residuals as though they were plain deltas and return wrong values
+  // rather than failing.
+  //
+  // Plain Delta restates only when a step is not representable, which makes
+  // its restatements both a necessity and the only thing bounding a seek.
+  // Folding the residual removes the necessity, so this type emits them on a
+  // stride instead: they are pure anchors, and the decoder cannot tell -- and
+  // does not need to tell -- an anchor from a necessity.
+  // EXPERIMENTAL: Not production-ready. Do not enable for production tables
+  // without consulting the Nimble team (oncall: dwios).
+  DeltaZigzag = 25,
 };
 std::string toString(EncodingType encodingType);
 /// Returns the encoding type for 'name'. Throws if 'name' is unknown.

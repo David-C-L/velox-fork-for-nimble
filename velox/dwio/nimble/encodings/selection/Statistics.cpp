@@ -312,6 +312,8 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
     if (rising) {
       ++stats.nonDecreasingCount;
       stats.maxIncrease = std::max(stats.maxIncrease, delta);
+    } else {
+      stats.maxDecrease = std::max(stats.maxDecrease, delta);
     }
   }
   adjacentPairStats_ = stats;

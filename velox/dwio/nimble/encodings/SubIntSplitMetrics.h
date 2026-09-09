@@ -94,6 +94,13 @@ struct SegmentMetrics {
   // required bit width whenever the delta distribution is right-skewed.
   uint64_t maxDelta{0};
 
+  // Max of (v[i-1] - v[i]) over decreasing pairs only, as a magnitude. What a
+  // delta array must additionally cover when the sign is folded into the
+  // residual instead of a decrease being restated, which is how DeltaZigzag
+  // stores one. Free to collect: the magnitude is already computed for
+  // sumAbsDelta on the same pair and would otherwise be discarded.
+  uint64_t maxDecrease{0};
+
   // How many distinct values were seen exactly once, and exactly twice, over
   // the rows that were actually counted (the whole segment, or the prefix
   // scanned before the unique cap stopped the counting).
@@ -260,6 +267,7 @@ class MetricCollector {
     uint64_t sumAbsDelta = 0;
     uint64_t monotonic = 0;
     uint64_t maxDelta = 0;
+    uint64_t maxDecrease = 0;
 
     // Read as values[i - 1] rather than carried in a variable, so that the
     // dependency between adjacent elements is an array access the compiler can
@@ -279,6 +287,7 @@ class MetricCollector {
       // Only a rising pair is a delta the encoding would pack, and taking the
       // maximum against zero on a falling one leaves it alone.
       maxDelta = std::max(maxDelta, rising ? delta : uint64_t{0});
+      maxDecrease = std::max(maxDecrease, rising ? uint64_t{0} : delta);
     }
 
     SegmentMetrics out;
@@ -291,6 +300,7 @@ class MetricCollector {
     out.sumAbsDelta = sumAbsDelta;
     out.monotonicCount = monotonic;
     out.maxDelta = maxDelta;
+    out.maxDecrease = maxDecrease;
 
     // The histogram gets its own pass, scalar, in the same form the general
     // path uses. It is deliberately not in the loop above, and fusing it back
@@ -447,6 +457,8 @@ class MetricCollector {
         if (v >= prev) {
           ++out.monotonicCount;
           out.maxDelta = std::max(out.maxDelta, v - prev);
+        } else {
+          out.maxDecrease = std::max(out.maxDecrease, prev - v);
         }
       }
       prev = v;

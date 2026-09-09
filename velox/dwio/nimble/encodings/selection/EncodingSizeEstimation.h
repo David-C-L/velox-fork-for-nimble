@@ -176,6 +176,14 @@ struct EncodingSizeEstimation {
           return std::nullopt;
         }
       }
+      case EncodingType::DeltaZigzag: {
+        if constexpr (isIntegralType<physicalType>()) {
+          return DeltaEncoding<physicalType>::estimateSizeZigzag(
+              entryCount, statistics, options);
+        } else {
+          return std::nullopt;
+        }
+      }
       case EncodingType::FOR: {
         if constexpr (isIntegralType<physicalType>()) {
           return ForEncoding<physicalType>::estimateSize(

@@ -246,6 +246,12 @@ class Statistics {
     /// to cover the widest delta it stores, so this and not the average is what
     /// sizes one.
     uint64_t maxIncrease{0};
+    /// Largest step over a decreasing pair, as a magnitude. Sizes a delta
+    /// array that folds the sign into the residual rather than restating on a
+    /// decrease, where the width has to cover the widest step in either
+    /// direction. Costs nothing to collect: the loop already computes this
+    /// magnitude for a falling pair and, without this, discards it.
+    uint64_t maxDecrease{0};
     /// Sum of |v[i] - v[i-1]| over every pair, from which an average step
     /// follows for a caller that wants one.
     uint64_t sumAbsoluteDelta{0};

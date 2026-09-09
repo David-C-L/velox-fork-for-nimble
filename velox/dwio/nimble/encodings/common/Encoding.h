@@ -254,6 +254,28 @@ class Encoding {
     /// behaviour again.
     bool subIntSplitAllowDeltaBlock{false};
 
+    /// Row stride at which DeltaZigzag forces an absolute restatement.
+    ///
+    /// Folding the residual removes every necessary restatement, so without a
+    /// forced one a stream would carry exactly one absolute value, at row 0,
+    /// and DeltaEncoding::skip() -- which seeks by finding the last
+    /// restatement at or before the target -- would degrade to replaying the
+    /// whole prefix. These anchors are what keep a seek bounded at `stride`
+    /// accumulate steps.
+    ///
+    /// Does not appear on the wire. Placement is recorded in the
+    /// is-restatement bitmap the format already carries, so the decoder
+    /// derives everything from the bitmap and a writer may change this
+    /// without breaking any reader.
+    ///
+    /// 256 balances three things. Below 256 the anchors start costing
+    /// DeltaEncoding::materialize() its fast path, which tests 16 bitmap bits
+    /// at a time and takes a branchless loop only for an all-delta chunk: at
+    /// 256 one chunk in 16 carries an anchor, at 16 every chunk would. Above
+    /// 256 the seek bound grows for anchor savings already below one bit per
+    /// row (~0.3 bits/row at 256 for a 64-bit stream).
+    uint32_t deltaZigzagAnchorStride{256};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

@@ -45,6 +45,7 @@ struct ChunkMeasurement {
 uint8_t nestedChildrenCount(nimble::EncodingType encodingType) {
   switch (encodingType) {
     case nimble::EncodingType::Delta:
+    case nimble::EncodingType::DeltaZigzag:
     case nimble::EncodingType::BlockBitPacking:
     case nimble::EncodingType::FOR:
       return 3;
