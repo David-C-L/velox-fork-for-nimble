@@ -319,12 +319,48 @@ typename HuffmanEncoding<T>::physicalType HuffmanEncoding<T>::decodeValue(
   NIMBLE_UNREACHABLE("Invalid Huffman row {}", row);
 }
 
+// Decodes the run in one forward pass over the bitstream.
+//
+// decodeValue replays from the nearest checkpoint on every call, so asking it
+// for a whole run re-decoded the same prefix once per row: with a stride of
+// kCheckpointStride that is ~128 redundant symbol decodes per row. Codes are
+// variable length, so a row's bit offset genuinely is only reachable by
+// decoding forward -- but only once, not once per row. The replay to the
+// starting row is still paid, bounded by the stride and charged per call.
+//
+// decodeValue is left as it is: it remains the point path, where there is no
+// preceding row to carry a bit offset from.
 template <typename T>
 void HuffmanEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
   NIMBLE_DCHECK_LE(currentRow_ + rowCount, this->rowCount_);
+  if (rowCount == 0) {
+    return;
+  }
   auto* output = static_cast<physicalType*>(buffer);
+
+  const uint32_t checkpoint = currentRow_ / kCheckpointStride;
+  uint32_t bitOffset = checkpoints_[checkpoint];
+  const uint32_t mask = (1u << tableLog_) - 1;
+
+  auto nextEntry = [&]() {
+    uint32_t bits = 0;
+    const uint32_t byteOffset = bitOffset >> 3;
+    const uint32_t available =
+        std::min<uint32_t>(4, bitstreamBytes_ - byteOffset);
+    std::memcpy(&bits, bitstream_ + byteOffset, available);
+    bits >>= bitOffset & 7;
+    const auto entry = decodeTable_[bits & mask];
+    NIMBLE_CHECK_GT(entry.bits, 0);
+    bitOffset += entry.bits;
+    return entry;
+  };
+
+  for (uint32_t row = checkpoint * kCheckpointStride; row < currentRow_;
+       ++row) {
+    nextEntry();
+  }
   for (uint32_t i = 0; i < rowCount; ++i) {
-    output[i] = decodeValue(currentRow_ + i);
+    output[i] = alphabet_[nextEntry().symbol];
   }
   currentRow_ += rowCount;
 }

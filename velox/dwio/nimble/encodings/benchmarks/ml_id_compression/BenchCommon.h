@@ -49,6 +49,7 @@
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
+#include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
@@ -1095,6 +1096,13 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   encoders.push_back(
       makeEncoderEntry<MainlyConstantEncoding<T>>(
           "MainlyConstant", "Baseline", "mainly_constant", true, false, false));
+  // Huffman has no top-level arm of its own, only the SIS/huffOn and huffOff
+  // planner flag, so its own decode throughput has never been measured here.
+  // The withdrawal of Huffman from SubIntSplit's nested candidates rests on a
+  // bulk decode figure, which makes that figure worth measuring directly.
+  encoders.push_back(
+      makeEncoderEntry<HuffmanEncoding<T>>(
+          "Huffman", "Baseline", "huffman", true, false, false));
 
   // Read-path variants. Each encodes byte-for-byte identically to the entry it
   // shadows and differs only in reading by index rather than by cursor, so the
