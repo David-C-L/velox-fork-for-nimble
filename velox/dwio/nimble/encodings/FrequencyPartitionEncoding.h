@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -481,23 +482,189 @@ class FrequencyPartitionEncoding
     return rank;
   }
 
+  // Counts positions in [begin, end) whose unpacked tag equals `target`,
+  // using word-parallel (SWAR) comparison instead of one unpack per position.
+  //
+  // Each 64-bit word is assembled at the bit offset of position `j` and
+  // treated as `fieldsPerWord = 64 / tagBits` packed fields. `target` is
+  // broadcast into every field and XORed against the word, so a matching
+  // field becomes all-zero and a mismatching field is nonzero. An OR-fold
+  // (repeatedly OR-ing each field's bits down into its own low bit, one bit
+  // of shift at a time) turns "field is nonzero" into a single bit per
+  // field with no cross-field interaction, then a popcount over the
+  // complemented low bits counts the matches in one instruction sequence.
+  // The OR-fold is deliberately single-bit-step rather than the doubling
+  // 1,2,4,... step sequence a byte-parallel "any zero byte" trick normally
+  // uses: doubling can fold in a bit from the *next* field once the
+  // cumulative shift reaches tagBits, silently corrupting the match/no-match
+  // result for that field. Single-bit steps keep every folded-in bit inside
+  // the field it started in.
+  //
+  // A word-sized load starting at bit offset `bitOff` can need up to
+  // bitOff + 64 bits -- up to 127, i.e. 16 bytes, not 8 -- so an unaligned
+  // window is assembled from two 8-byte loads (`lo`, `hi`) and spliced with
+  // a shift-and-or; reading only 8 bytes here would zero-fill the top
+  // fields instead of supplying their real bits, understating a mismatch
+  // (and overstating a match against tag 0) for however many fields the
+  // load was short. (Both mistakes were caught by fuzzing this function
+  // against the scalar loop before this landed -- the had-zero-field
+  // subtraction trick and the doubling OR-fold both look right and are
+  // both wrong for this use.)
+  //
+  // Falls back to the scalar unpack for: the head/tail of the range (whatever
+  // does not fill a whole word), and any word for which the two-word load
+  // would read past the end of tagArray_. tagBits <= 8 is required (same
+  // precondition as unpackTagAt); it always holds here since tagBits is
+  // ceilLog2(numTiers + 1) and numTiers <= kMaxTiers.
+  uint32_t countEqualTag(
+      uint32_t begin,
+      uint32_t end,
+      uint8_t target) const {
+    if (begin >= end) {
+      return 0;
+    }
+    const uint8_t* tagBase = tagArray_.data();
+#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
+    if (!swarCountEnabledForBench_) {
+      uint32_t count = 0;
+      for (uint32_t j = begin; j < end; ++j) {
+        count += (unpackTagAt(tagBase, j, tagBits_) == target) ? 1 : 0;
+      }
+      return count;
+    }
+#endif
+    const uint32_t fieldsPerWord = 64 / tagBits_;
+    if (fieldsPerWord == 0) {
+      // tagBits_ > 64 cannot happen (max 8), but guards against a nonsense
+      // shift below if it ever did.
+      uint32_t count = 0;
+      for (uint32_t j = begin; j < end; ++j) {
+        count += (unpackTagAt(tagBase, j, tagBits_) == target) ? 1 : 0;
+      }
+      return count;
+    }
+    // One bit set at the low bit of every field: both a per-field "OR-fold
+    // result" mask and, multiplied by `target`, the broadcast of `target`
+    // into every field.
+    uint64_t ones = 0;
+    for (uint32_t i = 0; i < fieldsPerWord; ++i) {
+      ones |= uint64_t{1} << (i * tagBits_);
+    }
+    const uint64_t targetBroadcast = ones * static_cast<uint64_t>(target);
+    const size_t tagArrayBytes = tagArray_.size();
+
+    uint32_t count = 0;
+    uint32_t j = begin;
+    while (j < end) {
+      const uint32_t remaining = end - j;
+      const size_t bitPos = static_cast<size_t>(j) * tagBits_;
+      const size_t byteIdx = bitPos / 8;
+      const uint32_t bitOff = static_cast<uint32_t>(bitPos % 8);
+      if (remaining < fieldsPerWord || byteIdx + 16 > tagArrayBytes) {
+        const uint32_t blockEnd = std::min(j + fieldsPerWord, end);
+        for (uint32_t k = j; k < blockEnd; ++k) {
+          count += (unpackTagAt(tagBase, k, tagBits_) == target) ? 1 : 0;
+        }
+        j = blockEnd;
+        continue;
+      }
+      uint64_t lo;
+      uint64_t hi;
+      std::memcpy(&lo, tagBase + byteIdx, sizeof(lo));
+      std::memcpy(&hi, tagBase + byteIdx + 8, sizeof(hi));
+      const uint64_t word =
+          (bitOff == 0) ? lo : ((lo >> bitOff) | (hi << (64 - bitOff)));
+      uint64_t t = word ^ targetBroadcast;
+      for (uint32_t shift = 1; shift < tagBits_; ++shift) {
+        t |= t >> 1;
+      }
+      const uint64_t matchLowBits = ~t & ones;
+      count += static_cast<uint32_t>(__builtin_popcountll(matchLowBits));
+      j += fieldsPerWord;
+    }
+    return count;
+  }
+
   // Count elements with tag == tierIdx strictly before position `pos`.
-  // Uses tierRankSamples_ and tagArray_. tierIdx == tiers_.size() is fallback.
+  // Uses tierRankSamples_ and tagArray_. tierIdx == tiers_.size() is
+  // fallback: tag values >= tiers_.size() (a range predicate, not a single
+  // value), so that bucket is counted with the scalar loop rather than the
+  // equality-only SWAR path.
+  //
+  // Reuses the per-tier scan cursor (cursorPos_/cursorRank_/cursorValid_)
+  // when the cursor sits between the nearest sample and `pos`, so a
+  // caller visiting positions in ascending order (as gather probes do,
+  // and as materializeImpl's seeding step does across consecutive tiers of
+  // the same range) rescans only the gap since its last call instead of
+  // replaying from the sample every time.
   uint32_t tierRankAtForTag(uint32_t tierIdx, uint32_t pos) const {
     const uint32_t sampleIdx = pos / kRankSampleStride;
+    const uint32_t sampleStart = sampleIdx * kRankSampleStride;
+
+    uint32_t scanStart = sampleStart;
     uint32_t rank = tierRankSamples_[tierIdx][sampleIdx];
-    const uint32_t scanStart = sampleIdx * kRankSampleStride;
-    const uint8_t* tagBase = tagArray_.data();
-    const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
-    for (uint32_t j = scanStart; j < pos; ++j) {
-      const uint8_t t = unpackTagAt(tagBase, j, tagBits_);
-      const uint32_t b = (t < numActiveTiers) ? t : numActiveTiers;
-      if (b == tierIdx) {
-        ++rank;
+#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
+    if (cursorReuseEnabledForBench_)
+#endif
+    {
+      if (cursorValid_[tierIdx] && cursorPos_[tierIdx] <= pos &&
+          cursorPos_[tierIdx] > scanStart) {
+        scanStart = cursorPos_[tierIdx];
+        rank = cursorRank_[tierIdx];
       }
+    }
+
+    const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
+    if (tierIdx < numActiveTiers) {
+      rank += countEqualTag(scanStart, pos, static_cast<uint8_t>(tierIdx));
+    } else {
+      const uint8_t* tagBase = tagArray_.data();
+      for (uint32_t j = scanStart; j < pos; ++j) {
+        if (unpackTagAt(tagBase, j, tagBits_) >= numActiveTiers) {
+          ++rank;
+        }
+      }
+    }
+
+#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
+    if (cursorReuseEnabledForBench_)
+#endif
+    {
+      cursorPos_[tierIdx] = pos;
+      cursorRank_[tierIdx] = rank;
+      cursorValid_[tierIdx] = true;
     }
     return rank;
   }
+
+#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
+ public:
+  // Testing-only knobs that isolate each tierRankAtForTag optimisation for
+  // benchmarking. Compiled in only under this macro, so the shipped binary
+  // (built without it) carries neither the flags nor the branch that reads
+  // them: both optimisations are unconditionally active there. Not part of
+  // the encoding format.
+  static void setSwarCountEnabledForBench(bool value) {
+    swarCountEnabledForBench_ = value;
+  }
+  static void setCursorReuseEnabledForBench(bool value) {
+    cursorReuseEnabledForBench_ = value;
+  }
+  // In-memory size of tierRankSamples_ in bytes, for reporting the space a
+  // larger kRankSampleStride gives back. This table is rebuilt at decode
+  // construction and never serialised, so it has no effect on payload_bytes.
+  size_t tierRankSamplesBytesForBench() const {
+    size_t total = 0;
+    for (const auto& perTier : tierRankSamples_) {
+      total += perTier.size() * sizeof(uint32_t);
+    }
+    return total;
+  }
+
+ private:
+  inline static bool swarCountEnabledForBench_{true};
+  inline static bool cursorReuseEnabledForBench_{true};
+#endif
 
   // ---------------------------------------------------------------------------
   // Per-index-type decode helpers
@@ -538,6 +705,24 @@ class FrequencyPartitionEncoding
   // tierRankSamples_[t][si] = count of tag==t in positions [0,
   // si*kRankSampleStride) Index tiers_.size() is used for the fallback bucket.
   std::vector<std::vector<uint32_t>> tierRankSamples_;
+
+  // Forward-scan cursor for tierRankAtForTag, keyed the same way as
+  // tierRankSamples_ (index tiers_.size() is the fallback bucket).
+  // cursorPos_[t]/cursorRank_[t] record the position and rank of the most
+  // recent tierRankAtForTag(t, ...) call, so a later call at a position ahead
+  // of the cursor can resume scanning from there instead of from the nearest
+  // sample. Gather probes visit rows in ascending original-row order (see
+  // readWithVisitor), which is exactly the access pattern this rewards.
+  //
+  // Declared mutable because tierRankAtForTag is const: it is a cache of
+  // already-computed ranks, not part of the encoding's decoded value. This is
+  // safe without synchronization because a decoded Encoding is always owned
+  // through a single std::unique_ptr (see EncodingFactory) and never shared
+  // across threads -- the same assumption the existing currentOriginalPos_ /
+  // currentTier_ streaming cursors already rely on.
+  mutable std::vector<uint32_t> cursorPos_;
+  mutable std::vector<uint32_t> cursorRank_;
+  mutable std::vector<bool> cursorValid_;
 };
 
 //
@@ -747,6 +932,9 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
               (totalRowCount_ + kRankSampleStride - 1) / kRankSampleStride + 1;
           tierRankSamples_.assign(
               numBuckets, std::vector<uint32_t>(numSamples, 0));
+          cursorPos_.assign(numBuckets, 0);
+          cursorRank_.assign(numBuckets, 0);
+          cursorValid_.assign(numBuckets, false);
 
           std::vector<uint32_t> counts(numBuckets, 0);
           for (uint32_t i = 0; i < totalRowCount_; ++i) {
