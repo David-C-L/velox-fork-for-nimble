@@ -347,6 +347,13 @@ inline constexpr std::array<uint32_t, 3> kBlockElementCounts{
     65'536,
     262'144};
 
+/// Block size standing for "no blocking at all": one block covering any column
+/// the sweep runs, so the codec sees the whole payload and a read must
+/// decompress all of it. The motivation figure needs that point for Zstd the
+/// way openzl/auto supplies it for OpenZL, and expressing it as a block size
+/// keeps both codecs on one code path instead of adding a second arm shape.
+inline constexpr uint32_t kWholePayloadBlockElements = 1u << 30;
+
 /// Builds one arm for a codec at one block size.
 ///
 /// `codecName` becomes the arm's prefix, so the codec and the block size are
@@ -390,13 +397,25 @@ EncoderEntry<T> makeBlockCodecEntry(
 template <typename T>
 std::vector<EncoderEntry<T>> buildZstdBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
-  entries.reserve(kBlockElementCounts.size());
+  entries.reserve(kBlockElementCounts.size() + 1);
   for (const uint32_t blockSize : kBlockElementCounts) {
     entries.push_back(makeBlockCodecEntry<T>(
         "zstd", "Zstd", blockSize, []() -> std::unique_ptr<BlockCodec<T>> {
           return std::make_unique<NimbleBlockCodec<T>>(CompressionType::Zstd);
         }));
   }
+  // The unblocked baseline, named to match openzl/auto rather than the
+  // block-<n> arms, because a single block is a different claim about the
+  // format: it cannot seek at all.
+  entries.push_back(makeBlockCodecEntry<T>(
+      "zstd",
+      "Zstd",
+      kWholePayloadBlockElements,
+      []() -> std::unique_ptr<BlockCodec<T>> {
+        return std::make_unique<NimbleBlockCodec<T>>(CompressionType::Zstd);
+      }));
+  entries.back().name = "zstd/auto";
+  entries.back().variant = "auto";
   return entries;
 }
 
