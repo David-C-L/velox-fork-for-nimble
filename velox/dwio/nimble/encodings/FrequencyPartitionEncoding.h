@@ -71,9 +71,12 @@
 // Index payload layout (TierTagArray):
 //   1 byte: tagBits = ceilLog2(numTiers + 1), minimum 1
 //   3 bytes: padding
-//   4 bytes: tagArrayByteCount
-//   [tagArrayByteCount]: packed tag array (LSB-first; tag = tier index
-//                        0..numTiers-1, or numTiers for fallback)
+//   4 bytes: tagStreamByteCount
+//   [tagStreamByteCount]: nested encoding of the tag per row (tag = tier
+//                         index 0..numTiers-1, or numTiers for fallback).
+//                         The constructor decodes it once and repacks it
+//                         LSB-first at tagBits per row, which is the form
+//                         every read works from.
 //
 // Index payload layout (EliasFano):
 //   For each non-empty tier (same order as above):
@@ -706,10 +709,36 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
         case FreqPartIndexType::TierTagArray: {
           tagBits_ = encoding::read<uint8_t>(pos);
           pos += 3; // skip alignment padding
-          const uint32_t tagArrayByteCount = encoding::readUint32(pos);
-          tagArray_.resize(tagArrayByteCount);
-          std::memcpy(tagArray_.data(), pos, tagArrayByteCount);
-          pos += tagArrayByteCount;
+          const uint32_t tagStreamBytes = encoding::readUint32(pos);
+          {
+            auto tagEncoding = encodingFactory.create(
+                *this->pool_,
+                std::string_view(pos, tagStreamBytes),
+                stringBufferFactory);
+            Vector<uint32_t> tagValues(this->pool_);
+            tagValues.resize(totalRowCount_);
+            tagEncoding->materialize(totalRowCount_, tagValues.data());
+            const size_t packedBytes =
+                (static_cast<size_t>(totalRowCount_) * tagBits_ + 7) / 8;
+            tagArray_.resize(packedBytes);
+            std::fill(tagArray_.begin(), tagArray_.end(), 0);
+            uint64_t acc = 0;
+            size_t accBits = 0;
+            size_t outByte = 0;
+            for (uint32_t i = 0; i < totalRowCount_; ++i) {
+              acc |= static_cast<uint64_t>(tagValues[i]) << accBits;
+              accBits += tagBits_;
+              while (accBits >= 8) {
+                tagArray_[outByte++] = static_cast<uint8_t>(acc & 0xFF);
+                acc >>= 8;
+                accBits -= 8;
+              }
+            }
+            if (accBits > 0) {
+              tagArray_[outByte] = static_cast<uint8_t>(acc & 0xFF);
+            }
+          }
+          pos += tagStreamBytes;
 
           // Single O(N) pass: build per-tier sampled rank index.
           const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
@@ -1353,8 +1382,6 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     // Build tag array: tag[pos] = tier index (0..numTiers-1) or numTiers
     // (fallback).
     const uint8_t tagBits = ceilLog2WithMinOne(numTiers + 1);
-    const size_t tagArrayByteCount =
-        (static_cast<size_t>(valueCount) * tagBits + 7) / 8;
 
     // Reverse map: row → tag
     std::vector<uint8_t> rowToTag(valueCount, static_cast<uint8_t>(numTiers));
@@ -1364,33 +1391,32 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
       }
     }
 
-    // Pack tags into byte array using accumulator pattern.
-    std::vector<uint8_t> tagArray(tagArrayByteCount, 0);
-    uint64_t tagAcc = 0;
-    size_t tagAccBits = 0;
-    size_t tagByteOut = 0;
+    // The tag stream goes through nested selection rather than being packed at
+    // a fixed tagBits width. Tags are the tier a row landed in, so their
+    // distribution is the tier distribution, which is skewed by construction:
+    // tiers exist because some values are far more frequent than others. A
+    // fixed-width packing spends ceilLog2(numTiers + 1) bits on every row and
+    // cannot use that skew. The constructor decodes this stream once and
+    // repacks it to the fixed width, so whatever it costs to decode is paid
+    // per encoding rather than per read.
+    Vector<uint32_t> tagValues(pool);
+    tagValues.reserve(valueCount);
     for (uint32_t pos = 0; pos < valueCount; ++pos) {
-      tagAcc |= static_cast<uint64_t>(rowToTag[pos]) << tagAccBits;
-      tagAccBits += tagBits;
-      while (tagAccBits >= 8) {
-        tagArray[tagByteOut++] = static_cast<uint8_t>(tagAcc & 0xFF);
-        tagAcc >>= 8;
-        tagAccBits -= 8;
-      }
+      tagValues.push_back(static_cast<uint32_t>(rowToTag[pos]));
     }
-    if (tagAccBits > 0) {
-      tagArray[tagByteOut] = static_cast<uint8_t>(tagAcc & 0xFF);
-    }
-
-    // Write: tagBits (1) + padding (3) + tagArrayByteCount (4) + tag data
+    const std::string_view serializedTags =
+        selection.template encodeNested<uint32_t>(
+            EncodingIdentifiers::FrequencyPartition::TierTags,
+            {tagValues},
+            scopedBuffer.get(),
+            options);
     indexPayload.push_back(static_cast<char>(tagBits));
-    indexPayload.resize(indexPayload.size() + 3, '\0'); // 3 bytes padding
-    const uint32_t tagByteCount32 = static_cast<uint32_t>(tagArrayByteCount);
-    const char* bc = reinterpret_cast<const char*>(&tagByteCount32);
+    indexPayload.resize(indexPayload.size() + 3, '\0');
+    const uint32_t nestedBytes = static_cast<uint32_t>(serializedTags.size());
+    const char* bc = reinterpret_cast<const char*>(&nestedBytes);
     indexPayload.insert(indexPayload.end(), bc, bc + 4);
-    const char* tagBytes = reinterpret_cast<const char*>(tagArray.data());
     indexPayload.insert(
-        indexPayload.end(), tagBytes, tagBytes + tagArrayByteCount);
+        indexPayload.end(), serializedTags.begin(), serializedTags.end());
 
   } else if (indexType == FreqPartIndexType::EliasFano) {
     // Build per-tier Elias-Fano position encodings.

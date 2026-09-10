@@ -138,7 +138,7 @@ class BenchEncodingSelectionPolicy
 
   std::unique_ptr<nimble::EncodingSelectionPolicyBase> createImpl(
       nimble::EncodingType parentEncodingType,
-      nimble::NestedEncodingIdentifier /* identifier */,
+      nimble::NestedEncodingIdentifier nestedEncodingIdentifier,
       nimble::DataType type) override {
     // With realNestedSelection set, a sub-stream's encodings are chosen by the
     // writer's own cost-based factory rather than forced to Trivial, so
@@ -147,8 +147,12 @@ class BenchEncodingSelectionPolicy
     // std::nullopt.
     //
     // The candidate list comes from nestedEncodingReadFactors, the same
-    // function ManualEncodingSelectionPolicy::createImpl uses, and
-    // parentEncodingType is forwarded to it rather than discarded. Discarding
+    // function ManualEncodingSelectionPolicy::createImpl uses, and both
+    // parentEncodingType and the nested identifier are forwarded to it rather
+    // than discarded. The identifier was dropped here until the index streams
+    // became role-scoped, at which point dropping it would have offered the
+    // writer an encoding this policy withheld -- the same divergence the note
+    // below describes, in the other direction and just as quiet. Discarding
     // it is what made this policy differ from the writer: the augmented list a
     // SubIntSplit section gets is keyed on the parent type, so dropping the
     // parent silently offered a section eight encodings where the writer offers
@@ -162,7 +166,8 @@ class BenchEncodingSelectionPolicy
           nimble::nestedEncodingReadFactors(
               nimble::ManualEncodingSelectionPolicyFactory::
                   defaultEncodingReadFactors(),
-              parentEncodingType),
+              parentEncodingType,
+              nestedEncodingIdentifier),
           compressionOptionsFor(compressionType_)}
           .createPolicy(type);
     }

@@ -98,6 +98,27 @@ using EncodingSelectionPolicyCreator =
 #define UNIQUE_PTR_FACTORY(data_type, class, ...) \
   UNIQUE_PTR_FACTORY_EXTRA(data_type, class, , __VA_ARGS__)
 
+/// Whether a nested stream is decoded once when its parent encoding is
+/// constructed, rather than on every read that touches it.
+///
+/// Only the positional index of FrequencyPartition qualifies today: the tag
+/// stream is materialised and repacked in the constructor, and every read
+/// afterwards works from the packed form.
+inline bool isDecodedOnceAtConstruction(
+    EncodingType parentEncodingType,
+    std::optional<NestedEncodingIdentifier> nestedEncodingIdentifier) {
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+  return parentEncodingType == EncodingType::FrequencyPartition &&
+      nestedEncodingIdentifier.has_value() &&
+      nestedEncodingIdentifier.value() ==
+      EncodingIdentifiers::FrequencyPartition::TierTags;
+#else
+  (void)parentEncodingType;
+  (void)nestedEncodingIdentifier;
+  return false;
+#endif
+}
+
 /// The encodings a nested stream may be chosen from, given the candidates its
 /// parent was chosen from and the encoding the parent settled on.
 ///
@@ -111,7 +132,9 @@ using EncodingSelectionPolicyCreator =
 /// plausible sizes, and only the sizes differ.
 inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
     const std::vector<std::pair<EncodingType, float>>& parentReadFactors,
-    EncodingType parentEncodingType) {
+    EncodingType parentEncodingType,
+    std::optional<NestedEncodingIdentifier> nestedEncodingIdentifier =
+        std::nullopt) {
   std::vector<std::pair<EncodingType, float>> nested;
   nested.reserve(parentReadFactors.size());
   // In each sub-level of the encoding selection, we exclude the encodings
@@ -195,6 +218,33 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
     }
   }
 #endif
+
+  // Streams that are decoded once at construction rather than on every read.
+  //
+  // A sub-stream in this role is materialised in full when the encoding is
+  // built and then never touched again by a read: the reader works from the
+  // decoded form, so what the stream costs to decode is paid once per encoding
+  // rather than once per row. That makes encodings admissible here that are
+  // rightly withheld from section payloads, where decode cost is per-read and
+  // a slow section throttles the whole column.
+  //
+  // Huffman is the case in point. It is deliberately absent from the
+  // SubIntSplit list above because it decodes serially, and that cost lands on
+  // every read of a section it encodes. In this role it lands once, against a
+  // stream whose symbol distribution is exactly what an entropy coder is for.
+  //
+  // Membership is by role, not by encoding: any sub-stream that is decoded
+  // once at construction belongs here, and the list should grow as such
+  // streams appear rather than being read as a rule about one encoding.
+  if (isDecodedOnceAtConstruction(
+          parentEncodingType, nestedEncodingIdentifier)) {
+    if (std::find_if(nested.begin(), nested.end(), [](const auto& entry) {
+          return entry.first == EncodingType::Huffman;
+        }) == nested.end()) {
+      nested.emplace_back(EncodingType::Huffman, 0.85f);
+    }
+  }
+
   return nested;
 }
 
@@ -422,7 +472,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         ? nestedEncodingReadFactorsOverride_.value()
         : candidateEncodingReadFactors_;
     auto nestedEncodingReadFactors = nimble::nestedEncodingReadFactors(
-        sourceEncodingReadFactors, parentEncodingType);
+        sourceEncodingReadFactors, parentEncodingType, nestedEncodingIdentifier);
     UNIQUE_PTR_FACTORY(
         nestedDataType,
         ManualEncodingSelectionPolicy,

@@ -97,11 +97,24 @@ inline Encoding::Options sectionEncodingOptions(
   sectionOptions.fixedBitWidthUseExactBits = true;
   // FrequencyPartitionEncoding with NoIndex (frequencyPartitionIndex == 0)
   // outputs values in tier-reordered order, which would desync this section
-  // from sibling sections at decode time. PerTierBitmaps (1) keeps
-  // materialize() in original row order for every sub-encoding that reads this
-  // field.
+  // from sibling sections at decode time, so a section always carries an
+  // index.
+  //
+  // TierTagArray (2) rather than PerTierBitmaps (1). A bitmap per tier costs
+  // one bit per row per tier whatever the tier distribution; a tag array costs
+  // ceilLog2(tiers + 1) bits per row and is the cheaper of the two from three
+  // tiers up, which is where sections land. It is also the faster of the two
+  // on a contiguous read, since a row needs one tag rather than a test against
+  // every tier's bitmap.
+  //
+  // The cost is random access. A tag array has no rank structure, so a point
+  // read scans a sampled stride to recover the row's rank within its tier;
+  // bitmaps answer the same question from a Rank9 superblock. Sections are
+  // read contiguously far more often than they are probed, and a slow section
+  // throttles the whole column on a scan, so the contiguous case is the one
+  // this weighs. A workload dominated by point reads wants the other choice.
   sectionOptions.frequencyPartitionIndex =
-      1u; // FreqPartIndexType::PerTierBitmaps
+      2u; // FreqPartIndexType::TierTagArray
   return sectionOptions;
 }
 
