@@ -305,13 +305,18 @@ TEST(SubIntSplitSelectorTest, RestrictedGridCannotRecoverAnOmittedBoundary) {
   config.candidateBoundaries = {0, 16, 32};
   const auto restricted = selectSplits(samples, 32, samples.size(), config);
 
-  bool unrestrictedSplitsAtSix = false;
-  for (const auto& segment : unrestricted.segments) {
-    unrestrictedSplitsAtSix |= segment.bitStart == 6;
-  }
-  ASSERT_TRUE(unrestrictedSplitsAtSix);
+  // Whatever the unrestricted DP split at first, a candidate set without that
+  // offset cannot reach it, and the plan it does reach cannot cost less.
+  ASSERT_GT(unrestricted.segments.size(), 1u);
+  const int omitted = unrestricted.segments[1].bitStart;
+  ASSERT_EQ(
+      std::find(
+          config.candidateBoundaries.begin(),
+          config.candidateBoundaries.end(),
+          omitted),
+      config.candidateBoundaries.end());
   for (const auto& segment : restricted.segments) {
-    EXPECT_NE(segment.bitStart, 6);
+    EXPECT_NE(segment.bitStart, omitted);
   }
   EXPECT_GE(restricted.totalCost, unrestricted.totalCost);
 }

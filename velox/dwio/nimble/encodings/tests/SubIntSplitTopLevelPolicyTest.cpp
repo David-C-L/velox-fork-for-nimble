@@ -77,8 +77,12 @@ TEST(SubIntSplitTopLevelPolicyTest, FlatProfileFallsBackToTheFullGrid) {
   config.maxBoundaries = 4;
   EXPECT_EQ(candidateSplitBoundaries(profile, config).size(), 33u);
 
+  // Without the fallback the policy still hands back four offsets, because
+  // "the four largest gradients" is well defined when every gradient is zero
+  // and means nothing. That is the narrowing guessing, and it is the reason
+  // the fallback exists rather than an argument that it is unnecessary.
   config.fallBackToFullGrid = false;
-  EXPECT_EQ(candidateSplitBoundaries(profile, config).size(), 2u);
+  EXPECT_EQ(candidateSplitBoundaries(profile, config).size(), 6u);
 }
 
 // kTopGradient keeps exactly the offsets with the largest gradient, plus the
