@@ -339,10 +339,22 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   size_t numBlockDecodes_{0};
 };
 
-/// Block sizes swept, in elements. At 8 bytes per element they are 8 KB
-/// (vector scale), 512 KB and 2 MB (row-group scale), which brackets what a
-/// columnar format actually ships.
-inline constexpr std::array<uint32_t, 3> kBlockElementCounts{
+/// Block sizes swept, in elements. At 8 bytes per element these run from
+/// 512 B through 8 KB (vector scale) to 512 KB and 2 MB (row-group scale),
+/// which brackets what a columnar format actually ships and then goes below
+/// it deliberately.
+///
+/// The two smallest exist to find where compression breaks. Blocking a
+/// heavyweight codec is the obvious way to buy back the random access it
+/// lacks, and at 1024 elements it looks free: Zstd is smaller blocked than
+/// whole (50.40 against 54.15 bits per element on twitter-snowflake), so the
+/// ladder as it stood suggested smaller blocks are strictly better. A codec
+/// cannot amortise its own header and dictionary over 64 or 256 values, so
+/// the ratio has to turn somewhere below 1024, and the figure needs the turn
+/// to be visible rather than asserted.
+inline constexpr std::array<uint32_t, 5> kBlockElementCounts{
+    64,
+    256,
     1024,
     65'536,
     262'144};
