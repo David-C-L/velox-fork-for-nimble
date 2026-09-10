@@ -32,6 +32,12 @@
 
 DEFINE_bool(validate, false, "Round-trip check after encoding");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
+DEFINE_bool(
+    mlidc_encode_profile,
+    false,
+    "Attribute SubIntSplit encode time to its phases and emit them as extra "
+    "columns. Adds one untimed warm encode per arm to fill the counters, so "
+    "the timed measurement itself is unaffected.");
 
 constexpr std::string_view kDriver = "bench_encode";
 
@@ -113,6 +119,22 @@ int runBenchmark() {
       "encode_MBps",
       "skipped"};
 
+  if (FLAGS_mlidc_encode_profile) {
+    for (const char* column :
+         {"profile_total_ns",
+          "profile_select_splits_ns",
+          "profile_extract_section_ns",
+          "profile_encode_section_ns",
+          "profile_transform_apply_ns",
+          "profile_serialize_ns",
+          "profile_unattributed_ns",
+          "profile_num_extract_section",
+          "profile_num_encode_section",
+          "profile_num_transform_priced"}) {
+      csvColumns.emplace_back(column);
+    }
+  }
+
   std::string csvPath = FLAGS_mlidc_output_csv.empty() ? "bench_encode.csv"
                                                        : FLAGS_mlidc_output_csv;
   CsvResultWriter csv(csvPath, csvColumns);
@@ -139,6 +161,7 @@ int runBenchmark() {
     for (const auto& enc : context.encoders) {
       facebook::nimble::Encoding::Options opts;
       std::unique_ptr<NimbleBenchTargetBase<Elem>> target;
+      facebook::nimble::detail::subintsplit::EncodeProfile encodeProfile;
 
       CacheController controller(hotPolicy, topo);
 
@@ -146,6 +169,21 @@ int runBenchmark() {
         auto result = measure(spec, controller, emptyTargets, [&]() {
           target = enc.factory(data, opts);
         });
+
+        // One extra encode with the counters attached, outside the timed
+        // region, so instrumentation cannot perturb encode_Meps. The phase
+        // shares come from this encode; the throughput from the one above.
+        if (FLAGS_mlidc_encode_profile) {
+          facebook::nimble::Encoding::Options profileOpts = opts;
+          profileOpts.subIntSplitEncodeProfile = &encodeProfile;
+          const auto profileStart = std::chrono::steady_clock::now();
+          auto profiled = enc.factory(data, profileOpts);
+          encodeProfile.totalNs =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - profileStart)
+                  .count();
+          (void)profiled;
+        }
 
         const size_t payloadBytes = target->payloadSize();
         const double ratio = rawBytes > 0
@@ -181,6 +219,24 @@ int runBenchmark() {
         csv.set("encode_Meps", meps);
         csv.set("encode_MBps", mbps);
         csv.set("skipped", int64_t{0});
+        if (FLAGS_mlidc_encode_profile) {
+          csv.set("profile_total_ns", encodeProfile.totalNs);
+          csv.set("profile_select_splits_ns", encodeProfile.selectSplitsNs);
+          csv.set("profile_extract_section_ns", encodeProfile.extractSectionNs);
+          csv.set("profile_encode_section_ns", encodeProfile.encodeSectionNs);
+          csv.set("profile_transform_apply_ns", encodeProfile.transformApplyNs);
+          csv.set("profile_serialize_ns", encodeProfile.serializeNs);
+          csv.set("profile_unattributed_ns", encodeProfile.unattributedNs());
+          csv.set(
+              "profile_num_extract_section",
+              static_cast<int64_t>(encodeProfile.numExtractSection));
+          csv.set(
+              "profile_num_encode_section",
+              static_cast<int64_t>(encodeProfile.numEncodeSection));
+          csv.set(
+              "profile_num_transform_priced",
+              static_cast<int64_t>(encodeProfile.numTransformPriced));
+        }
         csv.endRow();
       } catch (const std::exception& ex) {
         std::cerr << "  [SKIP] " << enc.name << ": " << ex.what() << "\n";
@@ -223,6 +279,7 @@ int main(int argc, char** argv) {
 #else
 
 #include <iostream>
+#include <chrono>
 int main() {
   std::cerr << "bench_encode requires NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS\n";
   return 1;

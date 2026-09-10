@@ -1009,6 +1009,11 @@ std::string_view SubIntSplitEncoding<T>::encode(
     auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
     selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
     selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
+    // Grid pricing plus the DP. The bit-flip profile is computed inside
+    // selectSplits, so it is counted here rather than as its own phase.
+    detail::subintsplit::ScopedEncodePhase selectPhase{
+        options.subIntSplitEncodeProfile,
+        &detail::subintsplit::EncodeProfile::selectSplitsNs};
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
@@ -1045,6 +1050,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // then narrowed to its storage width, so a transform never has to know which
   // width it is working in.
   const auto extractSection = [&](const auto& seg) {
+    detail::subintsplit::ScopedEncodePhase extractPhase{
+        options.subIntSplitEncodeProfile,
+        &detail::subintsplit::EncodeProfile::extractSectionNs};
+    if (options.subIntSplitEncodeProfile != nullptr) {
+      ++options.subIntSplitEncodeProfile->numExtractSection;
+    }
     const int width = seg.bitEnd - seg.bitStart + 1;
     const uint64_t mask =
         (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
@@ -1137,6 +1148,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
   const auto encodeSection = [&](uint8_t s,
                                  uint8_t storageBytes,
                                  const std::vector<uint64_t>& sectionU64) {
+    // Nested selection plus the encode. encodeNested builds a child selection
+    // policy and computes Statistics over the section, so this phase carries a
+    // second cost model on top of the split DP's.
+    detail::subintsplit::ScopedEncodePhase encodePhase{
+        options.subIntSplitEncodeProfile,
+        &detail::subintsplit::EncodeProfile::encodeSectionNs};
+    if (options.subIntSplitEncodeProfile != nullptr) {
+      ++options.subIntSplitEncodeProfile->numEncodeSection;
+    }
     std::string_view encoded;
     switch (storageBytes) {
       case 1: {
@@ -1412,14 +1432,25 @@ std::string_view SubIntSplitEncoding<T>::encode(
         auto transformed = sectionU64;
         std::vector<uint64_t> codebook;
         std::vector<uint32_t> primaryIndices;
-        const size_t stateBytes = applyTransform(
-            candidate,
-            width,
-            keyValues,
-            std::span<const uint32_t>(keyPermutation),
-            transformed,
-            codebook,
-            primaryIndices);
+        size_t stateBytes = 0;
+        {
+          // The transform itself. The trial encode that prices it is timed
+          // separately, inside encodeSection.
+          detail::subintsplit::ScopedEncodePhase transformPhase{
+              options.subIntSplitEncodeProfile,
+              &detail::subintsplit::EncodeProfile::transformApplyNs};
+          if (options.subIntSplitEncodeProfile != nullptr) {
+            ++options.subIntSplitEncodeProfile->numTransformPriced;
+          }
+          stateBytes = applyTransform(
+              candidate,
+              width,
+              keyValues,
+              std::span<const uint32_t>(keyPermutation),
+              transformed,
+              codebook,
+              primaryIndices);
+        }
         const std::string_view alternative = encodeSection(s, sb, transformed);
         const size_t total = alternative.size() + stateBytes;
 
@@ -1516,6 +1547,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
   }
   const uint32_t encodingSize = prefixSize + specificHeader + sectionsSize;
 
+  detail::subintsplit::ScopedEncodePhase serializePhase{
+      options.subIntSplitEncodeProfile,
+      &detail::subintsplit::EncodeProfile::serializeNs};
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
 

@@ -31,6 +31,7 @@
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include "velox/dwio/nimble/encodings/SubIntSplitEncodeProfile.h"
 
 /// The Encoding class defines an interface for interacting with encodings
 /// (aka vectors, aka arrays) of encoded data. The API is tailored for
@@ -174,6 +175,11 @@ class Encoding {
     /// neither force nothing nor search for a key and force at the same time.
     /// Never set outside tests: production always wants the cost comparison.
     bool subIntSplitForceApply = false;
+
+    /// Optional sink for SubIntSplit's per-phase encode timings. Null, the
+    /// default, disables the instrumentation entirely; encode then pays one
+    /// null check per phase. Never set in production.
+    detail::subintsplit::EncodeProfile* subIntSplitEncodeProfile = nullptr;
 
     /// Block size for BlockBitPacking encoding. Determines how many rows
     /// are packed per block. Written to the stream header; the reader
