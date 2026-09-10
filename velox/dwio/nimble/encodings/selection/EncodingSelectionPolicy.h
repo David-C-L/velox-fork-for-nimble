@@ -31,6 +31,7 @@
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
+#include "velox/dwio/nimble/encodings/selection/SelectionCostTally.h"
 
 namespace facebook::nimble {
 
@@ -380,9 +381,16 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     // minimal cost.
     for (const auto& entry : candidateEncodingReadFactors) {
       const auto encodingType = entry.first;
+      const auto estimateStart = std::chrono::steady_clock::now();
       const auto estimatedSize =
           detail::EncodingSizeEstimation<T>::estimateSize(
               encodingType, values, statistics, options);
+      detail::recordEstimate(
+          encodingType,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - estimateStart)
+              .count(),
+          estimatedSize.has_value());
       if (!estimatedSize.has_value()) {
         NIMBLE_SELECTION_LOG(encodingType << " encoding is incompatible.");
         continue;
@@ -404,6 +412,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         selectedEstimatedSize = estimatedSize;
       }
     }
+
+    detail::recordSelectionWin(selectedEncoding);
 
     NIMBLE_SELECTION_LOG(
         "Selected Encoding"

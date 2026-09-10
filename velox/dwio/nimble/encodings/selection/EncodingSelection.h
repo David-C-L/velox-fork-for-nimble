@@ -32,6 +32,7 @@
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/selection/SelectionCostTally.h"
 
 namespace facebook::nimble {
 
@@ -248,9 +249,26 @@ std::string_view EncodingSelection<T>::encodeNested(
               ->template create<NestedT>(
                   encodingType(), nestedEncodingIdentifier)
               .release()));
-  auto statistics = Statistics<NestedT>::create(values);
-  auto selectionResult = nestedPolicy->select(values, statistics, options);
+  std::optional<Statistics<NestedT>> statisticsHolder;
+  {
+    detail::ScopedSelectionPhase phase{
+        &detail::SelectionCostTally::statisticsNs,
+        &detail::SelectionCostTally::numStatistics};
+    statisticsHolder = Statistics<NestedT>::create(values);
+  }
+  auto statistics = std::move(statisticsHolder.value());
 
+  EncodingSelectionResult selectionResult;
+  {
+    detail::ScopedSelectionPhase phase{
+        &detail::SelectionCostTally::selectNs,
+        &detail::SelectionCostTally::numSelect};
+    selectionResult = nestedPolicy->select(values, statistics, options);
+  }
+
+  detail::ScopedSelectionPhase encodePhase{
+      &detail::SelectionCostTally::encodeNs,
+      &detail::SelectionCostTally::numEncode};
   return EncodingFactory::encode<NestedT>(
       EncodingSelection<NestedT>{
           std::move(selectionResult),

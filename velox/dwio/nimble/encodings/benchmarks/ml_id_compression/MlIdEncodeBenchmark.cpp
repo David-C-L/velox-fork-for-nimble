@@ -162,6 +162,7 @@ int runBenchmark() {
       facebook::nimble::Encoding::Options opts;
       std::unique_ptr<NimbleBenchTargetBase<Elem>> target;
       facebook::nimble::detail::subintsplit::EncodeProfile encodeProfile;
+      facebook::nimble::detail::SelectionCostTally tally;
 
       CacheController controller(hotPolicy, topo);
 
@@ -176,6 +177,7 @@ int runBenchmark() {
         if (FLAGS_mlidc_encode_profile) {
           facebook::nimble::Encoding::Options profileOpts = opts;
           profileOpts.subIntSplitEncodeProfile = &encodeProfile;
+          facebook::nimble::detail::ScopedSelectionCostTally tallyScope{&tally};
           const auto profileStart = std::chrono::steady_clock::now();
           auto profiled = enc.factory(data, profileOpts);
           encodeProfile.totalNs =
@@ -183,6 +185,32 @@ int runBenchmark() {
                   std::chrono::steady_clock::now() - profileStart)
                   .count();
           (void)profiled;
+        }
+
+        if (FLAGS_mlidc_encode_profile) {
+          std::cout << "  [selection] " << enc.name << " statistics "
+                    << tally.statisticsNs / 1000000.0 << " ms over "
+                    << tally.numStatistics << " streams, pricing "
+                    << tally.selectNs / 1000000.0 << " ms over "
+                    << tally.numSelect << ", encode "
+                    << tally.encodeNs / 1000000.0 << " ms over "
+                    << tally.numEncode << "\n";
+          for (size_t i = 0;
+               i < facebook::nimble::detail::SelectionCostTally::
+                       kNumEncodingTypes;
+               ++i) {
+            if (tally.estimateCalls[i] == 0) {
+              continue;
+            }
+            std::cout << "    " << std::setw(18)
+                      << facebook::nimble::toString(
+                             static_cast<facebook::nimble::EncodingType>(i))
+                      << "  priced " << std::setw(6) << tally.estimateCalls[i]
+                      << "  won " << std::setw(6) << tally.wins[i]
+                      << "  incompatible " << std::setw(6)
+                      << tally.incompatible[i] << "  cost "
+                      << tally.estimateNs[i] / 1000000.0 << " ms\n";
+          }
         }
 
         const size_t payloadBytes = target->payloadSize();
@@ -280,6 +308,7 @@ int main(int argc, char** argv) {
 
 #include <iostream>
 #include <chrono>
+#include "velox/dwio/nimble/encodings/selection/SelectionCostTally.h"
 int main() {
   std::cerr << "bench_encode requires NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS\n";
   return 1;
