@@ -1143,6 +1143,18 @@ std::string_view SubIntSplitEncoding<T>::encode(
   transformInfo.keySection =
       detail::SubIntSplitTransformInfo::kNoKeySection;
 
+  // The bit-flip run-structure and Delta gates share one profile fetch.
+  // selection.statistics() is the outer Statistics<physicalType> for the
+  // whole column, already built before encode() was reached; bitFlipProfile()
+  // populates it lazily with one O(valueCount) XOR-and-popcount pass, computed
+  // at most once here and sliced per section below by encodeSection -- never
+  // recomputed per section or per gate. Left null when both gates are off so
+  // that pass is never paid.
+  const BitFlipProfile* bitFlipGateProfile =
+      (options.subIntSplitBitFlipGate || options.subIntSplitBitFlipDeltaGate)
+      ? &selection.statistics().bitFlipProfile()
+      : nullptr;
+
   // Encodes one section at its storage width. Called more than once per
   // section, since choosing whether to transform means pricing both.
   const auto encodeSection = [&](uint8_t s,
@@ -1157,6 +1169,47 @@ std::string_view SubIntSplitEncoding<T>::encode(
     if (options.subIntSplitEncodeProfile != nullptr) {
       ++options.subIntSplitEncodeProfile->numEncodeSection;
     }
+
+    // Bounds P(repeat) for this section from the sliced parent profile and
+    // resolves the gate's verdict, carried to the nested selection through a
+    // per-section copy of sectionOptions. See Encoding::Options::
+    // subIntSplitBitFlipGateDecision for why this is a copy rather than a
+    // mutation of sectionOptions itself: the verdict must not leak to
+    // whichever section reuses sectionOptions next.
+    const Encoding::Options* sectionEncodeOptions = &sectionOptions;
+    Encoding::Options gatedSectionOptions;
+    bool needsGatedOptions = false;
+    if (bitFlipGateProfile != nullptr) {
+      gatedSectionOptions = sectionOptions;
+      needsGatedOptions = true;
+    }
+    if (bitFlipGateProfile != nullptr && options.subIntSplitBitFlipGate) {
+      const auto& seg = segments[s];
+      double repeatBound = 1.0;
+      for (int bit = seg.bitStart; bit <= seg.bitEnd; ++bit) {
+        repeatBound *= (1.0 - bitFlipGateProfile->flipProbability[bit]);
+      }
+      gatedSectionOptions.subIntSplitBitFlipGateDecision =
+          repeatBound < options.subIntSplitBitFlipGateThreshold;
+    }
+    // Delta bit-flip gate: HEURISTIC, not a sound bound (see
+    // Encoding::Options::subIntSplitBitFlipDeltaGate for why). Delta's
+    // residual width is set by the section's single widest non-descending
+    // step, so a section whose own top bit flips at or above threshold is
+    // read as evidence that step is close to the section's full width,
+    // leaving Delta no narrower than plain packing once its restatement
+    // overhead is counted. O(1): one array lookup, no loop over the section's
+    // bits, unlike the run-structure bound above.
+    if (bitFlipGateProfile != nullptr && options.subIntSplitBitFlipDeltaGate) {
+      const auto& seg = segments[s];
+      gatedSectionOptions.subIntSplitBitFlipDeltaGateDecision =
+          bitFlipGateProfile->flipProbability[seg.bitEnd] >=
+          options.subIntSplitBitFlipDeltaGateThreshold;
+    }
+    if (needsGatedOptions) {
+      sectionEncodeOptions = &gatedSectionOptions;
+    }
+
     std::string_view encoded;
     switch (storageBytes) {
       case 1: {
@@ -1169,7 +1222,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::span<const uint8_t>(
                 sectionValues.data(), sectionValues.size()),
             sectionBuffer,
-            sectionOptions);
+            *sectionEncodeOptions);
         break;
       }
       case 2: {
@@ -1182,7 +1235,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::span<const uint16_t>(
                 sectionValues.data(), sectionValues.size()),
             sectionBuffer,
-            sectionOptions);
+            *sectionEncodeOptions);
         break;
       }
       case 4: {
@@ -1195,7 +1248,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::span<const uint32_t>(
                 sectionValues.data(), sectionValues.size()),
             sectionBuffer,
-            sectionOptions);
+            *sectionEncodeOptions);
         break;
       }
       case 8: {
@@ -1208,7 +1261,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
             std::span<const uint64_t>(
                 sectionValues.data(), sectionValues.size()),
             sectionBuffer,
-            sectionOptions);
+            *sectionEncodeOptions);
         break;
       }
       default: {

@@ -68,6 +68,30 @@ struct SelectionCostTally {
   /// incompatible with the values. Priced work that could not have been used.
   std::array<size_t, kNumEncodingTypes> incompatible{};
 
+  /// Times the bit-flip run-structure gate (Encoding::Options::
+  /// subIntSplitBitFlipGate) decided a stream's runs could not meaningfully
+  /// exist, so RLE, Constant and MainlyConstant were gated -- skipped if the
+  /// gate was acting, or left priced but flagged if it was in shadow mode.
+  size_t gatedStreams{0};
+
+  /// Of gatedStreams, how many were actually won by RLE, Constant or
+  /// MainlyConstant. Only meaningful for a shadow-mode run: an acting gate
+  /// never lets one of the three it skipped win, so this stays zero there by
+  /// construction.
+  size_t gatedStreamsWrong{0};
+
+  /// Times the Delta bit-flip gate (Encoding::Options::
+  /// subIntSplitBitFlipDeltaGate) decided a section's top bit flips too often
+  /// for Delta to help, so Delta was gated -- skipped if the gate was acting,
+  /// or left priced but flagged if it was in shadow mode. Independent of
+  /// gatedStreams: a section can be gated by neither, either, or both gates.
+  size_t gatedStreamsDelta{0};
+
+  /// Of gatedStreamsDelta, how many were actually won by Delta. Only
+  /// meaningful for a shadow-mode run, for the same reason as
+  /// gatedStreamsWrong.
+  size_t gatedStreamsDeltaWrong{0};
+
   void reset() {
     *this = SelectionCostTally{};
   }
@@ -158,6 +182,45 @@ inline void recordSelectionWin(EncodingType type) {
   const auto index = static_cast<size_t>(type);
   if (index < SelectionCostTally::kNumEncodingTypes) {
     ++tally->wins[index];
+  }
+}
+
+/// Records one bit-flip run-structure gate verdict. Call only when the gate
+/// decided to gate the stream (see Encoding::Options::
+/// subIntSplitBitFlipGateDecision); a pass-through verdict is not tallied.
+inline void recordGateDecision() {
+  auto* tally = currentSelectionCostTally();
+  if (tally != nullptr) {
+    ++tally->gatedStreams;
+  }
+}
+
+/// Records that a gated stream was actually won by one of the encodings the
+/// gate would have skipped. Meaningful only for shadow-mode runs; see
+/// SelectionCostTally::gatedStreamsWrong.
+inline void recordGateWrong() {
+  auto* tally = currentSelectionCostTally();
+  if (tally != nullptr) {
+    ++tally->gatedStreamsWrong;
+  }
+}
+
+/// Records one Delta bit-flip gate verdict. Call only when the gate decided
+/// to gate the stream (see Encoding::Options::
+/// subIntSplitBitFlipDeltaGateDecision).
+inline void recordDeltaGateDecision() {
+  auto* tally = currentSelectionCostTally();
+  if (tally != nullptr) {
+    ++tally->gatedStreamsDelta;
+  }
+}
+
+/// Records that a Delta-gated stream was actually won by Delta. Meaningful
+/// only for shadow-mode runs; see SelectionCostTally::gatedStreamsDeltaWrong.
+inline void recordDeltaGateWrong() {
+  auto* tally = currentSelectionCostTally();
+  if (tally != nullptr) {
+    ++tally->gatedStreamsDeltaWrong;
   }
 }
 

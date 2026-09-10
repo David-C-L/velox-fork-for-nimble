@@ -81,6 +81,8 @@ DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
+DECLARE_double(mlidc_bitflip_gate_threshold);
+DECLARE_double(mlidc_bitflip_delta_gate_threshold);
 
 namespace facebook::nimble::mlidc {
 
@@ -1311,6 +1313,115 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
+  // The bit-flip run-structure gate measured against the production arm
+  // rather than SIS/auto. SIS/auto prices transform candidates too, so its
+  // pricing budget (2349 ms, 561 nested streams) is far larger than what
+  // SIS/realNested pays (369 ms, 118 nested streams) for the same column;
+  // the gate's fixed bitFlipProfile() cost is paid once per column either
+  // way, so whether it amortises depends on which arm is asked. See
+  // Encoding::Options::subIntSplitBitFlipGate and
+  // SelectionCostTally::gatedStreams/gatedStreamsWrong.
+  {
+    const std::vector<std::pair<const char*, bool>> arms{
+        {"SIS/realNested+bitFlipGate", false},
+        {"SIS/realNested+bitFlipGateShadow", true},
+    };
+    for (const auto& [name, shadow] : arms) {
+      EncoderEntry<T> entry;
+      entry.name = name;
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested";
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [shadow](
+                           const Vector<T>& data,
+                           const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitBitFlipGate = true;
+        o.subIntSplitBitFlipGateThreshold = FLAGS_mlidc_bitflip_gate_threshold;
+        o.subIntSplitBitFlipGateShadow = shadow;
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
+  // The Delta bit-flip gate (Encoding::Options::subIntSplitBitFlipDeltaGate),
+  // measured the same way as the run-structure gate above and independent of
+  // it: only Delta is gated here. Heuristic, not sound -- see the field
+  // comment.
+  {
+    const std::vector<std::pair<const char*, bool>> arms{
+        {"SIS/realNested+deltaGate", false},
+        {"SIS/realNested+deltaGateShadow", true},
+    };
+    for (const auto& [name, shadow] : arms) {
+      EncoderEntry<T> entry;
+      entry.name = name;
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested";
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [shadow](
+                           const Vector<T>& data,
+                           const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitBitFlipDeltaGate = true;
+        o.subIntSplitBitFlipDeltaGateThreshold =
+            FLAGS_mlidc_bitflip_delta_gate_threshold;
+        o.subIntSplitBitFlipGateShadow = shadow;
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
+  // Both bit-flip gates together on the production arm: run-structure gate at
+  // its recommended threshold plus the Delta gate, so the cumulative effect
+  // can be measured against each gate alone.
+  {
+    const std::vector<std::pair<const char*, bool>> arms{
+        {"SIS/realNested+bothGates", false},
+        {"SIS/realNested+bothGatesShadow", true},
+    };
+    for (const auto& [name, shadow] : arms) {
+      EncoderEntry<T> entry;
+      entry.name = name;
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested";
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [shadow](
+                           const Vector<T>& data,
+                           const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitBitFlipGate = true;
+        o.subIntSplitBitFlipGateThreshold = FLAGS_mlidc_bitflip_gate_threshold;
+        o.subIntSplitBitFlipDeltaGate = true;
+        o.subIntSplitBitFlipDeltaGateThreshold =
+            FLAGS_mlidc_bitflip_delta_gate_threshold;
+        o.subIntSplitBitFlipGateShadow = shadow;
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
   // SIS/legacyCost and SIS/legacyCost+view are dropped, together with the
   // legacy inventory they were the only readers of. They pinned the cost
   // models SubIntSplit scored before Delta, FOR, PFOR, Huffman, DeltaBlock,
@@ -1416,6 +1527,46 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
           impl->encodeWith(data, o, /*realNestedSelection=*/true);
           return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
         }
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
+  // The bit-flip run-structure gate, same auto-transform base as SIS/auto
+  // above. Two arms: bitFlipGate acts on the gate's verdict (skips RLE,
+  // Constant and MainlyConstant where it fires), bitFlipGateShadow computes
+  // and tallies the same verdict but prices every candidate regardless, so
+  // the verdict can be checked against the encoding that actually won. See
+  // Encoding::Options::subIntSplitBitFlipGate and
+  // SelectionCostTally::gatedStreams/gatedStreamsWrong.
+  {
+    const std::vector<std::pair<const char*, bool>> arms{
+        {"SIS/auto+bitFlipGate", false},
+        {"SIS/auto+bitFlipGateShadow", true},
+    };
+    for (const auto& [name, shadow] : arms) {
+      EncoderEntry<T> entry;
+      entry.name = name;
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested";
+      entry.inventory = "full";
+      entry.transform = "auto";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [shadow](
+                           const Vector<T>& data,
+                           const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitAutoTransform = true;
+        o.subIntSplitKeySection = 0xFF;
+        o.subIntSplitBitFlipGate = true;
+        o.subIntSplitBitFlipGateThreshold = FLAGS_mlidc_bitflip_gate_threshold;
+        o.subIntSplitBitFlipGateShadow = shadow;
         auto impl =
             std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
         impl->target.encode(data, o, /*realNestedSelection=*/true);

@@ -350,6 +350,49 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       }
     }
 
+    // Bit-flip run-structure gate (see Encoding::Options::
+    // subIntSplitBitFlipGate): a section whose sliced bit-flip profile bounds
+    // P(repeat) below threshold cannot meaningfully contain runs, so RLE,
+    // Constant and MainlyConstant are skipped without pricing them. Shadow
+    // mode tallies the decision but never filters, so the gate's accuracy can
+    // be checked against the encoding that actually wins.
+    const bool gateFired =
+        options.subIntSplitBitFlipGate && options.subIntSplitBitFlipGateDecision;
+    if (gateFired) {
+      detail::recordGateDecision();
+    }
+    if (gateFired && !options.subIntSplitBitFlipGateShadow) {
+      candidateEncodingReadFactors.erase(
+          std::remove_if(
+              candidateEncodingReadFactors.begin(),
+              candidateEncodingReadFactors.end(),
+              [](const auto& entry) {
+                return entry.first == EncodingType::RLE ||
+                    entry.first == EncodingType::Constant ||
+                    entry.first == EncodingType::MainlyConstant;
+              }),
+          candidateEncodingReadFactors.end());
+    }
+
+    // Delta bit-flip gate (see Encoding::Options::subIntSplitBitFlipDeltaGate):
+    // independent of the run-structure gate above, and heuristic rather than
+    // sound -- see the field comment for why. Shares the same shadow flag.
+    const bool deltaGateFired = options.subIntSplitBitFlipDeltaGate &&
+        options.subIntSplitBitFlipDeltaGateDecision;
+    if (deltaGateFired) {
+      detail::recordDeltaGateDecision();
+    }
+    if (deltaGateFired && !options.subIntSplitBitFlipGateShadow) {
+      candidateEncodingReadFactors.erase(
+          std::remove_if(
+              candidateEncodingReadFactors.begin(),
+              candidateEncodingReadFactors.end(),
+              [](const auto& entry) {
+                return entry.first == EncodingType::Delta;
+              }),
+          candidateEncodingReadFactors.end());
+    }
+
     // Fast path: when there are no candidate encodings, fall back to Trivial.
     if (candidateEncodingReadFactors.empty()) {
       return {
@@ -414,6 +457,15 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     }
 
     detail::recordSelectionWin(selectedEncoding);
+    if (gateFired &&
+        (selectedEncoding == EncodingType::RLE ||
+         selectedEncoding == EncodingType::Constant ||
+         selectedEncoding == EncodingType::MainlyConstant)) {
+      detail::recordGateWrong();
+    }
+    if (deltaGateFired && selectedEncoding == EncodingType::Delta) {
+      detail::recordDeltaGateWrong();
+    }
 
     NIMBLE_SELECTION_LOG(
         "Selected Encoding"

@@ -130,7 +130,9 @@ int runBenchmark() {
           "profile_unattributed_ns",
           "profile_num_extract_section",
           "profile_num_encode_section",
-          "profile_num_transform_priced"}) {
+          "profile_num_transform_priced",
+          "gated_streams",
+          "gated_streams_wrong"}) {
       csvColumns.emplace_back(column);
     }
   }
@@ -195,6 +197,21 @@ int runBenchmark() {
                     << tally.numSelect << ", encode "
                     << tally.encodeNs / 1000000.0 << " ms over "
                     << tally.numEncode << "\n";
+          if (enc.name.find("bitFlipGate") != std::string::npos ||
+              enc.name.find("bothGates") != std::string::npos) {
+            std::cout << "  [gate] " << enc.name << " gated "
+                      << tally.gatedStreams << " of " << tally.numSelect
+                      << " streams, " << tally.gatedStreamsWrong
+                      << " would have been won by RLE/Constant/"
+                         "MainlyConstant\n";
+          }
+          if (enc.name.find("deltaGate") != std::string::npos ||
+              enc.name.find("bothGates") != std::string::npos) {
+            std::cout << "  [deltaGate] " << enc.name << " gated "
+                      << tally.gatedStreamsDelta << " of " << tally.numSelect
+                      << " streams, " << tally.gatedStreamsDeltaWrong
+                      << " would have been won by Delta\n";
+          }
           for (size_t i = 0;
                i < facebook::nimble::detail::SelectionCostTally::
                        kNumEncodingTypes;
@@ -264,6 +281,11 @@ int runBenchmark() {
           csv.set(
               "profile_num_transform_priced",
               static_cast<int64_t>(encodeProfile.numTransformPriced));
+          csv.set(
+              "gated_streams", static_cast<int64_t>(tally.gatedStreams));
+          csv.set(
+              "gated_streams_wrong",
+              static_cast<int64_t>(tally.gatedStreamsWrong));
         }
         csv.endRow();
       } catch (const std::exception& ex) {

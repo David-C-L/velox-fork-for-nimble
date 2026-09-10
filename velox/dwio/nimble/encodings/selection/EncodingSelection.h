@@ -266,6 +266,24 @@ std::string_view EncodingSelection<T>::encodeNested(
     selectionResult = nestedPolicy->select(values, statistics, options);
   }
 
+  // subIntSplitBitFlipGateDecision and subIntSplitBitFlipDeltaGateDecision
+  // are each a verdict about this stream alone, sliced from its parent's
+  // bit-flip profile. select() has already consumed them; carrying either
+  // into the winning encoding's own encode() would apply the same verdict to
+  // that encoding's nested streams (e.g. a Dictionary's indices), whose run
+  // structure this stream's profile says nothing about. Stripped here rather
+  // than left to each encoding to reset, so both gates stay scoped to one
+  // level regardless of what wins.
+  const Encoding::Options* encodeOptions = &options;
+  Encoding::Options ungatedOptions;
+  if (options.subIntSplitBitFlipGateDecision ||
+      options.subIntSplitBitFlipDeltaGateDecision) {
+    ungatedOptions = options;
+    ungatedOptions.subIntSplitBitFlipGateDecision = false;
+    ungatedOptions.subIntSplitBitFlipDeltaGateDecision = false;
+    encodeOptions = &ungatedOptions;
+  }
+
   detail::ScopedSelectionPhase encodePhase{
       &detail::SelectionCostTally::encodeNs,
       &detail::SelectionCostTally::numEncode};
@@ -276,7 +294,7 @@ std::string_view EncodingSelection<T>::encodeNested(
           std::move(nestedPolicy)},
       values,
       buffer,
-      options);
+      *encodeOptions);
 }
 
 } // namespace facebook::nimble

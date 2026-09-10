@@ -121,3 +121,18 @@ DEFINE_string(
     "The 8- and 16-bit types are excluded because SubIntSplitEncoding only "
     "supports 32- and 64-bit types. With --mlidc_file, the column is parsed as "
     "this type.");
+DEFINE_double(
+    mlidc_bitflip_gate_threshold,
+    0.05,
+    "Threshold the bit-flip run-structure gate (Encoding::Options::"
+    "subIntSplitBitFlipGateThreshold) compares its P(repeat) upper bound "
+    "against for the SIS/auto+bitFlipGate and SIS/auto+bitFlipGateShadow "
+    "arms. Swept across driver invocations to trade gate accuracy against "
+    "pricing savings; this is not a production default.");
+DEFINE_double(
+    mlidc_bitflip_delta_gate_threshold,
+    0.05,
+    "Threshold the Delta bit-flip gate (Encoding::Options::"
+    "subIntSplitBitFlipDeltaGateThreshold) compares a section's top-bit flip "
+    "probability against for the *+deltaGate and *+deltaGateShadow arms. "
+    "Swept across driver invocations; this is not a production default.");

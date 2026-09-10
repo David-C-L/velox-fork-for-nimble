@@ -260,6 +260,78 @@ class Encoding {
     /// behaviour again.
     bool subIntSplitAllowDeltaBlock{false};
 
+    /// Enables the bit-flip run-structure gate for SubIntSplit sections.
+    /// A section's per-bit flip probabilities, sliced from the parent
+    /// column's BitFlipProfile, bound the probability that any value equals
+    /// its predecessor: P(repeat) <= product(1 - flipProbability[bit]) over
+    /// the section's bits. When that bound falls below
+    /// subIntSplitBitFlipGateThreshold, runs cannot meaningfully exist, so
+    /// RLE, Constant and MainlyConstant -- the three most expensive
+    /// candidates to price and the only ones that need run or repeat
+    /// structure to win -- are skipped for that section without touching its
+    /// data. False by default.
+    bool subIntSplitBitFlipGate{false};
+
+    /// Threshold subIntSplitBitFlipGate compares its P(repeat) upper bound
+    /// against; below it, the run/repeat encodings are gated. Only
+    /// meaningful when subIntSplitBitFlipGate is true. Left unset (0.0, which
+    /// gates nothing, since the bound is always positive) rather than given a
+    /// production default: the right value depends on the threshold sweep a
+    /// caller runs to trade gate accuracy against pricing savings.
+    double subIntSplitBitFlipGateThreshold{0.0};
+
+    /// When true, subIntSplitBitFlipGate and subIntSplitBitFlipDeltaGate each
+    /// compute and tally their decision (see SelectionCostTally::
+    /// gatedStreams/gatedStreamsWrong and gatedStreamsDelta/
+    /// gatedStreamsDeltaWrong) but do not act on it -- every candidate is
+    /// still priced -- so a gate's accuracy can be measured against the
+    /// encoding that actually won. Shared by both gates rather than given one
+    /// shadow flag each: shadow mode is the same idea in both cases (measure
+    /// without acting), and a caller sweeping thresholds wants it applied
+    /// uniformly.
+    bool subIntSplitBitFlipGateShadow{false};
+
+    /// Resolved per-section gate verdict, set by SubIntSplitEncoding::encode
+    /// from the sliced parent profile before a section's own nested
+    /// selection runs. Never set by a caller: it is stripped back to false
+    /// by EncodingSelection::encodeNested once consumed, so it never reaches
+    /// the nested streams of whatever encoding wins the section -- their run
+    /// structure has nothing to do with the section's raw bit-flip profile.
+    bool subIntSplitBitFlipGateDecision{false};
+
+    /// Enables a second, independent bit-flip-profile gate that skips only
+    /// Delta. Delta's cost model sets its residual width from the single
+    /// widest non-descending step in the section (see DeltaEncoding::
+    /// estimateSize), so one section whose values swing close to the section's
+    /// own top bit forces Delta's residual array close to the section's plain
+    /// width -- at which point Delta's restatement and is-restatement
+    /// overhead make it strictly worse than plain FixedBitWidth. This is a
+    /// HEURISTIC, not a sound bound: the highest bit where a XOR b differs
+    /// bounds |a - b| only from above (< 2^(k+1)), not from below -- a
+    /// borrow/carry chain (e.g. 0x1000 0000 vs 0x0FFF FFFF) flips the top bit
+    /// while the true difference is 1. What justifies gating anyway is that
+    /// Delta's width is set by the single worst step, so it takes only one
+    /// wide, non-adversarial step for the flip to be genuine, and adversarial
+    /// borrow chains are rare enough in real columns that they contribute
+    /// negligibly to flipProbability at a fixed bit over many pairs. Measure
+    /// wrongness before trusting it on a new column shape. False by default.
+    bool subIntSplitBitFlipDeltaGate{false};
+
+    /// Threshold subIntSplitBitFlipDeltaGate compares the section's own top
+    /// bit's flip probability against; at or above it, Delta is gated. Only
+    /// meaningful when subIntSplitBitFlipDeltaGate is true. Left unset (0.0,
+    /// which gates every section whose top bit ever flips) rather than given
+    /// a production default, for the same reason as
+    /// subIntSplitBitFlipGateThreshold.
+    double subIntSplitBitFlipDeltaGateThreshold{0.0};
+
+    /// Resolved per-section Delta-gate verdict. Same lifecycle as
+    /// subIntSplitBitFlipGateDecision: set by SubIntSplitEncoding::encode,
+    /// consumed by ManualEncodingSelectionPolicy::select, and stripped by
+    /// EncodingSelection::encodeNested before the winning encoding's own
+    /// nested streams encode.
+    bool subIntSplitBitFlipDeltaGateDecision{false};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.
