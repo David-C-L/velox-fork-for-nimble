@@ -220,8 +220,33 @@ class SubIntSplitEncoding
   // Per-section transform metadata from the header. Empty ids mean the stream
   // predates transforms, or chose none.
   detail::SubIntSplitTransformInfo transformInfo_;
-  // Widened section values for the block being decoded, reused across blocks.
-  std::vector<std::vector<uint64_t>> sectionScratch_;
+  // Widened section values for the block being decoded, one contiguous run of
+  // blockCapacity_ elements per section (section s at
+  // sectionScratchFlat_[s * blockCapacity_]), reused across blocks. Populated
+  // only for a section that needs a uint64 span: one that is itself
+  // transformed (invert() requires it) or that serves as another section's
+  // key (keySpan is handed to invert() the same way). Every other section
+  // decodes straight into sectionNativeFlat_ below and assembly reads it at
+  // its own width, so most streams never widen at all. One flat buffer avoids
+  // the pointer chase a vector of per-section vectors costs on every access.
+  std::vector<uint64_t> sectionScratchFlat_;
+  // Byte-packed decode buffers for a section sectionNeedsWide_ marks false, at
+  // the section's own storage width. Sections are packed back to back in
+  // encounter order; sectionNativeOffsets_[s] is section s's byte offset,
+  // recomputed at the start of every block since it depends on which sections
+  // in this stream need widening, not on the block itself.
+  std::vector<uint8_t> sectionNativeFlat_;
+  // Byte offset of each section within sectionNativeFlat_, valid only for the
+  // block decodeTransformBlock is currently assembling.
+  std::vector<uint32_t> sectionNativeOffsets_;
+  // Elements per section sectionScratchFlat_ is sized for; also blockSize
+  // (transformInfo_.blockSize once known), so it covers the largest block
+  // this stream ever decodes.
+  uint32_t blockCapacity_{0};
+  // Whether section s must be widened to uint64: it carries a transform, or
+  // it is the key section another section's transform reads. Computed once
+  // at construction, since transformIds and keySection never change after.
+  std::vector<bool> sectionNeedsWide_;
   // The block currently held in blockCache_, and the row the sections stand
   // at. Only meaningful for a transformed stream.
   uint32_t cachedBlockStart_{0};
@@ -324,6 +349,21 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
     sec.storageBytes = parsed[s].storageBytes;
     sec.encoding = EncodingFactory().create(
         *this->pool_, parsed[s].stream, stringBufferFactory, options);
+  }
+
+  // A section needs a uint64 span only if invert() is called on it directly,
+  // or if it is handed to another section's invert() as the key. Every other
+  // section is assembled straight from its own storage width.
+  sectionNeedsWide_.assign(sections_.size(), false);
+  for (size_t s = 0; s < transformInfo_.transformIds.size(); ++s) {
+    if (transformInfo_.transformIds[s] != 0) {
+      sectionNeedsWide_[s] = true;
+    }
+  }
+  if (transformInfo_.keySection != detail::SubIntSplitTransformInfo::
+                                        kNoKeySection &&
+      transformInfo_.keySection < sectionNeedsWide_.size()) {
+    sectionNeedsWide_[transformInfo_.keySection] = true;
   }
 
   // Attribution is opt-in and populated once here: bit range, width, chosen
@@ -723,29 +763,73 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   const uint32_t blockCount =
       std::min(blockSize, this->rowCount() - blockStart);
 
-  const uint32_t neededBytes =
-      blockCount * static_cast<uint32_t>(sizeof(physicalType));
-  if (scratchBuf_.size() < neededBytes) [[unlikely]] {
-    scratchBuf_.resize(neededBytes);
+  // sectionScratchFlat_ holds one blockCapacity_-element run per section, so
+  // it must cover the largest block this stream ever decodes; blockSize is
+  // that bound (checked once, since it is constant for the stream's life).
+  if (blockCapacity_ < blockSize) {
+    blockCapacity_ = blockSize;
+    sectionScratchFlat_.resize(
+        static_cast<size_t>(sections_.size()) * blockCapacity_);
+  }
+  // Narrow sections that need no widening (sectionNeedsWide_[s] false) pack
+  // into sectionNativeFlat_ back to back and are never touched again until
+  // assembly reads them at their own width. Only a section that invert() (or
+  // another section's keySpan) actually needs as a uint64 span pays a
+  // widening copy; on a stream with few transformed sections this removes
+  // that copy for most of them, where previously every section paid it
+  // regardless of whether anything downstream needed a wider type. Offsets
+  // are recomputed every call since they depend on which sections need
+  // widening, not on blockCount.
+  sectionNativeOffsets_.resize(sections_.size());
+  uint32_t nativeBytes = 0;
+  for (size_t s = 0; s < sections_.size(); ++s) {
+    sectionNativeOffsets_[s] = nativeBytes;
+    if (sections_[s].storageBytes != 8 && !sectionNeedsWide_[s]) {
+      nativeBytes += blockCount * sections_[s].storageBytes;
+    }
+  }
+  if (sectionNativeFlat_.size() < nativeBytes) {
+    sectionNativeFlat_.resize(nativeBytes);
   }
 
-  // Every section is widened to 64 bits first, so a transform never has to
-  // know which width its section was stored at. The buffers are held across
-  // blocks rather than allocated per block: a bulk decode walks thousands of
-  // them, and that allocation would otherwise be charged to the transform when
-  // it belongs to this loop.
-  auto& sectionValues = sectionScratch_;
-  sectionValues.resize(sections_.size());
   for (size_t s = 0; s < sections_.size(); ++s) {
     auto& sec = sections_[s];
-    auto& values = sectionValues[s];
-    values.resize(blockCount);
+    const bool needsWide = sectionNeedsWide_[s];
+    uint64_t* wide = sectionScratchFlat_.data() + s * blockCapacity_;
+    if (sec.storageBytes == 8) {
+      // Already the target width: decode directly into the flat buffer,
+      // skipping the narrow-to-wide copy entirely.
+      materializeSection(sec, s, blockCount, wide);
+      continue;
+    }
+    if (!needsWide) {
+      uint8_t* native = sectionNativeFlat_.data() + sectionNativeOffsets_[s];
+      switch (sec.storageBytes) {
+        case 1:
+          materializeSection(sec, s, blockCount, native);
+          break;
+        case 2:
+          materializeSection(
+              sec, s, blockCount, reinterpret_cast<uint16_t*>(native));
+          break;
+        default:
+          materializeSection(
+              sec, s, blockCount, reinterpret_cast<uint32_t*>(native));
+          break;
+      }
+      continue;
+    }
+    const uint32_t neededBytes =
+        blockCount * static_cast<uint32_t>(sizeof(physicalType));
+    if (scratchBuf_.size() < neededBytes) [[unlikely]] {
+      scratchBuf_.resize(neededBytes);
+    }
     switch (sec.storageBytes) {
       case 1: {
         auto* scratch = reinterpret_cast<uint8_t*>(scratchBuf_.data());
         materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
-          values[i] = scratch[i];
+          wide[i] = scratch[i];
         }
         break;
       }
@@ -753,23 +837,15 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
         auto* scratch = reinterpret_cast<uint16_t*>(scratchBuf_.data());
         materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
-          values[i] = scratch[i];
-        }
-        break;
-      }
-      case 4: {
-        auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
-        materializeSection(sec, s, blockCount, scratch);
-        for (uint32_t i = 0; i < blockCount; ++i) {
-          values[i] = scratch[i];
+          wide[i] = scratch[i];
         }
         break;
       }
       default: {
-        auto* scratch = reinterpret_cast<uint64_t*>(scratchBuf_.data());
+        auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
         materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
-          values[i] = scratch[i];
+          wide[i] = scratch[i];
         }
         break;
       }
@@ -783,7 +859,9 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   if (transformInfo_.keySection !=
       detail::SubIntSplitTransformInfo::kNoKeySection) {
     keySpan = std::span<const uint64_t>(
-        sectionValues[transformInfo_.keySection]);
+        sectionScratchFlat_.data() +
+            transformInfo_.keySection * blockCapacity_,
+        blockCount);
   }
 
   const uint32_t blockIndex = blockStart / blockSize;
@@ -802,17 +880,71 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     subintsplit::TransformContext context{
         .keySection = keySpan,
         .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
-    transform->invert(sectionValues[s], context, state);
+    transform->invert(
+        std::span<uint64_t>(
+            sectionScratchFlat_.data() + s * blockCapacity_, blockCount),
+        context,
+        state);
   }
 
+  // Accumulate one section at a time across the whole block, reusing the same
+  // SIMD kernel the untransformed path calls from materialize(): section 0
+  // initialises every output element, later sections OR their bits in. A
+  // section that was never widened is accumulated straight from its own
+  // storage width; only a widened section reads through sectionScratchFlat_.
+  // This replaces a per-row loop that dispatched on each section's width and
+  // widening state row by row -- the same work, but organised so the
+  // dispatch happens once per section rather than once per (row, section).
   blockCache_.resize(blockCount);
-  for (uint32_t i = 0; i < blockCount; ++i) {
-    uint64_t assembled = 0;
-    for (size_t s = 0; s < sections_.size(); ++s) {
-      assembled |= (sectionValues[s][i] & sections_[s].mask)
-          << sections_[s].bitStart;
+  physicalType* dst = blockCache_.data();
+  for (size_t s = 0; s < sections_.size(); ++s) {
+    const auto& sec = sections_[s];
+    const int shift = sec.bitStart;
+    const uint64_t mask = sec.mask;
+    const bool isFirst = (s == 0);
+    if (sec.storageBytes == 8 || sectionNeedsWide_[s]) {
+      const auto* src = sectionScratchFlat_.data() + s * blockCapacity_;
+      if (isFirst) {
+        accumulateSection<uint64_t, true>(src, dst, blockCount, mask, shift);
+      } else {
+        accumulateSection<uint64_t, false>(src, dst, blockCount, mask, shift);
+      }
+      continue;
     }
-    blockCache_[i] = static_cast<physicalType>(assembled);
+    const uint8_t* native =
+        sectionNativeFlat_.data() + sectionNativeOffsets_[s];
+    switch (sec.storageBytes) {
+      case 1: {
+        if (isFirst) {
+          accumulateSection<uint8_t, true>(
+              native, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint8_t, false>(
+              native, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+      case 2: {
+        const auto* src = reinterpret_cast<const uint16_t*>(native);
+        if (isFirst) {
+          accumulateSection<uint16_t, true>(src, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint16_t, false>(
+              src, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+      default: {
+        const auto* src = reinterpret_cast<const uint32_t*>(native);
+        if (isFirst) {
+          accumulateSection<uint32_t, true>(src, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint32_t, false>(
+              src, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+    }
   }
   cachedBlockStart_ = blockStart;
 }
