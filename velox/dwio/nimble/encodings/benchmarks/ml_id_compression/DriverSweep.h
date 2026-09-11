@@ -188,6 +188,14 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
     std::string_view driver,
     const std::string& dataset) {
   facebook::nimble::Encoding::Options options;
+  // The four assembly-path switches apply uniformly to every arm's decode
+  // side: each EncoderEntry::factory either forwards `options` unchanged or
+  // copies it before overriding unrelated fields, so setting them here once
+  // reaches every arm without threading them through every factory.
+  options.subIntSplitReuseKeyRuns = FLAGS_mlidc_reuse_key_runs;
+  options.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
+  options.subIntSplitFuseInvertAssembly = FLAGS_mlidc_fuse_invert_assembly;
+  options.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
   // Which arm is being built is known here and nowhere below it, so the encode
   // cache reads it from here rather than every encode signature growing an
   // argument it would only pass through.

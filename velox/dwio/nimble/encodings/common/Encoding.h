@@ -180,10 +180,11 @@ class Encoding {
     std::unordered_set<EncodingType> subIntSplitAllowedEncodings;
 
     /// Test-only: skips the opt-in cost comparison that keeps a SubIntSplit
-    /// transform only where it encodes smaller, and applies subIntSplitTransform
-    /// to every eligible section regardless. A test that pins a transform id
-    /// without this can pass while never actually exercising the transform,
-    /// because selection is free to decide it does not pay on synthetic data
+    /// transform only where it encodes smaller, and applies
+    /// subIntSplitTransform to every eligible section regardless. A test that
+    /// pins a transform id without this can pass while never actually
+    /// exercising the transform, because selection is free to decide it does
+    /// not pay on synthetic data
     /// -- which is exactly what happened to this encoding's own test suite.
     /// Requires subIntSplitTransform to name a real transform and
     /// subIntSplitKeySection to be a valid section (not 0xFF), so this can
@@ -286,6 +287,31 @@ class Encoding {
     /// cycles the reported Meps figures should not carry. See
     /// SubIntSplitDecodeProfile.h.
     SubIntSplitDecodeProfile* subIntSplitDecodeProfile = nullptr;
+
+    /// Computes a key-derived transform's run ids, run values, sorted run
+    /// order, and per-run start offsets once per block and shares them across
+    /// every section keyed on that block's key, instead of each section's
+    /// invert() rebuilding them from scratch. Default true; false reproduces
+    /// the per-section rebuild for the assembly ablation.
+    bool subIntSplitReuseKeyRuns = true;
+
+    /// Reuses scratch buffers for KeyDerivedTransform::invert across blocks
+    /// instead of allocating them per call. Default true; false reproduces
+    /// the per-call allocation for the assembly ablation.
+    bool subIntSplitReuseScratch = true;
+
+    /// Fuses a key-derived section's invert() into assembly: instead of
+    /// merging into a temporary buffer, copying it back into the section's
+    /// values, and letting assembly read them again, the merge reads and the
+    /// output OR happen in the same pass. Default true; false keeps the
+    /// merge-then-assemble path for the assembly ablation.
+    bool subIntSplitFuseInvertAssembly = true;
+
+    /// Assembles a whole-block bulk read directly into the caller's output
+    /// buffer, skipping the copy out of blockCache_. Partial reads and point
+    /// probes are unaffected: they still populate and read blockCache_ as
+    /// before. Default true; false keeps the copy for the assembly ablation.
+    bool subIntSplitAssembleDirect = true;
 
     /// Direct alphabet for SharedDictionary encodings when the read path has
     /// already resolved the dictionary bound to this value stream.

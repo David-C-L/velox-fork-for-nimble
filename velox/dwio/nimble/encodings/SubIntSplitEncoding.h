@@ -240,11 +240,45 @@ class SubIntSplitEncoding
   uint32_t sectionsAt_{0};
   std::vector<physicalType> blockCache_;
 
+  // Fix A: the key's run bookkeeping for the block currently being decoded,
+  // built once and shared by every section keyed on it, instead of each
+  // one's invert() rebuilding it. Reused across blocks purely to reuse
+  // capacity; every field is fully overwritten before being read.
+  subintsplit::KeyRunState keyRunState_;
+  // Fix B: KeyDerivedTransform::invert's own scratch, threaded through
+  // TransformContext::keyDerivedScratch so it reuses buffers across its
+  // calls instead of allocating six of them per call.
+  subintsplit::KeyDerivedScratch keyDerivedScratch_;
+  // Fix 4: working run-start cursor for the fused key-derived accumulate
+  // path (decodeTransformBlock's assembly loop, not invert()), reused across
+  // sections and blocks.
+  std::vector<uint32_t> fusedCursor_;
+  // Fix 4, only when fix A is off: per-section key-run bookkeeping the fused
+  // accumulate path builds itself, reused across calls purely for capacity.
+  subintsplit::KeyRunState fusedKeyRunState_;
+
+  // Runtime switches for the four assembly-path optimisations under
+  // measurement (see Encoding::Options for what each does). All default
+  // true; production always wants every one. Checked once per block, never
+  // per row, so flipping them costs nothing measurable on its own.
+  bool optReuseKeyRuns_{true};
+  bool optReuseScratch_{true};
+  bool optFuseInvertAssembly_{true};
+  bool optAssembleDirect_{true};
+
   // Decodes a stream whose sections carry a transform, out of whole blocks.
   void materializeTransformed(uint32_t rowCount, physicalType* output);
 
-  // Decodes and inverts the block at `blockStart` into blockCache_.
-  void decodeTransformBlock(uint32_t blockStart, uint32_t blockSize);
+  // Decodes and inverts the block at `blockStart` into blockCache_, or, when
+  // `directOutput` is not null, straight into it instead (fix D). Only a read
+  // that consumes the whole block may pass a non-null directOutput: doing so
+  // leaves blockCache_ and cachedBlockStart_ untouched, so a later partial
+  // read or point probe redecodes normally rather than reading stale cache
+  // contents.
+  void decodeTransformBlock(
+      uint32_t blockStart,
+      uint32_t blockSize,
+      physicalType* directOutput);
 
   // Persistent scratch buffer reused across materialize() calls. Sized to
   // kMaterializeChunkSize * sizeof(physicalType) bytes on first use.
@@ -350,6 +384,13 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
       transformInfo_.keySection < sectionNeedsWide_.size()) {
     sectionNeedsWide_[transformInfo_.keySection] = true;
   }
+
+  // Fixed for the stream's life, since Options never changes after
+  // construction; see Encoding::Options for what each switch does.
+  optReuseKeyRuns_ = options.subIntSplitReuseKeyRuns;
+  optReuseScratch_ = options.subIntSplitReuseScratch;
+  optFuseInvertAssembly_ = options.subIntSplitFuseInvertAssembly;
+  optAssembleDirect_ = options.subIntSplitAssembleDirect;
 
   // Attribution is opt-in and populated once here: bit range, width, chosen
   // encoding, and encoded size never change after construction, so only the
@@ -710,11 +751,26 @@ void SubIntSplitEncoding<T>::materializeTransformed(
   for (uint32_t produced = 0; produced < rowCount;) {
     const uint32_t row = row_ + produced;
     const uint32_t blockStart = (row / blockSize) * blockSize;
+    const uint32_t blockCount =
+        std::min(blockSize, this->rowCount() - blockStart);
+    const uint32_t from = row - blockStart;
+    // Fix D: a read that starts at the block's first row and consumes the
+    // whole block never needs blockCache_ at all -- wantsWholeSpan already
+    // means this call redecodes every block it touches, so the cache buys it
+    // nothing but a copy. Assemble straight into the caller's buffer instead.
+    // A read that starts mid-block, or does not consume the block fully,
+    // still goes through blockCache_ exactly as before, which is what keeps
+    // partial reads and point probes unaffected.
+    if (optAssembleDirect_ && wantsWholeSpan && from == 0 &&
+        rowCount - produced >= blockCount) {
+      decodeTransformBlock(blockStart, blockSize, output + produced);
+      produced += blockCount;
+      continue;
+    }
     if (wantsWholeSpan || blockStart != cachedBlockStart_ ||
         blockCache_.empty()) {
-      decodeTransformBlock(blockStart, blockSize);
+      decodeTransformBlock(blockStart, blockSize, nullptr);
     }
-    const uint32_t from = row - blockStart;
     const uint32_t take = std::min(
         static_cast<uint32_t>(blockCache_.size()) - from, rowCount - produced);
     std::copy_n(blockCache_.data() + from, take, output + produced);
@@ -727,7 +783,8 @@ void SubIntSplitEncoding<T>::materializeTransformed(
 template <typename T>
 void SubIntSplitEncoding<T>::decodeTransformBlock(
     uint32_t blockStart,
-    uint32_t blockSize) {
+    uint32_t blockSize,
+    physicalType* directOutput) {
   // The sections decode forwards only. Reaching a block behind where they
   // stand means starting over, which a sequential read never does and a
   // gather over sorted ranges never does either.
@@ -835,6 +892,28 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
         std::span<const uint64_t>(sectionScratch_[transformInfo_.keySection]);
   }
 
+  // Fix A: build the key's run bookkeeping once, here, when at least one
+  // section in this block is actually keyed on it, and share it with every
+  // such section's invert() through TransformContext instead of letting each
+  // one rebuild it. Skipped (haveSharedKeyRunState stays false) when the
+  // switch is off, in which case invert() rebuilds it itself, exactly as
+  // before either fix existed.
+  bool haveSharedKeyRunState = false;
+  if (optReuseKeyRuns_ && !keySpan.empty()) {
+    for (size_t s = 0; s < sections_.size(); ++s) {
+      const uint8_t id = transformInfo_.transformIds[s];
+      if (id != 0 &&
+          subintsplit::transformForRaw(id)->id() ==
+              subintsplit::TransformId::KeyDerived) {
+        haveSharedKeyRunState = true;
+        break;
+      }
+    }
+    if (haveSharedKeyRunState) {
+      subintsplit::buildKeyRunState(keySpan, keyRunState_);
+    }
+  }
+
   const uint32_t blockIndex = blockStart / blockSize;
   for (size_t s = 0; s < sections_.size(); ++s) {
     const uint8_t id = transformInfo_.transformIds[s];
@@ -842,6 +921,12 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       continue;
     }
     const auto* transform = subintsplit::transformForRaw(id);
+    // Fix 4: a key-derived section is inverted inline in the assembly loop
+    // below instead of through invert(), so it is skipped here.
+    if (optFuseInvertAssembly_ &&
+        transform->id() == subintsplit::TransformId::KeyDerived) {
+      continue;
+    }
     subintsplit::TransformState state;
     state.codebook = transformInfo_.codebooks[s];
     const auto& blockState = transformInfo_.primaryIndices[s];
@@ -851,6 +936,15 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     subintsplit::TransformContext context{
         .keySection = keySpan,
         .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
+    if (haveSharedKeyRunState) {
+      context.keyRunIds = keyRunState_.runOfRow;
+      context.keyRunValues = keyRunState_.runValues;
+      context.keyRunSortedRank = keyRunState_.sortedRank;
+      context.keyRunStart = keyRunState_.runStart;
+    }
+    if (optReuseScratch_) {
+      context.keyDerivedScratch = &keyDerivedScratch_;
+    }
     transform->invert(sectionScratch_[s], context, state);
   }
 
@@ -863,13 +957,53 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   // section's width and widening state row by row -- the same work, but
   // organised so the dispatch happens once per section rather than once per
   // (row, section).
-  blockCache_.resize(blockCount);
-  physicalType* dst = blockCache_.data();
+  //
+  // Fix D: a whole-block bulk read hands its own output buffer in as
+  // directOutput, so assembly writes straight into it and blockCache_ is
+  // left untouched.
+  const bool direct = directOutput != nullptr;
+  if (!direct) {
+    blockCache_.resize(blockCount);
+  }
+  physicalType* dst = direct ? directOutput : blockCache_.data();
   for (size_t s = 0; s < sections_.size(); ++s) {
     const auto& sec = sections_[s];
     const int shift = sec.bitStart;
     const uint64_t mask = sec.mask;
     const bool isFirst = (s == 0);
+    const uint8_t id = transformInfo_.transformIds[s];
+    // Fix 4: undo the key-derived permutation and OR its bits into dst in one
+    // pass, instead of invert() merging into a temporary buffer that
+    // accumulateSection would otherwise read right back out of
+    // sectionScratch_.
+    if (optFuseInvertAssembly_ && id != 0 &&
+        subintsplit::transformForRaw(id)->id() ==
+            subintsplit::TransformId::KeyDerived) {
+      const subintsplit::KeyRunState* runState;
+      if (haveSharedKeyRunState) {
+        runState = &keyRunState_;
+      } else {
+        subintsplit::buildKeyRunState(keySpan, fusedKeyRunState_);
+        runState = &fusedKeyRunState_;
+      }
+      fusedCursor_.assign(runState->runStart.begin(), runState->runStart.end());
+      const uint64_t* src = sectionScratch_[s].data();
+      const uint32_t* runOfRow = runState->runOfRow.data();
+      const uint32_t* sortedRank = runState->sortedRank.data();
+      uint32_t* cursor = fusedCursor_.data();
+      if (isFirst) {
+        for (uint32_t i = 0; i < blockCount; ++i) {
+          const uint64_t v = src[cursor[sortedRank[runOfRow[i]]]++];
+          dst[i] = static_cast<physicalType>((v & mask) << shift);
+        }
+      } else {
+        for (uint32_t i = 0; i < blockCount; ++i) {
+          const uint64_t v = src[cursor[sortedRank[runOfRow[i]]]++];
+          dst[i] |= static_cast<physicalType>((v & mask) << shift);
+        }
+      }
+      continue;
+    }
     if (sec.storageBytes == 8 || sectionNeedsWide_[s]) {
       const auto* src = sectionScratch_[s].data();
       if (isFirst) {
@@ -911,7 +1045,9 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       }
     }
   }
-  cachedBlockStart_ = blockStart;
+  if (!direct) {
+    cachedBlockStart_ = blockStart;
+  }
 }
 
 /// Whether a plan of `candidateBytes` displaces the smallest found so far.
