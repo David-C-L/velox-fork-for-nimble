@@ -28,6 +28,7 @@
 #include "velox/dwio/nimble/encodings/BlockBitPackingEncoding.h"
 #include "velox/dwio/nimble/encodings/DeltaBlockEncoding.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
+#include "velox/dwio/nimble/encodings/FrequencyPartitionEncoding.h"
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
 #include "velox/dwio/nimble/encodings/SparseBoolEncoding.h"
@@ -626,6 +627,29 @@ forCostBits(const SegmentMetrics& m, size_t numValues, int bitWidth) noexcept {
       packedBits;
 }
 
+// Multiplier applied to the undiscounted TierTagArray index estimate below to
+// approximate the size after nested encoding selection (which, empirically,
+// usually picks Huffman over the tag stream's skewed tier distribution). 1.0
+// disables the discount, pricing the raw packed width -- the safer default,
+// since an optimistic estimate over-selects FrequencyPartition while a
+// pessimistic one merely under-selects it. Kept as a named constant so the
+// discount can be measured independently of the base fix; must be kept in
+// sync with FrequencyPartitionEncoding.h's matching
+// kFrequencyPartitionNestedIndexDiscount -- the two estimators price the same
+// wire format on different paths.
+constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
+
+// Bits needed to distinguish `x` outcomes, minimum 1. Selection-time twin of
+// FrequencyPartitionEncoding's private, encode-time ceilLog2WithMinOne: kept
+// separate because that one is a class-private helper with no encoding
+// instance available here to call it on.
+inline uint8_t ceilLog2WithMinOne(uint32_t x) noexcept {
+  if (x <= 1u) {
+    return 1u;
+  }
+  return static_cast<uint8_t>(std::bit_width(x - 1u));
+}
+
 // Number of PerTierBitmaps tiers FrequencyPartitionEncoding::encode would
 // create for `uniqueCount` distinct values, mirroring its tier-capacity table
 // (FrequencyPartitionEncoding.h: keyBitOptions = {1,2,4,8,16,32} bits with
@@ -678,12 +702,20 @@ inline double frequencyPartitionCostBits(
   const double keyCostBits = tier0Coverage * n * 1.0 + tier1Coverage * n * 2.0 +
       fallbackCoverage * n * static_cast<double>(storageWidthBits(bitWidth));
 
-  // PerTierBitmaps index: one N-bit bitmap per active tier (4-byte
-  // bitmapByteCount prefix + numValues bits rounded to a 64-bit word), not a
-  // fixed 2 tiers -- see frequencyPartitionNumTiers.
+  // TierTagArray index: SubIntSplitEncoding::sectionEncodingOptions forces
+  // frequencyPartitionIndex to TierTagArray for every section (see
+  // SubIntSplitEncoding.h), so that -- not PerTierBitmaps -- is the index a
+  // FrequencyPartition candidate here would actually pay for. Priced as an
+  // 8-byte header (tagBits + padding + tagStreamByteCount) plus the
+  // undiscounted packed width of one tagBits-wide tag per row, mirroring
+  // FrequencyPartitionEncoding::estimateSize's TierTagArray case; see
+  // kFrequencyPartitionNestedIndexDiscount above for the nested-selection
+  // discount this omits by default.
   const uint32_t numTiers = frequencyPartitionNumTiers(m.uniqueCount);
-  const double bitmapBits = std::ceil(n / 64.0) * 64.0 + 32.0;
-  const double indexBits = static_cast<double>(numTiers) * bitmapBits;
+  const uint8_t tagBits = ceilLog2WithMinOne(numTiers + 1);
+  const double indexHeaderBits = 8.0 * 8.0;
+  const double indexBits = indexHeaderBits +
+      static_cast<double>(tagBits) * n * kFrequencyPartitionNestedIndexDiscount;
 
   // One dictionary + one key stream per active tier, each a nested
   // sub-encoding with a ~7-byte header.

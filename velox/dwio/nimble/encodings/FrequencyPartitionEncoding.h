@@ -107,6 +107,18 @@ class FrequencyPartitionEncoding
 
   static const int kNumPartitionsOffset = Encoding::kPrefixSize;
   static constexpr uint8_t kFormatVersion = 1;
+
+  // Multiplier applied to the undiscounted TierTagArray tag-stream estimate
+  // in estimateSize() to approximate the size after nested encoding
+  // selection (which, empirically, usually picks Huffman over the tag
+  // stream's skewed tier distribution). 1.0 disables the discount, pricing
+  // the raw packed width -- the safer default, since an optimistic estimate
+  // over-selects FrequencyPartition while a pessimistic one merely
+  // under-selects it. Kept as a named constant so the discount can be
+  // measured independently of the base fix; see
+  // SubIntSplitCostModels.h's matching kFrequencyPartitionNestedIndexDiscount,
+  // which must be updated together with this one.
+  static constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
   static constexpr uint32_t kRankSampleStride = 256;
   // Upper bound on tiers: one per entry of the key-bit table
   // {1, 2, 4, 8, 16, 32}, which is what encode() fills.
@@ -280,15 +292,57 @@ class FrequencyPartitionEncoding
 
     // The positional index, without which materialize() would hand back rows
     // in tier order and desync a SubIntSplit section from its siblings.
-    // PerTierBitmaps is the mode SubIntSplit forces and the one priced here;
-    // the two rarer modes are packed differently and this over-states them.
+    // Priced per the actual index type in options.frequencyPartitionIndex,
+    // rather than always as PerTierBitmaps: TierTagArray -- the mode
+    // SubIntSplitEncoding forces (see SubIntSplitEncoding::
+    // sectionEncodingOptions) -- is packed very differently from a bitmap and
+    // was badly over-priced by the bitmap formula.
     const auto indexType =
         static_cast<FreqPartIndexType>(options.frequencyPartitionIndex);
     if (indexType != FreqPartIndexType::NoIndex && nonEmptyTiers > 0) {
-      const uint64_t bitmapWords = (rowCount + 63) / 64;
       payloadSize += 1 + 1 + 4; // formatVersion + indexType + payload length
-      payloadSize +=
-          static_cast<uint64_t>(nonEmptyTiers) * (4 + bitmapWords * 8);
+      switch (indexType) {
+        case FreqPartIndexType::PerTierBitmaps: {
+          // One N-bit bitmap per active tier (4-byte bitmapByteCount prefix +
+          // numValues bits rounded to a 64-bit word).
+          const uint64_t bitmapWords = (rowCount + 63) / 64;
+          payloadSize +=
+              static_cast<uint64_t>(nonEmptyTiers) * (4 + bitmapWords * 8);
+          break;
+        }
+        case FreqPartIndexType::TierTagArray: {
+          // tagBits(1) + padding(3) + tagStreamByteCount(4) header, then the
+          // tag stream. The stream goes through nested selection at encode
+          // time (FrequencyPartitionEncoding::encode), so its real size is
+          // usually smaller than this: this prices the undiscounted
+          // FixedBitWidth packing of one tagBits-wide tag per row, the same
+          // way the dictionary/key streams above are priced against
+          // TrivialEncoding/FixedBitWidthEncoding::estimateSize.
+          // kFrequencyPartitionNestedIndexDiscount (1.0 = no discount, i.e.
+          // this pessimistic estimate) is where a nested-selection discount
+          // would be applied if one is adopted later.
+          payloadSize += 8;
+          payloadSize += static_cast<uint64_t>(std::llround(
+              static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
+                  rowCount,
+                  /*minValue=*/0,
+                  /*maxValue=*/tiersCreated, // tag values span 0..numTiers
+                  options)) *
+              kFrequencyPartitionNestedIndexDiscount));
+          break;
+        }
+        case FreqPartIndexType::EliasFano: {
+          // No dedicated EliasFano estimator yet: reuse the PerTierBitmaps
+          // formula. EliasFano is packed differently and this over-states
+          // it, the same way it over-stated TierTagArray before this fix.
+          const uint64_t bitmapWords = (rowCount + 63) / 64;
+          payloadSize +=
+              static_cast<uint64_t>(nonEmptyTiers) * (4 + bitmapWords * 8);
+          break;
+        }
+        case FreqPartIndexType::NoIndex:
+          break;
+      }
     }
 
     return outerSize + payloadSize;
