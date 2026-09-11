@@ -133,6 +133,20 @@ class Encoding {
     /// 2 = TierTagArray, 3 = EliasFano.
     uint8_t frequencyPartitionIndex = 0;
 
+    /// When true, TierTagArray builds a per-tier `resolvedValues` vector at
+    /// decode construction, mapping rank directly to the decoded value, and
+    /// point/range/bulk decode read from it instead of chasing
+    /// `dictionary[indices[rank]]`. Removes two dependent loads (the indices
+    /// lookup and the dictionary lookup it feeds) from the hot path at the
+    /// cost of holding both the original indices/dictionary tables and the
+    /// resolved values in memory at once: the resolved table is |T| bytes per
+    /// row versus 4 bytes per row for indices, so for T wider than uint32_t
+    /// this roughly doubles the tier's decoded-value footprint. Payload bytes
+    /// are unaffected either way -- this table is rebuilt at decode
+    /// construction and never serialised. Default false since the memory
+    /// cost is real even when the format does not change.
+    bool frequencyPartitionResolveTierValues = false;
+
     /// Reversible transform applied to SubIntSplit's sections, as a
     /// subintsplit::TransformId. Zero, the default, applies none and writes
     /// the stream in the original format. The section named by

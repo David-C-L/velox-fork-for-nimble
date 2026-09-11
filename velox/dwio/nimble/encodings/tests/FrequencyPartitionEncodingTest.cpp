@@ -427,9 +427,11 @@ static void testIndexedRoundTrip(
     velox::memory::MemoryPool* pool,
     nimble::Buffer& buffer,
     const nimble::Vector<T>& data,
-    nimble::FreqPartIndexType indexType) {
+    nimble::FreqPartIndexType indexType,
+    bool resolveTierValues = false) {
   nimble::Encoding::Options opts{};
   opts.frequencyPartitionIndex = static_cast<uint8_t>(indexType);
+  opts.frequencyPartitionResolveTierValues = resolveTierValues;
   auto encoding = nimble::test::Encoder<nimble::FrequencyPartitionEncoding<T>>::
       createEncoding(
           buffer, data, nullptr, nimble::CompressionType::Uncompressed, opts);
@@ -507,6 +509,21 @@ TEST_F(FrequencyPartitionEncodingTest, indexedTierTagArrayInt32) {
       pool_.get(), *buffer_, data, nimble::FreqPartIndexType::TierTagArray);
 }
 
+// Options::frequencyPartitionResolveTierValues opts TierTagArray into
+// resolving indices[rank] -> dictionary index at decode construction, so
+// point/range/bulk decode read the resolved value directly. Round-trips
+// identically to the un-resolved path -- it only changes which table decode
+// reads from, not the values.
+TEST_F(FrequencyPartitionEncodingTest, indexedTierTagArrayResolvedValuesInt32) {
+  auto data = makeSkewedData<int32_t>(pool_.get(), 500, 4, 20);
+  testIndexedRoundTrip(
+      pool_.get(),
+      *buffer_,
+      data,
+      nimble::FreqPartIndexType::TierTagArray,
+      /*resolveTierValues=*/true);
+}
+
 TEST_F(FrequencyPartitionEncodingTest, indexedEliasFanoInt32) {
   auto data = makeSkewedData<int32_t>(pool_.get(), 500, 4, 20);
   testIndexedRoundTrip(
@@ -543,6 +560,18 @@ TEST_F(FrequencyPartitionEncodingTest, indexedTierTagArrayUint64) {
   auto data = makeSkewedData<uint64_t>(pool_.get(), 400, 8, 30);
   testIndexedRoundTrip(
       pool_.get(), *buffer_, data, nimble::FreqPartIndexType::TierTagArray);
+}
+
+TEST_F(
+    FrequencyPartitionEncodingTest,
+    indexedTierTagArrayResolvedValuesUint64) {
+  auto data = makeSkewedData<uint64_t>(pool_.get(), 400, 8, 30);
+  testIndexedRoundTrip(
+      pool_.get(),
+      *buffer_,
+      data,
+      nimble::FreqPartIndexType::TierTagArray,
+      /*resolveTierValues=*/true);
 }
 
 TEST_F(FrequencyPartitionEncodingTest, indexedEliasFanoUint64) {

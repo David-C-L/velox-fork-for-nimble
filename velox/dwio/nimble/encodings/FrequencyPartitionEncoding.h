@@ -128,6 +128,23 @@ class FrequencyPartitionEncoding
   template <typename DecoderVisitor>
   void readWithVisitor(DecoderVisitor& visitor, ReadWithVisitorParams& params);
 
+  /// In-memory size, in bytes, of TierTagArray's decode-time index: the
+  /// flattened rank-sample table, the forward-scan cursor, and (when
+  /// Options::frequencyPartitionResolveTierValues was set) each tier's
+  /// resolved-value table. Zero for any other index type. All of this is
+  /// rebuilt every time a TierTagArray column is decoded and never
+  /// serialised, so it is a load-time memory cost, not a payload cost.
+  size_t tagRankIndexBytes() const {
+    size_t total = tierRankSamples_.size() * sizeof(uint32_t);
+    total += cursorPos_.size() * sizeof(uint32_t);
+    total += cursorRank_.size() * sizeof(uint32_t);
+    total += (cursorValid_.size() + 7) / 8; // std::vector<bool> packs 1 bit each.
+    for (const auto& tier : tiers_) {
+      total += tier.resolvedValues.size() * sizeof(T);
+    }
+    return total;
+  }
+
   static std::string_view encode(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
@@ -293,6 +310,13 @@ class FrequencyPartitionEncoding
     uint32_t startRow; // NoIndex only: offset in encoded stream
     uint32_t size; // NoIndex only: count in encoded stream
 
+    // Optional, opt-in (Options::frequencyPartitionResolveTierValues): rank
+    // resolved directly to a value, i.e. resolvedValues[rank] ==
+    // dictionary[indices[rank]]. Populated once at decode construction so
+    // TierTagArray's point/range/bulk decode can skip the indices lookup and
+    // the dictionary lookup it feeds. Empty when the option is off.
+    Vector<T> resolvedValues;
+
     // Index fields — populated based on indexType_:
     uint32_t tierCount{0}; // element count (indexed modes)
     Vector<uint64_t> bitmap; // PerTierBitmaps: N-bit bitmap
@@ -306,6 +330,7 @@ class FrequencyPartitionEncoding
           indices(pool),
           startRow(0),
           size(0),
+          resolvedValues(pool),
           bitmap(pool),
           rankSuperblock(pool),
           efPositions(pool) {}
@@ -602,7 +627,8 @@ class FrequencyPartitionEncoding
     const uint32_t sampleStart = sampleIdx * kRankSampleStride;
 
     uint32_t scanStart = sampleStart;
-    uint32_t rank = tierRankSamples_[tierIdx][sampleIdx];
+    uint32_t rank =
+        tierRankSamples_[tierIdx * numRankSamplesPerBucket_ + sampleIdx];
 #ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
     if (cursorReuseEnabledForBench_)
 #endif
@@ -654,11 +680,7 @@ class FrequencyPartitionEncoding
   // larger kRankSampleStride gives back. This table is rebuilt at decode
   // construction and never serialised, so it has no effect on payload_bytes.
   size_t tierRankSamplesBytesForBench() const {
-    size_t total = 0;
-    for (const auto& perTier : tierRankSamples_) {
-      total += perTier.size() * sizeof(uint32_t);
-    }
-    return total;
+    return tierRankSamples_.size() * sizeof(uint32_t);
   }
 
  private:
@@ -672,6 +694,17 @@ class FrequencyPartitionEncoding
 
   template <FreqPartIndexType I>
   T decodeAtOriginalIndexImpl(uint32_t u) const;
+
+  // Reads the value at `rank` within `tier`: resolvedValues[rank] when the
+  // opt-in Options::frequencyPartitionResolveTierValues table was built
+  // (skipping the indices lookup and the dictionary lookup it feeds), else
+  // the ordinary dictionary[indices[rank]] chain.
+  static T tierValueAtRank(const TierInfo& tier, uint32_t rank) {
+    if (!tier.resolvedValues.empty()) {
+      return tier.resolvedValues[rank];
+    }
+    return tier.dictionary[tier.indices[rank]];
+  }
 
   template <FreqPartIndexType I>
   void materializeImpl(T* dst, uint32_t start, uint32_t count) const;
@@ -702,9 +735,14 @@ class FrequencyPartitionEncoding
   // TierTagArray fields
   uint8_t tagBits_;
   Vector<uint8_t> tagArray_;
-  // tierRankSamples_[t][si] = count of tag==t in positions [0,
-  // si*kRankSampleStride) Index tiers_.size() is used for the fallback bucket.
-  std::vector<std::vector<uint32_t>> tierRankSamples_;
+  // Flattened [numBuckets x numSamplesPerBucket] table: tierRankSamples_
+  // [t * numRankSamplesPerBucket_ + si] = count of tag==t in positions
+  // [0, si*kRankSampleStride). Index tiers_.size() is used for the fallback
+  // bucket. Held as one contiguous allocation instead of a vector of vectors
+  // so a lookup costs one pointer chase (into this buffer) rather than two
+  // (into the outer vector, then into the per-tier inner vector).
+  std::vector<uint32_t> tierRankSamples_;
+  uint32_t numRankSamplesPerBucket_{0};
 
   // Forward-scan cursor for tierRankAtForTag, keyed the same way as
   // tierRankSamples_ (index tiers_.size() is the fallback bucket).
@@ -925,13 +963,16 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
           }
           pos += tagStreamBytes;
 
-          // Single O(N) pass: build per-tier sampled rank index.
+          // Single O(N) pass: build per-tier sampled rank index, flattened
+          // into one [numBuckets x numSamples] buffer (see tierRankSamples_)
+          // so a lookup chases one pointer instead of two.
           const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
           const uint32_t numBuckets = static_cast<uint32_t>(numActiveTiers) + 1;
           const uint32_t numSamples =
               (totalRowCount_ + kRankSampleStride - 1) / kRankSampleStride + 1;
+          numRankSamplesPerBucket_ = numSamples;
           tierRankSamples_.assign(
-              numBuckets, std::vector<uint32_t>(numSamples, 0));
+              static_cast<size_t>(numBuckets) * numSamples, 0);
           cursorPos_.assign(numBuckets, 0);
           cursorRank_.assign(numBuckets, 0);
           cursorValid_.assign(numBuckets, false);
@@ -941,7 +982,8 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
             if (i % kRankSampleStride == 0) {
               const uint32_t si = i / kRankSampleStride;
               for (uint32_t t = 0; t < numBuckets; ++t) {
-                tierRankSamples_[t][si] = counts[t];
+                tierRankSamples_[t * numRankSamplesPerBucket_ + si] =
+                    counts[t];
               }
             }
             const uint8_t tag = unpackTagAt(tagArray_.data(), i, tagBits_);
@@ -953,12 +995,27 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
           const uint32_t lastSi =
               (totalRowCount_ + kRankSampleStride - 1) / kRankSampleStride;
           for (uint32_t t = 0; t < numBuckets; ++t) {
-            tierRankSamples_[t][lastSi] = counts[t];
+            tierRankSamples_[t * numRankSamplesPerBucket_ + lastSi] =
+                counts[t];
           }
 
           // Set tierCount from the scan.
           for (uint32_t t = 0; t < numActiveTiers; ++t) {
             tiers_[t].tierCount = counts[t];
+          }
+
+          // Opt-in (Options::frequencyPartitionResolveTierValues): resolve
+          // indices[rank] -> dictionary index into a direct rank -> value
+          // table, so decode can skip both loads at read time. Memory, not
+          // format, cost: held alongside the existing indices/dictionary
+          // tables, not instead of them.
+          if (options.frequencyPartitionResolveTierValues) {
+            for (auto& tier : tiers_) {
+              tier.resolvedValues.resize(tier.indices.size());
+              for (uint32_t rank = 0; rank < tier.indices.size(); ++rank) {
+                tier.resolvedValues[rank] = tier.dictionary[tier.indices[rank]];
+              }
+            }
           }
           break;
         }
@@ -1097,7 +1154,7 @@ T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(uint32_t u) const {
     const uint8_t tag = unpackTagAt(tagArray_.data(), u, tagBits_);
     if (tag < numActiveTiers) {
       const uint32_t rank = tierRankAtForTag(tag, u);
-      return tiers_[tag].dictionary[tiers_[tag].indices[rank]];
+      return tierValueAtRank(tiers_[tag], rank);
     }
     const uint32_t fallbackRank = tierRankAtForTag(numActiveTiers, u);
     return unencodedValues_[fallbackRank];
@@ -1190,14 +1247,23 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
     }
   }
 
+  // Software prefetch was tried here (issuing a prefetch for row
+  // i + kDistance's indices/resolvedValues slot once its cheap,
+  // non-dependent tag was known, ahead of consuming row i's own dependent
+  // chain) and measured as a net regression: -43% on bulk (144 -> 81
+  // Melem/s) and -35 to -46% on range at B=64/512/4096, large enough to
+  // erase tierValueAtRank's own gain. The per-row cost of the extra
+  // unpackTagAt call and branch outweighed any latency it hid -- this walk's
+  // working set (tier5's dictionary/indices, ~3.7-7.4MB) fits the LLC, so it
+  // is not DRAM-latency-bound the way the hypothesis assumed. Do not
+  // reintroduce without re-measuring against this baseline.
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t u = start + i;
 
     if constexpr (I == FreqPartIndexType::TierTagArray) {
       const uint8_t tag = unpackTagAt(tagArray_.data(), u, tagBits_);
       if (tag < numTiers) {
-        const auto& tier = tiers_[tag];
-        dst[i] = tier.dictionary[tier.indices[cursor[tag]++]];
+        dst[i] = tierValueAtRank(tiers_[tag], cursor[tag]++);
       } else {
         dst[i] = unencodedValues_[fallbackCursor++];
       }

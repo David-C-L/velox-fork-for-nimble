@@ -1276,6 +1276,34 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   }
 
   {
+    // Same as FPE/fpe_tagtag, with Options::frequencyPartitionResolveTierValues
+    // set: TierTagArray resolves indices[rank] -> dictionary index into a
+    // per-tier rank -> value table at decode construction, so decode reads it
+    // directly instead of chasing dictionary[indices[rank]]. Measures the
+    // opt-in load-chain shortening against the default-off arm above; payload
+    // bytes are identical between the two, since this table is never
+    // serialised.
+    EncoderEntry<T> entry;
+    entry.name = "FPE/fpe_tagtag_resolved";
+    entry.family = "FrequencyPartition";
+    entry.variant = "fpe_tagtag_resolved";
+    entry.isSequential = true;
+    entry.fastSkip = true;
+    entry.randomAccess = true;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl = std::make_unique<
+          NimbleBenchTargetImpl<FrequencyPartitionEncoding<T>>>();
+      Encoding::Options o = opts;
+      o.frequencyPartitionIndex =
+          static_cast<uint8_t>(FreqPartIndexType::TierTagArray);
+      o.frequencyPartitionResolveTierValues = true;
+      impl->target.encode(data, o, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
     EncoderEntry<T> entry;
     entry.name = "SIS/realNested";
     entry.family = "SubIntSplit";
