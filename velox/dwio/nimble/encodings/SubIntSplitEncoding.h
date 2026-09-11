@@ -42,7 +42,6 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
-#include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
@@ -50,6 +49,7 @@
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -220,8 +220,20 @@ class SubIntSplitEncoding
   // Per-section transform metadata from the header. Empty ids mean the stream
   // predates transforms, or chose none.
   detail::SubIntSplitTransformInfo transformInfo_;
-  // Widened section values for the block being decoded, reused across blocks.
+  // Widened section values for the block being decoded, reused across
+  // blocks. Populated only for a section that needs a uint64 span: one that
+  // is itself transformed (invert() requires it) or that serves as another
+  // section's key (keySpan is handed to invert() the same way). Every other
+  // section decodes straight into sectionNative_ below and assembly reads it
+  // at its own width, so most streams never widen at all.
   std::vector<std::vector<uint64_t>> sectionScratch_;
+  // Byte-packed decode buffer for a section sectionNeedsWide_ marks false, at
+  // the section's own storage width, one vector per section.
+  std::vector<std::vector<uint8_t>> sectionNative_;
+  // Whether section s must be widened to uint64: it carries a transform, or
+  // it is the key section another section's transform reads. Computed once
+  // at construction, since transformIds and keySection never change after.
+  std::vector<bool> sectionNeedsWide_;
   // The block currently held in blockCache_, and the row the sections stand
   // at. Only meaningful for a transformed stream.
   uint32_t cachedBlockStart_{0};
@@ -272,10 +284,8 @@ class SubIntSplitEncoding
     const auto start = std::chrono::steady_clock::now();
     sec.encoding->materialize(count, scratch);
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    decodeProfile_->sections[sectionIndex].decodeNanos +=
-        static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
-                .count());
+    decodeProfile_->sections[sectionIndex].decodeNanos += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
   }
 
   // Forwards to the kernel shared with SubIntSplitEncodingView.
@@ -324,6 +334,21 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
     sec.storageBytes = parsed[s].storageBytes;
     sec.encoding = EncodingFactory().create(
         *this->pool_, parsed[s].stream, stringBufferFactory, options);
+  }
+
+  // A section needs a uint64 span only if invert() is called on it directly,
+  // or if it is handed to another section's invert() as the key. Every other
+  // section is assembled straight from its own storage width.
+  sectionNeedsWide_.assign(sections_.size(), false);
+  for (size_t s = 0; s < transformInfo_.transformIds.size(); ++s) {
+    if (transformInfo_.transformIds[s] != 0) {
+      sectionNeedsWide_[s] = true;
+    }
+  }
+  if (transformInfo_.keySection !=
+          detail::SubIntSplitTransformInfo::kNoKeySection &&
+      transformInfo_.keySection < sectionNeedsWide_.size()) {
+    sectionNeedsWide_[transformInfo_.keySection] = true;
   }
 
   // Attribution is opt-in and populated once here: bit range, width, chosen
@@ -729,17 +754,49 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     scratchBuf_.resize(neededBytes);
   }
 
-  // Every section is widened to 64 bits first, so a transform never has to
-  // know which width its section was stored at. The buffers are held across
-  // blocks rather than allocated per block: a bulk decode walks thousands of
-  // them, and that allocation would otherwise be charged to the transform when
-  // it belongs to this loop.
-  auto& sectionValues = sectionScratch_;
-  sectionValues.resize(sections_.size());
+  // A section that carries a transform, or that serves as another section's
+  // key, decodes into a widened uint64 scratch entry since invert() (and
+  // keySpan) need that span. Every other section decodes straight into its
+  // own native-width buffer and assembly reads it at that width, skipping
+  // the widen entirely. Buffers are held across blocks rather than allocated
+  // per block: a bulk decode walks thousands of them, and that allocation
+  // would otherwise be charged to the transform when it belongs to this
+  // loop.
+  sectionScratch_.resize(sections_.size());
+  sectionNative_.resize(sections_.size());
   for (size_t s = 0; s < sections_.size(); ++s) {
     auto& sec = sections_[s];
-    auto& values = sectionValues[s];
+    if (!sectionNeedsWide_[s] && sec.storageBytes != 8) {
+      auto& native = sectionNative_[s];
+      native.resize(blockCount * sec.storageBytes);
+      switch (sec.storageBytes) {
+        case 1:
+          materializeSection(sec, s, blockCount, native.data());
+          break;
+        case 2:
+          materializeSection(
+              sec, s, blockCount, reinterpret_cast<uint16_t*>(native.data()));
+          break;
+        default:
+          materializeSection(
+              sec, s, blockCount, reinterpret_cast<uint32_t*>(native.data()));
+          break;
+      }
+      continue;
+    }
+    auto& values = sectionScratch_[s];
     values.resize(blockCount);
+    if (sec.storageBytes == 8) {
+      // Already the target width: decode directly, skipping the
+      // narrow-to-wide copy entirely.
+      materializeSection(sec, s, blockCount, values.data());
+      continue;
+    }
+    const uint32_t neededBytes =
+        blockCount * static_cast<uint32_t>(sizeof(physicalType));
+    if (scratchBuf_.size() < neededBytes) [[unlikely]] {
+      scratchBuf_.resize(neededBytes);
+    }
     switch (sec.storageBytes) {
       case 1: {
         auto* scratch = reinterpret_cast<uint8_t*>(scratchBuf_.data());
@@ -757,16 +814,8 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
         }
         break;
       }
-      case 4: {
-        auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
-        materializeSection(sec, s, blockCount, scratch);
-        for (uint32_t i = 0; i < blockCount; ++i) {
-          values[i] = scratch[i];
-        }
-        break;
-      }
       default: {
-        auto* scratch = reinterpret_cast<uint64_t*>(scratchBuf_.data());
+        auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
         materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
           values[i] = scratch[i];
@@ -782,8 +831,8 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
   std::span<const uint64_t> keySpan;
   if (transformInfo_.keySection !=
       detail::SubIntSplitTransformInfo::kNoKeySection) {
-    keySpan = std::span<const uint64_t>(
-        sectionValues[transformInfo_.keySection]);
+    keySpan =
+        std::span<const uint64_t>(sectionScratch_[transformInfo_.keySection]);
   }
 
   const uint32_t blockIndex = blockStart / blockSize;
@@ -802,17 +851,65 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     subintsplit::TransformContext context{
         .keySection = keySpan,
         .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
-    transform->invert(sectionValues[s], context, state);
+    transform->invert(sectionScratch_[s], context, state);
   }
 
+  // Accumulate one section at a time across the whole block, reusing the
+  // same SIMD kernel the untransformed path calls from materialize():
+  // section 0 initialises every output element, later sections OR their
+  // bits in. A section that was never widened is accumulated straight from
+  // its own native-width buffer; only a widened section reads through
+  // sectionScratch_. This replaces a per-row loop that dispatched on each
+  // section's width and widening state row by row -- the same work, but
+  // organised so the dispatch happens once per section rather than once per
+  // (row, section).
   blockCache_.resize(blockCount);
-  for (uint32_t i = 0; i < blockCount; ++i) {
-    uint64_t assembled = 0;
-    for (size_t s = 0; s < sections_.size(); ++s) {
-      assembled |= (sectionValues[s][i] & sections_[s].mask)
-          << sections_[s].bitStart;
+  physicalType* dst = blockCache_.data();
+  for (size_t s = 0; s < sections_.size(); ++s) {
+    const auto& sec = sections_[s];
+    const int shift = sec.bitStart;
+    const uint64_t mask = sec.mask;
+    const bool isFirst = (s == 0);
+    if (sec.storageBytes == 8 || sectionNeedsWide_[s]) {
+      const auto* src = sectionScratch_[s].data();
+      if (isFirst) {
+        accumulateSection<uint64_t, true>(src, dst, blockCount, mask, shift);
+      } else {
+        accumulateSection<uint64_t, false>(src, dst, blockCount, mask, shift);
+      }
+      continue;
     }
-    blockCache_[i] = static_cast<physicalType>(assembled);
+    const uint8_t* native = sectionNative_[s].data();
+    switch (sec.storageBytes) {
+      case 1: {
+        if (isFirst) {
+          accumulateSection<uint8_t, true>(
+              native, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint8_t, false>(
+              native, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+      case 2: {
+        const auto* src = reinterpret_cast<const uint16_t*>(native);
+        if (isFirst) {
+          accumulateSection<uint16_t, true>(src, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint16_t, false>(src, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+      default: {
+        const auto* src = reinterpret_cast<const uint32_t*>(native);
+        if (isFirst) {
+          accumulateSection<uint32_t, true>(src, dst, blockCount, mask, shift);
+        } else {
+          accumulateSection<uint32_t, false>(src, dst, blockCount, mask, shift);
+        }
+        break;
+      }
+    }
   }
   cachedBlockStart_ = blockStart;
 }
@@ -864,8 +961,7 @@ inline subintsplit::SectionProfile profileSection(
     if (distinct == 0) {
       return false;
     }
-    const int codeBits =
-        distinct == 1 ? 1 : 64 - __builtin_clzll(distinct - 1);
+    const int codeBits = distinct == 1 ? 1 : 64 - __builtin_clzll(distinct - 1);
     if (codeBits >= width) {
       return true;
     }
@@ -915,9 +1011,7 @@ inline subintsplit::SectionProfile profileSection(
 // whole apparatus for it, sorting as many runs as there are rows and probing a
 // table that large once per row, which profiling found dominating decode on a
 // column whose first section is a 19-bit identifier.
-inline bool groupsEnoughToKey(
-    const std::vector<uint64_t>& key,
-    int boundBits) {
+inline bool groupsEnoughToKey(const std::vector<uint64_t>& key, int boundBits) {
   // Below this, a run averages fewer than four rows and there is little to
   // gather.
   constexpr size_t kMinRowsPerRun = 4;
@@ -1175,8 +1269,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   transformInfo.transformIds.assign(splitCount, 0);
   transformInfo.codebooks.assign(splitCount, {});
   transformInfo.primaryIndices.assign(splitCount, {});
-  transformInfo.keySection =
-      detail::SubIntSplitTransformInfo::kNoKeySection;
+  transformInfo.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
 
   // Encodes one section at its storage width. Called more than once per
   // section, since choosing whether to transform means pricing both.
@@ -1252,55 +1345,56 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // would cost compression -- a key-derived sort clusters far better over a
   // whole section than over 4096 rows -- and buy nothing, because neither
   // needs a bounded span to address a row.
-  const auto applyTransform = [&](const subintsplit::SectionTransform*
-                                      transform,
-                                  int width,
-                                  const std::vector<uint64_t>& keyValues,
-                                  std::span<const uint32_t> keyOrder,
-                                  std::vector<uint64_t>& sectionU64,
-                                  std::vector<uint64_t>& codebook,
-                                  std::vector<uint32_t>& primaryIndices) {
-    subintsplit::TransformState sharedState;
-    transform->prepareSection(sectionU64, sharedState);
-    codebook = sharedState.codebook;
+  const auto applyTransform =
+      [&](const subintsplit::SectionTransform* transform,
+          int width,
+          const std::vector<uint64_t>& keyValues,
+          std::span<const uint32_t> keyOrder,
+          std::vector<uint64_t>& sectionU64,
+          std::vector<uint64_t>& codebook,
+          std::vector<uint32_t>& primaryIndices) {
+        subintsplit::TransformState sharedState;
+        transform->prepareSection(sectionU64, sharedState);
+        codebook = sharedState.codebook;
 
-    if (transform->positionMapping() !=
-        subintsplit::PositionMapping::Sequential) {
-      subintsplit::TransformState state;
-      state.codebook = sharedState.codebook;
-      subintsplit::TransformContext context{
-          .keySection = keyValues, .width = width, .keyOrder = keyOrder};
-      transform->apply(sectionU64, context, state);
-      if (codebook.empty()) {
-        codebook = std::move(state.codebook);
-      }
-    } else {
-      const uint32_t blockSize = subintsplit::kTransformBlockSize;
-      for (uint32_t start = 0; start < valueCount; start += blockSize) {
-        const uint32_t count =
-            std::min<uint32_t>(blockSize, valueCount - start);
-        subintsplit::TransformState state;
-        state.codebook = sharedState.codebook;
-        // No keyOrder: this branch hands the transform one block of the key
-        // at a time, and a permutation of the whole section does not describe
-        // the order within a block.
-        subintsplit::TransformContext context{
-            .keySection = keyValues.empty()
-                ? std::span<const uint64_t>{}
-                : std::span<const uint64_t>(keyValues.data() + start, count),
-            .width = width};
-        transform->apply(
-            std::span<uint64_t>(sectionU64.data() + start, count),
-            context,
-            state);
-        primaryIndices.push_back(state.primaryIndex);
-      }
-    }
-    // What subIntSplitTransformHeaderSize will charge for this section: the
-    // codebook and its count, and the per-block state and its count.
-    return 4 + codebook.size() * sizeof(uint64_t) + 4 +
-        primaryIndices.size() * 4;
-  };
+        if (transform->positionMapping() !=
+            subintsplit::PositionMapping::Sequential) {
+          subintsplit::TransformState state;
+          state.codebook = sharedState.codebook;
+          subintsplit::TransformContext context{
+              .keySection = keyValues, .width = width, .keyOrder = keyOrder};
+          transform->apply(sectionU64, context, state);
+          if (codebook.empty()) {
+            codebook = std::move(state.codebook);
+          }
+        } else {
+          const uint32_t blockSize = subintsplit::kTransformBlockSize;
+          for (uint32_t start = 0; start < valueCount; start += blockSize) {
+            const uint32_t count =
+                std::min<uint32_t>(blockSize, valueCount - start);
+            subintsplit::TransformState state;
+            state.codebook = sharedState.codebook;
+            // No keyOrder: this branch hands the transform one block of the key
+            // at a time, and a permutation of the whole section does not
+            // describe the order within a block.
+            subintsplit::TransformContext context{
+                .keySection = keyValues.empty()
+                    ? std::span<const uint64_t>{}
+                    : std::span<const uint64_t>(
+                          keyValues.data() + start, count),
+                .width = width};
+            transform->apply(
+                std::span<uint64_t>(sectionU64.data() + start, count),
+                context,
+                state);
+            primaryIndices.push_back(state.primaryIndex);
+          }
+        }
+        // What subIntSplitTransformHeaderSize will charge for this section: the
+        // codebook and its count, and the per-block state and its count.
+        return 4 + codebook.size() * sizeof(uint64_t) + 4 +
+            primaryIndices.size() * 4;
+      };
 
   // Neither a section's extracted values nor its untransformed encoding
   // depends on which section is being tried as the key, so both are done once
@@ -1335,8 +1429,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // have faced. Abandoning there is therefore not a heuristic: the candidate
   // the search settles on is the one it would have settled on had every plan
   // been priced to the end.
-  const auto attemptWithKey =
-      [&](uint8_t candidateKey, size_t bound) -> std::optional<Attempt> {
+  const auto attemptWithKey = [&](uint8_t candidateKey,
+                                  size_t bound) -> std::optional<Attempt> {
     Attempt attempt;
     attempt.sections.assign(splitCount, std::string_view{});
     attempt.info.transformIds.assign(splitCount, 0);
@@ -1546,8 +1640,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // A key section is only worth holding back if some other section was
   // actually keyed on it.
   if (!transformInfo.anyTransform()) {
-    transformInfo.keySection =
-        detail::SubIntSplitTransformInfo::kNoKeySection;
+    transformInfo.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
   }
 
   // Write final encoding to main buffer.
