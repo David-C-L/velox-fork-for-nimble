@@ -130,6 +130,46 @@ inline constexpr uint32_t kTransformBlockSize = 4096;
 /// Returns the name of a transform id, for logging and test failures.
 std::string toString(TransformId id);
 
+/// Bookkeeping for undoing a key-derived permutation: which run each row's
+/// key falls in, the value each run stands for, that run's rank among the
+/// sorted distinct keys, and where each rank's rows start once the block is
+/// arranged in that order. A block's key section produces exactly one of
+/// these; every section keyed on it shares the same one rather than each
+/// rebuilding it, when the caller chooses to share it (see
+/// TransformContext::keyRunIds and friends below).
+struct KeyRunState {
+  /// Run id of each row's key, in original row order.
+  std::vector<uint32_t> runOfRow;
+  /// The value each run id stands for.
+  std::vector<uint64_t> runValues;
+  /// Sorted rank of each run id among the distinct keys, ascending.
+  std::vector<uint32_t> sortedRank;
+  /// Prefix-sum run starts in sorted-rank order; runValues.size() + 1
+  /// entries.
+  std::vector<uint32_t> runStart;
+};
+
+/// Fills `out` with the KeyRunState for `keys`. Reused by
+/// KeyDerivedTransform::invert when the caller has not already supplied one
+/// through TransformContext, and by any caller that shares one KeyRunState
+/// across several sections keyed on the same block.
+void buildKeyRunState(std::span<const uint64_t> keys, KeyRunState& out);
+
+/// Scratch KeyDerivedTransform::invert reuses across calls instead of
+/// allocating fresh buffers each time. `local` holds a KeyRunState built here
+/// when the caller did not supply one; `cursor` and `rows` are always needed,
+/// since the merge that undoes the permutation mutates them.
+struct KeyDerivedScratch {
+  /// Run bookkeeping built here when TransformContext did not supply one.
+  KeyRunState local;
+  /// Working copy of the run starts, consumed (incremented) during the merge
+  /// that undoes the permutation.
+  std::vector<uint32_t> cursor;
+  /// Values in original row order, filled by the merge before being copied
+  /// back into the section.
+  std::vector<uint64_t> rows;
+};
+
 /// Everything a transform needs about the block beyond the section itself.
 struct TransformContext {
   /// The section this transform is keyed on, already decoded and in original
@@ -155,6 +195,20 @@ struct TransformContext {
   /// candidate key across several sections would otherwise rebuild the same
   /// permutation once per section.
   std::span<const uint32_t> keyOrder;
+  /// Sorted rank of each run, indexed by run id: entry r is where
+  /// keyRunValues[r] sits among the distinct keys in ascending order. Empty
+  /// unless the caller already has it, the same condition as keyRunIds.
+  std::span<const uint32_t> keyRunSortedRank;
+  /// Prefix-sum run starts in sorted-rank order: the run whose sorted rank is
+  /// r begins at keyRunStart[r], and has keyRunValues.size() + 1 entries.
+  /// Empty unless the caller already has it, the same condition as
+  /// keyRunIds.
+  std::span<const uint32_t> keyRunStart;
+  /// Reusable scratch KeyDerivedTransform::invert may use instead of
+  /// allocating its own buffers every call. Null means allocate locally, so
+  /// omitting it is always correct, just slower. Non-owning: the caller
+  /// decides the buffers' lifetime.
+  KeyDerivedScratch* keyDerivedScratch = nullptr;
 };
 
 /// The permutation that stably sorts `key`, ties keeping their original row

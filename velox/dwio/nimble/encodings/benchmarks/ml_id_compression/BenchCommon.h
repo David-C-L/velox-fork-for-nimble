@@ -43,18 +43,18 @@
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/compression/Compression.h"
+#include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
+#include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
-#include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
-#include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
-#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
 #include "velox/dwio/nimble/tools/EncodingUtilities.h"
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,10 @@ DECLARE_string(mlidc_outer_compression);
 DECLARE_int32(mlidc_block_codec_iters);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
+DECLARE_bool(mlidc_reuse_key_runs);
+DECLARE_bool(mlidc_reuse_scratch);
+DECLARE_bool(mlidc_fuse_invert_assembly);
+DECLARE_bool(mlidc_assemble_direct);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
@@ -261,8 +265,9 @@ struct NimbleBenchTargetImpl
     if (payload.empty()) {
       return {};
     }
-    return nimble::tools::getEncodingTreeLabel(std::string_view(
-        reinterpret_cast<const char*>(payload.data()), payload.size()));
+    return nimble::tools::getEncodingTreeLabel(
+        std::string_view(
+            reinterpret_cast<const char*>(payload.data()), payload.size()));
   }
 
   std::string describeNodeEstimates() override {
@@ -396,9 +401,7 @@ class NimbleViewBenchTargetImpl
   std::string describeNodeEstimates() override {
     return encoded_.empty() ? std::string{}
                             : describeEncodingNodeEstimates(
-                                  std::string_view(encoded_),
-                                  *pool_,
-                                  options_);
+                                  std::string_view(encoded_), *pool_, options_);
   }
 
  private:
@@ -1036,7 +1039,8 @@ std::vector<DatasetEntry<T>> defaultDatasets() {
   // above this is not regenerated per seed, so the seed is ignored.
   if (!FLAGS_mlidc_file.empty()) {
     out.push_back({FLAGS_mlidc_dataset_name, [](uint32_t n, uint64_t /*seed*/) {
-                     auto data = detail::loadColumnLines<T>(FLAGS_mlidc_file, n);
+                     auto data =
+                         detail::loadColumnLines<T>(FLAGS_mlidc_file, n);
                      return detail::applyInputOrder<T>(std::move(data));
                    }});
   }
@@ -1394,19 +1398,18 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         entry.isSequential = false;
         entry.fastSkip = true;
         entry.randomAccess = true;
-        entry.factory = [rawId](
-                            const Vector<T>& data,
-                            const Encoding::Options& opts) {
-          Encoding::Options o = opts;
-          o.subIntSplitTransform = rawId;
-          // 0xFF: let the encoder find the section worth keying on rather
-          // than assert one, since that is a property of the column.
-          o.subIntSplitKeySection = 0xFF;
-          auto impl = std::make_unique<
-              NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
-          impl->encodeWith(data, o, /*realNestedSelection=*/true);
-          return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-        };
+        entry.factory =
+            [rawId](const Vector<T>& data, const Encoding::Options& opts) {
+              Encoding::Options o = opts;
+              o.subIntSplitTransform = rawId;
+              // 0xFF: let the encoder find the section worth keying on rather
+              // than assert one, since that is a property of the column.
+              o.subIntSplitKeySection = 0xFF;
+              auto impl = std::make_unique<
+                  NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+              impl->encodeWith(data, o, /*realNestedSelection=*/true);
+              return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+            };
         encoders.push_back(std::move(entry));
       }
     }

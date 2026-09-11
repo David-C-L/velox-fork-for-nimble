@@ -67,6 +67,34 @@ DEFINE_bool(
     "rather than a second arm because crossing it with the Huffman arms would "
     "double every SubIntSplit target for a comparison that is run once.");
 DEFINE_bool(
+    mlidc_reuse_key_runs,
+    true,
+    "Encoding::Options::subIntSplitReuseKeyRuns: shares one block's "
+    "key-derived run bookkeeping across every section keyed on it instead of "
+    "each section's invert() rebuilding it. True is what production ships; "
+    "pass false to isolate its effect in the assembly ablation.");
+DEFINE_bool(
+    mlidc_reuse_scratch,
+    true,
+    "Encoding::Options::subIntSplitReuseScratch: reuses "
+    "KeyDerivedTransform::invert's scratch buffers across blocks instead of "
+    "allocating them per call. True is what production ships; pass false to "
+    "isolate its effect in the assembly ablation.");
+DEFINE_bool(
+    mlidc_fuse_invert_assembly,
+    true,
+    "Encoding::Options::subIntSplitFuseInvertAssembly: undoes a key-derived "
+    "section's permutation directly in the assembly accumulate step instead "
+    "of merging into a temporary buffer first. True is what production "
+    "ships; pass false to isolate its effect in the assembly ablation.");
+DEFINE_bool(
+    mlidc_assemble_direct,
+    true,
+    "Encoding::Options::subIntSplitAssembleDirect: assembles a whole-block "
+    "bulk read directly into the caller's output buffer instead of through "
+    "blockCache_. True is what production ships; pass false to isolate its "
+    "effect in the assembly ablation.");
+DEFINE_bool(
     mlidc_dump_encoding,
     false,
     "Print the encoding tree each encoder selected, including the bit ranges "

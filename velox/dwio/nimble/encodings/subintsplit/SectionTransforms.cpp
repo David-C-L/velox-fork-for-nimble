@@ -99,11 +99,49 @@ void scatter(std::span<uint64_t> values, const std::vector<uint32_t>& order) {
   std::copy(scratch.begin(), scratch.end(), values.begin());
 }
 
+} // namespace
+
+void buildKeyRunState(std::span<const uint64_t> keys, KeyRunState& out) {
+  const size_t count = keys.size();
+  folly::F14FastMap<uint64_t, uint32_t> runOf;
+  runOf.reserve(count / 8);
+  out.runOfRow.resize(count);
+  for (size_t i = 0; i < count; ++i) {
+    const auto inserted =
+        runOf.emplace(keys[i], static_cast<uint32_t>(runOf.size()));
+    out.runOfRow[i] = inserted.first->second;
+  }
+  out.runValues.resize(runOf.size());
+  for (const auto& entry : runOf) {
+    out.runValues[entry.second] = entry.first;
+  }
+
+  const auto runs = static_cast<uint32_t>(out.runValues.size());
+  std::vector<uint32_t> rank(runs);
+  std::iota(rank.begin(), rank.end(), 0u);
+  const auto& runValues = out.runValues;
+  std::sort(rank.begin(), rank.end(), [&runValues](uint32_t a, uint32_t b) {
+    return runValues[a] < runValues[b];
+  });
+  out.sortedRank.resize(runs);
+  for (uint32_t i = 0; i < runs; ++i) {
+    out.sortedRank[rank[i]] = i;
+  }
+
+  out.runStart.assign(runs + 1, 0);
+  for (size_t i = 0; i < count; ++i) {
+    ++out.runStart[out.sortedRank[out.runOfRow[i]] + 1];
+  }
+  std::partial_sum(
+      out.runStart.begin(), out.runStart.end(), out.runStart.begin());
+}
+
+namespace {
+
 std::vector<uint64_t> sortedAlphabet(std::span<const uint64_t> values) {
   std::vector<uint64_t> alphabet(values.begin(), values.end());
   std::sort(alphabet.begin(), alphabet.end());
-  alphabet.erase(
-      std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
+  alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
   return alphabet;
 }
 
@@ -163,59 +201,46 @@ class KeyDerivedTransform : public SectionTransform {
     // transform pays, so it stays in cache, where a map that chases a pointer
     // per row does not. Profiling put nearly half of all first-level read
     // misses in this function, and they were those probes.
-    // The reader hands over dense run ids where the encoding holding the key
-    // already had them, which a dictionary does. Rebuilding them means hashing
-    // every row to recover ids that were already there, and profiling put that
-    // and the sort it feeds at a third of the instructions on one column.
-    std::vector<uint32_t> derivedIds;
-    std::vector<uint64_t> derivedValues;
+    // The reader hands over dense run ids, run values, sorted run order, and
+    // per-run start offsets where a caller already built them -- shared
+    // across every section keyed on the same block's key -- through
+    // TransformContext. Rebuilding them means hashing every row and sorting
+    // the runs to recover bookkeeping that was already there, and profiling
+    // put that at a third of the instructions on one column. `given` reflects
+    // whether the caller supplied that whole bundle: keyRunIds is either
+    // fully populated alongside the rest, or entirely empty, never partial.
+    KeyDerivedScratch localScratch;
+    KeyDerivedScratch& scratch = context.keyDerivedScratch != nullptr
+        ? *context.keyDerivedScratch
+        : localScratch;
     const bool given = !context.keyRunIds.empty();
     if (!given) {
-      folly::F14FastMap<uint64_t, uint32_t> runOf;
-      runOf.reserve(count / 8);
-      derivedIds.resize(count);
-      for (size_t i = 0; i < count; ++i) {
-        const auto inserted =
-            runOf.emplace(keys[i], static_cast<uint32_t>(runOf.size()));
-        derivedIds[i] = inserted.first->second;
-      }
-      derivedValues.resize(runOf.size());
-      for (const auto& entry : runOf) {
-        derivedValues[entry.second] = entry.first;
-      }
+      buildKeyRunState(keys, scratch.local);
     }
-    const std::span<const uint32_t> runOfRow =
-        given ? context.keyRunIds : std::span<const uint32_t>(derivedIds);
-    const std::span<const uint64_t> runValues =
-        given ? context.keyRunValues : std::span<const uint64_t>(derivedValues);
+    const std::span<const uint32_t> runOfRow = given
+        ? context.keyRunIds
+        : std::span<const uint32_t>(scratch.local.runOfRow);
+    const std::span<const uint64_t> runValues = given
+        ? context.keyRunValues
+        : std::span<const uint64_t>(scratch.local.runValues);
+    const std::span<const uint32_t> position = given
+        ? context.keyRunSortedRank
+        : std::span<const uint32_t>(scratch.local.sortedRank);
+    const std::span<const uint32_t> runStart = given
+        ? context.keyRunStart
+        : std::span<const uint32_t>(scratch.local.runStart);
     NIMBLE_CHECK_EQ(
         runOfRow.size(), count, "Key-derived needs one run id per row.");
-    const size_t runs = runValues.size();
 
-    // The rows were laid out in the key's sorted order, so the runs are walked
-    // in that order too. Only the distinct keys are sorted, of which there are
-    // few; sorting the rows is what this whole path exists to avoid.
-    std::vector<uint32_t> rank(runs);
-    std::iota(rank.begin(), rank.end(), 0u);
-    std::sort(rank.begin(), rank.end(), [runValues](uint32_t a, uint32_t b) {
-      return runValues[a] < runValues[b];
-    });
-    std::vector<uint32_t> position(runs);
-    for (uint32_t i = 0; i < runs; ++i) {
-      position[rank[i]] = i;
-    }
-
-    std::vector<uint32_t> cursor(runs + 1, 0);
+    // cursor starts as a copy of runStart because several sections may share
+    // the same runStart read-only, while the merge below consumes cursor by
+    // incrementing it.
+    scratch.cursor.assign(runStart.begin(), runStart.end());
+    scratch.rows.resize(count);
     for (size_t i = 0; i < count; ++i) {
-      ++cursor[position[runOfRow[i]] + 1];
+      scratch.rows[i] = values[scratch.cursor[position[runOfRow[i]]]++];
     }
-    std::partial_sum(cursor.begin(), cursor.end(), cursor.begin());
-
-    std::vector<uint64_t> rows(count);
-    for (size_t i = 0; i < count; ++i) {
-      rows[i] = values[cursor[position[runOfRow[i]]]++];
-    }
-    std::copy(rows.begin(), rows.end(), values.begin());
+    std::copy(scratch.rows.begin(), scratch.rows.end(), values.begin());
   }
 
   // Where a row went is its rank in the sort of the key section, and the key
@@ -521,8 +546,7 @@ class BitPlaneTransform : public SectionTransform {
     const int width = context.width;
     uint64_t row = 0;
     for (int bit = 0; bit < width; ++bit) {
-      const uint64_t destination =
-          static_cast<uint64_t>(bit) * count + index;
+      const uint64_t destination = static_cast<uint64_t>(bit) * count + index;
       const uint64_t word =
           readWordAt(static_cast<uint32_t>(destination / width));
       if ((word >> (destination % width)) & 1ULL) {
@@ -620,7 +644,8 @@ const SectionTransform* transformFor(TransformId id) {
       return &kBitPlane;
   }
   NIMBLE_UNREACHABLE(
-      fmt::format("Unsupported SubIntSplit transform id: {}", static_cast<int>(id)));
+      fmt::format(
+          "Unsupported SubIntSplit transform id: {}", static_cast<int>(id)));
 }
 
 } // namespace facebook::nimble::subintsplit
