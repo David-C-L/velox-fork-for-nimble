@@ -97,6 +97,13 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_bulk_benchmark MlIdDecodeBulkBenchmark.cpp OPENZL
 )
 
+# MlIdDecodeSectionProfileBenchmark: attributes a SubIntSplit bulk decode to
+# its individual sections, using Options::subIntSplitDecodeProfile.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_decode_section_profile_benchmark
+  MlIdDecodeSectionProfileBenchmark.cpp
+)
+
 # MlIdDecodeRangeBenchmark: contiguous-range decode across (start, length).
 nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_range_benchmark MlIdDecodeRangeBenchmark.cpp OPENZL

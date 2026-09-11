@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -38,6 +39,7 @@
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
@@ -210,6 +212,11 @@ class SubIntSplitEncoding
 
   std::vector<SectionInfo> sections_;
 
+  // Optional per-section decode attribution, null in production. Set from
+  // Encoding::Options at construction; every section's own materialize()
+  // call in the bulk paths below is timed into it when non-null.
+  SubIntSplitDecodeProfile* decodeProfile_{nullptr};
+
   // Per-section transform metadata from the header. Empty ids mean the stream
   // predates transforms, or chose none.
   detail::SubIntSplitTransformInfo transformInfo_;
@@ -248,6 +255,28 @@ class SubIntSplitEncoding
   // Number of output elements processed per chunk in materialize().
   static constexpr uint32_t kMaterializeChunkSize =
       detail::kSubIntSplitChunkSize;
+
+  // Runs one section's own materialize() call, timing it into decodeProfile_
+  // when attribution is armed. Null decodeProfile_ (the production default)
+  // costs one branch and nothing else.
+  template <typename ScratchT>
+  void materializeSection(
+      const SectionInfo& sec,
+      size_t sectionIndex,
+      uint32_t count,
+      ScratchT* scratch) {
+    if (decodeProfile_ == nullptr) {
+      sec.encoding->materialize(count, scratch);
+      return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    sec.encoding->materialize(count, scratch);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    decodeProfile_->sections[sectionIndex].decodeNanos +=
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
+                .count());
+  }
 
   // Forwards to the kernel shared with SubIntSplitEncodingView.
   template <typename SectionT, bool IsFirst>
@@ -295,6 +324,23 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
     sec.storageBytes = parsed[s].storageBytes;
     sec.encoding = EncodingFactory().create(
         *this->pool_, parsed[s].stream, stringBufferFactory, options);
+  }
+
+  // Attribution is opt-in and populated once here: bit range, width, chosen
+  // encoding, and encoded size never change after construction, so only the
+  // timing accumulated in materialize() needs to be reset between passes.
+  decodeProfile_ = options.subIntSplitDecodeProfile;
+  if (decodeProfile_ != nullptr) {
+    decodeProfile_->sections.resize(parsed.size());
+    for (size_t s = 0; s < parsed.size(); ++s) {
+      auto& profile = decodeProfile_->sections[s];
+      profile.bitStart = sections_[s].bitStart;
+      profile.bitEnd = sections_[s].bitEnd;
+      profile.storageBytes = sections_[s].storageBytes;
+      profile.encodingType = sections_[s].encoding->encodingType();
+      profile.encodedBytes = parsed[s].stream.size();
+      profile.decodeNanos = 0;
+    }
   }
 }
 
@@ -368,7 +414,7 @@ void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
       switch (sec.storageBytes) {
         case 1: {
           auto* scratch = reinterpret_cast<uint8_t*>(scratchBuf_.data());
-          sec.encoding->materialize(chunkCount, scratch);
+          materializeSection(sec, s, chunkCount, scratch);
           if (isFirst)
             accumulateSection<uint8_t, true>(
                 scratch, chunkOutput, chunkCount, mask, shift);
@@ -379,7 +425,7 @@ void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
         }
         case 2: {
           auto* scratch = reinterpret_cast<uint16_t*>(scratchBuf_.data());
-          sec.encoding->materialize(chunkCount, scratch);
+          materializeSection(sec, s, chunkCount, scratch);
           if (isFirst)
             accumulateSection<uint16_t, true>(
                 scratch, chunkOutput, chunkCount, mask, shift);
@@ -390,7 +436,7 @@ void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
         }
         case 4: {
           auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
-          sec.encoding->materialize(chunkCount, scratch);
+          materializeSection(sec, s, chunkCount, scratch);
           if (isFirst)
             accumulateSection<uint32_t, true>(
                 scratch, chunkOutput, chunkCount, mask, shift);
@@ -401,7 +447,7 @@ void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
         }
         case 8: {
           auto* scratch = reinterpret_cast<uint64_t*>(scratchBuf_.data());
-          sec.encoding->materialize(chunkCount, scratch);
+          materializeSection(sec, s, chunkCount, scratch);
           if (isFirst)
             accumulateSection<uint64_t, true>(
                 scratch, chunkOutput, chunkCount, mask, shift);
@@ -697,7 +743,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     switch (sec.storageBytes) {
       case 1: {
         auto* scratch = reinterpret_cast<uint8_t*>(scratchBuf_.data());
-        sec.encoding->materialize(blockCount, scratch);
+        materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
           values[i] = scratch[i];
         }
@@ -705,7 +751,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       }
       case 2: {
         auto* scratch = reinterpret_cast<uint16_t*>(scratchBuf_.data());
-        sec.encoding->materialize(blockCount, scratch);
+        materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
           values[i] = scratch[i];
         }
@@ -713,7 +759,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       }
       case 4: {
         auto* scratch = reinterpret_cast<uint32_t*>(scratchBuf_.data());
-        sec.encoding->materialize(blockCount, scratch);
+        materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
           values[i] = scratch[i];
         }
@@ -721,7 +767,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       }
       default: {
         auto* scratch = reinterpret_cast<uint64_t*>(scratchBuf_.data());
-        sec.encoding->materialize(blockCount, scratch);
+        materializeSection(sec, s, blockCount, scratch);
         for (uint32_t i = 0; i < blockCount; ++i) {
           values[i] = scratch[i];
         }
