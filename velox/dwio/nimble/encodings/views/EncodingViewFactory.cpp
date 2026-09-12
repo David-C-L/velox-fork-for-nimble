@@ -22,11 +22,14 @@
 #include "velox/dwio/nimble/encodings/views/BlockBitPackingEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/ConstantEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/DeltaBlockEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/DeltaEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/DictionaryEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FOREncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FixedBitWidthEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/FrequencyPartitionEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/HuffmanEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/MainlyConstantEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/MaterializedEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/PFOREncodingView.h"
 #include "velox/dwio/nimble/encodings/views/RLEEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/SimdForBitpackEncodingView.h"
@@ -36,6 +39,25 @@
 
 namespace facebook::nimble {
 namespace detail {
+
+// Rows below which a Delta or FrequencyPartition stream is held decoded
+// instead of read positionally.
+//
+// Both encodings turn up at two very different scales. One is a SubIntSplit
+// section: millions of rows, read in order, where decoding the whole stream
+// into an array costs a pass and a rowCount * 8 buffer that a positional read
+// does not need. The other is a table inside another view -- a
+// BlockBitPacking bit-offset stream, an RLE run-length stream -- a few
+// thousand rows that the enclosing view probes once per block for the length
+// of the column. Replaying a prefix sum or a tier rank for each of those
+// probes costs far more than the array it saves, and at this size the array
+// is half a megabyte at most.
+//
+// Measured on the three SubIntSplit columns: reading these tables
+// positionally cost the whole-column view read 1.5-2.2x, on a column
+// (osm_h3_r9) that carries no Delta or FrequencyPartition section at all and
+// whose only exposure to them is through such tables.
+constexpr uint32_t kMaterializeBelowRows = 1u << 16;
 
 template <typename T>
 std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
@@ -98,6 +120,34 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
       }
       NIMBLE_INCOMPATIBLE_ENCODING(
           "DeltaBlock encoding only supports integral data types, got {}.",
+          TypeTraits<T>::dataType);
+    case EncodingType::Delta:
+      if constexpr (
+          isIntegralType<physicalType>() &&
+          !std::is_same_v<physicalType, bool>) {
+        if (EncodingPrefix::readRowCount(data, options.useVarintRowCount) <=
+            kMaterializeBelowRows) {
+          return std::make_unique<MaterializedEncodingView<T>>(
+              data, pool, options);
+        }
+        return std::make_unique<DeltaEncodingView<T>>(data, pool, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "Delta encoding only supports non-bool integral data types, got {}.",
+          TypeTraits<T>::dataType);
+    case EncodingType::FrequencyPartition:
+      if constexpr (
+          isIntegralType<physicalType>() &&
+          !std::is_same_v<physicalType, bool>) {
+        if (EncodingPrefix::readRowCount(data, options.useVarintRowCount) <=
+            kMaterializeBelowRows) {
+          return std::make_unique<MaterializedEncodingView<T>>(
+              data, pool, options);
+        }
+        return std::make_unique<FrequencyPartitionEncodingView<T>>(data, pool, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "FrequencyPartition encoding only supports non-bool integral data types, got {}.",
           TypeTraits<T>::dataType);
     case EncodingType::Huffman:
       if constexpr (
@@ -185,6 +235,8 @@ bool supportsEncodingView(EncodingType encodingType) {
       EncodingType::RLE,
       EncodingType::FOR,
       EncodingType::DeltaBlock,
+      EncodingType::Delta,
+      EncodingType::FrequencyPartition,
       EncodingType::Huffman,
       EncodingType::PFOR,
       EncodingType::SimdForBitpack,

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -105,7 +106,6 @@ class FrequencyPartitionEncoding
   using cppDataType = T;
   using physicalType = typename TypeTraits<T>::physicalType;
 
-  static const int kNumPartitionsOffset = Encoding::kPrefixSize;
   static constexpr uint8_t kFormatVersion = 1;
 
   // Multiplier applied to the undiscounted TierTagArray tag-stream estimate
@@ -126,6 +126,45 @@ class FrequencyPartitionEncoding
   // Run length below which the per-row path beats the cursor walk.
   // Set above kMaxTiers so the crossover is never the marginal case.
   static constexpr uint32_t kSequentialThreshold = 8;
+
+  /// Forward-scan state for a positional read. Per tier, and in the last slot
+  /// the fallback bucket, it records where the previous rank query landed, so
+  /// a reader moving forward rescans only the gap since its last call instead
+  /// of replaying from the nearest rank sample.
+  ///
+  /// Held by the reader rather than by the encoding: a view over one encoding
+  /// is read from several threads at once, and two readers walking different
+  /// parts of the column would otherwise keep resetting each other.
+  struct ScanCursor {
+    /// Position of the last rank query in each bucket.
+    std::array<uint32_t, kMaxTiers + 1> position{};
+    /// Rank the last query in each bucket returned.
+    std::array<uint32_t, kMaxTiers + 1> rank{};
+    /// Whether the bucket's recorded position means anything yet.
+    std::array<bool, kMaxTiers + 1> valid{};
+
+    /// Forgets every recorded position, which a reader does when it starts
+    /// reading a different encoding.
+    void reset() {
+      valid.fill(false);
+    }
+  };
+
+  /// Decodes the value at original row `index`, independent of the streaming
+  /// position that materialize() and skip() advance. Reads through
+  /// `scanCursor`, so a reader holding its own can probe rows in any order
+  /// and from any thread.
+  T decodeAtOriginalIndex(uint32_t index, ScanCursor& scanCursor) const;
+
+  /// Decodes rows [start, start + count) into `output`, independent of the
+  /// streaming position. Walks the range once carrying `scanCursor` rather
+  /// than ranking each row, which is what makes a forward read cost one
+  /// increment per row instead of one rank query.
+  void decodeRange(
+      uint32_t start,
+      uint32_t count,
+      T* output,
+      ScanCursor& scanCursor) const;
 
   FrequencyPartitionEncoding(
       velox::memory::MemoryPool& pool,
@@ -148,9 +187,7 @@ class FrequencyPartitionEncoding
   /// serialised, so it is a load-time memory cost, not a payload cost.
   size_t tagRankIndexBytes() const {
     size_t total = tierRankSamples_.size() * sizeof(uint32_t);
-    total += cursorPos_.size() * sizeof(uint32_t);
-    total += cursorRank_.size() * sizeof(uint32_t);
-    total += (cursorValid_.size() + 7) / 8; // std::vector<bool> packs 1 bit each.
+    total += sizeof(ScanCursor);
     for (const auto& tier : tiers_) {
       total += tier.resolvedValues.size() * sizeof(T);
     }
@@ -676,7 +713,10 @@ class FrequencyPartitionEncoding
   // and as materializeImpl's seeding step does across consecutive tiers of
   // the same range) rescans only the gap since its last call instead of
   // replaying from the sample every time.
-  uint32_t tierRankAtForTag(uint32_t tierIdx, uint32_t pos) const {
+  uint32_t tierRankAtForTag(
+      uint32_t tierIdx,
+      uint32_t pos,
+      ScanCursor& scanCursor) const {
     const uint32_t sampleIdx = pos / kRankSampleStride;
     const uint32_t sampleStart = sampleIdx * kRankSampleStride;
 
@@ -687,10 +727,10 @@ class FrequencyPartitionEncoding
     if (cursorReuseEnabledForBench_)
 #endif
     {
-      if (cursorValid_[tierIdx] && cursorPos_[tierIdx] <= pos &&
-          cursorPos_[tierIdx] > scanStart) {
-        scanStart = cursorPos_[tierIdx];
-        rank = cursorRank_[tierIdx];
+      if (scanCursor.valid[tierIdx] && scanCursor.position[tierIdx] <= pos &&
+          scanCursor.position[tierIdx] > scanStart) {
+        scanStart = scanCursor.position[tierIdx];
+        rank = scanCursor.rank[tierIdx];
       }
     }
 
@@ -710,9 +750,9 @@ class FrequencyPartitionEncoding
     if (cursorReuseEnabledForBench_)
 #endif
     {
-      cursorPos_[tierIdx] = pos;
-      cursorRank_[tierIdx] = rank;
-      cursorValid_[tierIdx] = true;
+      scanCursor.position[tierIdx] = pos;
+      scanCursor.rank[tierIdx] = rank;
+      scanCursor.valid[tierIdx] = true;
     }
     return rank;
   }
@@ -747,7 +787,7 @@ class FrequencyPartitionEncoding
   // ---------------------------------------------------------------------------
 
   template <FreqPartIndexType I>
-  T decodeAtOriginalIndexImpl(uint32_t u) const;
+  T decodeAtOriginalIndexImpl(uint32_t u, ScanCursor& scanCursor) const;
 
   // Reads the value at `rank` within `tier`: resolvedValues[rank] when the
   // opt-in Options::frequencyPartitionResolveTierValues table was built
@@ -761,7 +801,11 @@ class FrequencyPartitionEncoding
   }
 
   template <FreqPartIndexType I>
-  void materializeImpl(T* dst, uint32_t start, uint32_t count) const;
+  void materializeImpl(
+      T* dst,
+      uint32_t start,
+      uint32_t count,
+      ScanCursor& scanCursor) const;
 
   // ---------------------------------------------------------------------------
   // Member variables
@@ -798,23 +842,17 @@ class FrequencyPartitionEncoding
   std::vector<uint32_t> tierRankSamples_;
   uint32_t numRankSamplesPerBucket_{0};
 
-  // Forward-scan cursor for tierRankAtForTag, keyed the same way as
-  // tierRankSamples_ (index tiers_.size() is the fallback bucket).
-  // cursorPos_[t]/cursorRank_[t] record the position and rank of the most
-  // recent tierRankAtForTag(t, ...) call, so a later call at a position ahead
-  // of the cursor can resume scanning from there instead of from the nearest
-  // sample. Gather probes visit rows in ascending original-row order (see
-  // readWithVisitor), which is exactly the access pattern this rewards.
+  // The cursor the encoding's own reads carry. A caller reaching the
+  // positional API directly brings its own instead, which is what lets a view
+  // over this encoding be read from several threads.
   //
   // Declared mutable because tierRankAtForTag is const: it is a cache of
-  // already-computed ranks, not part of the encoding's decoded value. This is
-  // safe without synchronization because a decoded Encoding is always owned
-  // through a single std::unique_ptr (see EncodingFactory) and never shared
-  // across threads -- the same assumption the existing currentOriginalPos_ /
+  // already-computed ranks, not part of the encoding's decoded value. Safe
+  // without synchronization because a decoded Encoding is always owned through
+  // a single std::unique_ptr (see EncodingFactory) and never shared across
+  // threads -- the same assumption the existing currentOriginalPos_ /
   // currentTier_ streaming cursors already rely on.
-  mutable std::vector<uint32_t> cursorPos_;
-  mutable std::vector<uint32_t> cursorRank_;
-  mutable std::vector<bool> cursorValid_;
+  mutable ScanCursor cursor_;
 };
 
 //
@@ -843,7 +881,10 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
       fallbackWordPrefix_{this->pool_},
       tagBits_(0),
       tagArray_{this->pool_} {
-  const auto* pos = data.data() + kNumPartitionsOffset;
+  // Not kPrefixSize: encode() writes a varint row count when
+  // Options::useVarintRowCount asks for one, and the payload then starts past
+  // a prefix of a different length. dataOffset() is that length.
+  const auto* pos = data.data() + this->dataOffset();
   const uint32_t numPartitions = encoding::readUint32(pos);
   const EncodingFactory encodingFactory(options);
 
@@ -1027,9 +1068,7 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
           numRankSamplesPerBucket_ = numSamples;
           tierRankSamples_.assign(
               static_cast<size_t>(numBuckets) * numSamples, 0);
-          cursorPos_.assign(numBuckets, 0);
-          cursorRank_.assign(numBuckets, 0);
-          cursorValid_.assign(numBuckets, false);
+          cursor_.reset();
 
           std::vector<uint32_t> counts(numBuckets, 0);
           for (uint32_t i = 0; i < totalRowCount_; ++i) {
@@ -1190,7 +1229,9 @@ void FrequencyPartitionEncoding<T>::skip(uint32_t rowCount) {
 
 template <typename T>
 template <FreqPartIndexType I>
-T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(uint32_t u) const {
+T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(
+    uint32_t u,
+    ScanCursor& scanCursor) const {
   if constexpr (I == FreqPartIndexType::PerTierBitmaps) {
     for (const auto& tier : tiers_) {
       if (tier.bitmap.empty()) {
@@ -1207,10 +1248,11 @@ T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(uint32_t u) const {
     const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
     const uint8_t tag = unpackTagAt(tagArray_.data(), u, tagBits_);
     if (tag < numActiveTiers) {
-      const uint32_t rank = tierRankAtForTag(tag, u);
+      const uint32_t rank = tierRankAtForTag(tag, u, scanCursor);
       return tierValueAtRank(tiers_[tag], rank);
     }
-    const uint32_t fallbackRank = tierRankAtForTag(numActiveTiers, u);
+    const uint32_t fallbackRank =
+        tierRankAtForTag(numActiveTiers, u, scanCursor);
     return unencodedValues_[fallbackRank];
 
   } else if constexpr (I == FreqPartIndexType::EliasFano) {
@@ -1257,7 +1299,8 @@ template <FreqPartIndexType I>
 void FrequencyPartitionEncoding<T>::materializeImpl(
     T* dst,
     uint32_t start,
-    uint32_t count) const {
+    uint32_t count,
+    ScanCursor& scanCursor) const {
   const uint32_t numTiers = static_cast<uint32_t>(tiers_.size());
   NIMBLE_CHECK(numTiers <= kMaxTiers, "tier count exceeds cursor capacity");
 
@@ -1268,7 +1311,7 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
   // the row actually lands in and skip the seeding entirely.
   if (count <= kSequentialThreshold) {
     for (uint32_t i = 0; i < count; ++i) {
-      dst[i] = decodeAtOriginalIndexImpl<I>(start + i);
+      dst[i] = decodeAtOriginalIndexImpl<I>(start + i, scanCursor);
     }
     return;
   }
@@ -1285,7 +1328,7 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
     if constexpr (I == FreqPartIndexType::PerTierBitmaps) {
       cursor[t] = tier.bitmap.empty() ? 0 : popcountPrefixFast(tier, start);
     } else if constexpr (I == FreqPartIndexType::TierTagArray) {
-      cursor[t] = tierRankAtForTag(t, start);
+      cursor[t] = tierRankAtForTag(t, start, scanCursor);
     } else if constexpr (I == FreqPartIndexType::EliasFano) {
       cursor[t] = static_cast<uint32_t>(
           std::lower_bound(
@@ -1295,7 +1338,7 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
   }
   if (hasFallback) {
     if constexpr (I == FreqPartIndexType::TierTagArray) {
-      fallbackCursor = tierRankAtForTag(numTiers, start);
+      fallbackCursor = tierRankAtForTag(numTiers, start, scanCursor);
     } else {
       fallbackCursor = fallbackRankAt(start);
     }
@@ -1349,6 +1392,95 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
 }
 
 // ---------------------------------------------------------------------------
+// Positional reads
+// ---------------------------------------------------------------------------
+
+template <typename T>
+T FrequencyPartitionEncoding<T>::decodeAtOriginalIndex(
+    uint32_t index,
+    ScanCursor& scanCursor) const {
+  switch (indexType_) {
+    case FreqPartIndexType::PerTierBitmaps:
+      return decodeAtOriginalIndexImpl<FreqPartIndexType::PerTierBitmaps>(
+          index, scanCursor);
+    case FreqPartIndexType::TierTagArray:
+      return decodeAtOriginalIndexImpl<FreqPartIndexType::TierTagArray>(
+          index, scanCursor);
+    case FreqPartIndexType::EliasFano:
+      return decodeAtOriginalIndexImpl<FreqPartIndexType::EliasFano>(
+          index, scanCursor);
+    case FreqPartIndexType::NoIndex: {
+      // Without an index the stream is in tier order, so the row is found by
+      // which tier's range it falls in rather than by ranking it.
+      const uint32_t tierIndex = getTierForRow(index);
+      if (tierIndex < tiers_.size()) {
+        const auto& tier = tiers_[tierIndex];
+        return tier.dictionary[tier.indices[index - tier.startRow]];
+      }
+      return unencodedValues_[index - unencodedStartRow_];
+    }
+  }
+  NIMBLE_UNREACHABLE("unknown FreqPartIndexType");
+}
+
+template <typename T>
+void FrequencyPartitionEncoding<T>::decodeRange(
+    uint32_t start,
+    uint32_t count,
+    T* output,
+    ScanCursor& scanCursor) const {
+  switch (indexType_) {
+    case FreqPartIndexType::PerTierBitmaps:
+      materializeImpl<FreqPartIndexType::PerTierBitmaps>(
+          output, start, count, scanCursor);
+      return;
+    case FreqPartIndexType::TierTagArray:
+      materializeImpl<FreqPartIndexType::TierTagArray>(
+          output, start, count, scanCursor);
+      return;
+    case FreqPartIndexType::EliasFano:
+      materializeImpl<FreqPartIndexType::EliasFano>(
+          output, start, count, scanCursor);
+      return;
+    case FreqPartIndexType::NoIndex: {
+      // Tier order again: the range is a run of whole tier segments, so it is
+      // copied a segment at a time rather than a row at a time.
+      uint32_t produced = 0;
+      uint32_t row = start;
+      while (produced < count) {
+        const uint32_t tierIndex = getTierForRow(row);
+        if (tierIndex < tiers_.size()) {
+          const auto& tier = tiers_[tierIndex];
+          const uint32_t tierOffset = row - tier.startRow;
+          const uint32_t toRead =
+              std::min(count - produced, tier.size - tierOffset);
+          for (uint32_t i = 0; i < toRead; ++i) {
+            output[produced + i] =
+                tier.dictionary[tier.indices[tierOffset + i]];
+          }
+          produced += toRead;
+          row += toRead;
+        } else {
+          const uint32_t tierOffset = row - unencodedStartRow_;
+          const uint32_t toRead = std::min(
+              count - produced,
+              static_cast<uint32_t>(unencodedValues_.size()) - tierOffset);
+          NIMBLE_CHECK_GT(toRead, 0, "FrequencyPartition read ran past the last tier.");
+          std::memcpy(
+              output + produced,
+              unencodedValues_.data() + tierOffset,
+              toRead * sizeof(T));
+          produced += toRead;
+          row += toRead;
+        }
+      }
+      return;
+    }
+  }
+  NIMBLE_UNREACHABLE("unknown FreqPartIndexType");
+}
+
+// ---------------------------------------------------------------------------
 // materialize / readWithVisitor
 // ---------------------------------------------------------------------------
 
@@ -1362,15 +1494,15 @@ void FrequencyPartitionEncoding<T>::materialize(
     switch (indexType_) {
       case FreqPartIndexType::PerTierBitmaps:
         materializeImpl<FreqPartIndexType::PerTierBitmaps>(
-            output, currentOriginalPos_, rowCount);
+            output, currentOriginalPos_, rowCount, cursor_);
         break;
       case FreqPartIndexType::TierTagArray:
         materializeImpl<FreqPartIndexType::TierTagArray>(
-            output, currentOriginalPos_, rowCount);
+            output, currentOriginalPos_, rowCount, cursor_);
         break;
       case FreqPartIndexType::EliasFano:
         materializeImpl<FreqPartIndexType::EliasFano>(
-            output, currentOriginalPos_, rowCount);
+            output, currentOriginalPos_, rowCount, cursor_);
         break;
       default:
         NIMBLE_UNREACHABLE("unknown FreqPartIndexType");
@@ -1446,19 +1578,19 @@ void FrequencyPartitionEncoding<T>::readWithVisitor(
       case FreqPartIndexType::PerTierBitmaps:
         detail::readWithVisitorSlow(visitor, params, skipFn, [&] {
           return decodeAtOriginalIndexImpl<FreqPartIndexType::PerTierBitmaps>(
-              currentOriginalPos_++);
+              currentOriginalPos_++, cursor_);
         });
         break;
       case FreqPartIndexType::TierTagArray:
         detail::readWithVisitorSlow(visitor, params, skipFn, [&] {
           return decodeAtOriginalIndexImpl<FreqPartIndexType::TierTagArray>(
-              currentOriginalPos_++);
+              currentOriginalPos_++, cursor_);
         });
         break;
       case FreqPartIndexType::EliasFano:
         detail::readWithVisitorSlow(visitor, params, skipFn, [&] {
           return decodeAtOriginalIndexImpl<FreqPartIndexType::EliasFano>(
-              currentOriginalPos_++);
+              currentOriginalPos_++, cursor_);
         });
         break;
       default:

@@ -44,6 +44,8 @@ TEST_F(EncodingViewTest, supportsEncodingViewMatchesViewableEncodingSet) {
       nimble::EncodingType::RLE,
       nimble::EncodingType::FOR,
       nimble::EncodingType::DeltaBlock,
+      nimble::EncodingType::Delta,
+      nimble::EncodingType::FrequencyPartition,
       nimble::EncodingType::Huffman,
       nimble::EncodingType::PFOR,
       nimble::EncodingType::SimdForBitpack,
@@ -58,9 +60,7 @@ TEST_F(EncodingViewTest, supportsEncodingViewMatchesViewableEncodingSet) {
       nimble::EncodingType::Sentinel,
       nimble::EncodingType::Nullable,
       nimble::EncodingType::Varint,
-      nimble::EncodingType::Delta,
       nimble::EncodingType::Prefix,
-      nimble::EncodingType::FrequencyPartition,
       nimble::EncodingType::Fsst,
       nimble::EncodingType::SharedDictionary};
   for (const auto encodingType : unsupportedEncodings) {
@@ -101,9 +101,7 @@ TEST_F(EncodingViewTest, rejectsUnsupportedEncodingTypes) {
       unsupportedEncodings{
           {nimble::EncodingType::Sentinel, nimble::DataType::Int32},
           {nimble::EncodingType::Nullable, nimble::DataType::Int32},
-          {nimble::EncodingType::Delta, nimble::DataType::Int32},
           {nimble::EncodingType::Prefix, nimble::DataType::String},
-          {nimble::EncodingType::FrequencyPartition, nimble::DataType::Uint32},
           {nimble::EncodingType::Fsst, nimble::DataType::String},
       };
 

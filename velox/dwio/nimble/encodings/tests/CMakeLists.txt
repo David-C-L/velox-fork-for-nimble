@@ -36,6 +36,7 @@ add_executable(
   ConstantEncodingViewTest.cpp
   ConstantEncodingTest.cpp
   DictionaryEncodingTest.cpp
+  DeltaEncodingViewTest.cpp
   DictionaryEncodingViewTest.cpp
   EncodingLayoutTest.cpp
   EncodingSelectionTest.cpp
@@ -54,6 +55,7 @@ add_executable(
   Lz4CompressorTest.cpp
   ForEncodingTest.cpp
   FrequencyPartitionEncodingTest.cpp
+  FrequencyPartitionEncodingViewTest.cpp
   MainlyConstantEncodingTest.cpp
   MainlyConstantEncodingViewTest.cpp
   NullableEncodingTest.cpp

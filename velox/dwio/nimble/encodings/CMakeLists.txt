@@ -51,6 +51,9 @@ add_library(
   selection/Statistics.cpp
   subintsplit/SectionTransforms.cpp
   views/DeltaBlockEncodingView.h
+  views/DeltaEncodingView.h
+  views/FrequencyPartitionEncodingView.h
+  views/MaterializedEncodingView.h
   views/EncodingViewFactory.cpp
   views/HuffmanEncodingView.h
   views/TrivialEncodingView.h
