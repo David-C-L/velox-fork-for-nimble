@@ -174,6 +174,14 @@ enum class EncodingType {
   // EXPERIMENTAL: Not production-ready. Do not enable for production tables
   // without consulting the Nimble team (oncall: dwios).
   SubIntSplitReordered = 24,
+  // SubIntSplit whose sections are cut into independently decodable blocks. A
+  // distinct type rather than a flag inside SubIntSplit, for the same reason
+  // SubIntSplitReordered is one: a reader without blocking support would read
+  // a block directory as though it were section values and return garbage as
+  // though it were the originals.
+  // EXPERIMENTAL: Not production-ready. Do not enable for production tables
+  // without consulting the Nimble team (oncall: dwios).
+  SubIntSplitBlocked = 25,
 };
 std::string toString(EncodingType encodingType);
 /// Returns the encoding type for 'name'. Throws if 'name' is unknown.

@@ -35,7 +35,10 @@
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
+#include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
+#include "velox/dwio/nimble/encodings/tests/TestUtils.h"
+#include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
 
 using namespace facebook;
 
@@ -673,6 +676,123 @@ TEST(SubIntSplitEncodingTests, aLooserWidthBoundReachesTheSameVerdict) {
     EXPECT_FALSE(nimble::groupsEnoughToKey(distinctPerRow, boundBits))
         << "bound " << boundBits;
   }
+}
+
+namespace {
+
+// Encodes `values` as SubIntSplit under `options`, forcing the encoding rather
+// than letting selection pick it, so a blocking test measures blocking and not
+// what the planner felt like choosing.
+std::string_view encodeSubIntSplit(
+    const std::vector<uint64_t>& values,
+    nimble::Buffer& buffer,
+    const nimble::Encoding::Options& options) {
+  nimble::Vector<uint64_t> input{&buffer.getMemoryPool()};
+  input.resize(values.size());
+  std::copy(values.begin(), values.end(), input.data());
+  return nimble::test::Encoder<nimble::SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, input, nimble::CompressionType::Uncompressed, options);
+}
+
+nimble::Encoding::Options blockedOptions(uint32_t blockSize) {
+  nimble::Encoding::Options options;
+  options.subIntSplitBlockSize = blockSize;
+  return options;
+}
+
+} // namespace
+
+// Blocking changes how a column is laid out and must not change what it
+// decodes to. 300 values at a block of 64 leaves a short final block, which is
+// the case an off-by-one in the block walk shows up in.
+TEST(SubIntSplitEncodingTests, blockedStreamDecodesToTheSameValuesAsUnblocked) {
+  const auto values = makeStructuredValuesWithLowCardinalityNoise<uint64_t>();
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+
+  nimble::Buffer plainBuffer{*pool};
+  const auto plain =
+      encodeSubIntSplit(values, plainBuffer, nimble::Encoding::Options{});
+  nimble::Buffer blockedBuffer{*pool};
+  const auto blocked =
+      encodeSubIntSplit(values, blockedBuffer, blockedOptions(64));
+
+  expectBitwiseEqual(values, decodeAll<uint64_t>(plain, *pool));
+  expectBitwiseEqual(values, decodeAll<uint64_t>(blocked, *pool));
+}
+
+// A reader without blocking support must fail on the type rather than read a
+// block directory as though it were section values, which is why a blocked
+// stream announces a type of its own instead of setting a flag inside
+// SubIntSplit.
+TEST(SubIntSplitEncodingTests, blockedStreamAnnouncesADistinctEncodingType) {
+  const auto values = makeStructuredValuesWithLowCardinalityNoise<uint64_t>();
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+
+  nimble::Buffer plainBuffer{*pool};
+  const auto plain =
+      encodeSubIntSplit(values, plainBuffer, nimble::Encoding::Options{});
+  nimble::Buffer blockedBuffer{*pool};
+  const auto blocked =
+      encodeSubIntSplit(values, blockedBuffer, blockedOptions(64));
+
+  EXPECT_EQ(
+      nimble::EncodingPrefix::encodingType(plain),
+      nimble::EncodingType::SubIntSplit);
+  EXPECT_EQ(
+      nimble::EncodingPrefix::encodingType(blocked),
+      nimble::EncodingType::SubIntSplitBlocked);
+}
+
+// The view is the path that addresses a row rather than reaching it, and it is
+// what the row-range parallel reader uses, so it is checked on both a whole
+// span and single rows.
+TEST(SubIntSplitEncodingTests, blockedStreamRoundTripsThroughTheView) {
+  const auto values = makeStructuredValuesWithLowCardinalityNoise<uint64_t>();
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+
+  nimble::Buffer buffer{*pool};
+  const auto blocked = encodeSubIntSplit(values, buffer, blockedOptions(64));
+
+  auto view = nimble::createEncodingView(
+      blocked, pool.get(), nimble::Encoding::Options{});
+  ASSERT_NE(view, nullptr);
+  ASSERT_EQ(view->rowCount(), values.size());
+
+  std::vector<uint64_t> whole(values.size());
+  view->read(0, static_cast<uint32_t>(values.size()), whole.data());
+  expectBitwiseEqual(values, whole);
+
+  // Rows either side of a block boundary, so a read that resolves to the wrong
+  // block cannot pass by landing on an equal neighbour.
+  for (const uint32_t row : {0u, 63u, 64u, 65u, 191u, 255u, 256u, 299u}) {
+    uint64_t one{0};
+    view->readAt(row, &one);
+    EXPECT_EQ(one, values[row]) << "row " << row;
+  }
+
+  // A range that starts and ends inside different blocks.
+  std::vector<uint64_t> middle(100);
+  view->read(50, 100, middle.data());
+  for (size_t i = 0; i < middle.size(); ++i) {
+    EXPECT_EQ(middle[i], values[50 + i]) << "row " << (50 + i);
+  }
+}
+
+// The byte after splitCount says which shape the header takes. A value this
+// reader does not know has to be refused: read as a transform it would take
+// the section headers from the wrong offset and return nonsense as though it
+// were data.
+TEST(SubIntSplitEncodingTests, unknownHeaderShapeIsRejected) {
+  const auto values = makeStructuredValuesWithLowCardinalityNoise<uint64_t>();
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+
+  nimble::Buffer buffer{*pool};
+  const auto blocked = encodeSubIntSplit(values, buffer, blockedOptions(64));
+
+  std::string corrupted{blocked};
+  corrupted[nimble::Encoding::kPrefixSize + 1] = static_cast<char>(3);
+  EXPECT_THROW(
+      decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException);
 }
 
 TEST(SubIntSplitEncodingTests, truncatedStreamThrowsRatherThanReadingPastEnd) {

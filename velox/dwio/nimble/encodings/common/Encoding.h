@@ -192,6 +192,17 @@ class Encoding {
     /// Never set outside tests: production always wants the cost comparison.
     bool subIntSplitForceApply = false;
 
+    /// Rows per independently decodable block in a SubIntSplit section. Zero,
+    /// the default, writes one span per section and the original format.
+    ///
+    /// A blocked section bounds every per-section cost to one block: a
+    /// dictionary, a frequency tier table or a delta anchor covers a block
+    /// rather than the column, which is what makes a block addressable
+    /// without replaying the stream and what lets separate blocks decode on
+    /// separate cores. It is charged for in per-block headers, so the size a
+    /// column gives up for it grows as the block shrinks.
+    uint32_t subIntSplitBlockSize = 0;
+
     /// Block size for BlockBitPacking encoding. Determines how many rows
     /// are packed per block. Written to the stream header; the reader
     /// reads it back from the stream (self-describing).

@@ -1486,6 +1486,61 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
+  // Blocked SubIntSplit, at the block sizes the block codecs are measured at
+  // plus the two below them, since the question is where blocking stops paying
+  // for itself and that is expected to be at the small end.
+  //
+  // Both a cursor and a view arm, because they answer different questions. The
+  // cursor arm says what blocking costs and buys a sequential reader. The view
+  // arm is the one that can be parallelised by row, and a blocked section is
+  // what makes its construction cheap: the fallback that decodes a whole span
+  // covers one block rather than the column.
+  for (const uint32_t blockSize : {4096u, 16384u, 65536u, 262144u}) {
+    const std::string suffix = "block-" + std::to_string(blockSize);
+    {
+      EncoderEntry<T> entry;
+      entry.name = "SIS/" + suffix;
+      entry.family = "SubIntSplit";
+      entry.variant = suffix;
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = false;
+      entry.randomAccess = false;
+      entry.factory = [blockSize](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        Encoding::Options o = opts;
+        o.subIntSplitBlockSize = blockSize;
+        impl->target.encode(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+    {
+      EncoderEntry<T> entry;
+      entry.name = "SIS/" + suffix + "+view";
+      entry.family = "SubIntSplit";
+      entry.variant = suffix + "_view";
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = true;
+      entry.randomAccess = true;
+      entry.factory = [blockSize](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
+        auto impl = std::make_unique<
+            NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        Encoding::Options o = opts;
+        o.subIntSplitBlockSize = blockSize;
+        impl->encodeWith(data, o, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
   // SIS/legacyCost and SIS/legacyCost+view are dropped, together with the
   // legacy inventory they were the only readers of. They pinned the cost
   // models SubIntSplit scored before Delta, FOR, PFOR, Huffman, DeltaBlock,

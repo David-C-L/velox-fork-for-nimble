@@ -50,6 +50,7 @@ constexpr auto kEncodingTypes =
         {EncodingType::SharedDictionary, "SharedDictionary"},
         {EncodingType::Slice, "Slice"},
         {EncodingType::SubIntSplitReordered, "SubIntSplitReordered"},
+        {EncodingType::SubIntSplitBlocked, "SubIntSplitBlocked"},
     });
 
 constexpr auto kReadOnlyEncodingTypes = std::to_array<EncodingType>({

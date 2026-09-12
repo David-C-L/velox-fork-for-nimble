@@ -122,6 +122,67 @@ struct SubIntSplitSection {
   std::string_view stream;
 };
 
+// How the flags byte after splitCount describes the rest of the header.
+enum class SubIntSplitHeaderShape : uint8_t {
+  // One span per section, which is what every stream written before transforms
+  // or blocking carries.
+  Plain = 0,
+  // A transform block follows, and the sections carry reversible transforms.
+  Transformed = 1,
+  // Each section's payload is a block directory followed by independently
+  // decodable blocks.
+  Blocked = 2,
+};
+
+// One section's blocks, as its payload describes them.
+struct SubIntSplitBlockedSection {
+  // Rows per block. The last block holds the remainder, so it may be shorter.
+  uint32_t blockSize{0};
+  std::vector<std::string_view> blocks;
+};
+
+// Walks a blocked section's payload: its block size, its block count, one byte
+// length per block, then the blocks themselves back to back.
+//
+// A block is an ordinary encoding stream, so nothing below this point needs to
+// know the section was blocked: each block is created, viewed and decoded by
+// the same machinery an unblocked section uses for its single span.
+inline SubIntSplitBlockedSection parseBlockedSectionPayload(
+    std::string_view payload) {
+  const char* pos = payload.data();
+  const char* const end = payload.data() + payload.size();
+  auto requireBytes = [&](size_t bytes) {
+    NIMBLE_CHECK(
+        pos <= end && static_cast<size_t>(end - pos) >= bytes,
+        "SubIntSplit blocked section is truncated.");
+  };
+
+  SubIntSplitBlockedSection parsed;
+  requireBytes(8);
+  parsed.blockSize = encoding::readUint32(pos);
+  NIMBLE_CHECK(
+      parsed.blockSize > 0, "SubIntSplit blocked section has a zero block size.");
+  const uint32_t numBlocks = encoding::readUint32(pos);
+  NIMBLE_CHECK(
+      numBlocks > 0, "SubIntSplit blocked section has no blocks.");
+
+  // Checked before reserving: the count comes off the wire, and a corrupt one
+  // would otherwise size a vector by up to four billion entries.
+  requireBytes(static_cast<size_t>(numBlocks) * sizeof(uint32_t));
+  std::vector<uint32_t> blockSizes(numBlocks);
+  for (uint32_t b = 0; b < numBlocks; ++b) {
+    blockSizes[b] = encoding::readUint32(pos);
+  }
+
+  parsed.blocks.reserve(numBlocks);
+  for (uint32_t b = 0; b < numBlocks; ++b) {
+    requireBytes(blockSizes[b]);
+    parsed.blocks.push_back(std::string_view{pos, blockSizes[b]});
+    pos += blockSizes[b];
+  }
+  return parsed;
+}
+
 // Walks the SubIntSplit header: splitCount, a reserved order byte, one
 // {bitStart, bitEnd, encodedSize} triple per section, then the section payloads
 // back to back in LSB-first order.
@@ -131,7 +192,8 @@ struct SubIntSplitSection {
 inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
     std::string_view data,
     uint32_t dataOffset,
-    SubIntSplitTransformInfo* transformInfo = nullptr) {
+    SubIntSplitTransformInfo* transformInfo = nullptr,
+    SubIntSplitHeaderShape* headerShape = nullptr) {
   const char* pos = data.data() + dataOffset;
   // Every field below comes off the wire, so a corrupt or truncated stream
   // reaches here as arbitrary bytes. Without these checks a bad length walks
@@ -152,11 +214,19 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   // more sections than bits.
   NIMBLE_CHECK(
       splitCount <= 64, "SubIntSplit stream declares too many sections.");
-  // Zero here means no transform, which is what every stream written before
-  // transforms existed carries, so those parse exactly as before.
-  const uint8_t transformPresent = encoding::read<uint8_t>(pos);
+  // Zero here means no transform and no blocking, which is what every stream
+  // written before either existed carries, so those parse exactly as before.
+  const uint8_t rawShape = encoding::read<uint8_t>(pos);
+  NIMBLE_CHECK(
+      rawShape <= static_cast<uint8_t>(SubIntSplitHeaderShape::Blocked),
+      "SubIntSplit stream declares an unknown header shape: {}",
+      static_cast<int>(rawShape));
+  const auto shape = static_cast<SubIntSplitHeaderShape>(rawShape);
+  if (headerShape != nullptr) {
+    *headerShape = shape;
+  }
 
-  if (transformPresent != 0) {
+  if (shape == SubIntSplitHeaderShape::Transformed) {
     SubIntSplitTransformInfo parsed;
     requireBytes(5 + splitCount);
     parsed.keySection = encoding::read<uint8_t>(pos);

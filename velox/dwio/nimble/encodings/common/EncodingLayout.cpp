@@ -207,6 +207,30 @@ EncodingLayout EncodingLayoutCapture::capture(
       // stream, and the layout tree describes how data is encoded, not how a
       // slice was deferred. Reported as childless.
       break;
+    case EncodingType::SubIntSplitBlocked: {
+      // Reported childless on purpose. Each section's payload is a block
+      // directory rather than a single nested stream, and the blocks under it
+      // may not agree on an encoding, so there is no one child that describes
+      // the section. The split boundaries are still captured, which is what a
+      // replay needs to rebuild the same plan.
+      detail::SubIntSplitHeaderShape shape{};
+      const auto sections = detail::parseSubIntSplitSections(
+          encoding, prefixSize, nullptr, &shape);
+      std::vector<detail::subintsplit::SegmentPlan> boundaryPlans;
+      boundaryPlans.reserve(sections.size());
+      for (const auto& section : sections) {
+        detail::subintsplit::SegmentPlan segment{};
+        segment.bitStart = section.bitStart;
+        segment.bitEnd = section.bitEnd;
+        boundaryPlans.push_back(segment);
+      }
+      return {
+          encodingType,
+          EncodingLayout::Config{
+              detail::subintsplit::makePreserveSplitConfig(boundaryPlans)},
+          compressionType,
+          {}};
+    }
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered: {
       // SubIntSplit decomposes its input into per-section bit-range

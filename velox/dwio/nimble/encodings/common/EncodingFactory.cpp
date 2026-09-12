@@ -200,7 +200,8 @@ std::unique_ptr<Encoding> EncodingFactory::create(
     // Both types are read by the same class; the header says whether the
     // sections carry a transform.
     case EncodingType::SubIntSplit:
-    case EncodingType::SubIntSplitReordered: {
+    case EncodingType::SubIntSplitReordered:
+    case EncodingType::SubIntSplitBlocked: {
       RETURN_ENCODING_BY_VARINT_TYPE(SubIntSplitEncoding, dataType);
     }
     case EncodingType::FrequencyPartition: {

@@ -159,11 +159,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
             nextViewId_.fetch_add(1, std::memory_order_relaxed)} {
     NIMBLE_CHECK(
         this->encodingType_ == EncodingType::SubIntSplit ||
-            this->encodingType_ == EncodingType::SubIntSplitReordered,
+            this->encodingType_ == EncodingType::SubIntSplitReordered ||
+            this->encodingType_ == EncodingType::SubIntSplitBlocked,
         "SubIntSplitEncodingView built over a stream that is not SubIntSplit.");
 
+    detail::SubIntSplitHeaderShape headerShape =
+        detail::SubIntSplitHeaderShape::Plain;
     const auto parsed = detail::parseSubIntSplitSections(
-        data, this->dataOffset_, &transformInfo_);
+        data, this->dataOffset_, &transformInfo_, &headerShape);
+    const bool blocked =
+        headerShape == detail::SubIntSplitHeaderShape::Blocked;
     NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
     // Validated before any section is built: a transform this reader does not
     // know would otherwise be skipped, and the values it returned would look
@@ -177,21 +182,29 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       Section section;
       switch (meta.storageBytes) {
         case 1:
-          section = makeSection<uint8_t>(meta, pool, options);
+          section = makeSection<uint8_t>(meta, pool, options, blocked);
           break;
         case 2:
-          section = makeSection<uint16_t>(meta, pool, options);
+          section = makeSection<uint16_t>(meta, pool, options, blocked);
           break;
         case 4:
-          section = makeSection<uint32_t>(meta, pool, options);
+          section = makeSection<uint32_t>(meta, pool, options, blocked);
           break;
         case 8:
-          section = makeSection<uint64_t>(meta, pool, options);
+          section = makeSection<uint64_t>(meta, pool, options, blocked);
           break;
         default:
           NIMBLE_UNREACHABLE("Invalid SubIntSplit section storage width.");
       }
-      NIMBLE_CHECK_EQ(section.view->rowCount(), this->rowCount_);
+    if (section.blockViews.empty()) {
+        NIMBLE_CHECK_EQ(section.view->rowCount(), this->rowCount_);
+      } else {
+        uint32_t blockedRows = 0;
+        for (const auto& blockView : section.blockViews) {
+          blockedRows += blockView->rowCount();
+        }
+        NIMBLE_CHECK_EQ(blockedRows, this->rowCount_);
+      }
 
       // A Constant section contributes the same bits to every row, so resolve
       // it now and keep it out of the per-row work entirely.
@@ -217,7 +230,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       // they need it row by row.
       const bool isKeySection = wireIndex == transformInfo_.keySection;
       if (this->rowCount_ > 0 && section.transform == nullptr &&
-          !isKeySection &&
+          !isKeySection && section.blockViews.empty() &&
           section.view->encodingType() == EncodingType::Constant) {
         constantBits_ |= static_cast<physicalType>(
                              section.valueAt(*section.view, 0) & section.mask)
@@ -236,7 +249,15 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // Bit width of the section, which a transform needs to know how wide a
     // value it is working with.
     int width{0};
+    // The section's single view, null when it is blocked.
     std::unique_ptr<EncodingView> view;
+    // Rows per block, zero when the section is not blocked.
+    uint32_t blockSize{0};
+    // One view per block, empty when the section is not blocked. This is what
+    // makes a blocked section cheap to address and cheap to parallelise: the
+    // fallback that decodes a whole span in its constructor now covers one
+    // block rather than the column.
+    std::vector<std::unique_ptr<EncodingView>> blockViews;
     // Position on the wire, which is how the header's per-section transform
     // state is addressed. Not the position in sections_, since folded
     // constants are dropped from that.
@@ -255,15 +276,70 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   static Section makeSection(
       const detail::SubIntSplitSection& meta,
       velox::memory::MemoryPool* pool,
-      const Encoding::Options& options) {
-    return Section{
-        .bitStart = meta.bitStart,
-        .mask = meta.mask,
-        .storageBytes = meta.storageBytes,
-        .width = meta.bitEnd - meta.bitStart + 1,
-        .view = detail::makeSectionView<SectionT>(meta.stream, pool, options),
-        .valueAt = &readValueAt<SectionT>,
-    };
+      const Encoding::Options& options,
+      bool blocked) {
+    Section section;
+    section.bitStart = meta.bitStart;
+    section.mask = meta.mask;
+    section.storageBytes = meta.storageBytes;
+    section.width = meta.bitEnd - meta.bitStart + 1;
+    section.valueAt = &readValueAt<SectionT>;
+    if (!blocked) {
+      section.view =
+          detail::makeSectionView<SectionT>(meta.stream, pool, options);
+      return section;
+    }
+    const auto blocks = detail::parseBlockedSectionPayload(meta.stream);
+    section.blockSize = blocks.blockSize;
+    section.blockViews.reserve(blocks.blocks.size());
+    for (const auto& block : blocks.blocks) {
+      section.blockViews.push_back(
+          detail::makeSectionView<SectionT>(block, pool, options));
+    }
+    return section;
+  }
+
+  // Reads one row of a section, from its single view or from the block the row
+  // falls in.
+  static uint64_t sectionValueAtIndex(const Section& section, uint32_t index) {
+    if (section.blockViews.empty()) {
+      return section.valueAt(*section.view, index);
+    }
+    const uint32_t block = index / section.blockSize;
+    NIMBLE_CHECK_LT(
+        block,
+        section.blockViews.size(),
+        "SubIntSplit row falls past the last block of a section.");
+    return section.valueAt(
+        *section.blockViews[block], index % section.blockSize);
+  }
+
+  // Reads a row range of a section, splitting it across the blocks it covers.
+  template <typename SectionT>
+  static void readSectionValues(
+      const Section& section,
+      uint32_t offset,
+      uint32_t count,
+      SectionT* output) {
+    if (section.blockViews.empty()) {
+      section.view->read(offset, count, output);
+      return;
+    }
+    uint32_t produced = 0;
+    while (produced < count) {
+      const uint32_t row = offset + produced;
+      const uint32_t block = row / section.blockSize;
+      NIMBLE_CHECK_LT(
+          block,
+          section.blockViews.size(),
+          "SubIntSplit read runs past the last block of a section.");
+      const EncodingView& blockView = *section.blockViews[block];
+      const uint32_t within = row % section.blockSize;
+      const uint32_t take =
+          std::min(blockView.rowCount() - within, count - produced);
+      blockView.read(within, take, output + produced);
+      produced += take;
+    }
   }
 
   // readAt() writes exactly the section's storage width, so the value is read
@@ -285,7 +361,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       bool isFirst,
       uint8_t* scratch) {
     auto* values = reinterpret_cast<SectionT*>(scratch);
-    section.view->read(offset, count, values);
+    readSectionValues<SectionT>(section, offset, count, values);
     if (isFirst) {
       detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(
           values, output, count, section.mask, section.bitStart);
@@ -339,7 +415,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           break;
         }
         default:
-          sectionValue = section.valueAt(*section.view, index);
+          sectionValue = sectionValueAtIndex(section, index);
           if (section.transform != nullptr) {
             sectionValue = section.transform->invertValue(
                 sectionValue, section.transformState);

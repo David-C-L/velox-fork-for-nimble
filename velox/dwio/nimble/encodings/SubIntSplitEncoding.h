@@ -207,7 +207,24 @@ class SubIntSplitEncoding
     int bitEnd{0};
     uint64_t mask{0}; // (1 << width) - 1, or ~0 for full 64-bit section
     uint8_t storageBytes{8}; // 1, 2, 4, or 8 — matches the section's DataType
+    // The section's single span, null when it is blocked.
     std::unique_ptr<Encoding> encoding;
+    // Rows per block, zero when the section is not blocked. The last block
+    // holds the remainder, so it may be shorter than this.
+    uint32_t blockSize{0};
+    // One encoding per block, empty when the section is not blocked. A block
+    // is an ordinary encoding stream, so these are created and decoded by the
+    // same machinery a single span uses.
+    std::vector<std::unique_ptr<Encoding>> blockEncodings;
+    // Where the cursor stands: the block it is in, and the row within it.
+    //
+    // Mutable because a sequential read advances the cursor while the section
+    // is reached through a const reference, exactly as the single-span path
+    // advances the Encoding it holds. Keeping it here rather than widening
+    // materializeSection's signature leaves every transformed call site,
+    // which never blocks, compiling unchanged.
+    mutable size_t currentBlock{0};
+    mutable uint32_t rowInBlock{0};
   };
 
   std::vector<SectionInfo> sections_;
@@ -312,14 +329,60 @@ class SubIntSplitEncoding
       uint32_t count,
       ScratchT* scratch) {
     if (decodeProfile_ == nullptr) {
-      sec.encoding->materialize(count, scratch);
+      decodeSectionRows(sec, count, scratch);
       return;
     }
     const auto start = std::chrono::steady_clock::now();
-    sec.encoding->materialize(count, scratch);
+    decodeSectionRows(sec, count, scratch);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     decodeProfile_->sections[sectionIndex].decodeNanos += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  }
+
+  // Walks the blocks covering the next `count` rows of a blocked section,
+  // calling `consume` with each block and the rows taken from it, and leaves
+  // the cursor on the block the next read starts in.
+  template <typename Consume>
+  static void advanceBlockedSection(
+      const SectionInfo& sec,
+      uint32_t count,
+      Consume&& consume) {
+    uint32_t taken = 0;
+    while (taken < count) {
+      NIMBLE_CHECK_LT(
+          sec.currentBlock,
+          sec.blockEncodings.size(),
+          "SubIntSplit read runs past the last block of a section.");
+      Encoding& block = *sec.blockEncodings[sec.currentBlock];
+      const uint32_t remaining = block.rowCount() - sec.rowInBlock;
+      const uint32_t take = std::min(remaining, count - taken);
+      consume(block, take);
+      taken += take;
+      sec.rowInBlock += take;
+      if (sec.rowInBlock == block.rowCount()) {
+        ++sec.currentBlock;
+        sec.rowInBlock = 0;
+      }
+    }
+  }
+
+  // Decodes `count` rows of a section, from its single span or from the blocks
+  // covering them.
+  template <typename ScratchT>
+  static void decodeSectionRows(
+      const SectionInfo& sec,
+      uint32_t count,
+      ScratchT* scratch) {
+    if (sec.blockEncodings.empty()) {
+      sec.encoding->materialize(count, scratch);
+      return;
+    }
+    uint32_t produced = 0;
+    advanceBlockedSection(
+        sec, count, [&](Encoding& block, uint32_t take) {
+          block.materialize(take, scratch + produced);
+          produced += take;
+        });
   }
 
   // Forwards to the kernel shared with SubIntSplitEncodingView.
@@ -349,8 +412,11 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
       sections_{},
       scratchBuf_{&pool},
       decodeBuf_{&pool} {
+  detail::SubIntSplitHeaderShape headerShape =
+      detail::SubIntSplitHeaderShape::Plain;
   const auto parsed = detail::parseSubIntSplitSections(
-      data, this->dataOffset(), &transformInfo_);
+      data, this->dataOffset(), &transformInfo_, &headerShape);
+  const bool blocked = headerShape == detail::SubIntSplitHeaderShape::Blocked;
   NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
   // Validate every id before decoding anything: a transform this reader does
   // not know would otherwise be skipped, returning transformed values as
@@ -366,8 +432,18 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
     sec.bitEnd = parsed[s].bitEnd;
     sec.mask = parsed[s].mask;
     sec.storageBytes = parsed[s].storageBytes;
-    sec.encoding = EncodingFactory().create(
-        *this->pool_, parsed[s].stream, stringBufferFactory, options);
+    if (!blocked) {
+      sec.encoding = EncodingFactory().create(
+          *this->pool_, parsed[s].stream, stringBufferFactory, options);
+      continue;
+    }
+    const auto blocks = detail::parseBlockedSectionPayload(parsed[s].stream);
+    sec.blockSize = blocks.blockSize;
+    sec.blockEncodings.reserve(blocks.blocks.size());
+    for (const auto& block : blocks.blocks) {
+      sec.blockEncodings.push_back(EncodingFactory().create(
+          *this->pool_, block, stringBufferFactory, options));
+    }
   }
 
   // A section needs a uint64 span only if invert() is called on it directly,
@@ -403,7 +479,9 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
       profile.bitStart = sections_[s].bitStart;
       profile.bitEnd = sections_[s].bitEnd;
       profile.storageBytes = sections_[s].storageBytes;
-      profile.encodingType = sections_[s].encoding->encodingType();
+      profile.encodingType = sections_[s].blockEncodings.empty()
+          ? sections_[s].encoding->encodingType()
+          : sections_[s].blockEncodings.front()->encodingType();
       profile.encodedBytes = parsed[s].stream.size();
       profile.decodeNanos = 0;
     }
@@ -413,7 +491,14 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
 template <typename T>
 void SubIntSplitEncoding<T>::reset() {
   for (auto& sec : sections_) {
-    sec.encoding->reset();
+    if (sec.encoding != nullptr) {
+      sec.encoding->reset();
+    }
+    for (auto& block : sec.blockEncodings) {
+      block->reset();
+    }
+    sec.currentBlock = 0;
+    sec.rowInBlock = 0;
   }
   row_ = 0;
   sectionsAt_ = 0;
@@ -433,7 +518,13 @@ void SubIntSplitEncoding<T>::skip(uint32_t rowCount) {
     return;
   }
   for (auto& sec : sections_) {
-    sec.encoding->skip(rowCount);
+    if (sec.blockEncodings.empty()) {
+      sec.encoding->skip(rowCount);
+      continue;
+    }
+    advanceBlockedSection(sec, rowCount, [](Encoding& block, uint32_t count) {
+      block.skip(count);
+    });
   }
   row_ += rowCount;
 }
@@ -1412,11 +1503,16 @@ std::string_view SubIntSplitEncoding<T>::encode(
   const auto encodeSection = [&](uint8_t s,
                                  uint8_t storageBytes,
                                  const std::vector<uint64_t>& sectionU64) {
+    // The span this call encodes: one block for a blocked section, the whole
+    // column otherwise. Taken from the values handed in rather than from the
+    // column's own length, which would run a block's encode past the end of
+    // its own values.
+    const uint32_t count = static_cast<uint32_t>(sectionU64.size());
     std::string_view encoded;
     switch (storageBytes) {
       case 1: {
-        Vector<uint8_t> sectionValues{sectionPool, valueCount};
-        for (uint32_t i = 0; i < valueCount; ++i) {
+        Vector<uint8_t> sectionValues{sectionPool, count};
+        for (uint32_t i = 0; i < count; ++i) {
           sectionValues[i] = static_cast<uint8_t>(sectionU64[i]);
         }
         encoded = selection.template encodeNested<uint8_t>(
@@ -1428,8 +1524,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
         break;
       }
       case 2: {
-        Vector<uint16_t> sectionValues{sectionPool, valueCount};
-        for (uint32_t i = 0; i < valueCount; ++i) {
+        Vector<uint16_t> sectionValues{sectionPool, count};
+        for (uint32_t i = 0; i < count; ++i) {
           sectionValues[i] = static_cast<uint16_t>(sectionU64[i]);
         }
         encoded = selection.template encodeNested<uint16_t>(
@@ -1441,8 +1537,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
         break;
       }
       case 4: {
-        Vector<uint32_t> sectionValues{sectionPool, valueCount};
-        for (uint32_t i = 0; i < valueCount; ++i) {
+        Vector<uint32_t> sectionValues{sectionPool, count};
+        for (uint32_t i = 0; i < count; ++i) {
           sectionValues[i] = static_cast<uint32_t>(sectionU64[i]);
         }
         encoded = selection.template encodeNested<uint32_t>(
@@ -1454,8 +1550,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
         break;
       }
       case 8: {
-        Vector<uint64_t> sectionValues{sectionPool, valueCount};
-        for (uint32_t i = 0; i < valueCount; ++i) {
+        Vector<uint64_t> sectionValues{sectionPool, count};
+        for (uint32_t i = 0; i < count; ++i) {
           sectionValues[i] = sectionU64[i];
         }
         encoded = selection.template encodeNested<uint64_t>(
@@ -1539,6 +1635,104 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // split count: splitCount * splitCount extractions, each a pass over every
   // value, and as many full nested encodes. Only the transformed encode
   // genuinely varies with the key, and that one stays where it is.
+  // A blocked stream cuts every section into independently decodable spans.
+  //
+  // It returns from here rather than setting a flag the code below reads,
+  // because everything below prices reversible transforms against each other
+  // and blocking is defined only for the untransformed path: a key-derived
+  // sort clusters over a whole section and a block would break exactly the
+  // grouping it exists to create. Sharing that search would mean disabling
+  // most of it.
+  if (options.subIntSplitBlockSize != 0) {
+    const uint32_t blockSize = options.subIntSplitBlockSize;
+    std::vector<std::string_view> blockedSections(splitCount);
+
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      const auto& seg = segments[s];
+      const int width = seg.bitEnd - seg.bitStart + 1;
+      const uint8_t storageBytes = sectionStorageBytes(width);
+      const std::vector<uint64_t> sectionU64 = extractSection(seg);
+
+      // Each block is selected and encoded on its own values, so a block whose
+      // values suit a different encoding than its neighbours gets it. That is
+      // the compression side of blocking: the per-block headers it costs buy
+      // per-block adaptivity as well as addressability.
+      std::vector<std::string_view> encodedBlocks;
+      encodedBlocks.reserve((valueCount + blockSize - 1) / blockSize);
+      for (uint32_t start = 0; start < valueCount; start += blockSize) {
+        const uint32_t count = std::min<uint32_t>(blockSize, valueCount - start);
+        const std::vector<uint64_t> blockValues(
+            sectionU64.begin() + start, sectionU64.begin() + start + count);
+        encodedBlocks.push_back(encodeSection(s, storageBytes, blockValues));
+      }
+
+      // Block size, block count, one length per block, then the blocks.
+      uint32_t payloadSize = 8u +
+          static_cast<uint32_t>(encodedBlocks.size()) *
+              static_cast<uint32_t>(sizeof(uint32_t));
+      for (const auto& block : encodedBlocks) {
+        payloadSize += static_cast<uint32_t>(block.size());
+      }
+
+      char* const payload = sectionBuffer.reserve(payloadSize);
+      char* payloadPos = payload;
+      encoding::writeUint32(blockSize, payloadPos);
+      encoding::writeUint32(
+          static_cast<uint32_t>(encodedBlocks.size()), payloadPos);
+      for (const auto& block : encodedBlocks) {
+        encoding::writeUint32(
+            static_cast<uint32_t>(block.size()), payloadPos);
+      }
+      for (const auto& block : encodedBlocks) {
+        encoding::writeBytes(block, payloadPos);
+      }
+      blockedSections[s] = std::string_view{payload, payloadSize};
+    }
+
+    const uint32_t blockedPrefixSize =
+        Encoding::serializePrefixSize(valueCount, useVarint);
+    uint32_t blockedSectionsSize = 0;
+    for (const auto& section : blockedSections) {
+      blockedSectionsSize += static_cast<uint32_t>(section.size());
+    }
+    const uint32_t blockedSize = blockedPrefixSize +
+        detail::subIntSplitSpecificHeaderSize(splitCount) +
+        blockedSectionsSize;
+
+    char* const blockedStart = buffer.reserve(blockedSize);
+    char* blockedPos = blockedStart;
+
+    // A type an older reader does not know, so a reader without blocking
+    // support fails in the factory instead of reading a block directory as
+    // though it were section values.
+    Encoding::serializePrefix(
+        EncodingType::SubIntSplitBlocked,
+        TypeTraits<T>::dataType,
+        valueCount,
+        useVarint,
+        blockedPos);
+    encoding::write<uint8_t>(splitCount, blockedPos);
+    encoding::write<uint8_t>(
+        static_cast<uint8_t>(detail::SubIntSplitHeaderShape::Blocked),
+        blockedPos);
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      const auto& seg = segments[s];
+      encoding::write<uint8_t>(static_cast<uint8_t>(seg.bitStart), blockedPos);
+      encoding::write<uint8_t>(static_cast<uint8_t>(seg.bitEnd), blockedPos);
+      encoding::writeUint32(
+          static_cast<uint32_t>(blockedSections[s].size()), blockedPos);
+    }
+    for (const auto& section : blockedSections) {
+      encoding::writeBytes(section, blockedPos);
+    }
+
+    NIMBLE_DCHECK_EQ(
+        static_cast<uint32_t>(blockedPos - blockedStart),
+        blockedSize,
+        "SubIntSplitEncoding: blocked encoding size mismatch");
+    return {blockedStart, blockedSize};
+  }
+
   std::vector<std::vector<uint64_t>> sectionValues64(splitCount);
   std::vector<uint8_t> sectionStorage(splitCount);
   std::vector<std::string_view> plainEncoded(splitCount);
