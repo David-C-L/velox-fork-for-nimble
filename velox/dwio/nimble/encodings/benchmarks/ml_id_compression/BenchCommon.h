@@ -80,6 +80,8 @@ DECLARE_bool(mlidc_reuse_key_runs);
 DECLARE_bool(mlidc_reuse_scratch);
 DECLARE_bool(mlidc_fuse_invert_assembly);
 DECLARE_bool(mlidc_assemble_direct);
+DECLARE_double(mlidc_sis_decode_weight);
+DECLARE_int32(mlidc_sis_decode_access_pattern);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
@@ -347,7 +349,8 @@ class NimbleViewBenchTargetImpl
 
   void materializeAll(T* dst, uint32_t n) override {
     if (timeViewConstruction_) {
-      view_ = createEncodingView(std::string_view(encoded_), pool_.get(), options_);
+      view_ =
+          createEncodingView(std::string_view(encoded_), pool_.get(), options_);
       NIMBLE_CHECK_NOT_NULL(view_);
     }
     view_->read(0, n, dst);

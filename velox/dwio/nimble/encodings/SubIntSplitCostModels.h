@@ -15,8 +15,8 @@
  */
 #pragma once
 
-#include <bit>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +32,7 @@
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
 #include "velox/dwio/nimble/encodings/SparseBoolEncoding.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
@@ -740,7 +741,32 @@ using AllowedEncodings = std::unordered_set<EncodingType>;
 /// This is the single dispatch point over the cost models. Anything wanting a
 /// subset calls it with a set rather than copying the dispatch, because a copy
 /// silently goes stale when an encoding or a signature changes here.
-inline double bestCostBitsRestricted(
+/// What one segment costs, priced on both axes at once.
+///
+/// `weightedBits` is what the split DP minimises. It is `sizeBits` plus the
+/// caller's weighted decode term, and at the default weight of zero the decode
+/// term is exactly zero, so `weightedBits == sizeBits` bit for bit and every
+/// boundary the planner picks is the one it picked before.
+///
+/// `sizeBits` and `decodeNanosPerRow` are carried alongside rather than
+/// recovered afterwards, so that a caller can report what a plan costs on each
+/// axis separately. Recomputing them from the winning encoding is not the same
+/// thing: the winner under a weight is not the winner under no weight, and the
+/// only place both are known is where the comparison was made.
+struct SegmentCost {
+  double weightedBits{std::numeric_limits<double>::infinity()};
+  double sizeBits{std::numeric_limits<double>::infinity()};
+  double decodeNanosPerRow{0.0};
+  EncodingType encoding{EncodingType::Trivial};
+};
+
+/// Prices `allowed` on size and decode together and returns the cheapest under
+/// `weighting`. An empty `allowed` considers every encoding.
+///
+/// This is the single dispatch point over the cost models. Anything wanting a
+/// subset calls it with a set rather than copying the dispatch, because a copy
+/// silently goes stale when an encoding or a signature changes here.
+inline SegmentCost bestSegmentCost(
     const SegmentMetrics& m,
     size_t numValues,
     size_t fullCount,
@@ -749,15 +775,27 @@ inline double bestCostBitsRestricted(
     const AllowedEncodings& allowed,
     bool allowHuffman,
     bool allowDeltaBlock,
-    EncodingType& bestEncoding) noexcept {
-  double best = std::numeric_limits<double>::infinity();
-  auto consider = [&](double cost, EncodingType type) noexcept {
+    const DecodeCostWeighting& weighting) noexcept {
+  SegmentCost best;
+  auto consider = [&](double sizeBits, EncodingType type) noexcept {
     if (!allowed.empty() && allowed.count(type) == 0) {
       return;
     }
-    if (cost < best) {
-      best = cost;
-      bestEncoding = type;
+    // An unrepresentable candidate never won before and must not start
+    // winning now: an infinite size times a zero weight is a NaN, and a NaN
+    // loses every comparison silently rather than visibly.
+    if (!std::isfinite(sizeBits)) {
+      return;
+    }
+    const double decodeNanos =
+        decodeNanosPerRow(type, weighting.accessPattern, sizeBits, numValues);
+    const double weighted =
+        sizeBits + decodeCostBits(decodeNanos, numValues, weighting.weight);
+    if (weighted < best.weightedBits) {
+      best.weightedBits = weighted;
+      best.sizeBits = sizeBits;
+      best.decodeNanosPerRow = decodeNanos;
+      best.encoding = type;
     }
   };
 
@@ -822,6 +860,35 @@ inline double bestCostBitsRestricted(
         deltaBlockCostBits(segValues, numValues), EncodingType::DeltaBlock);
   }
   return best;
+}
+
+/// Evaluates the cost models for `allowed` and returns the minimum cost in
+/// bits, setting `bestEncoding` to the winner. An empty `allowed` considers
+/// every encoding.
+///
+/// The size-only entry point, kept because most callers want exactly that.
+inline double bestCostBitsRestricted(
+    const SegmentMetrics& m,
+    size_t numValues,
+    size_t fullCount,
+    int bitWidth,
+    const std::vector<uint64_t>& segValues,
+    const AllowedEncodings& allowed,
+    bool allowHuffman,
+    bool allowDeltaBlock,
+    EncodingType& bestEncoding) noexcept {
+  const SegmentCost cost = bestSegmentCost(
+      m,
+      numValues,
+      fullCount,
+      bitWidth,
+      segValues,
+      allowed,
+      allowHuffman,
+      allowDeltaBlock,
+      DecodeCostWeighting{});
+  bestEncoding = cost.encoding;
+  return cost.weightedBits;
 }
 
 /// Evaluates every cost model. Equivalent to `bestCostBitsRestricted` with an

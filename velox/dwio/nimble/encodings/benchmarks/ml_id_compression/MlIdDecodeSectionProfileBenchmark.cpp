@@ -139,6 +139,9 @@ int runBenchmark() {
       plainOptions.subIntSplitFuseInvertAssembly =
           FLAGS_mlidc_fuse_invert_assembly;
       plainOptions.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
+      plainOptions.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
+      plainOptions.subIntSplitDecodeAccessPattern =
+          static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
       auto timedTarget = enc.factory(data, plainOptions);
       std::vector<Elem> sink(n);
       uint64_t bestNs = UINT64_MAX;
@@ -168,6 +171,9 @@ int runBenchmark() {
       profiledOptions.subIntSplitFuseInvertAssembly =
           FLAGS_mlidc_fuse_invert_assembly;
       profiledOptions.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
+      profiledOptions.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
+      profiledOptions.subIntSplitDecodeAccessPattern =
+          static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
       auto profiledTarget = enc.factory(data, profiledOptions);
 
       if (profile.sections.empty()) {

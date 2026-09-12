@@ -123,9 +123,9 @@ inline bool flagAffectsEncoding(const std::string& name) {
 inline std::filesystem::path nimbleSourceRoot() {
   // .../velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h
   return std::filesystem::path(__FILE__)
-      .parent_path()  // ml_id_compression
-      .parent_path()  // benchmarks
-      .parent_path()  // encodings
+      .parent_path() // ml_id_compression
+      .parent_path() // benchmarks
+      .parent_path() // encodings
       .parent_path(); // nimble
 }
 
@@ -290,6 +290,13 @@ inline std::string cacheArmIdentity(
   id += "|a" + std::to_string(options.subIntSplitAutoTransform ? 1 : 0);
   id += "|h" + std::to_string(options.subIntSplitAllowHuffman ? 1 : 0);
   id += "|d" + std::to_string(options.subIntSplitAllowDeltaBlock ? 1 : 0);
+  // The decode weight and its access pattern change which encodings the split
+  // planner picks, so they change the bytes and have to be in the key. A
+  // sweep over weights that shared one cache entry would report one plan's
+  // size for every weight, and would look like a weight that changes nothing.
+  id += "|w" + std::to_string(options.subIntSplitDecodeWeight);
+  id += "|p" +
+      std::to_string(static_cast<int>(options.subIntSplitDecodeAccessPattern));
   id += "|v" + std::to_string(options.useVarintRowCount ? 1 : 0);
   // deltaZigzagAnchorStride is deliberately absent: it does not exist on this
   // branch, and an option that no encoding here reads cannot change the bytes.

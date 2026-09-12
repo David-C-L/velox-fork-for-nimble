@@ -94,6 +94,20 @@ DEFINE_bool(
     "bulk read directly into the caller's output buffer instead of through "
     "blockCache_. True is what production ships; pass false to isolate its "
     "effect in the assembly ablation.");
+DEFINE_double(
+    mlidc_sis_decode_weight,
+    0.0,
+    "Encoding::Options::subIntSplitDecodeWeight: how much a SubIntSplit "
+    "section's predicted decode cost counts against its encoded size when the "
+    "split planner chooses boundaries and encodings. 0.0 is what production "
+    "ships and is size-only selection, bit for bit; raise it to price decode "
+    "and see which sections change encoding.");
+DEFINE_int32(
+    mlidc_sis_decode_access_pattern,
+    0,
+    "Encoding::Options::subIntSplitDecodeAccessPattern: the read shape decode "
+    "is costed for when --mlidc_sis_decode_weight is non-zero. 0 bulk, "
+    "1 point, 2 gather, 3 range.");
 DEFINE_bool(
     mlidc_dump_encoding,
     false,

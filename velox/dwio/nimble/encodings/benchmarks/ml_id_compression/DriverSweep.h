@@ -196,6 +196,12 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   options.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
   options.subIntSplitFuseInvertAssembly = FLAGS_mlidc_fuse_invert_assembly;
   options.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
+  // Zero by default, so every driver's selection is unchanged unless the flag
+  // is set. Set here alongside the assembly switches for the same reason: it
+  // reaches every arm without threading an argument through every factory.
+  options.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
+  options.subIntSplitDecodeAccessPattern =
+      static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
   // Which arm is being built is known here and nowhere below it, so the encode
   // cache reads it from here rather than every encode signature growing an
   // argument it would only pass through.

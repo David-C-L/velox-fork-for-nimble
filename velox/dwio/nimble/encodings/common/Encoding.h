@@ -271,6 +271,44 @@ class Encoding {
     /// behaviour again.
     bool subIntSplitAllowDeltaBlock{false};
 
+    /// How much a SubIntSplit section's decode cost counts against its
+    /// encoded size when the split planner chooses boundaries and encodings.
+    ///
+    /// Zero, the default, is size-only selection and reproduces the previous
+    /// behaviour exactly: the decode term is multiplied by this and added, so
+    /// at zero every boundary and every encoding is the one that was picked
+    /// before. Nothing about selection changes until a caller asks for it.
+    ///
+    /// The unit is bytes per row of encoded size per nanosecond per row of
+    /// decode, so 1.0 says "a nanosecond per row of decode is worth a byte per
+    /// row of size" and the useful range is roughly 0 to 1. It is an exchange
+    /// rate a caller picks, not a measurement.
+    ///
+    /// What it buys is the case section attribution kept finding and the size
+    /// models could not see: on twitter-snowflake, two FrequencyPartition
+    /// sections held 4.3% of the encoded bytes and cost 27% of bulk decode,
+    /// because section decode times add rather than max. A four-bit section
+    /// dragged the whole column and selection had no way to know.
+    ///
+    /// See SubIntSplitDecodeCost.h for where the per-encoding rates come from
+    /// and how well each is supported.
+    double subIntSplitDecodeWeight{0.0};
+
+    /// The read shape section decode is costed for when
+    /// subIntSplitDecodeWeight is non-zero: 0 bulk, 1 point, 2 gather, 3
+    /// range. Matches
+    /// detail::subintsplit::DecodeAccessPattern, and is a plain integer here
+    /// for the same reason subIntSplitTransform is -- this header cannot see
+    /// that enum.
+    ///
+    /// It matters because the encodings do not rank the same way on each.
+    /// FrequencyPartition with a TierTagArray index is competitive on bulk and
+    /// 36x worse than FixedBitWidth on a random probe; RLE's bulk cost is its
+    /// run count while its probe cost is a search. Weighting decode without
+    /// naming the pattern would optimise for whichever one the rates happened
+    /// to be fitted on.
+    uint8_t subIntSplitDecodeAccessPattern{0};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,15 @@ struct SegmentPlan {
   int bitEnd{0};
   EncodingType encoding{EncodingType::Trivial};
   double cost{0.0}; // estimated total bits for the full stream
+  // Estimated size alone, in bits for the full stream. Equal to `cost` at the
+  // default decode weight, and the two separate exactly when a caller has
+  // asked decode to count for something.
+  double sizeCostBits{0.0};
+  // Estimated nanoseconds per row this section costs to decode, under the
+  // access pattern the plan was selected for. Reported whatever the weight is,
+  // so a caller can see what a size-only plan costs to read without having to
+  // change the plan to find out.
+  double decodeNanosPerRow{0.0};
 };
 
 struct SelectorConfig {
@@ -55,6 +65,12 @@ struct SelectorConfig {
   // Encoding::Options::subIntSplitAllowDeltaBlock, which is what production
   // sets this from and which defaults the other way.
   bool allowDeltaBlock{true};
+  // How much a segment's decode cost counts against its size, and for which
+  // read shape. Zero is the default and reproduces size-only selection
+  // exactly -- see DecodeCostWeighting. Raising it lets the DP decline an
+  // encoding that stores a section well and reads it badly, which is what
+  // section attribution kept showing and the size models could not express.
+  DecodeCostWeighting decodeWeighting{};
 };
 
 inline SelectorConfig defaultSelectorConfig() noexcept {
@@ -62,7 +78,8 @@ inline SelectorConfig defaultSelectorConfig() noexcept {
       .minSegmentWidth = 1,
       .splitPenalty = 10.0,
       .allowHuffman = true,
-      .allowDeltaBlock = true};
+      .allowDeltaBlock = true,
+      .decodeWeighting = DecodeCostWeighting{}};
 }
 
 // Incremental bit-range value extractor.
@@ -240,6 +257,17 @@ class BitRangePartition {
 struct SelectorResult {
   std::vector<SegmentPlan> segments;
   double totalCost{0.0};
+  // The plan's estimated size alone, in bits: what the sections store, with
+  // no split penalty and no decode term. It is therefore below totalCost even
+  // at the default decode weight, by exactly the penalty the DP charges per
+  // boundary, and the two answer different questions -- what the plan costs
+  // the DP, and what the plan costs the file.
+  double totalSizeBits{0.0};
+  // The plan's estimated decode cost, composed over its sections by
+  // combineSectionDecodeNanos: nanoseconds per row for bulk and range,
+  // nanoseconds per probe for point and gather. Includes the per-section
+  // assembly term, so it prices the plan and not merely its sections.
+  double totalDecodeNanosPerRow{0.0};
 };
 
 // Run the DP split selector on `samples` (uint64_t values drawn from a
@@ -250,9 +278,12 @@ struct SelectorResult {
 // produces estimates in the right units.
 //
 // `costFn` scores a single segment: given (metrics, numValues, fullCount,
-// bitWidth, segValues, outBestEncoding), return the per-sample cost in bits and
-// write the best encoding into the output parameter. Defaults to
-// `bestCostBits`.
+// bitWidth, segValues), return a SegmentCost carrying the per-sample weighted
+// cost in bits, the per-sample size in bits, and the decode nanoseconds per
+// row of the encoding it chose. It returns all three rather than the minimum
+// alone because the DP minimises the weighted figure while the caller has to
+// be able to report the other two, and the only place all three are known is
+// the comparison that picked the winner.
 //
 // `fullCount` reaches the cost models as well as scaling their result. A model
 // needs it to tell a sample apart from the stream it came from: the count of
@@ -274,13 +305,8 @@ inline SelectorResult selectSplitsImpl(
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
   MetricCollector collector;
 
-  struct SegmentChoice {
-    double cost{std::numeric_limits<double>::infinity()};
-    EncodingType encoding{EncodingType::Trivial};
-  };
-
   const int sz = kBits;
-  std::vector<SegmentChoice> bestCost(sz * sz);
+  std::vector<SegmentCost> bestCost(sz * sz);
 
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
@@ -318,14 +344,17 @@ inline SelectorResult selectSplitsImpl(
           : collector.compute(segValues, requiredFlags);
       const int bitWidth = r - l + 1;
 
-      EncodingType bestEnc = EncodingType::Trivial;
-      const double perSampleCost =
-          costFn(metrics, numSamples, fullCount, bitWidth, segValues, bestEnc);
+      SegmentCost cell =
+          costFn(metrics, numSamples, fullCount, bitWidth, segValues);
 
-      const double fullCost = perSampleCost * static_cast<double>(fullCount) /
-          static_cast<double>(numSamples);
+      // Both cost figures are per-sample and scale to the full stream; the
+      // decode rate is already per row and must not be scaled with them.
+      const double scale =
+          static_cast<double>(fullCount) / static_cast<double>(numSamples);
+      cell.weightedBits *= scale;
+      cell.sizeBits *= scale;
 
-      bestCost[l * sz + r] = {fullCost, bestEnc};
+      bestCost[l * sz + r] = cell;
     }
   }
 
@@ -341,11 +370,11 @@ inline SelectorResult selectSplitsImpl(
         continue;
       }
       const auto& choice = bestCost[j * sz + (i - 1)];
-      if (!std::isfinite(choice.cost)) {
+      if (!std::isfinite(choice.weightedBits)) {
         continue;
       }
       const double splitCost = (j == 0) ? 0.0 : cfg.splitPenalty;
-      const double candidate = dp[j] + choice.cost + splitCost;
+      const double candidate = dp[j] + choice.weightedBits + splitCost;
       if (candidate < dp[i]) {
         dp[i] = candidate;
         prev[i] = j;
@@ -362,9 +391,16 @@ inline SelectorResult selectSplitsImpl(
     fallback.bitStart = 0;
     fallback.bitEnd = sz - 1;
     fallback.encoding = EncodingType::Trivial;
-    fallback.cost = bestCost[0 * sz + (sz - 1)].cost;
+    const SegmentCost& whole = bestCost[0 * sz + (sz - 1)];
+    fallback.cost = whole.weightedBits;
+    fallback.sizeCostBits = whole.sizeBits;
+    fallback.decodeNanosPerRow = whole.decodeNanosPerRow;
     result.segments.push_back(fallback);
     result.totalCost = fallback.cost;
+    result.totalSizeBits = fallback.sizeCostBits;
+    result.totalDecodeNanosPerRow = combineSectionDecodeNanos(
+        cfg.decodeWeighting.accessPattern,
+        std::span<const double>(&result.segments.back().decodeNanosPerRow, 1));
     return result;
   }
 
@@ -378,12 +414,24 @@ inline SelectorResult selectSplitsImpl(
     plan.bitStart = start;
     plan.bitEnd = idx - 1;
     plan.encoding = chosen[idx];
-    plan.cost = bestCost[start * sz + (idx - 1)].cost;
+    const SegmentCost& cell = bestCost[start * sz + (idx - 1)];
+    plan.cost = cell.weightedBits;
+    plan.sizeCostBits = cell.sizeBits;
+    plan.decodeNanosPerRow = cell.decodeNanosPerRow;
     result.segments.push_back(plan);
     idx = start;
   }
 
   std::reverse(result.segments.begin(), result.segments.end());
+
+  std::vector<double> sectionNanos;
+  sectionNanos.reserve(result.segments.size());
+  for (const auto& segment : result.segments) {
+    result.totalSizeBits += segment.sizeCostBits;
+    sectionNanos.push_back(segment.decodeNanosPerRow);
+  }
+  result.totalDecodeNanosPerRow = combineSectionDecodeNanos(
+      cfg.decodeWeighting.accessPattern, sectionNanos);
   return result;
 }
 
@@ -402,14 +450,14 @@ inline SelectorResult selectSplitsRestricted(
       cfg,
       [&allowed,
        allowHuffman = cfg.allowHuffman,
-       allowDeltaBlock = cfg.allowDeltaBlock](
+       allowDeltaBlock = cfg.allowDeltaBlock,
+       weighting = cfg.decodeWeighting](
           const SegmentMetrics& m,
           size_t numValues,
           size_t streamCount,
           int bitWidth,
-          const std::vector<uint64_t>& segValues,
-          EncodingType& bestEnc) noexcept {
-        return bestCostBitsRestricted(
+          const std::vector<uint64_t>& segValues) noexcept {
+        return bestSegmentCost(
             m,
             numValues,
             streamCount,
@@ -418,7 +466,7 @@ inline SelectorResult selectSplitsRestricted(
             allowed,
             allowHuffman,
             allowDeltaBlock,
-            bestEnc);
+            weighting);
       });
 }
 

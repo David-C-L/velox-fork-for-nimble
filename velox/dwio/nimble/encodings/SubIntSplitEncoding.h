@@ -1285,6 +1285,13 @@ std::string_view SubIntSplitEncoding<T>::encode(
     auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
     selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
     selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
+    // Zero by default, which leaves the DP minimising estimated bytes exactly
+    // as before. See Encoding::Options::subIntSplitDecodeWeight for what
+    // raising it prices and why the access pattern has to travel with it.
+    selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{
+        .weight = options.subIntSplitDecodeWeight,
+        .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
+            options.subIntSplitDecodeAccessPattern)};
     auto selectorResult = detail::subintsplit::selectSplitsRestricted(
         sampleBuf,
         kBits,
