@@ -1326,6 +1326,63 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   }
 
   {
+    // Same plan as SIS/realNested, with
+    // Options::frequencyPartitionResolveTierValues set. SubIntSplit's
+    // sectionEncodingOptions copies the caller's options, so the flag reaches
+    // every section: a FrequencyPartition section then resolves
+    // indices[rank] -> dictionary index into a per-tier rank -> value table at
+    // decode construction, and the read does one load where it did two. The
+    // sections are where this path spends 78 to 88% of its time, so this is
+    // the lever the assembly work does not reach. Payload is identical to the
+    // arm above, since the table is never serialised; the cost is memory.
+    EncoderEntry<T> entry;
+    entry.name = "SIS/realNested+resolved";
+    entry.family = "SubIntSplit";
+    entry.variant = "real_nested_resolved";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = false;
+    entry.randomAccess = false;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl =
+          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      Encoding::Options o = opts;
+      o.frequencyPartitionResolveTierValues = true;
+      impl->target.encode(data, o, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
+    // The transformed counterpart of the arm above, so the same question can
+    // be asked of the key-derived path, whose sections carry the same
+    // FrequencyPartition encodings.
+    EncoderEntry<T> entry;
+    entry.name = "SIS/key_derived+resolved";
+    entry.family = "SubIntSplit";
+    entry.variant = "key_derived_resolved";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = false;
+    entry.randomAccess = false;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl =
+          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      Encoding::Options o = opts;
+      o.frequencyPartitionResolveTierValues = true;
+      o.subIntSplitTransform =
+          static_cast<uint8_t>(subintsplit::TransformId::KeyDerived);
+      // 0xFF: let the encoder find the section worth keying on rather than
+      // assert one, matching the generated key_derived arms.
+      o.subIntSplitKeySection = 0xFF;
+      impl->target.encode(data, o, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
     EncoderEntry<T> entry;
     entry.name = "SIS/realNested+view";
     entry.family = "SubIntSplit";
