@@ -92,11 +92,24 @@ int runBenchmark() {
   const auto& context = *contextOrNull;
 
   std::vector<std::string> csvColumns = {
-      "driver",       "dtype",         "dataset",        "arm",
-      "N",            "section_index", "num_sections",   "bit_start",
-      "bit_end",      "width_bits",    "storage_bytes",  "encoding_type",
-      "encoded_bytes", "decode_ns_avg", "share_of_total", "implied_meps",
-      "arm_total_ns", "arm_timed_meps"};
+      "driver",
+      "dtype",
+      "dataset",
+      "arm",
+      "N",
+      "section_index",
+      "num_sections",
+      "bit_start",
+      "bit_end",
+      "width_bits",
+      "storage_bytes",
+      "encoding_type",
+      "encoded_bytes",
+      "decode_ns_avg",
+      "share_of_total",
+      "implied_meps",
+      "arm_total_ns",
+      "arm_timed_meps"};
   std::string csvPath = FLAGS_mlidc_output_csv.empty()
       ? "bench_decode_section_profile.csv"
       : FLAGS_mlidc_output_csv;
@@ -116,8 +129,16 @@ int runBenchmark() {
       }
 
       // Timed cross-check pass: profile off, matching bench_decode_bulk's
-      // measurement (reset + materializeAll, best-of-N via minimum).
+      // measurement (reset + materializeAll, best-of-N via minimum). The four
+      // assembly-path switches are read here rather than left default, since
+      // this driver builds its own Options directly instead of going through
+      // makeTargetOrSkip, which is where every other driver picks them up.
       Encoding::Options plainOptions;
+      plainOptions.subIntSplitReuseKeyRuns = FLAGS_mlidc_reuse_key_runs;
+      plainOptions.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
+      plainOptions.subIntSplitFuseInvertAssembly =
+          FLAGS_mlidc_fuse_invert_assembly;
+      plainOptions.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
       auto timedTarget = enc.factory(data, plainOptions);
       std::vector<Elem> sink(n);
       uint64_t bestNs = UINT64_MAX;
@@ -131,8 +152,9 @@ int runBenchmark() {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
                     .count()));
       }
-      const double armTimedMeps =
-          bestNs > 0 ? static_cast<double>(n) / static_cast<double>(bestNs) * 1e3 : 0.0;
+      const double armTimedMeps = bestNs > 0
+          ? static_cast<double>(n) / static_cast<double>(bestNs) * 1e3
+          : 0.0;
 
       // Attribution pass: profile on, timing deliberately excluded from the
       // arm's reported throughput. A fresh target is built from the same
@@ -141,6 +163,11 @@ int runBenchmark() {
       SubIntSplitDecodeProfile profile;
       Encoding::Options profiledOptions;
       profiledOptions.subIntSplitDecodeProfile = &profile;
+      profiledOptions.subIntSplitReuseKeyRuns = FLAGS_mlidc_reuse_key_runs;
+      profiledOptions.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
+      profiledOptions.subIntSplitFuseInvertAssembly =
+          FLAGS_mlidc_fuse_invert_assembly;
+      profiledOptions.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
       auto profiledTarget = enc.factory(data, profiledOptions);
 
       if (profile.sections.empty()) {
@@ -175,27 +202,27 @@ int runBenchmark() {
 
       std::cout << "  " << enc.name << ": " << profile.sections.size()
                 << " sections, timed=" << std::fixed << std::setprecision(1)
-                << armTimedMeps << " Meps, attribution total="
-                << (armTotalNs / reps) << " ns/iter\n";
+                << armTimedMeps
+                << " Meps, attribution total=" << (armTotalNs / reps)
+                << " ns/iter\n";
 
       for (size_t s = 0; s < profile.sections.size(); ++s) {
         const auto& section = profile.sections[s];
         const double avgNs =
             static_cast<double>(totalNs[s]) / static_cast<double>(reps);
         const double share = armTotalNs > 0
-            ? static_cast<double>(totalNs[s]) /
-                static_cast<double>(armTotalNs)
+            ? static_cast<double>(totalNs[s]) / static_cast<double>(armTotalNs)
             : 0.0;
         const double impliedMeps =
             avgNs > 0 ? static_cast<double>(n) / avgNs * 1e3 : 0.0;
 
         std::cout << "    [" << section.bitStart << ".." << section.bitEnd
-                   << "] " << toString(section.encodingType)
-                   << " bytes=" << section.encodedBytes
-                   << " avg_ns=" << std::fixed << std::setprecision(0)
-                   << avgNs << " share=" << std::setprecision(3) << share
-                   << " implied_Meps=" << std::setprecision(1) << impliedMeps
-                   << "\n";
+                  << "] " << toString(section.encodingType)
+                  << " bytes=" << section.encodedBytes
+                  << " avg_ns=" << std::fixed << std::setprecision(0) << avgNs
+                  << " share=" << std::setprecision(3) << share
+                  << " implied_Meps=" << std::setprecision(1) << impliedMeps
+                  << "\n";
 
         csv.beginRow();
         csv.set("driver", std::string(kDriver));
