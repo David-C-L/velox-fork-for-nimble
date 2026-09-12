@@ -62,7 +62,9 @@ template <typename T>
 std::unique_ptr<BlockCompressedTarget<T>>
 encodeBlocks(Codec codec, const Vector<T>& data, uint32_t blockSize) {
   auto target = std::make_unique<BlockCompressedTarget<T>>(
-      makeCodec<T>(codec), blockSize, "test");
+      makeCodec<T>(codec), blockSize, "test", [codec]() {
+        return makeCodec<T>(codec);
+      });
   target->encode(data, Encoding::Options{});
   return target;
 }

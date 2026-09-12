@@ -50,6 +50,7 @@
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/InputOrder.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ParallelRanges.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ResultWriter.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/SubstreamCompression.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
@@ -85,6 +86,7 @@ DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
+DECLARE_int32(mlidc_decode_threads);
 
 namespace facebook::nimble::mlidc {
 
@@ -350,7 +352,26 @@ class NimbleViewBenchTargetImpl
       view_ = createEncodingView(std::string_view(encoded_), pool_.get(), options_);
       NIMBLE_CHECK_NOT_NULL(view_);
     }
-    view_->read(0, n, dst);
+    const int threads = ParallelRanges::configuredThreads();
+    if (threads <= 1) {
+      view_->read(0, n, dst);
+      return;
+    }
+    // Row-range parallelism, which is what a view makes possible and a cursor
+    // does not: a slice starting at row 750000 is addressed directly instead of
+    // being reached by replaying the stream. Every section of the slice is read
+    // and assembled by the one thread, so the split balances whatever the
+    // section sizes are, and each thread writes only its own part of dst.
+    //
+    // Construction above stays serial. A section whose encoding has no view is
+    // decoded whole in the fallback view's constructor, so that work cannot be
+    // sliced by row and it is the serial term this arm is bounded by.
+    ParallelRanges::run(n, threads, [&](uint64_t from, uint64_t to, int) {
+      view_->read(
+          static_cast<uint32_t>(from),
+          static_cast<uint32_t>(to - from),
+          dst + from);
+    });
   }
 
   // A single-row read goes through readAt rather than a length-1 range: that is

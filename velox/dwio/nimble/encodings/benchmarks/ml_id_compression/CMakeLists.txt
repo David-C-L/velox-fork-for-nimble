@@ -50,6 +50,7 @@ velox_add_test_headers(
   GatherTraceGen.h
   MeasureLoop.h
   OpenZLBenchTarget.h
+  ParallelRanges.h
   PointTraceGen.h
   ResultWriter.h
   SelectiveTraceGen.h

@@ -100,6 +100,7 @@ inline bool flagAffectsEncoding(const std::string& name) {
       "mlidc_dump_encoding",
       "mlidc_block_codec_iters",
       "mlidc_block_codec_probes",
+      "mlidc_decode_threads",
       "mlidc_encode_cache_dir",
       "probes",
       "grid",

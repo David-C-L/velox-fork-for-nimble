@@ -88,7 +88,8 @@ int runBenchmark() {
       "random_access", "N",           "seed",          "cache_state",
       "evict_method",  "evict_ns",    "payload_bytes", "compression_ratio",
       "iterations",    "warmup",      "time_ns",       "time_p90_ns",
-      "time_min_ns",   "decode_Meps", "decode_MBps",   "skipped"};
+      "time_min_ns",   "decode_Meps", "decode_MBps",   "decode_threads",
+      "skipped"};
 
   std::string csvPath = FLAGS_mlidc_output_csv.empty() ? "bench_decode_bulk.csv"
                                                        : FLAGS_mlidc_output_csv;
@@ -174,6 +175,9 @@ int runBenchmark() {
       setTimingColumns(csv, result);
       csv.set("decode_Meps", meps);
       csv.set("decode_MBps", mbps);
+      csv.set(
+          "decode_threads",
+          static_cast<int64_t>(ParallelRanges::configuredThreads()));
       csv.set("skipped", int64_t{0});
       csv.endRow();
       csv.flush();
