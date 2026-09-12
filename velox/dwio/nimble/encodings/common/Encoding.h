@@ -147,7 +147,7 @@ class Encoding {
     /// are unaffected either way -- this table is rebuilt at decode
     /// construction and never serialised. Default false since the memory
     /// cost is real even when the format does not change.
-    bool frequencyPartitionResolveTierValues = false;
+    bool frequencyPartitionResolveTierValues = true;
 
     /// Reversible transform applied to SubIntSplit's sections, as a
     /// subintsplit::TransformId. Zero, the default, applies none and writes

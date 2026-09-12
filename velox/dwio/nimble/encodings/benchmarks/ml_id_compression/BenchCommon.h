@@ -334,7 +334,22 @@ class NimbleViewBenchTargetImpl
     NIMBLE_CHECK_NOT_NULL(view_);
   }
 
+  // A view over a section whose encoding has no real view falls back to
+  // MaterializedEncodingView, which decodes that whole section in its
+  // constructor. Building the view in encodeWith therefore moves that decode
+  // outside the timed region, and a +view bulk number on a column with a
+  // FrequencyPartition or Delta section is a partial decode. Setting this
+  // rebuilds the view inside materializeAll so the reported figure covers the
+  // same work the cursor path pays for.
+  void setTimeViewConstruction(bool value) {
+    timeViewConstruction_ = value;
+  }
+
   void materializeAll(T* dst, uint32_t n) override {
+    if (timeViewConstruction_) {
+      view_ = createEncodingView(std::string_view(encoded_), pool_.get(), options_);
+      NIMBLE_CHECK_NOT_NULL(view_);
+    }
     view_->read(0, n, dst);
   }
 
@@ -409,6 +424,7 @@ class NimbleViewBenchTargetImpl
   std::string encoded_;
   Encoding::Options options_;
   std::unique_ptr<EncodingView> view_;
+  bool timeViewConstruction_{false};
 };
 
 template <typename T>
@@ -1320,6 +1336,55 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
       auto impl =
           std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
       impl->target.encode(data, opts, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
+    // The +view arms above build the view in encodeWith, outside the timed
+    // region. Where a section's encoding has no real view -- FrequencyPartition
+    // and Delta are the two that matter here -- the fallback
+    // MaterializedEncodingView decodes that whole section in its constructor,
+    // so those arms report a partial decode. This pair repeats them with the
+    // construction inside the measurement, which is the like-for-like number
+    // against the cursor arms.
+    EncoderEntry<T> entry;
+    entry.name = "SIS/realNested+view+ctor";
+    entry.family = "SubIntSplit";
+    entry.variant = "real_nested_view_ctor";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = true;
+    entry.randomAccess = true;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl =
+          std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      impl->encodeWith(data, opts, /*realNestedSelection=*/true);
+      impl->setTimeViewConstruction(true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
+    EncoderEntry<T> entry;
+    entry.name = "SIS/key_derived+view+ctor";
+    entry.family = "SubIntSplit";
+    entry.variant = "key_derived_view_ctor";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = true;
+    entry.randomAccess = true;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      auto impl =
+          std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      Encoding::Options o = opts;
+      o.subIntSplitTransform =
+          static_cast<uint8_t>(subintsplit::TransformId::KeyDerived);
+      o.subIntSplitKeySection = 0xFF;
+      impl->encodeWith(data, o, /*realNestedSelection=*/true);
+      impl->setTimeViewConstruction(true);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
     encoders.push_back(std::move(entry));
