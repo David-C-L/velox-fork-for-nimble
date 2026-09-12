@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ParallelRanges.h"
 
 // ---------------------------------------------------------------------------
 // Addressable block compression
@@ -136,12 +138,15 @@ class NimbleBlockCodec : public BlockCodec<T> {
 template <typename T>
 class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
  public:
-  /// Takes the codec to apply per block and the block size in elements.
+  /// Takes the codec to apply per block, the block size in elements, and a
+  /// factory for the further codecs a multi-threaded scan needs.
   BlockCompressedTarget(
       std::unique_ptr<BlockCodec<T>> codec,
       uint32_t blockSize,
-      std::string codecName)
+      std::string codecName,
+      std::function<std::unique_ptr<BlockCodec<T>>()> makeCodec)
       : codec_{std::move(codec)},
+        makeCodec_{std::move(makeCodec)},
         blockSize_{blockSize},
         codecName_{std::move(codecName)} {
     NIMBLE_CHECK(blockSize_ > 0, "Block size must be positive");
@@ -186,7 +191,27 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
 
   void materializeAll(T* dst, uint32_t n) override {
     cachedBlock_ = kNoBlock;
-    readRange(0, n, dst);
+    const int threads = ParallelRanges::configuredThreads();
+    // A whole-column scan is exactly a partition of the block directory: every
+    // block is covered end to end, so each slice writes its own disjoint part
+    // of dst and no two threads meet. A partial read is served serially
+    // because it can share a block between slices, and one block is the unit
+    // this target decompresses.
+    if (threads <= 1 || n != count_ || blocks_.size() < 2 || !makeCodec_) {
+      readRange(0, n, dst);
+      return;
+    }
+    ensureThreadCodecs(threads);
+    ParallelRanges::run(
+        blocks_.size(), threads, [&](uint64_t from, uint64_t to, int slice) {
+          BlockCodec<T>& codec = *threadCodecs_[slice];
+          for (uint64_t block = from; block < to; ++block) {
+            decodeBlockWith(
+                codec,
+                static_cast<uint32_t>(block),
+                dst + static_cast<size_t>(block) * blockSize_);
+          }
+        });
   }
 
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
@@ -233,7 +258,7 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   /// that pin the "a read decompresses only what it overlaps" property; never
   /// read on a timed path.
   size_t numBlockDecodes() const {
-    return numBlockDecodes_;
+    return numBlockDecodes_.load(std::memory_order_relaxed);
   }
 
   size_t numBlocks() const {
@@ -317,17 +342,35 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   }
 
   void decodeBlock(uint32_t block, T* dst) {
+    decodeBlockWith(*codec_, block, dst);
+  }
+
+  void decodeBlockWith(BlockCodec<T>& codec, uint32_t block, T* dst) {
     const auto& entry = blocks_[block];
     const std::string_view bytes{payload_.data() + entry.offset, entry.size};
-    ++numBlockDecodes_;
+    numBlockDecodes_.fetch_add(1, std::memory_order_relaxed);
     if (entry.compressed) {
-      codec_->decompressBlock(bytes, entry.elements, dst);
+      codec.decompressBlock(bytes, entry.elements, dst);
       return;
     }
     std::memcpy(dst, bytes.data(), bytes.size());
   }
 
+  // One codec per slice. A codec holds a memory pool handle and, for OpenZL, a
+  // decompression context, so sharing one across threads would put two decodes
+  // inside the same allocator at once. Built once and kept, so only the first
+  // scan of a run pays for them and the per-iteration figure is a decode.
+  void ensureThreadCodecs(int threads) {
+    while (threadCodecs_.size() < static_cast<size_t>(threads)) {
+      threadCodecs_.push_back(makeCodec_());
+    }
+  }
+
   std::unique_ptr<BlockCodec<T>> codec_;
+  // Empty where the caller supplied no factory, which forces the serial path.
+  std::function<std::unique_ptr<BlockCodec<T>>()> makeCodec_;
+  // Index i belongs to slice i of a parallel scan and to no other thread.
+  std::vector<std::unique_ptr<BlockCodec<T>>> threadCodecs_;
   uint32_t blockSize_;
   std::string codecName_;
   uint32_t count_{0};
@@ -336,7 +379,7 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   std::vector<BlockEntry> blocks_;
   std::vector<T> scratch_;
   uint32_t cachedBlock_{kNoBlock};
-  size_t numBlockDecodes_{0};
+  std::atomic<size_t> numBlockDecodes_{0};
 };
 
 /// Block sizes swept, in elements. At 8 bytes per element they are 8 KB
@@ -377,7 +420,7 @@ EncoderEntry<T> makeBlockCodecEntry(
   entry.factory = [blockSize, codecName, makeCodec = std::move(makeCodec)](
                       const Vector<T>& data, const Encoding::Options& opts) {
     auto target = std::make_unique<BlockCompressedTarget<T>>(
-        makeCodec(), blockSize, codecName);
+        makeCodec(), blockSize, codecName, makeCodec);
     target->encode(data, opts);
     return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(target));
   };

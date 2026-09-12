@@ -149,3 +149,11 @@ DEFINE_string(
     "The 8- and 16-bit types are excluded because SubIntSplitEncoding only "
     "supports 32- and 64-bit types. With --mlidc_file, the column is parsed as "
     "this type.");
+DEFINE_int32(
+    mlidc_decode_threads,
+    1,
+    "Threads used to serve one bulk decode. One is the serial path every "
+    "earlier measurement used. Above one, a block codec partitions its block "
+    "directory and SubIntSplit's view partitions the row range, so the two "
+    "families are compared at equal core counts rather than one of them being "
+    "left single-threaded.");
