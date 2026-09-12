@@ -57,6 +57,19 @@ class FrequencyPartitionEncodingTest : public ::testing::Test {
             opts);
   }
 
+  template <typename T>
+  std::unique_ptr<nimble::Encoding> createEncodingWithVarintRowCount(
+      const nimble::Vector<T>& data) {
+    nimble::Encoding::Options opts{.useVarintRowCount = true};
+    return nimble::test::Encoder<nimble::FrequencyPartitionEncoding<T>>::
+        createEncoding(
+            *buffer_,
+            data,
+            nullptr,
+            nimble::CompressionType::Uncompressed,
+            opts);
+  }
+
   std::shared_ptr<velox::memory::MemoryPool> pool_;
   std::unique_ptr<nimble::Buffer> buffer_;
 };
@@ -81,6 +94,41 @@ TEST_F(FrequencyPartitionEncodingTest, basicEncodeDecode) {
 
   // FrequencyPartitionEncoding reorders data by frequency tiers
   // So we compare sorted values instead of maintaining original order
+  std::vector<int32_t> sortedData(data.begin(), data.end());
+  std::vector<int32_t> sortedResult(result.begin(), result.end());
+  std::sort(sortedData.begin(), sortedData.end());
+  std::sort(sortedResult.begin(), sortedResult.end());
+
+  ASSERT_EQ(sortedData.size(), sortedResult.size());
+  for (size_t i = 0; i < sortedData.size(); ++i) {
+    ASSERT_EQ(sortedResult[i], sortedData[i])
+        << "Mismatch at sorted index " << i;
+  }
+}
+
+// Test decode with a varint-encoded row count prefix. encode() writes a
+// variable-length prefix when Options::useVarintRowCount is set, so the
+// decoder must read its payload starting at that variable offset rather than
+// a fixed one.
+TEST_F(FrequencyPartitionEncodingTest, varintRowCountPrefix) {
+  nimble::Vector<int32_t> data(pool_.get());
+  data.push_back(1);
+  data.push_back(2);
+  data.push_back(1);
+  data.push_back(3);
+  data.push_back(1);
+  data.push_back(2);
+
+  auto encoding = createEncodingWithVarintRowCount(data);
+  ASSERT_EQ(encoding->encodingType(), nimble::EncodingType::FrequencyPartition);
+  ASSERT_EQ(encoding->dataType(), nimble::DataType::Int32);
+  ASSERT_EQ(encoding->rowCount(), 6);
+
+  nimble::Vector<int32_t> result(pool_.get(), 6);
+  encoding->materialize(6, result.data());
+
+  // FrequencyPartitionEncoding reorders data by frequency tiers, so compare
+  // sorted values instead of maintaining original order.
   std::vector<int32_t> sortedData(data.begin(), data.end());
   std::vector<int32_t> sortedResult(result.begin(), result.end());
   std::sort(sortedData.begin(), sortedData.end());
