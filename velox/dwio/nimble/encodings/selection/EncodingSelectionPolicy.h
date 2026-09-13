@@ -392,6 +392,13 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     double minCost = std::numeric_limits<double>::max();
     EncodingType selectedEncoding = EncodingType::Trivial;
     std::optional<uint64_t> selectedEstimatedSize;
+    // What size alone would have chosen here, which the decode-weighted
+    // winner is held against below. Tracked unconditionally: it is the
+    // incumbent when the weight is zero, and two comparisons on a loop this
+    // short cost nothing measurable.
+    double minSizeCost = std::numeric_limits<double>::max();
+    EncodingType sizeSelectedEncoding = EncodingType::Trivial;
+    std::optional<uint64_t> sizeSelectedEstimatedSize;
     // Iterate on all candidate encodings, and pick the encoding with the
     // minimal cost.
     for (const auto& entry : candidateEncodingReadFactors) {
@@ -415,7 +422,14 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       // choosing on size alone cannot see that. See SubIntSplitDecodeCost.h
       // for where the per-encoding rates come from and how well each is
       // supported by measurement.
-      double cost = static_cast<double>(estimatedSize.value() * readFactor);
+      const double sizeCost =
+          static_cast<double>(estimatedSize.value() * readFactor);
+      if (sizeCost < minSizeCost) {
+        minSizeCost = sizeCost;
+        sizeSelectedEncoding = encodingType;
+        sizeSelectedEstimatedSize = estimatedSize;
+      }
+      double cost = sizeCost;
       if (decodeWeight != 0.0) {
         const double nanosPerRow = detail::subintsplit::decodeNanosPerRow(
             encodingType,
@@ -434,6 +448,21 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         minCost = cost;
         selectedEncoding = encodingType;
         selectedEstimatedSize = estimatedSize;
+      }
+    }
+
+    // Bounded on size, like the split and the transform above it. Without
+    // this a section can be handed an encoding that reads faster and stores
+    // the column arbitrarily worse, and the section is where that is least
+    // visible: no single section looks like it cost much.
+    if (decodeWeight != 0.0 && selectedEstimatedSize.has_value() &&
+        sizeSelectedEstimatedSize.has_value()) {
+      const double allowedSize =
+          static_cast<double>(sizeSelectedEstimatedSize.value()) *
+          (1.0 + options.subIntSplitMaxSizeRegression);
+      if (static_cast<double>(selectedEstimatedSize.value()) > allowedSize) {
+        selectedEncoding = sizeSelectedEncoding;
+        selectedEstimatedSize = sizeSelectedEstimatedSize;
       }
     }
 

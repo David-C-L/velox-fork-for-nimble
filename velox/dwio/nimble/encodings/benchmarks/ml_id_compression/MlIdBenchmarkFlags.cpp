@@ -108,6 +108,14 @@ DEFINE_int32(
     "Encoding::Options::subIntSplitDecodeAccessPattern: the read shape decode "
     "is costed for when --mlidc_sis_decode_weight is non-zero. 0 bulk, "
     "1 point, 2 gather, 3 range.");
+DEFINE_double(
+    mlidc_sis_max_size_regression,
+    0.05,
+    "Encoding::Options::subIntSplitMaxSizeRegression: the most encoded size, "
+    "as a fraction, that decode weighting may give up against what size-only "
+    "selection would have chosen. Inert at --mlidc_sis_decode_weight=0, where "
+    "the two plans are the same plan. Pass something large to reproduce the "
+    "unbounded objective, which pays an uncompressed column for speed.");
 DEFINE_bool(
     mlidc_dump_encoding,
     false,

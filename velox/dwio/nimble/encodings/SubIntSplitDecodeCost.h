@@ -107,6 +107,67 @@ inline constexpr double kAssemblyNanosPerRowPerSection = 0.38;
 /// rather than folded into a rate.
 inline constexpr double kKeyDerivedTransformNanosPerRowPerSection = 4.4;
 
+/// Nanoseconds per row a key-derived section costs the reader, given the
+/// number of distinct values `distinctKeys` in the section it is keyed on.
+///
+/// Supersedes kKeyDerivedTransformNanosPerRowPerSection, which is kept only
+/// because the figure it records is what the older calibration reported.
+/// That constant was wrong twice over: it was fitted by dividing a plan's
+/// residual by the plan's total section count while being charged once per
+/// *transformed* section, and it was a constant at all.
+///
+/// What the reader does is a k-way merge, one cursor per distinct key, so it
+/// rotates through k positions of the values array and pays whatever level of
+/// the hierarchy holds k cache lines. Measured per transformed section, on
+/// taz, against the key cardinality the encoding dump reports:
+///
+///     osm_s2_l30          k =      4   10.80 ns/row
+///     twitter-snowflake   k =     16    8.93
+///     osm_h3_r9           k =   2113   12.47
+///     inaturalist         k =  36789   24.22
+///     publicbi_npi        k = 137295   39.36
+///
+/// Interpolated linearly in log2(k) between those, and flat outside them. The
+/// two smallest disagree by less than they differ from anything else, which is
+/// what a cache-resident merge should look like, so the low end is flat rather
+/// than fitted through them. The high end is clamped rather than extrapolated:
+/// nothing here measured a key larger than 137295, and a slope run past its
+/// last point is an invention.
+///
+/// Five points, one per column, which is the same weight of evidence the
+/// constant had. It is a shape the mechanism predicts rather than a validated
+/// fit; treat it as Inferred.
+inline double keyDerivedTransformNanosPerRow(size_t distinctKeys) noexcept {
+  // log2(k), and the residual measured at that k.
+  struct Anchor {
+    double log2Keys;
+    double nanosPerRow;
+  };
+  static constexpr Anchor kAnchors[] = {
+      {4.00, 9.0}, // twitter-snowflake, k = 16
+      {11.04, 12.5}, // osm_h3_r9, k = 2113
+      {15.17, 24.2}, // inaturalist, k = 36789
+      {17.07, 39.4}, // publicbi_npi, k = 137295
+  };
+  if (distinctKeys <= 1) {
+    return kAnchors[0].nanosPerRow;
+  }
+  const double log2Keys = std::log2(static_cast<double>(distinctKeys));
+  if (log2Keys <= kAnchors[0].log2Keys) {
+    return kAnchors[0].nanosPerRow;
+  }
+  constexpr size_t kCount = sizeof(kAnchors) / sizeof(kAnchors[0]);
+  for (size_t i = 1; i < kCount; ++i) {
+    if (log2Keys <= kAnchors[i].log2Keys) {
+      const double span = kAnchors[i].log2Keys - kAnchors[i - 1].log2Keys;
+      const double t = (log2Keys - kAnchors[i - 1].log2Keys) / span;
+      return kAnchors[i - 1].nanosPerRow +
+          t * (kAnchors[i].nanosPerRow - kAnchors[i - 1].nanosPerRow);
+    }
+  }
+  return kAnchors[kCount - 1].nanosPerRow;
+}
+
 /// Nanoseconds of per-probe overhead charged per section on the sparse
 /// patterns, the point analogue of kAssemblyNanosPerRowPerSection. Not
 /// separately fitted -- it is folded into the point rates below, which were

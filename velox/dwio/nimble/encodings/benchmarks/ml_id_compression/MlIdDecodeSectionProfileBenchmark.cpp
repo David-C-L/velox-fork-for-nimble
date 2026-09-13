@@ -142,6 +142,8 @@ int runBenchmark() {
       plainOptions.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
       plainOptions.subIntSplitDecodeAccessPattern =
           static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
+      plainOptions.subIntSplitMaxSizeRegression =
+          FLAGS_mlidc_sis_max_size_regression;
       auto timedTarget = enc.factory(data, plainOptions);
       std::vector<Elem> sink(n);
       uint64_t bestNs = UINT64_MAX;
@@ -174,6 +176,8 @@ int runBenchmark() {
       profiledOptions.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
       profiledOptions.subIntSplitDecodeAccessPattern =
           static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
+      profiledOptions.subIntSplitMaxSizeRegression =
+          FLAGS_mlidc_sis_max_size_regression;
       auto profiledTarget = enc.factory(data, profiledOptions);
 
       if (profile.sections.empty()) {

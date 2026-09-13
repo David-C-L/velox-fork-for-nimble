@@ -329,6 +329,30 @@ class Encoding {
     /// sections dear.
     bool subIntSplitSectionSelection{false};
 
+    /// The most encoded size, as a fraction, that decode weighting may give
+    /// up against what size-only selection would have chosen for the same
+    /// column.
+    ///
+    /// subIntSplitDecodeWeight prices decode in bytes and adds it to a size in
+    /// bytes, so the objective has no floor: raise the weight far enough and
+    /// an uncompressed column scores as a win, which is what ipv4 did at
+    /// weight 0.25 when it abandoned the split for a single Trivial<Uint32>
+    /// section at 32 bits per element. A weight cannot express the bound,
+    /// because both of its terms are unbounded and in the same units.
+    ///
+    /// So the bound is stated here instead, and enforced wherever a
+    /// decode-weighted choice is made: the split planner, the transform key
+    /// search, and a section's encoding selection. Each compares the plan it
+    /// chose against the plan size alone would have chosen at the same point,
+    /// and takes the size-only one when the weighted one costs more than this
+    /// fraction extra.
+    ///
+    /// Inert at the default decode weight of zero, where the two plans are
+    /// the same plan. It is a constraint, not an exchange rate: sweeping it
+    /// traces the compression/decode frontier in a unit that means the same
+    /// thing on every column, which a weight does not.
+    double subIntSplitMaxSizeRegression{0.05};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

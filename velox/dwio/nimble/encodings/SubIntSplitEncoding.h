@@ -1152,7 +1152,10 @@ inline subintsplit::SectionProfile profileSection(
 // whole apparatus for it, sorting as many runs as there are rows and probing a
 // table that large once per row, which profiling found dominating decode on a
 // column whose first section is a 19-bit identifier.
-inline bool groupsEnoughToKey(const std::vector<uint64_t>& key, int boundBits) {
+inline bool groupsEnoughToKey(
+    const std::vector<uint64_t>& key,
+    int boundBits,
+    size_t* distinctOut = nullptr) {
   // Below this, a run averages fewer than four rows and there is little to
   // gather.
   constexpr size_t kMinRowsPerRun = 4;
@@ -1220,6 +1223,9 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key, int boundBits) {
         }
       }
     }
+    if (distinctOut != nullptr) {
+      *distinctOut = distinct;
+    }
     return true;
   }
 
@@ -1231,6 +1237,13 @@ inline bool groupsEnoughToKey(const std::vector<uint64_t>& key, int boundBits) {
     if (seen.insert(value).second && ++distinct > distinctLimit) {
       return false;
     }
+  }
+  // Exact on every path that reaches here. The early exits above return false
+  // the moment the count passes the bound, so a key that is admitted was
+  // counted to completion, and what the transform costs to undo depends on
+  // this number. See keyDerivedTransformNanosPerRow.
+  if (distinctOut != nullptr) {
+    *distinctOut = distinct;
   }
   return true;
 }
@@ -1303,6 +1316,37 @@ std::string_view SubIntSplitEncoding<T>::encode(
         valueCount,
         options.subIntSplitAllowedEncodings,
         selectorConfig);
+
+    // What the weighted plan gave up in bytes, bounded against what size
+    // alone would have stored the column in. The DP minimises size plus a
+    // decode term in the same units, so on a column with structure it will
+    // keep buying decode with bytes for as long as the weight makes that
+    // arithmetic work, and there is no point at which it stops on its own.
+    //
+    // Costed rather than estimated: the size-only plan is a second run of the
+    // same DP over the same sample, which is the only way to know what was
+    // given up, since the weighted plan's own totalSizeBits says what it
+    // stores and not what it could have stored. Paid only when the weight is
+    // on, and the sample is the same one already extracted.
+    if (selectorConfig.decodeWeighting.weight != 0.0) {
+      auto sizeOnlyConfig = selectorConfig;
+      sizeOnlyConfig.decodeWeighting =
+          detail::subintsplit::DecodeCostWeighting{};
+      auto sizeOnly = detail::subintsplit::selectSplitsRestricted(
+          sampleBuf,
+          kBits,
+          valueCount,
+          options.subIntSplitAllowedEncodings,
+          sizeOnlyConfig);
+      // Compared on estimated size alone, not on totalCost: bytes are what is
+      // being bounded, and totalCost is the objective that has just been shown
+      // not to bound them.
+      const double allowedSizeBits = sizeOnly.totalSizeBits *
+          (1.0 + options.subIntSplitMaxSizeRegression);
+      if (selectorResult.totalSizeBits > allowedSizeBits) {
+        selectorResult = std::move(sizeOnly);
+      }
+    }
 
     segments = std::move(selectorResult.segments);
   }
@@ -1413,27 +1457,6 @@ std::string_view SubIntSplitEncoding<T>::encode(
         uint8_t{0xFF},
         "subIntSplitForceApply requires a pinned subIntSplitKeySection.");
   }
-
-  // A key-derived section is stored in key order, so the reader has to
-  // scatter it back to row order. That costs
-  // kKeyDerivedTransformNanosPerRowPerSection per row for every section that
-  // took the transform, it lands in assembly rather than in any section's
-  // materialize(), and until here nothing choosing the transform could see it:
-  // the choice was made on encoded bytes alone.
-  //
-  // The split DP cannot price this and says so -- boundaries are fixed before
-  // any section is offered a transform, so there is nothing to charge it
-  // against there. This decision is taken after the boundaries are known,
-  // which is precisely why the cost is available here and not there.
-  //
-  // Zero at the default weight, leaving the transform chosen on size as before.
-  const size_t keyDerivedDecodePenaltyBytes =
-      static_cast<size_t>(detail::subintsplit::decodeCostBits(
-                              detail::subintsplit::
-                                  kKeyDerivedTransformNanosPerRowPerSection,
-                              valueCount,
-                              options.subIntSplitDecodeWeight) /
-                          8.0);
 
   transformInfo.transformIds.assign(splitCount, 0);
   transformInfo.codebooks.assign(splitCount, {});
@@ -1618,12 +1641,29 @@ std::string_view SubIntSplitEncoding<T>::encode(
     const std::vector<uint64_t>& keyValues =
         hasKey ? sectionValues64[candidateKey] : noKey;
     bool keyGroups = true;
+    // Distinct values in the candidate key, which is what the reader's merge
+    // rotates through and so what the transform costs per row to undo. Zero
+    // where there is no key, where the penalty is not charged at all.
+    size_t keyDistinct = 0;
     if (hasKey) {
       attempt.info.keySection = candidateKey;
       const auto& keySegment = segments[candidateKey];
       keyGroups = groupsEnoughToKey(
-          keyValues, keySegment.bitEnd - keySegment.bitStart + 1);
+          keyValues,
+          keySegment.bitEnd - keySegment.bitStart + 1,
+          &keyDistinct);
     }
+
+    // Priced per candidate key rather than once for the column: two keys over
+    // the same sections cost the reader differently, and on publicbi_npi the
+    // two candidates differ by a factor of 440 in cardinality. Zero at the
+    // default weight, leaving the transform chosen on size as before.
+    const size_t keyDerivedDecodePenaltyBytes = static_cast<size_t>(
+        detail::subintsplit::decodeCostBits(
+            detail::subintsplit::keyDerivedTransformNanosPerRow(keyDistinct),
+            valueCount,
+            options.subIntSplitDecodeWeight) /
+        8.0);
 
     // The permutation a key-derived transform gathers by is a property of the
     // candidate key and of nothing else, so every section in the loop below
@@ -1785,6 +1825,21 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // the guess.
   constexpr size_t kNoBound = std::numeric_limits<size_t>::max();
   std::optional<Attempt> best;
+  // The smallest attempt on bytes alone, which is what the cost-minimal
+  // attempt is held against. Tracked only while the decode weight is on,
+  // since without it the two are the same attempt and the copy would be
+  // waste.
+  const bool boundTransformSize = options.subIntSplitDecodeWeight != 0.0;
+  std::optional<Attempt> smallestAttempt;
+  const auto offerToSmallest = [&](const std::optional<Attempt>& attempt) {
+    if (!boundTransformSize || !attempt.has_value()) {
+      return;
+    }
+    if (!smallestAttempt.has_value() ||
+        attempt->totalBytes < smallestAttempt->totalBytes) {
+      smallestAttempt = attempt;
+    }
+  };
   if (anyCandidateNeedsKey) {
     if (keySection != detail::SubIntSplitTransformInfo::kNoKeySection) {
       NIMBLE_CHECK_LT(
@@ -1800,22 +1855,47 @@ std::string_view SubIntSplitEncoding<T>::encode(
       if (options.subIntSplitAutoTransform) {
         best = attemptWithKey(
             detail::SubIntSplitTransformInfo::kNoKeySection, kNoBound);
+        offerToSmallest(best);
       }
       for (uint8_t candidate = 0; candidate < splitCount; ++candidate) {
         // Bounded by the incumbent, so an attempt that comes back has already
         // beaten it on the same test that used to be applied here. There is
         // nothing left to compare: anything that would not have displaced the
         // incumbent was abandoned rather than finished.
+        // Bounding on cost prunes an attempt that stores the column
+        // better than the incumbent but reads it worse, and that is exactly
+        // the attempt the cap may have to fall back to. So while the cap is
+        // live every candidate is priced to the end; the pruning is kept
+        // otherwise, where it is still exact.
         auto attempt = attemptWithKey(
-            candidate, best.has_value() ? best->costBytes : kNoBound);
+            candidate,
+            boundTransformSize
+                ? kNoBound
+                : (best.has_value() ? best->costBytes : kNoBound));
         if (attempt.has_value()) {
-          best = std::move(attempt);
+          offerToSmallest(attempt);
+          if (!best.has_value() || attempt->costBytes < best->costBytes) {
+            best = std::move(attempt);
+          }
         }
       }
     }
   } else {
     best = attemptWithKey(
         detail::SubIntSplitTransformInfo::kNoKeySection, kNoBound);
+  }
+
+  // The transform is bounded on size for the same reason the split is: its
+  // decode penalty is charged in bytes, and a penalty in bytes can always be
+  // made to outweigh bytes. Where the attempt the weighted search settled on
+  // stores the column worse than the smallest attempt by more than the caller
+  // allowed, the smallest attempt is what gets written.
+  if (smallestAttempt.has_value() && best.has_value()) {
+    const double allowedBytes = static_cast<double>(smallestAttempt->totalBytes) *
+        (1.0 + options.subIntSplitMaxSizeRegression);
+    if (static_cast<double>(best->totalBytes) > allowedBytes) {
+      best = std::move(smallestAttempt);
+    }
   }
 
   sectionData = std::move(best->sections);
@@ -1904,12 +1984,29 @@ template <typename T>
 std::string SubIntSplitEncoding<T>::debugString(int offset) const {
   std::string indent(offset, ' ');
   std::string result = indent +
-      "SubIntSplitEncoding sections=" + std::to_string(sections_.size()) + "\n";
+      "SubIntSplitEncoding sections=" + std::to_string(sections_.size());
+  // Which section the permutation sorts by, and which sections took a
+  // transform. Both decide what the plan costs to read -- a key-derived
+  // section is stored in key order and the reader has to put it back -- and
+  // neither was printed, so a transformed plan and an untransformed one
+  // dumped identically and could only be told apart by their encoded size.
+  if (transformInfo_.keySection !=
+      detail::SubIntSplitTransformInfo::kNoKeySection) {
+    result += " keySection=" + std::to_string(transformInfo_.keySection);
+  }
+  result += "\n";
   for (size_t s = 0; s < sections_.size(); ++s) {
     const auto& sec = sections_[s];
     result += indent + "  [" + std::to_string(sec.bitStart) + ".." +
         std::to_string(sec.bitEnd) +
-        "] storageBytes=" + std::to_string(sec.storageBytes) + "\n";
+        "] storageBytes=" + std::to_string(sec.storageBytes);
+    if (s < transformInfo_.transformIds.size() &&
+        transformInfo_.transformIds[s] != 0) {
+      result += " transform=" +
+          subintsplit::toString(static_cast<subintsplit::TransformId>(
+              transformInfo_.transformIds[s]));
+    }
+    result += "\n";
     result += sec.encoding->debugString(offset + 4);
     result += "\n";
   }
