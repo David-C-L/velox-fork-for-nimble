@@ -85,6 +85,7 @@ DECLARE_int32(mlidc_sis_decode_access_pattern);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
+DECLARE_bool(mlidc_sis_withdraw_frequency_partition);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
 

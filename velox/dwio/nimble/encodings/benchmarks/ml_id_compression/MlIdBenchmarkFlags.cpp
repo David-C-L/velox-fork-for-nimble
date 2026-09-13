@@ -163,3 +163,12 @@ DEFINE_string(
     "The 8- and 16-bit types are excluded because SubIntSplitEncoding only "
     "supports 32- and 64-bit types. With --mlidc_file, the column is parsed as "
     "this type.");
+
+DEFINE_bool(
+    mlidc_sis_withdraw_frequency_partition,
+    false,
+    "Whether SubIntSplit's split planner may cost a bit range as "
+    "FrequencyPartition. False is what production ships. Pass true to measure "
+    "what withdrawing it costs in bytes and buys in decode: FrequencyPartition "
+    "stores a low-cardinality section well and reads it slowly, and a size-only "
+    "objective cannot see the second half of that.");

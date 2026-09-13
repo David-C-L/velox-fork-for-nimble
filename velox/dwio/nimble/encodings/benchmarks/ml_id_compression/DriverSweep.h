@@ -196,6 +196,29 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   options.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
   options.subIntSplitFuseInvertAssembly = FLAGS_mlidc_fuse_invert_assembly;
   options.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
+  // Withdraws FrequencyPartition from the encodings the split planner may
+  // cost a section against, leaving every other candidate in place. False,
+  // the default, is production behaviour. Withdrawing an encoding moves the
+  // boundaries the DP picks and not merely the encoding named for a
+  // section, because a section's cost is what the DP minimises over.
+  if (FLAGS_mlidc_sis_withdraw_frequency_partition) {
+    options.subIntSplitAllowedEncodings = {
+        facebook::nimble::EncodingType::Trivial,
+        facebook::nimble::EncodingType::RLE,
+        facebook::nimble::EncodingType::Dictionary,
+        facebook::nimble::EncodingType::FixedBitWidth,
+        facebook::nimble::EncodingType::Varint,
+        facebook::nimble::EncodingType::Delta,
+        facebook::nimble::EncodingType::Constant,
+        facebook::nimble::EncodingType::MainlyConstant,
+        facebook::nimble::EncodingType::PFOR,
+        facebook::nimble::EncodingType::SimdForBitpack,
+        facebook::nimble::EncodingType::BlockBitPacking,
+        facebook::nimble::EncodingType::FOR,
+        facebook::nimble::EncodingType::Huffman,
+        facebook::nimble::EncodingType::DeltaBlock,
+    };
+  }
   // Zero by default, so every driver's selection is unchanged unless the flag
   // is set. Set here alongside the assembly switches for the same reason: it
   // reaches every arm without threading an argument through every factory.

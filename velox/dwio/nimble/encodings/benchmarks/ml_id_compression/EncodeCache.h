@@ -290,6 +290,12 @@ inline std::string cacheArmIdentity(
   id += "|a" + std::to_string(options.subIntSplitAutoTransform ? 1 : 0);
   id += "|h" + std::to_string(options.subIntSplitAllowHuffman ? 1 : 0);
   id += "|d" + std::to_string(options.subIntSplitAllowDeltaBlock ? 1 : 0);
+  // A restricted inventory changes which encodings the planner may pick, so
+  // it changes the bytes. Without this the withdrawn and unrestricted arms
+  // share one cache entry, and the withdrawal would appear to change
+  // nothing at all.
+  id += "|q" +
+      std::to_string(options.subIntSplitAllowedEncodings.empty() ? 0 : 1);
   // The decode weight and its access pattern change which encodings the split
   // planner picks, so they change the bytes and have to be in the key. A
   // sweep over weights that shared one cache entry would report one plan's
