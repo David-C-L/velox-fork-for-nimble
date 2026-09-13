@@ -20,7 +20,13 @@
 
 #include <optional>
 #include <span>
+#include <algorithm>
 #include <string>
+#include <utility>
+
+#include <gflags/gflags.h>
+
+DECLARE_string(mlidc_sis_withdraw_nested_encodings);
 
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/common/Vector.h"
@@ -162,13 +168,38 @@ class BenchEncodingSelectionPolicy
     // this used to do has gone -- for a SubIntSplit parent the generic rule
     // removes exactly what the erase did.
     if (realNestedSelection_) {
+      auto readFactors = nimble::nestedEncodingReadFactors(
+          nimble::ManualEncodingSelectionPolicyFactory::
+              defaultEncodingReadFactors(),
+          parentEncodingType,
+          nestedEncodingIdentifier);
+      // Withdraws the named encodings from what a section may be encoded as.
+      // Empty, the default, leaves the writer's candidate list untouched.
+      //
+      // This is the list a section's encoding is chosen from. Withdrawing an
+      // encoding from the split planner alone moves only where the boundaries
+      // fall, and leaves the section encoded exactly as before, which is why
+      // the planner-side gate on its own reports that a withdrawal changed
+      // nothing.
+      //
+      // Matching is by substring of toString(), so a name that prefixes
+      // another withdraws both: "Delta" takes DeltaBlock with it.
+      if (!FLAGS_mlidc_sis_withdraw_nested_encodings.empty()) {
+        const std::string& withdrawn =
+            FLAGS_mlidc_sis_withdraw_nested_encodings;
+        readFactors.erase(
+            std::remove_if(
+                readFactors.begin(),
+                readFactors.end(),
+                [&withdrawn](
+                    const std::pair<nimble::EncodingType, float>& entry) {
+                  return withdrawn.find(nimble::toString(entry.first)) !=
+                      std::string::npos;
+                }),
+            readFactors.end());
+      }
       return nimble::ManualEncodingSelectionPolicyFactory{
-          nimble::nestedEncodingReadFactors(
-              nimble::ManualEncodingSelectionPolicyFactory::
-                  defaultEncodingReadFactors(),
-              parentEncodingType,
-              nestedEncodingIdentifier),
-          compressionOptionsFor(compressionType_)}
+          std::move(readFactors), compressionOptionsFor(compressionType_)}
           .createPolicy(type);
     }
     UNIQUE_PTR_FACTORY(

@@ -172,3 +172,14 @@ DEFINE_bool(
     "what withdrawing it costs in bytes and buys in decode: FrequencyPartition "
     "stores a low-cardinality section well and reads it slowly, and a size-only "
     "objective cannot see the second half of that.");
+
+DEFINE_string(
+    mlidc_sis_withdraw_nested_encodings,
+    "",
+    "Comma-separated encoding names withdrawn from the candidate list a "
+    "SubIntSplit section's encoding is chosen from, e.g. FrequencyPartition. "
+    "Empty, the default, is production behaviour. This is the list that "
+    "decides a section's encoding; Encoding::Options::"
+    "subIntSplitAllowedEncodings gates only the split planner's cost models, "
+    "so withdrawing an encoding there alone leaves the section encoded as "
+    "before. Matching is by substring, so Delta withdraws DeltaBlock too.");
