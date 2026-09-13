@@ -51,3 +51,23 @@ target_link_libraries(
   fmt::fmt
   Folly::folly
 )
+
+add_executable(nimble_ml_id_block_lazy_test BlockLazyTargetTest.cpp)
+
+add_test(nimble_ml_id_block_lazy_test nimble_ml_id_block_lazy_test)
+
+target_link_libraries(
+  nimble_ml_id_block_lazy_test
+  # For the gflag definitions the benchmark headers declare.
+  nimble_ml_id_benchmark_common
+  nimble_encodings
+  nimble_common
+  nimble_tools_common
+  openzl_cpp
+  velox_common_base
+  gmock
+  gtest
+  gflags
+  fmt::fmt
+  Folly::folly
+)

@@ -84,6 +84,16 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
   for (auto& entry : buildZstdBlockEncoders<T>()) {
     context.encoders.push_back(std::move(entry));
   }
+  // The same blocks, kept once decoded. Wrapping a block arm rather than
+  // zstd/whole is what makes the laziness real: with a whole-payload inner,
+  // decoding "one block" would decompress the entire column.
+  for (auto& entry : buildZstdBlockEncoders<T>()) {
+    if (entry.variant == "block-" + std::to_string(kLazyBlockElementCount)) {
+      context.encoders.push_back(
+          withBlockLazyMaterialization<T>(
+              std::move(entry), kLazyBlockElementCount));
+    }
+  }
   // Zstd over the whole column, and the same bytes read through a buffer
   // decoded once on the first access. The pair is the amortisation question
   // asked of a blackbox codec: what a reader pays per probe while it holds only
@@ -107,6 +117,17 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
     // rather than an argued one.
     for (auto& entry : buildOpenZLBlockEncoders<T>()) {
       context.encoders.push_back(std::move(entry));
+    }
+    // The third regime on the frontier. openzl/auto+materialize holds a whole
+    // decoded column to answer a probe in tens of nanoseconds; this holds only
+    // the blocks a workload actually reached, and the gap between the two on
+    // the resident axis is what the time axis alone could not show.
+    for (auto& entry : buildOpenZLBlockEncoders<T>()) {
+      if (entry.variant == "block-" + std::to_string(kLazyBlockElementCount)) {
+        context.encoders.push_back(
+            withBlockLazyMaterialization<T>(
+                std::move(entry), kLazyBlockElementCount));
+      }
     }
   }
   // Applied last so it can select an OpenZL entry too. Mirrors
@@ -338,6 +359,7 @@ inline void appendAccessColumns(std::vector<std::string>& columns) {
   columns.push_back("builds_access_structure");
   columns.push_back("build_ns");
   columns.push_back("time_incl_build_ns");
+  columns.push_back("resident_bytes");
 }
 
 /// Measures what building the target's access structure costs, and leaves it
@@ -372,6 +394,13 @@ MeasureResult measureAccessStructureBuild(
 /// buildNs is what measureAccessStructureBuild() reported and timeNs the
 /// measured read time that excludes it, so the row carries both and their sum
 /// and a reader never has to guess which of the two a number is.
+///
+/// resident_bytes is sampled here, which is after that row's reads rather than
+/// after its build. That ordering is the point: an arm that materialises
+/// lazily has no final footprint until a workload has touched it, so sampling
+/// at construction would report every lazy arm at its compressed size and
+/// erase the axis. It also means the column answers the question the time
+/// columns cannot -- what an arm is holding in order to go that fast.
 template <typename T>
 void setAccessColumns(
     CsvResultWriter& csv,
@@ -384,6 +413,7 @@ void setAccessColumns(
       target.buildsAccessStructure() ? int64_t{1} : int64_t{0});
   csv.set("build_ns", buildNs);
   csv.set("time_incl_build_ns", timeNs + buildNs);
+  csv.set("resident_bytes", static_cast<int64_t>(target.residentBytes()));
 }
 
 } // namespace facebook::nimble::mlidc

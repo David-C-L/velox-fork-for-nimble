@@ -229,6 +229,15 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
         2 * sizeof(uint32_t);
   }
 
+  /// The compressed blocks, the block directory, and the one scratch block a
+  /// partial read decompresses into. A block arm holds its column compressed
+  /// and one block uncompressed, which is the footprint the block-size axis is
+  /// really trading against.
+  size_t residentBytes() const override {
+    return payload_.size() + blocks_.size() * sizeof(BlockEntry) +
+        scratch_.capacity() * sizeof(T);
+  }
+
   /// Blocks decompressed since the last encode. Instrumentation for the tests
   /// that pin the "a read decompresses only what it overlaps" property; never
   /// read on a timed path.
@@ -431,6 +440,229 @@ EncoderEntry<T> buildZstdWholeEncoder() {
   entry.isSequential = true;
   return entry;
 }
+
+// ---------------------------------------------------------------------------
+// Lazy partial materialisation
+// ---------------------------------------------------------------------------
+
+/// Keeps the blocks it has decoded, and only those.
+///
+/// MaterializingTarget decodes the entire column on the first access, which
+/// makes a fair comparison against a view impossible: the view materialises
+/// only the sections that lack a real one and serves the rest from the
+/// compressed representation, so the two answer the same reads while holding
+/// very different amounts of memory. Decoding both in full would just be bulk
+/// decode, which is already measured. This is the middle case, and it is the
+/// one a reader actually deploys: materialise at the granularity the format is
+/// addressable at, and let a workload decide how much of the column ends up
+/// resident.
+///
+/// Wraps a block target rather than a whole-payload one on purpose. With a
+/// whole-payload inner, decoding "one block" would decompress the entire
+/// column and the laziness would be fictitious.
+template <typename T>
+class BlockLazyTarget : public NimbleBenchTargetBase<T> {
+ public:
+  /// Takes an inner block target the entry's factory has already encoded, the
+  /// column length, and the block size that inner target was built with. The
+  /// two block sizes must agree, or a "decode one block" here would span two
+  /// of the inner target's.
+  BlockLazyTarget(
+      std::unique_ptr<NimbleBenchTargetBase<T>> inner,
+      uint32_t rowCount,
+      uint32_t blockSize)
+      : inner_{std::move(inner)}, rowCount_{rowCount}, blockSize_{blockSize} {
+    NIMBLE_CHECK(blockSize_ > 0, "Block size must be positive");
+    resetCache();
+  }
+
+  void encode(const Vector<T>& data, const Encoding::Options& opts) override {
+    inner_->encode(data, opts);
+    rowCount_ = data.size();
+    resetCache();
+  }
+
+  /// Reads every row, bypassing the cache.
+  ///
+  /// A bulk read must not turn into full materialisation by a side door: if it
+  /// populated the cache, one scan would leave the whole column resident and
+  /// this arm would silently become the +materialize arm it exists to be
+  /// distinguished from.
+  void materializeAll(T* dst, uint32_t n) override {
+    inner_->materializeAll(dst, n);
+  }
+
+  void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
+    readRange(begin, count, dst);
+  }
+
+  void skipThenMaterialize(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+      T* dst) override {
+    for (const auto& [begin, count] : ranges) {
+      readRange(begin, count, dst);
+      dst += count;
+    }
+  }
+
+  /// Block-addressable, and it stays so however much has been cached: a read
+  /// that misses still costs exactly the blocks it overlaps.
+  ReadPath readPath() const override {
+    return blockCount() <= 1 ? ReadPath::kWholePayload : ReadPath::kBlock;
+  }
+
+  /// False, and deliberately. There is no one-time build to amortise here --
+  /// the cost is spread across the reads that happen to miss, and it depends
+  /// on which rows a workload touches rather than on the column. The story
+  /// this arm tells is resident_bytes rising along the ops axis, not a build
+  /// cost paid up front.
+  bool buildsAccessStructure() const override {
+    return false;
+  }
+
+  /// Drops every cached block, so the next read decodes again. The drivers
+  /// call this inside the timed region that measures a read starting from
+  /// nothing, and a cache that survived it would make that region measure a
+  /// copy.
+  void discardAccessStructure() override {
+    resetCache();
+  }
+
+  size_t payloadSize() const override {
+    return inner_->payloadSize();
+  }
+
+  /// The compressed column plus exactly the blocks a workload has decoded.
+  ///
+  /// This is the axis the arm exists for: it starts at the inner target's
+  /// footprint and rises towards full materialisation only as far as the reads
+  /// actually reach.
+  size_t residentBytes() const override {
+    return inner_->residentBytes() + cachedBytes_ +
+        cache_.capacity() * sizeof(std::vector<T>);
+  }
+
+  /// Blocks decoded since the last reset. Instrumentation for the tests that
+  /// pin "a k-probe workload touches min(k, blocks) blocks"; never read on a
+  /// timed path.
+  size_t numBlockMaterializations() const {
+    return numBlockMaterializations_;
+  }
+
+  /// Blocks currently held decoded.
+  size_t numCachedBlocks() const {
+    return numCachedBlocks_;
+  }
+
+  std::vector<std::span<const std::byte>> internalBuffers() const override {
+    return inner_->internalBuffers();
+  }
+
+  std::string describe() override {
+    return inner_->describe();
+  }
+
+  std::string describeTree() override {
+    return inner_->describeTree();
+  }
+
+  std::string describeNodeEstimates() override {
+    return inner_->describeNodeEstimates();
+  }
+
+ private:
+  uint32_t blockCount() const {
+    return static_cast<uint32_t>(
+        (static_cast<size_t>(rowCount_) + blockSize_ - 1) / blockSize_);
+  }
+
+  void resetCache() {
+    cache_.assign(blockCount(), std::vector<T>{});
+    cachedBytes_ = 0;
+    numCachedBlocks_ = 0;
+  }
+
+  // Indexed by block number rather than looked up in a hash map, so a hit is
+  // an array index and the bookkeeping stays out of the measured loop.
+  void ensureBlock(uint32_t block) {
+    if (!cache_[block].empty()) {
+      return;
+    }
+    const uint32_t blockBegin = block * blockSize_;
+    const uint32_t elements = std::min(blockSize_, rowCount_ - blockBegin);
+    std::vector<T> decoded(elements);
+    inner_->materializeRange(blockBegin, elements, decoded.data());
+    cachedBytes_ += decoded.capacity() * sizeof(T);
+    ++numCachedBlocks_;
+    ++numBlockMaterializations_;
+    cache_[block] = std::move(decoded);
+  }
+
+  void readRange(uint32_t begin, uint32_t count, T* dst) {
+    if (count == 0) {
+      return;
+    }
+    NIMBLE_CHECK(
+        static_cast<size_t>(begin) + count <= rowCount_,
+        "Read past end of column: begin {}, count {}, elements {}",
+        begin,
+        count,
+        rowCount_);
+    const uint32_t end = begin + count;
+    const uint32_t lastBlock = (end - 1) / blockSize_;
+    for (uint32_t block = begin / blockSize_; block <= lastBlock; ++block) {
+      ensureBlock(block);
+      const uint32_t blockBegin = block * blockSize_;
+      const uint32_t from = std::max(begin, blockBegin);
+      const uint32_t to = std::min(
+          end, blockBegin + static_cast<uint32_t>(cache_[block].size()));
+      std::copy(
+          cache_[block].data() + (from - blockBegin),
+          cache_[block].data() + (to - blockBegin),
+          dst + (from - begin));
+    }
+  }
+
+  std::unique_ptr<NimbleBenchTargetBase<T>> inner_;
+  uint32_t rowCount_{0};
+  uint32_t blockSize_{0};
+  // One entry per block; an empty entry means that block is not decoded.
+  std::vector<std::vector<T>> cache_;
+  size_t cachedBytes_{0};
+  size_t numCachedBlocks_{0};
+  size_t numBlockMaterializations_{0};
+};
+
+/// Wraps a block arm so it keeps the blocks it decodes.
+///
+/// Composed like withMaterializedAccess so the pair encodes to the same bytes
+/// and differs only in what a read leaves behind. blockSize must be the one
+/// the wrapped entry was built with.
+template <typename T>
+EncoderEntry<T> withBlockLazyMaterialization(
+    EncoderEntry<T> entry,
+    uint32_t blockSize) {
+  entry.name += "+lazy";
+  entry.variant += "_lazy";
+  entry.isSequential = false;
+  entry.fastSkip = true;
+  entry.randomAccess = true;
+  auto inner = std::move(entry.factory);
+  entry.factory = [inner = std::move(inner), blockSize](
+                      const Vector<T>& data, const Encoding::Options& opts) {
+    auto target = std::make_unique<BlockLazyTarget<T>>(
+        inner(data, opts), static_cast<uint32_t>(data.size()), blockSize);
+    // The inner factory has already encoded; calling encode() here would
+    // encode a second time.
+    return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(target));
+  };
+  return entry;
+}
+
+/// The block size the lazy arms are built at, taken from kBlockElementCounts
+/// as the middle one: 512 KB at eight bytes per element, which is row-group
+/// scale rather than vector scale.
+inline constexpr uint32_t kLazyBlockElementCount = 65'536;
 
 } // namespace facebook::nimble::mlidc
 

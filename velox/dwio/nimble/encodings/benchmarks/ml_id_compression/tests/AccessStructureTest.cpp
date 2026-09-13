@@ -81,6 +81,13 @@ class CountingTarget : public NimbleBenchTargetBase<int64_t> {
     return values_.size() * sizeof(int64_t);
   }
 
+  // Holds only what it was given. A decorator wrapping this one adds whatever
+  // it keeps decoded on top, which is what the resident-bytes tests below
+  // measure the difference of.
+  size_t residentBytes() const override {
+    return values_.size() * sizeof(int64_t);
+  }
+
   std::vector<std::span<const std::byte>> internalBuffers() const override {
     return {
         {reinterpret_cast<const std::byte*>(values_.data()),
@@ -132,6 +139,54 @@ TEST(MaterializingTargetTest, decodesOnceForManyReads) {
   }
   EXPECT_EQ(innerRaw->numFullDecodes(), 1u);
   EXPECT_EQ(materializing.numBuilds(), 1u);
+}
+
+// The other half of what +materialize costs. decodesOnceForManyReads says it
+// stops decoding; this says what it holds in order to stop, which is a whole
+// decoded column on top of the payload. The pair is the point of the
+// resident-bytes axis: the arm buys its per-probe time with memory, and a
+// chart showing only time cannot see the price.
+TEST(MaterializingTargetTest, residentBytesGrowsByADecodedColumn) {
+  const auto data = makeData(kRows);
+  auto inner = std::make_unique<CountingTarget>(toVector(data));
+  const size_t innerBytes = inner->residentBytes();
+  MaterializingTarget<int64_t> target{std::move(inner), kRows};
+
+  // Nothing decoded yet, so it holds what the inner codec holds.
+  EXPECT_EQ(target.residentBytes(), innerBytes);
+
+  int64_t value{};
+  target.materializeRange(11, 1, &value);
+  EXPECT_GE(
+      target.residentBytes(), innerBytes + kRows * sizeof(int64_t));
+
+  // A second read adds nothing: the column is already held.
+  const size_t afterFirst = target.residentBytes();
+  target.materializeRange(12, 1, &value);
+  EXPECT_EQ(target.residentBytes(), afterFirst);
+
+  // Discarding gives it back, or a driver's discard/rebuild cycle would leak.
+  target.discardAccessStructure();
+  EXPECT_EQ(target.residentBytes(), innerBytes);
+}
+
+// Every target answers residentBytes, and a compressed-only arm must answer
+// with something close to its payload rather than with a decoded column. This
+// is the baseline the frontier is drawn against, so a cursor arm quietly
+// holding more than it stores would be visible here.
+TEST(CursorTargetTest, residentBytesIsAboutThePayload) {
+  const auto data = makeData(kRows);
+  NimbleBenchTargetImpl<FixedBitWidthEncoding<int64_t>> target;
+  target.encode(data, Encoding::Options{});
+
+  const size_t raw = static_cast<size_t>(kRows) * sizeof(int64_t);
+  int64_t value{};
+  target.materializeRange(23, 1, &value);
+  ASSERT_EQ(value, data[23]);
+
+  EXPECT_GE(target.residentBytes(), target.payloadSize());
+  // FixedBitWidth keeps no decoded copy, so a read must not have left one.
+  EXPECT_LT(target.residentBytes(), raw);
 }
 
 // Discarding has to actually discard, or a driver measuring construction would

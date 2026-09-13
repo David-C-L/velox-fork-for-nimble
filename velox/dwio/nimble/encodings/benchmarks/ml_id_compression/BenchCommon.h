@@ -94,6 +94,23 @@ DECLARE_string(mlidc_dtype);
 namespace facebook::nimble::mlidc {
 
 // ---------------------------------------------------------------------------
+// Per-target memory pools
+// ---------------------------------------------------------------------------
+
+// Returns a leaf pool of this target's own, so that what a target allocates is
+// attributable to it rather than pooled with every other arm in the sweep.
+//
+// benchmarks::benchmarkPool() is itself a leaf, so it cannot have children; a
+// target that shared it would report the whole sweep's allocations as its own.
+// A view's index structures are allocated here, which is what makes them
+// measured rather than estimated from bits per element.
+inline std::shared_ptr<velox::memory::MemoryPool> makeTargetPool() {
+  static std::atomic<size_t> nextId{0};
+  return velox::memory::memoryManager()->addLeafPool(
+      "mlidc_target_" + std::to_string(nextId++));
+}
+
+// ---------------------------------------------------------------------------
 // NimbleBenchTarget<EncodingT>
 // ---------------------------------------------------------------------------
 // Wraps a single encode/decode cycle.  After encode() the object holds the
@@ -105,7 +122,7 @@ class NimbleBenchTarget {
  public:
   using T = typename EncodingT::cppDataType;
 
-  NimbleBenchTarget() : pool_(benchmarks::benchmarkPool()) {}
+  NimbleBenchTarget() : pool_(makeTargetPool()) {}
 
   // Encode data.  Destroys any previously encoded state.
   void encode(
@@ -188,6 +205,29 @@ class NimbleBenchTarget {
     return encoding_.get();
   }
 
+  // The encoded bytes, whatever the Encoding allocated from this target's own
+  // pool, and any decoded span the Encoding keeps across reads. The last of
+  // those is not pool-backed -- a transformed SubIntSplit stream caches a
+  // decoded block in plain std::vectors -- so it has to be asked for
+  // separately or a resident-memory number would omit a decoded column.
+  size_t residentBytes() const {
+    size_t bytes = encoded_.size() + static_cast<size_t>(pool_->usedBytes());
+    if (encoding_ != nullptr) {
+      bytes += encoding_->decodeCacheBytes();
+    }
+    return bytes;
+  }
+
+  bool retainsDecodeCache() const {
+    return encoding_ != nullptr && encoding_->retainsDecodeCache();
+  }
+
+  void dropDecodeCache() {
+    if (encoding_ != nullptr) {
+      encoding_->dropDecodeCache();
+    }
+  }
+
  private:
   std::shared_ptr<velox::memory::MemoryPool> pool_;
   std::string encoded_;
@@ -208,6 +248,22 @@ struct NimbleBenchTargetBase {
       const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
       T* dst) = 0;
   virtual size_t payloadSize() const = 0;
+
+  /// Bytes this target holds in memory to serve reads, including the encoded
+  /// payload, anything decoded and kept, and any index structure built over
+  /// it.
+  ///
+  /// Pure, for the reason readPath() is: a target that quietly held a decoded
+  /// copy of the column would otherwise be compared on time alone against one
+  /// that held only compressed bytes, and the two would look like the same
+  /// deployment at very different footprints. That is exactly the error this
+  /// column exists to expose, so no target may decline to answer.
+  ///
+  /// Sampled after a workload rather than after construction: a target that
+  /// materialises lazily has no final footprint until something has read from
+  /// it.
+  virtual size_t residentBytes() const = 0;
+
   virtual std::vector<std::span<const std::byte>> internalBuffers() const = 0;
 
   /// How a partial read reaches its rows.
@@ -292,10 +348,40 @@ struct NimbleBenchTargetImpl
     return target.internalBuffers();
   }
   // An Encoding carries a cursor, so materializeRange reaches row i by
-  // resetting and skipping i rows. Nothing is built once and reused, so there
-  // is no build phase to separate out.
+  // resetting and skipping i rows.
   ReadPath readPath() const override {
     return ReadPath::kCursor;
+  }
+
+  size_t residentBytes() const override {
+    return target.residentBytes();
+  }
+
+  // Usually nothing is built once and reused, and this is false. The exception
+  // is a stream that keeps a decoded span across reads, which among the
+  // encodings here means a transformed SubIntSplit plan: its first probe
+  // decodes the whole column into that cache and every probe after it copies
+  // out of it, so the arm has a one-time build however sequential its
+  // interface looks. Reporting false there would charge that decode to
+  // whichever read came first, or hide it in warmup, and leave a per-probe
+  // figure that is really the cost of a memcpy.
+  bool buildsAccessStructure() const override {
+    return target.retainsDecodeCache();
+  }
+
+  // Forces that first decode now. A one-row read is what populates the cache,
+  // and for an unblocked transformed plan the span it decodes is the whole
+  // column, so this is the cost a first probe pays.
+  void buildAccessStructure() override {
+    if (!target.retainsDecodeCache()) {
+      return;
+    }
+    T value{};
+    target.materializeRange(0, 1, &value);
+  }
+
+  void discardAccessStructure() override {
+    target.dropDecodeCache();
   }
   std::string describe() override {
     auto* encoding = target.encoding();
@@ -440,6 +526,15 @@ class NimbleViewBenchTargetImpl
     return encoded_.size();
   }
 
+  // The encoded bytes plus whatever the view allocated from this target's own
+  // pool. That second term is the point of the per-target pool: a view's index
+  // structures, and the buffer a MaterializedEncodingView decodes a viewless
+  // section into, are pool-backed, so they are measured here rather than
+  // estimated from bits per element.
+  size_t residentBytes() const override {
+    return encoded_.size() + static_cast<size_t>(pool_->usedBytes());
+  }
+
   std::vector<std::span<const std::byte>> internalBuffers() const override {
     // The view's own index structures (a run-end array, say) are private to it,
     // so eviction reaches the payload only. Cache-state rows for view encoders
@@ -477,7 +572,7 @@ class NimbleViewBenchTargetImpl
   }
 
  private:
-  std::shared_ptr<velox::memory::MemoryPool> pool_{benchmarks::benchmarkPool()};
+  std::shared_ptr<velox::memory::MemoryPool> pool_{makeTargetPool()};
   std::string encoded_;
   Encoding::Options options_;
   std::unique_ptr<EncodingView> view_;
@@ -608,6 +703,17 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     return compressed_.size();
   }
 
+  // The compressed payload, whatever the inner target still holds, and the
+  // buffer the last read decompressed into. All three are resident at once
+  // while a read is being served, which is the footprint this deployment
+  // actually has.
+  size_t residentBytes() const override {
+    return compressed_.size() + inner_->residentBytes() +
+        (lastDecompressed_ != nullptr
+             ? static_cast<size_t>(lastDecompressed_->capacity())
+             : 0);
+  }
+
   std::vector<std::span<const std::byte>> internalBuffers() const override {
     return {
         {reinterpret_cast<const std::byte*>(compressed_.data()),
@@ -672,7 +778,7 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     lastDecompressed_ = std::move(buffer);
   }
 
-  std::shared_ptr<velox::memory::MemoryPool> pool_{benchmarks::benchmarkPool()};
+  std::shared_ptr<velox::memory::MemoryPool> pool_{makeTargetPool()};
   std::unique_ptr<NimbleBenchTargetBase<T>> inner_;
   CompressionType compressionType_;
   CompressionType storedType_{CompressionType::Uncompressed};
@@ -800,6 +906,15 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
   // not what the column occupies.
   size_t payloadSize() const override {
     return inner_->payloadSize();
+  }
+
+  // What it occupies on disk is payloadSize(); what it occupies in memory is
+  // this, and for a materialised arm the two differ by a whole decoded column.
+  // Reporting only the first is what let a materialised blackbox codec look
+  // dominant on a time axis while holding more uncompressed bytes than the
+  // compressed column it was beating.
+  size_t residentBytes() const override {
+    return inner_->residentBytes() + values_.capacity() * sizeof(T);
   }
 
   std::vector<std::span<const std::byte>> internalBuffers() const override {

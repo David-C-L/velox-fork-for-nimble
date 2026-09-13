@@ -240,6 +240,106 @@ view. The `openzl/auto+materialize` and `zstd/whole+materialize` arms are those,
 and they encode to the same bytes as their bare twins, so the pair differs in
 how a read is addressed and in nothing else.
 
+## Resident memory as an axis
+
+Time alone made the amortisation curves compare unlike things, and the
+comparison flattered whichever arm was willing to hold the most memory.
+`+materialize` decompresses the **entire** column and answers reads by indexing
+a flat array. A view does not: it materialises only the sections that lack a
+real view and serves the rest from the compressed representation. Both answer
+the same reads, so on a time-only chart `openzl/auto+materialize` looked
+unanswerable — 13.7 ms build and 35.9 ns/op on snowflake point against
+`SIS/realNested+view`'s 71.7 ms and 765 ns/op — while holding roughly 8 MB of
+uncompressed column to do it, against about 5 MB compressed. That is a cache
+result reported as a compression result.
+
+Decompressing both in full is not the fix; that is bulk decode, which
+`nimble_ml_id_decode_bulk_benchmark` already measures. The fix is to let each
+system materialise lazily at its own natural granularity and to put what it
+holds on an axis of its own. Every measured driver therefore writes a
+`resident_bytes` column beside `read_path` and `build_ns`.
+
+`NimbleBenchTargetBase::residentBytes()` is **pure**, for the same reason
+`readPath()` is: a target that quietly held a decoded copy of the column would
+otherwise be compared on time alone against one holding only compressed bytes,
+and the two would look like the same deployment. Each target answers for what
+it actually keeps — the cursor and view targets report their encoded bytes plus
+their own memory pool, `MaterializingTarget` adds the decoded buffer,
+`BlockCompressedTarget` reports payload plus directory plus scratch,
+`OpenZLBenchTarget` its frame plus scratch, and `OuterCompressedTarget` sums
+the compressed bytes, the inner target and the last decompressed buffer.
+
+Two details make those numbers honest rather than nominal.
+
+**Per-target memory pools.** Each target takes its own
+`memoryManager()->addLeafPool("mlidc_target_N")` via `makeTargetPool()` instead
+of sharing `benchmarks::benchmarkPool()`. (That pool is itself a leaf, so it
+cannot have children — a target sharing it would report the whole sweep's
+allocations as its own.) This is what makes a view's index structures genuinely
+measured rather than estimated from bits per element, since they and the buffer
+a `MaterializedEncodingView` decodes a viewless section into are both
+pool-backed.
+
+**Decode caches that no pool can see.** A transformed SubIntSplit stream keeps
+a decoded block across `reset()`, in plain `std::vector`s rather than
+pool-backed `Vector<T>`s, so neither `payloadSize()` nor the pool reports it.
+Worse, the block size is only ever assigned under a condition no existing
+transform satisfies, so the "block" is the whole column: the first probe
+decodes every row and every probe after it copies out of that cache. Measured
+on a 1M-row column that is roughly 8 MB held against a 4.98 MB payload, and it
+is why such an arm reads flat in N while its untransformed twin scales
+linearly. `Encoding::decodeCacheBytes()` exposes it so `residentBytes()` can
+count it.
+
+The same finding gives those arms a build cost the harness used to attribute
+nowhere: a whole-column decode hidden entirely by warmup. `Encoding` therefore
+also answers `retainsDecodeCache()` and `dropDecodeCache()`, and the cursor
+target reports `buildsAccessStructure()` true exactly when the encoding retains
+a cache, builds it by forcing that first read, and discards it for real. A
+transformed arm now appears on the amortisation curves as build-plus-residency,
+next to the materialised blackbox arms it actually resembles, rather than as a
+per-probe constant that is really a memcpy.
+
+`resident_bytes` is sampled in `setAccessColumns()`, which every driver calls
+while writing the row — that is **after** that row's reads, not after its
+build. The ordering is deliberate: an arm that materialises lazily has no final
+footprint until a workload has touched it, so sampling at construction would
+report every lazy arm at its compressed size and erase the axis.
+
+### Block-lazy arms
+
+`BlockLazyTarget` is the middle regime between holding a column compressed and
+holding it decoded, and it is the one a reader actually deploys: materialise at
+the granularity the format is addressable at, and let the workload decide how
+much ends up resident. It keeps the blocks it has decoded, indexed by block
+number in a vector rather than a hash map, so a hit is an array index and the
+bookkeeping stays out of the measured loop.
+
+It wraps the **block** arms rather than `openzl/auto`, and that is not
+incidental: with a whole-payload inner, decoding "one block" would decompress
+the entire column and the laziness would be fictitious. The arms are
+`zstd/block-65536+lazy` and `openzl/block-65536+lazy`, composed by
+`withBlockLazyMaterialization` exactly as `withMaterializedAccess` composes the
+full-materialise arms, so each lazy arm encodes to the same bytes as its bare
+twin and differs only in what a read leaves behind.
+
+It reports `ReadPath::kBlock` and `buildsAccessStructure() == false` with
+`build_ns` of zero, because its cost genuinely is not a one-time build: it is
+spread across whichever reads happen to miss, and depends on which rows a
+workload touches rather than on the column. The story is told by
+`resident_bytes` rising along the ops axis. `materializeAll` bypasses the cache
+so that a bulk scan cannot turn the arm into full materialisation by a side
+door.
+
+Keep all three regimes when reading a chart. Compressed-only, block-lazy and
+fully-materialised together are what make the frontier legible; any one of them
+alone reproduces the original error in a different direction.
+`tests/BlockLazyTargetTest.cpp` pins the behaviour rather than the timing: that
+k scattered probes decode `min(k, blocks)` blocks and never the column, that
+repeated probes in one block decode it once, that `resident_bytes` rises with
+the reads and returns on discard, and that `materializeAll` leaves nothing
+cached.
+
 ## Running
 
 ```bash
@@ -279,9 +379,12 @@ them from a scratch directory.
 
 ## Where the shared code lives
 
-`BenchCommon.h` holds the bench targets, the encoder and dataset suites, and
-outer compression. `BlockCodecTarget.h` holds the block-addressable codec target
-and its Zstd arms; the OpenZL codec and arms sit in `OpenZLBenchTarget.h`
+`BenchCommon.h` holds the bench targets, the encoder and dataset suites, per-target
+memory pools (`makeTargetPool`) and outer compression. `BlockCodecTarget.h` holds
+the block-addressable codec target and its Zstd arms, plus `BlockLazyTarget` and
+the `withBlockLazyMaterialization` decorator, which live there rather than in a
+file of their own because they are meaningful only over a block-addressable
+inner; the OpenZL codec and arms sit in `OpenZLBenchTarget.h`
 alongside the graph they share with `openzl/auto`. `ResultWriter.h` holds the CSV writer and the run manifest.
 `SubstreamCompression.h` holds the encode path described above. `ElemType.h`
 holds the element-type vocabulary: parsing `--mlidc_dtype`, the name reported in

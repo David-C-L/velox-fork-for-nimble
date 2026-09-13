@@ -150,6 +150,14 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
     return compressed_.size();
   }
 
+  // The frame plus the scratch buffer a partial read decompresses into. That
+  // scratch is a whole decoded column and it is kept between reads, so an arm
+  // that has served one range is holding the column uncompressed even though
+  // it recomputes it on the next call.
+  size_t residentBytes() const override {
+    return compressed_.size() + scratch_.capacity() * sizeof(T);
+  }
+
   // No addressable interior at all, so every read decompresses the frame.
   ReadPath readPath() const override {
     return ReadPath::kWholePayload;
