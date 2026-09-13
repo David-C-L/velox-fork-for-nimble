@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <memory>
 #include <random>
+#include <span>
 #include <string_view>
 #include <vector>
 #include "folly/Random.h"
@@ -353,6 +354,37 @@ TEST_F(ForEncodingTest, constantFramesCostNoPayloadBits) {
   for (uint32_t i = 0; i < kRowCount; ++i) {
     ASSERT_EQ(result[i], 7U) << "row " << i;
   }
+}
+
+TEST_F(ForEncodingTest, estimateSizeHoldsConstantFramesAtOneBit) {
+  // The encoder writes a constant frame at width 0, but the size estimators
+  // price it at one bit so the rung cannot move selection. A constant column
+  // and a one-bit column with the same references must therefore be quoted
+  // identically, by both estimators, even though they encode differently.
+  constexpr uint32_t kRowCount = 8192;
+
+  std::vector<uint32_t> constantData(kRowCount, 7);
+  std::vector<uint32_t> oneBitData;
+  oneBitData.reserve(kRowCount);
+  for (uint32_t i = 0; i < kRowCount; ++i) {
+    oneBitData.push_back(7 + (i & 1U));
+  }
+  const std::span<const uint32_t> constantValues{constantData};
+  const std::span<const uint32_t> oneBitValues{oneBitData};
+
+  const auto oneBitEstimate =
+      nimble::ForEncoding<uint32_t>::estimateSize(oneBitValues);
+  EXPECT_EQ(
+      nimble::ForEncoding<uint32_t>::estimateSize(constantValues),
+      oneBitEstimate);
+
+  // The statistics estimator sees min == max for the constant column, which
+  // is the same metadata layout the values estimator derives for the one-bit
+  // column: every frame's reference is 7 and every frame is one bit wide.
+  EXPECT_EQ(
+      nimble::ForEncoding<uint32_t>::estimateSize(
+          kRowCount, nimble::Statistics<uint32_t>::create(constantValues)),
+      oneBitEstimate);
 }
 
 // Builds a column whose first, middle and last frames are constant, with
