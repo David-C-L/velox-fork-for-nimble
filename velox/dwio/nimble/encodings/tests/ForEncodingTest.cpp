@@ -432,10 +432,11 @@ TEST_F(ForEncodingTest, roundTripsEveryBitWidthAlignedAndUnaligned) {
 }
 
 // Frames of differing widths in one stream, which is what a real column
-// produces and what makes the per-frame width dispatch worth having. Slices of
-// such a stream are deliberately not covered: they currently mis-decode a
-// width-33 frame, which reproduces without any of the decode fast paths and so
-// is a pre-existing defect rather than something this test should pin down.
+// produces and what makes the per-frame width dispatch worth having. Slicing
+// such a stream is the only way a frame comes to start part-way through a
+// byte at a width above 8: a fresh encode begins every frame at a multiple of
+// 128 values, but a slice re-packs from an arbitrary row, so a narrow leading
+// frame leaves the frames after it at an arbitrary bit phase.
 TEST_F(ForEncodingTest, roundTripsMixedBitWidthFrames) {
   constexpr uint32_t kFrameSize = 128;
 
@@ -483,6 +484,21 @@ TEST_F(ForEncodingTest, roundTripsMixedBitWidthFrames) {
       T value{};
       point.materialize(1, &value);
       ASSERT_EQ(value, data[i]) << "point row " << i;
+    }
+
+    for (const uint32_t offset : {1u, 2u, 3u, 5u, 7u, 63u, 65u, 127u, 129u}) {
+      SCOPED_TRACE(testing::Message() << "slice offset=" << offset);
+      const uint32_t length = rowCount - offset;
+      nimble::Buffer sliceBuffer{*pool_};
+      const auto sliced = nimble::ForEncoding<T>::slice(
+          encoded, offset, length, sliceBuffer, nimble::Encoding::Options{});
+
+      nimble::ForEncoding<T> slice{*pool_, sliced};
+      nimble::Vector<T> sliceOutput(pool_.get(), length);
+      slice.materialize(length, sliceOutput.data());
+      for (uint32_t i = 0; i < length; ++i) {
+        ASSERT_EQ(sliceOutput[i], data[offset + i]) << "sliced row " << i;
+      }
     }
   };
 
