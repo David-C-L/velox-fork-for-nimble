@@ -154,7 +154,7 @@ class ForEncoding final
       } else {
         maxException = static_cast<uint64_t>(maxValue - minValue);
       }
-      const uint8_t bitWidth = minBitWidth(maxException);
+      const uint8_t bitWidth = estimateBitWidth(maxException);
 
       totalBits += static_cast<uint64_t>(bitWidth) * frameLength;
       minFrameBitWidth = std::min(minFrameBitWidth, bitWidth);
@@ -198,7 +198,7 @@ class ForEncoding final
 
     const auto fullRange =
         static_cast<uint64_t>(statistics.max() - statistics.min());
-    const uint8_t localBits = minBitWidth(fullRange);
+    const uint8_t localBits = estimateBitWidth(fullRange);
     const uint64_t totalBits = static_cast<uint64_t>(localBits) * rowCount;
 
     return frameMetadataSize(
@@ -400,6 +400,24 @@ class ForEncoding final
       }
     }
     return 64;
+  }
+
+  // Prices a frame for the size estimators, which deliberately stop one rung
+  // short of what the encoder writes.
+  //
+  // minBitWidth gives a constant frame width 0 and the encoder emits it that
+  // way, but selection compares this estimate against other encodings'
+  // estimates, and FOR's is already optimistic about what FOR really
+  // produces. On the snowflake [4..11] section the estimate beat RLE while
+  // the encoded result was 184,457 bytes against RLE's 127,160. Letting the
+  // zero rung shrink the estimate as well compounds that existing error and
+  // pulls sections onto FOR that RLE encodes better, which cost more than the
+  // rung saved. Holding a constant frame at one bit leaves selection exactly
+  // where it was before the rung and errs in the direction that does not lose
+  // the section. The divergence from minBitWidth is intentional; a future
+  // change that makes the estimator accurate could remove it.
+  static uint8_t estimateBitWidth(uint64_t maxValue) {
+    return std::max<uint8_t>(minBitWidth(maxValue), uint8_t{1});
   }
 
   static void prepareSliceHeaderMetadata(
