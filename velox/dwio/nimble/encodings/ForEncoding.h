@@ -380,9 +380,16 @@ class ForEncoding final
   // FOR stores residual widths using a fixed set of wire-supported widths.
   // velox::bits::bitsRequired returns the exact bit count; this rounds that
   // count up to the nearest width the FOR payload writer can encode.
+  //
+  // A frame whose values are all equal has a zero residual range and needs no
+  // payload bits: the reference alone reconstructs every value. Width 0 says
+  // so, which costs the frame nothing in the packed payload and lets the
+  // decoders skip bit extraction for it entirely. Width 0 is unambiguous
+  // against streams written before this rung existed, because rounding up a
+  // non-zero range never produces it.
   static uint8_t minBitWidth(uint64_t maxValue) {
     if (maxValue == 0) {
-      return 1;
+      return 0;
     }
 
     constexpr std::array<uint8_t, 7> kBitWidths = {1, 2, 4, 8, 16, 32, 64};
