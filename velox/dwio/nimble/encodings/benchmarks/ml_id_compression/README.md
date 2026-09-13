@@ -17,6 +17,7 @@ sources compile to a stub `main` that exits non-zero.
 | `nimble_ml_id_decode_range_benchmark` | Contiguous-range decode throughput | yes |
 | `nimble_ml_id_decode_point_benchmark` | Single-probe point-lookup latency | yes |
 | `nimble_ml_id_decode_gather_benchmark` | Gather decode throughput over a (selectivity, run length) grid | yes |
+| `nimble_ml_id_amortisation_benchmark` | Cost of N operations against a one-time build, per access pattern | yes |
 | `nimble_ml_id_cost_model_oracle_benchmark` | SIS DP cost model against a measured oracle | no |
 | `nimble_ml_id_index_oracle_benchmark` | FPE index-type sweep | no |
 | `nimble_ml_id_ablation_benchmark` | Progressive encoding-set restriction for SIS sections | no |
@@ -159,19 +160,25 @@ byte), one terminating offset, and an eight-byte header of element count and
 block size. At K = 1024 and eight-byte elements that is 0.061% of the raw column,
 and it falls by 64x at K = 65536.
 
-These arms are deliberately **not** marked `wholePayloadCodec`: a read does not
-decompress the whole payload, and capping their iterations would hide the
-block-size effect they exist to measure. Their cost is bounded by K instead.
+`BlockCompressedTarget` reports `ReadPath::kBlock`, so the iteration caps below
+leave it alone: a read does not decompress the whole payload, and capping these
+arms would hide the block-size effect they exist to measure. The one exception
+is derived rather than declared — a column short enough to fit in a single block
+reports `kWholePayload`, because an arm holding all of it in one block is a
+whole-payload codec whatever K was set to. `zstd/whole` is that case on purpose.
 `tests/BlockCodecTargetTest.cpp` pins both the round trip — including partial
 final blocks, single-element columns and ranges spanning block boundaries — and
 the "decompresses only what it overlaps" property itself.
 
 ### Keeping the sweeps bounded
 
-Entries where every read decompresses everything are marked
-`EncoderEntry::wholePayloadCodec`. The range and gather drivers sweep hundreds of
-grid cells, and a full decompress per cell would dominate wall-clock time, so
-`specFor()` in `MeasureLoop.h` caps those entries at
+Targets where every read decompresses everything report
+`ReadPath::kWholePayload` from `NimbleBenchTargetBase::readPath()`. This used to
+be a flag on `EncoderEntry`, which `--mlidc_outer_compression` made wrong: that
+flag wraps every arm in a whole-payload codec without any of them declaring one,
+so those runs went uncapped. The range and gather drivers sweep hundreds of grid
+cells, and a full decompress per cell would dominate wall-clock time, so
+`specFor()` in `MeasureLoop.h` caps those targets at
 `--mlidc_block_codec_iters` (default 1) and drops warmup. Their timings are
 correspondingly noisier than the rest, which is the intended trade: enough signal
 to compare orders of magnitude, without the sweep taking hours.
@@ -186,6 +193,52 @@ used, not the nominal flag values.
 Note that the sequential Nimble encodings are slow here too, for a different reason:
 a probe resets the encoding and skips from position zero, so cost grows with the row
 index. Expect to lower `--probes` for a run that includes RLE or SIS.
+
+## View construction, and what it is amortised over
+
+A view, or a decoded buffer, costs something to build and then serves reads
+cheaply. Reporting only one of those two numbers is misleading in whichever
+direction the arm happens to favour, so the harness reports both, always, and
+from one run.
+
+`NimbleBenchTargetBase` exposes the question directly: `readPath()` says how a
+read reaches its rows, `buildsAccessStructure()` says whether there is a
+one-time build at all, and `buildAccessStructure()` / `discardAccessStructure()`
+let a driver time it. A driver asks the target rather than reading the arm's
+name. That is not hypothetical tidiness — the point driver's
+`emulated_point_read` column used to be written as a constant `1` for every arm
+including the view arms it was meant to separate, and a previous analysis had to
+reconstruct it from the encoding name. It now reads `0` exactly when the target
+answers a one-row probe with one row's work.
+
+Every measured driver therefore writes four extra columns: `read_path`,
+`builds_access_structure`, `build_ns`, and `time_incl_build_ns`. `time_ns` stays
+the read time with the structure already built, so both numbers are on the same
+row and neither can be quoted without the other. This replaces the old
+`SIS/...+view+ctor` arms, which covered two view arms out of a dozen and put the
+two numbers on different rows.
+
+`nimble_ml_id_amortisation_benchmark` sweeps the axis itself. For every arm and
+each of the three access patterns, it runs 1, 4, 16, ... up to
+`--amortisation_max_ops` operations and reports both `time_ns` (structure
+already built) and `total_measured_ns` (structure discarded inside the timed
+region), so `total(N) = build + N * per_op` is recoverable and the crossover
+with the equivalent cursor arm is in the data. One operation is one call: a
+probe, a gather of `--amortisation_gather_ranges` ranges, or a read of
+`--amortisation_range_size` elements. The column is encoded once per arm and
+reused across every pattern and every step of the ladder, and
+`--mlidc_encode_cache_dir` removes the per-driver encode on top of that.
+
+Blackbox codecs are on the same curves. `openzl/auto` and `zstd/whole`
+decompress everything per read, which is what a reader holding only the
+compressed column pays, and it is why `openzl/auto` reads 7.5e-05 Mprobes/s on
+snowflake. That is a property of the deployment rather than of the codec, so
+`MaterializingTarget` wraps either one to decompress once on the first access
+and serve the rest from the decoded buffer — the structure
+`MaterializedEncodingView` already uses for a section whose encoding has no
+view. The `openzl/auto+materialize` and `zstd/whole+materialize` arms are those,
+and they encode to the same bytes as their bare twins, so the pair differs in
+how a read is addressed and in nothing else.
 
 ## Running
 

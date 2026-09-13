@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_executable(nimble_ml_id_access_structure_test AccessStructureTest.cpp)
+
+add_test(nimble_ml_id_access_structure_test nimble_ml_id_access_structure_test)
+
+target_link_libraries(
+  nimble_ml_id_access_structure_test
+  # For the gflag definitions the benchmark headers declare.
+  nimble_ml_id_benchmark_common
+  nimble_encodings
+  nimble_common
+  nimble_tools_common
+  openzl_cpp
+  velox_common_base
+  gmock
+  gtest
+  gflags
+  fmt::fmt
+  Folly::folly
+)
+
 add_executable(nimble_ml_id_block_codec_test BlockCodecTargetTest.cpp)
 
 add_test(nimble_ml_id_block_codec_test nimble_ml_id_block_codec_test)

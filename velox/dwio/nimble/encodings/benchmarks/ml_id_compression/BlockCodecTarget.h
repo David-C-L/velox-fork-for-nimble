@@ -240,6 +240,14 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
     return blocks_.size();
   }
 
+  /// Block-addressable, except when the whole column landed in one block: then
+  /// a read costs the payload however the arm was configured. Derived from the
+  /// encoded shape rather than declared, so a single-block arm cannot claim an
+  /// addressability it does not have.
+  ReadPath readPath() const override {
+    return blocks_.size() <= 1 ? ReadPath::kWholePayload : ReadPath::kBlock;
+  }
+
   std::vector<std::span<const std::byte>> internalBuffers() const override {
     return {
         {reinterpret_cast<const std::byte*>(payload_.data()), payload_.size()},
@@ -305,7 +313,10 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
         continue;
       }
       if (cachedBlock_ != block) {
-        scratch_.resize(blockSize_);
+        // The block's own element count, not blockSize_: the final block is
+        // short, and a whole-column arm sets blockSize_ to a bound rather than
+        // a length, where resizing to it would ask for 4 billion elements.
+        scratch_.resize(elements);
         decodeBlock(block, scratch_.data());
         cachedBlock_ = block;
       }
@@ -369,11 +380,6 @@ EncoderEntry<T> makeBlockCodecEntry(
   entry.isSequential = false;
   entry.fastSkip = false;
   entry.randomAccess = false;
-  // Deliberately false. The flag means a read must decompress the entire
-  // payload, and the point of this arm is that it does not; leaving it set
-  // would cap the iteration counts and hide the block-size effect the arm
-  // exists to measure.
-  entry.wholePayloadCodec = false;
   entry.factory = [blockSize, codecName, makeCodec = std::move(makeCodec)](
                       const Vector<T>& data, const Encoding::Options& opts) {
     auto target = std::make_unique<BlockCompressedTarget<T>>(
@@ -392,12 +398,38 @@ std::vector<EncoderEntry<T>> buildZstdBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
   entries.reserve(kBlockElementCounts.size());
   for (const uint32_t blockSize : kBlockElementCounts) {
-    entries.push_back(makeBlockCodecEntry<T>(
-        "zstd", "Zstd", blockSize, []() -> std::unique_ptr<BlockCodec<T>> {
-          return std::make_unique<NimbleBlockCodec<T>>(CompressionType::Zstd);
-        }));
+    entries.push_back(
+        makeBlockCodecEntry<T>(
+            "zstd", "Zstd", blockSize, []() -> std::unique_ptr<BlockCodec<T>> {
+              return std::make_unique<NimbleBlockCodec<T>>(
+                  CompressionType::Zstd);
+            }));
   }
   return entries;
+}
+
+/// Zstd over the whole column in one block: what a reader pays when it holds a
+/// compressed column and no block directory.
+///
+/// The block arms answer a probe from one block. This one has to decompress
+/// everything, which is the same read shape as openzl/auto, and it is the arm
+/// the materialise-on-first-access decorator has something to prove against.
+/// Expressed as a single block rather than as a target of its own so that the
+/// codec, the size accounting and the indexing stay the ones the block arms
+/// already use.
+template <typename T>
+EncoderEntry<T> buildZstdWholeEncoder() {
+  auto entry = makeBlockCodecEntry<T>(
+      "zstd",
+      "Zstd",
+      std::numeric_limits<uint32_t>::max(),
+      []() -> std::unique_ptr<BlockCodec<T>> {
+        return std::make_unique<NimbleBlockCodec<T>>(CompressionType::Zstd);
+      });
+  entry.name = "zstd/whole";
+  entry.variant = "whole";
+  entry.isSequential = true;
+  return entry;
 }
 
 } // namespace facebook::nimble::mlidc

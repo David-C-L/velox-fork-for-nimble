@@ -46,6 +46,7 @@
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/AccessStructure.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodingNodeEstimates.h"
@@ -208,6 +209,37 @@ struct NimbleBenchTargetBase {
       T* dst) = 0;
   virtual size_t payloadSize() const = 0;
   virtual std::vector<std::span<const std::byte>> internalBuffers() const = 0;
+
+  /// How a partial read reaches its rows.
+  ///
+  /// Pure, so every target answers and no driver has to infer it from the
+  /// arm's name. Naming a target "+view" does not make its reads indexed, and
+  /// wrapping one in an outer codec makes them whole-payload without renaming
+  /// anything.
+  virtual ReadPath readPath() const = 0;
+
+  /// Whether reads are served from a structure this target builds once and
+  /// then reuses: a view's indexed accessors, or a decoded buffer.
+  ///
+  /// False means every read pays the same cost, so the build cost is zero and
+  /// the per-read cost is the whole cost. That is a real answer rather than a
+  /// missing one, and an amortisation curve needs it in order to show the
+  /// flat line a cursor arm draws.
+  virtual bool buildsAccessStructure() const {
+    return false;
+  }
+
+  /// Builds that structure now, so a read that follows does not pay for it.
+  /// Idempotent, and a no-op where there is nothing to build.
+  virtual void buildAccessStructure() {}
+
+  /// Drops it, so the next read builds it again.
+  ///
+  /// Paired with buildAccessStructure() this is what lets one run report a
+  /// construction cost and a per-read cost separately, instead of a second arm
+  /// reporting the other one.
+  virtual void discardAccessStructure() {}
+
   /// Returns the encoding tree, for reporting which nested encodings a
   /// selection policy actually chose. Empty for targets that are not Nimble
   /// encodings and so have no tree to show.
@@ -258,6 +290,12 @@ struct NimbleBenchTargetImpl
   }
   std::vector<std::span<const std::byte>> internalBuffers() const override {
     return target.internalBuffers();
+  }
+  // An Encoding carries a cursor, so materializeRange reaches row i by
+  // resetting and skipping i rows. Nothing is built once and reused, so there
+  // is no build phase to separate out.
+  ReadPath readPath() const override {
+    return ReadPath::kCursor;
   }
   std::string describe() override {
     auto* encoding = target.encoding();
@@ -338,23 +376,35 @@ class NimbleViewBenchTargetImpl
     NIMBLE_CHECK_NOT_NULL(view_);
   }
 
-  // A view over a section whose encoding has no real view falls back to
-  // MaterializedEncodingView, which decodes that whole section in its
-  // constructor. Building the view in encodeWith therefore moves that decode
-  // outside the timed region, and a +view bulk number on a column with a
-  // FrequencyPartition or Delta section is a partial decode. Setting this
-  // rebuilds the view inside materializeAll so the reported figure covers the
-  // same work the cursor path pays for.
-  void setTimeViewConstruction(bool value) {
-    timeViewConstruction_ = value;
+  ReadPath readPath() const override {
+    return ReadPath::kIndexed;
+  }
+
+  // Reading through a view is two costs, not one. Where a section's encoding
+  // has no real view -- FrequencyPartition and Delta are the two that matter
+  // here -- the fallback MaterializedEncodingView decodes that whole section in
+  // its constructor, so a read that finds the view already built is reporting a
+  // partial decode. Separating the two is what lets one measurement report both
+  // numbers, rather than a second arm reporting the other one.
+  bool buildsAccessStructure() const override {
+    return true;
+  }
+
+  void buildAccessStructure() override {
+    if (view_ != nullptr) {
+      return;
+    }
+    view_ =
+        createEncodingView(std::string_view(encoded_), pool_.get(), options_);
+    NIMBLE_CHECK_NOT_NULL(view_);
+  }
+
+  void discardAccessStructure() override {
+    view_.reset();
   }
 
   void materializeAll(T* dst, uint32_t n) override {
-    if (timeViewConstruction_) {
-      view_ =
-          createEncodingView(std::string_view(encoded_), pool_.get(), options_);
-      NIMBLE_CHECK_NOT_NULL(view_);
-    }
+    buildAccessStructure();
     view_->read(0, n, dst);
   }
 
@@ -362,6 +412,7 @@ class NimbleViewBenchTargetImpl
   // the API a point lookup would actually use, and the one the point driver is
   // meant to be measuring.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
+    buildAccessStructure();
     if (count == 1) {
       view_->readAt(begin, dst);
     } else {
@@ -374,6 +425,7 @@ class NimbleViewBenchTargetImpl
   void skipThenMaterialize(
       const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
       T* dst) override {
+    buildAccessStructure();
     for (const auto& [begin, count] : ranges) {
       if (count == 1) {
         view_->readAt(begin, dst);
@@ -429,7 +481,6 @@ class NimbleViewBenchTargetImpl
   std::string encoded_;
   Encoding::Options options_;
   std::unique_ptr<EncodingView> view_;
-  bool timeViewConstruction_{false};
 };
 
 template <typename T>
@@ -445,10 +496,11 @@ struct EncoderEntry {
   bool isSequential{true};
   bool fastSkip{false};
   bool randomAccess{false};
-  // True when every read, however small, must first decompress the entire
-  // payload. Drivers use this to cap iterations so a block codec does not
-  // dominate wall-clock time on the fine-grained access sweeps.
-  bool wholePayloadCodec{false};
+  // Whether a read must first decompress the entire payload is deliberately
+  // not a field here. It used to be, and --mlidc_outer_compression made it
+  // wrong: that flag wraps every arm in a whole-payload codec without any of
+  // them declaring one. Drivers ask the target through
+  // NimbleBenchTargetBase::readPath() instead.
 
   // Factory: construct a fresh target and encode the given data.
   std::function<std::unique_ptr<NimbleBenchTargetBase<T>>(
@@ -545,6 +597,12 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     inner_->skipThenMaterialize(ranges, dst);
   }
 
+  // Whatever the inner encoding could do, a read here decompresses the whole
+  // payload first, which is the erasure this arm exists to measure.
+  ReadPath readPath() const override {
+    return ReadPath::kWholePayload;
+  }
+
   // The stored size, which is what an outer codec is chosen for.
   size_t payloadSize() const override {
     return compressed_.size();
@@ -636,7 +694,6 @@ EncoderEntry<T> withOuterCompression(
   // encoding had.
   entry.fastSkip = false;
   entry.randomAccess = false;
-  entry.wholePayloadCodec = true;
   auto inner = std::move(entry.factory);
   entry.factory = [inner = std::move(inner), compressionType](
                       const Vector<T>& data, const Encoding::Options& opts) {
@@ -644,6 +701,150 @@ EncoderEntry<T> withOuterCompression(
         inner(data, opts), compressionType);
     // The constructor compresses the payload the inner factory just encoded;
     // calling encode() here would encode a second time.
+    return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(target));
+  };
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// Materialise on first access
+// ---------------------------------------------------------------------------
+
+// Decodes the column once on the first access and serves everything after it
+// from the decoded buffer.
+//
+// A blackbox codec has no addressable interior, so OpenZLBenchTarget answers a
+// one-row probe by decompressing the column, and answers the next one by
+// decompressing it again. That is what a reader holding only the compressed
+// frame pays, and it is the honest number for that deployment. It is not the
+// only deployment. A reader that expects to come back can decompress once, keep
+// the rows, and serve the rest from memory; this decorator is that reader. It
+// is what puts a blackbox codec on the same amortisation curve as a view --
+// one build cost, a cheap per-read cost, and a break-even against the cursor
+// path somewhere between them -- instead of leaving it as a single number six
+// orders of magnitude off everything else.
+//
+// The structure is MaterializedEncodingView's, which does exactly this for a
+// section whose own encoding has no view.
+template <typename T>
+class MaterializingTarget : public NimbleBenchTargetBase<T> {
+ public:
+  // Takes an inner target the encoder entry's factory has already encoded, and
+  // the row count to decode, which the factory reads off the input column.
+  MaterializingTarget(
+      std::unique_ptr<NimbleBenchTargetBase<T>> inner,
+      uint32_t rowCount)
+      : inner_{std::move(inner)}, rowCount_{rowCount} {}
+
+  void encode(const Vector<T>& data, const Encoding::Options& opts) override {
+    inner_->encode(data, opts);
+    rowCount_ = data.size();
+    discardAccessStructure();
+  }
+
+  void materializeAll(T* dst, uint32_t n) override {
+    buildAccessStructure();
+    std::copy_n(values_.data(), n, dst);
+  }
+
+  void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
+    buildAccessStructure();
+    std::copy_n(values_.data() + begin, count, dst);
+  }
+
+  void skipThenMaterialize(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+      T* dst) override {
+    buildAccessStructure();
+    for (const auto& [begin, count] : ranges) {
+      std::copy_n(values_.data() + begin, count, dst);
+      dst += count;
+    }
+  }
+
+  // Indexed once the buffer exists, which is the claim this arm makes. What it
+  // costs to get there is the build cost, and it is reported separately rather
+  // than folded in or left out.
+  ReadPath readPath() const override {
+    return ReadPath::kIndexed;
+  }
+
+  bool buildsAccessStructure() const override {
+    return true;
+  }
+
+  void buildAccessStructure() override {
+    if (rowCount_ == 0 || !values_.empty()) {
+      return;
+    }
+    values_.resize(rowCount_);
+    inner_->materializeAll(values_.data(), rowCount_);
+    ++numBuilds_;
+  }
+
+  // Frees the buffer rather than marking it stale, because a genuine first
+  // access allocates it. Holding the allocation across a discard would make
+  // every rebuild cheaper than the one a reader actually pays for.
+  void discardAccessStructure() override {
+    values_ = std::vector<T>{};
+  }
+
+  /// Times the inner target has been decoded since construction.
+  /// Instrumentation for the tests that pin "decoded once, not once per read";
+  /// never read on a timed path.
+  size_t numBuilds() const {
+    return numBuilds_;
+  }
+
+  // The inner codec's stored bytes. Materialising changes what a read costs,
+  // not what the column occupies.
+  size_t payloadSize() const override {
+    return inner_->payloadSize();
+  }
+
+  std::vector<std::span<const std::byte>> internalBuffers() const override {
+    return inner_->internalBuffers();
+  }
+
+  std::string describe() override {
+    return inner_->describe();
+  }
+
+  std::string describeTree() override {
+    return inner_->describeTree();
+  }
+
+  std::string describeNodeEstimates() override {
+    return inner_->describeNodeEstimates();
+  }
+
+ private:
+  std::unique_ptr<NimbleBenchTargetBase<T>> inner_;
+  uint32_t rowCount_{0};
+  std::vector<T> values_;
+  size_t numBuilds_{0};
+};
+
+// Wraps entry's factory so its target decodes once and serves reads from the
+// decoded buffer.
+//
+// Named "+materialize" for the reason "+view" is: the pair encodes to the same
+// bytes and differs only in how a read is addressed, so the two rows are
+// comparable and the difference between them is what the one-time build buys.
+template <typename T>
+EncoderEntry<T> withMaterializedAccess(EncoderEntry<T> entry) {
+  entry.name += "+materialize";
+  entry.variant += "_materialize";
+  entry.isSequential = false;
+  entry.fastSkip = true;
+  entry.randomAccess = true;
+  auto inner = std::move(entry.factory);
+  entry.factory = [inner = std::move(inner)](
+                      const Vector<T>& data, const Encoding::Options& opts) {
+    auto target = std::make_unique<MaterializingTarget<T>>(
+        inner(data, opts), static_cast<uint32_t>(data.size()));
+    // The inner factory has already encoded; calling encode() here would encode
+    // a second time.
     return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(target));
   };
   return entry;
@@ -1346,54 +1547,15 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
-  {
-    // The +view arms above build the view in encodeWith, outside the timed
-    // region. Where a section's encoding has no real view -- FrequencyPartition
-    // and Delta are the two that matter here -- the fallback
-    // MaterializedEncodingView decodes that whole section in its constructor,
-    // so those arms report a partial decode. This pair repeats them with the
-    // construction inside the measurement, which is the like-for-like number
-    // against the cursor arms.
-    EncoderEntry<T> entry;
-    entry.name = "SIS/realNested+view+ctor";
-    entry.family = "SubIntSplit";
-    entry.variant = "real_nested_view_ctor";
-    entry.inventory = "full";
-    entry.isSequential = false;
-    entry.fastSkip = true;
-    entry.randomAccess = true;
-    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
-      auto impl =
-          std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
-      impl->encodeWith(data, opts, /*realNestedSelection=*/true);
-      impl->setTimeViewConstruction(true);
-      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-    };
-    encoders.push_back(std::move(entry));
-  }
-
-  {
-    EncoderEntry<T> entry;
-    entry.name = "SIS/key_derived+view+ctor";
-    entry.family = "SubIntSplit";
-    entry.variant = "key_derived_view_ctor";
-    entry.inventory = "full";
-    entry.isSequential = false;
-    entry.fastSkip = true;
-    entry.randomAccess = true;
-    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
-      auto impl =
-          std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
-      Encoding::Options o = opts;
-      o.subIntSplitTransform =
-          static_cast<uint8_t>(subintsplit::TransformId::KeyDerived);
-      o.subIntSplitKeySection = 0xFF;
-      impl->encodeWith(data, o, /*realNestedSelection=*/true);
-      impl->setTimeViewConstruction(true);
-      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-    };
-    encoders.push_back(std::move(entry));
-  }
+  // SIS/realNested+view+ctor and SIS/key_derived+view+ctor are gone. They
+  // existed to report the number their +view twins left out: a view built in
+  // encodeWith is built outside the timed region, and where a section falls
+  // back to MaterializedEncodingView that hides a whole-section decode. Baking
+  // a second arm per view arm never covered more than two of them, and the two
+  // numbers were never on the same row. Every driver now measures the build
+  // through NimbleBenchTargetBase::buildAccessStructure() and writes both
+  // build_ns and time_incl_build_ns, so every view arm reports both and none
+  // can report only one.
 
   {
     // Same plan as SIS/realNested, with

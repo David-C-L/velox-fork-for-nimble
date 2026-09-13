@@ -169,8 +169,8 @@ int runBenchmark() {
       if (b == 0 || b > n) {
         continue;
       }
-      const int offsetCount =
-          offsetsBySize.empty() ? FLAGS_range_offsets : offsetsBySize[sizeIndex];
+      const int offsetCount = offsetsBySize.empty() ? FLAGS_range_offsets
+                                                    : offsetsBySize[sizeIndex];
       std::uniform_int_distribution<size_t> pick(0, n - b);
       for (int i = 0; i < std::max(1, offsetCount); ++i) {
         Cell c;
@@ -241,13 +241,13 @@ int runBenchmark() {
       "elem_Meps",
       "input_MBps",
       "skipped"};
+  appendAccessColumns(csvColumns);
   std::string csvPath = FLAGS_mlidc_output_csv.empty()
       ? "bench_decode_range.csv"
       : FLAGS_mlidc_output_csv;
   CsvResultWriter csv(csvPath, csvColumns);
   if (!FLAGS_mlidc_output_manifest.empty())
     writeRunManifest(FLAGS_mlidc_output_manifest);
-
 
   std::vector<Elem> sink(n, Elem{});
   int validateFailures = 0;
@@ -270,7 +270,7 @@ int runBenchmark() {
       // the sweep finishes in reasonable time.
       const MeasureSpec encSpec = specFor(
           spec,
-          enc.wholePayloadCodec,
+          target->readPath(),
           static_cast<size_t>(FLAGS_mlidc_block_codec_iters));
 
       const size_t payloadBytes = target->payloadSize();
@@ -310,6 +310,12 @@ int runBenchmark() {
               reinterpret_cast<std::byte*>(sink.data()),
               static_cast<size_t>(n) * kElemSize));
 
+      // Measured once per encoder rather than per cell: the build does not
+      // depend on which range runs against it, and every cell reports it so
+      // the range time can be read with or without construction.
+      const auto build = measureAccessStructureBuild<Elem>(
+          encSpec, cell.controller, cell.targets, *target);
+
       {
         for (const Cell& c : cells) {
           auto result = measure(encSpec, cell.controller, cell.targets, [&]() {
@@ -346,6 +352,8 @@ int runBenchmark() {
           setTimingColumns(csv, result);
           csv.set("elem_Meps", elemMeps);
           csv.set("input_MBps", inputMBps);
+          setAccessColumns<Elem>(
+              csv, *target, build.time.median_ns, result.time.median_ns);
           csv.set("skipped", int64_t{0});
           csv.endRow();
         }

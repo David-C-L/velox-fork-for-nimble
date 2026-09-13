@@ -187,6 +187,7 @@ int runBenchmark() {
       "time_min_ns",
       "gather_Meps",
       "skipped"};
+  appendAccessColumns(csvColumns);
   std::string csvPath = FLAGS_mlidc_output_csv.empty()
       ? "bench_decode_gather.csv"
       : FLAGS_mlidc_output_csv;
@@ -213,7 +214,7 @@ int runBenchmark() {
       // the sweep finishes in reasonable time.
       const MeasureSpec encSpec = specFor(
           spec,
-          enc.wholePayloadCodec,
+          target->readPath(),
           static_cast<size_t>(FLAGS_mlidc_block_codec_iters));
 
       const size_t payloadBytes = target->payloadSize();
@@ -253,6 +254,12 @@ int runBenchmark() {
               reinterpret_cast<std::byte*>(sink.data()),
               static_cast<size_t>(n) * kElemSize));
 
+      // Measured once per encoder rather than per cell: the build does not
+      // depend on which gather runs against it, and every cell reports it so
+      // the gather time can be read with or without construction.
+      const auto build = measureAccessStructureBuild<Elem>(
+          encSpec, cell.controller, cell.targets, *target);
+
       for (double sigma : selectivityAxis) {
         for (size_t rl : runLengthAxis) {
           GatherAccessParams p{
@@ -291,6 +298,8 @@ int runBenchmark() {
           csv.set("gap_model", std::string(gapModelName(p.gapModel)));
           setTimingColumns(csv, result);
           csv.set("gather_Meps", meps);
+          setAccessColumns<Elem>(
+              csv, *target, build.time.median_ns, result.time.median_ns);
           csv.set("skipped", int64_t{0});
           csv.endRow();
         }

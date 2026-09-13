@@ -99,10 +99,14 @@ std::vector<EncoderEntry<T>> buildOpenZLBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
   entries.reserve(kBlockElementCounts.size());
   for (const uint32_t blockSize : kBlockElementCounts) {
-    entries.push_back(makeBlockCodecEntry<T>(
-        "openzl", "OpenZL", blockSize, []() -> std::unique_ptr<BlockCodec<T>> {
-          return std::make_unique<OpenZLBlockCodec<T>>();
-        }));
+    entries.push_back(
+        makeBlockCodecEntry<T>(
+            "openzl",
+            "OpenZL",
+            blockSize,
+            []() -> std::unique_ptr<BlockCodec<T>> {
+              return std::make_unique<OpenZLBlockCodec<T>>();
+            }));
   }
   return entries;
 }
@@ -144,6 +148,11 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
 
   size_t payloadSize() const override {
     return compressed_.size();
+  }
+
+  // No addressable interior at all, so every read decompresses the frame.
+  ReadPath readPath() const override {
+    return ReadPath::kWholePayload;
   }
 
   // Report the codec graph OpenZL chose for this column.
@@ -263,9 +272,6 @@ EncoderEntry<T> buildOpenZLEncoder() {
   entry.isSequential = true;
   entry.fastSkip = false;
   entry.randomAccess = false;
-  // Every partial read decompresses the whole payload, so drivers bound the
-  // iteration count for this entry.
-  entry.wholePayloadCodec = true;
   entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
     auto target = std::make_unique<OpenZLBenchTarget<T>>();
     target->encode(data, opts);
