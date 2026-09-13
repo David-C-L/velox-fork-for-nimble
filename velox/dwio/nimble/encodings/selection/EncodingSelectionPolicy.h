@@ -30,6 +30,7 @@
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 
 namespace facebook::nimble {
@@ -373,7 +374,22 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
           EncodingType::FixedBitWidth, values, statistics, options);
     }
 
-    float minCost = std::numeric_limits<float>::max();
+    // How much a section's decode counts against its size here, and for
+    // which read shape. Zero unless these are a SubIntSplit section's options
+    // and a caller asked for decode to count, and the term below is then
+    // exactly zero, so the encoding chosen is the encoding chosen before.
+    const double decodeWeight = options.subIntSplitSectionSelection
+        ? options.subIntSplitDecodeWeight
+        : 0.0;
+    const auto decodePattern =
+        static_cast<detail::subintsplit::DecodeAccessPattern>(
+            options.subIntSplitDecodeAccessPattern);
+
+    // Costs are compared in double so that the decode term, which is in bytes
+    // and can be large, does not lose the size term to rounding. With the
+    // decode term at zero every cost is a float value widened without change,
+    // so the comparisons are the ones float made.
+    double minCost = std::numeric_limits<double>::max();
     EncodingType selectedEncoding = EncodingType::Trivial;
     std::optional<uint64_t> selectedEstimatedSize;
     // Iterate on all candidate encodings, and pick the encoding with the
@@ -393,7 +409,23 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       // effectiveReadFactor above for the rule and why it lives there.
       const auto readFactor = effectiveReadFactor(
           encodingType, entry.second, estimatedSize.value(), fixedBitWidthSize);
-      const auto cost = estimatedSize.value() * readFactor;
+      // Size, as before, plus what reading the section back costs at the
+      // caller's exchange rate. Section decode times add rather than max, so
+      // one slow section is paid in full by every scan of the column, and
+      // choosing on size alone cannot see that. See SubIntSplitDecodeCost.h
+      // for where the per-encoding rates come from and how well each is
+      // supported by measurement.
+      double cost = static_cast<double>(estimatedSize.value() * readFactor);
+      if (decodeWeight != 0.0) {
+        const double nanosPerRow = detail::subintsplit::decodeNanosPerRow(
+            encodingType,
+            decodePattern,
+            static_cast<double>(estimatedSize.value()) * 8.0,
+            values.size());
+        cost += detail::subintsplit::decodeCostBits(
+                    nanosPerRow, values.size(), decodeWeight) /
+            8.0;
+      }
       NIMBLE_SELECTION_LOG(
           "Encoding: " << encodingType << ", Size: "
                        << velox::succinctBytes(estimatedSize.value())

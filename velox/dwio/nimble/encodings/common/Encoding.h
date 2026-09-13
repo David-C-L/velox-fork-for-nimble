@@ -309,6 +309,26 @@ class Encoding {
     /// to be fitted on.
     uint8_t subIntSplitDecodeAccessPattern{0};
 
+    /// Whether these options are the ones a SubIntSplit section is being
+    /// encoded with, rather than a column's own options.
+    ///
+    /// Set only by sectionEncodingOptions, and read only by encoding
+    /// selection, which uses it to decide whether subIntSplitDecodeWeight
+    /// applies. Without it the weight would either reach every stream in the
+    /// file or reach no section at all: the split planner's cost models and
+    /// the candidate list a section's encoding is actually chosen from are
+    /// different code with no shared configuration, and only the second of
+    /// them decides what a section is finally encoded as. Withdrawing an
+    /// encoding from the planner alone was measured to leave the section
+    /// encoded exactly as before.
+    ///
+    /// It marks the whole subtree below a section, not just its top encoding,
+    /// so a nested stream inside a section -- a FrequencyPartition tag stream,
+    /// say -- is priced on decode as well. That is deliberate: a tag stream
+    /// read once per row is exactly the cost that made FrequencyPartition
+    /// sections dear.
+    bool subIntSplitSectionSelection{false};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

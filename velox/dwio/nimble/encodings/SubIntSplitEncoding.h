@@ -41,6 +41,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
@@ -117,6 +118,10 @@ inline Encoding::Options sectionEncodingOptions(
   // this weighs. A workload dominated by point reads wants the other choice.
   sectionOptions.frequencyPartitionIndex =
       2u; // FreqPartIndexType::TierTagArray
+  // Tells encoding selection that these are a section's options, so that
+  // subIntSplitDecodeWeight applies to the candidate list a section's encoding
+  // is chosen from and not merely to the planner that placed the boundaries.
+  sectionOptions.subIntSplitSectionSelection = true;
   return sectionOptions;
 }
 
@@ -1409,6 +1414,27 @@ std::string_view SubIntSplitEncoding<T>::encode(
         "subIntSplitForceApply requires a pinned subIntSplitKeySection.");
   }
 
+  // A key-derived section is stored in key order, so the reader has to
+  // scatter it back to row order. That costs
+  // kKeyDerivedTransformNanosPerRowPerSection per row for every section that
+  // took the transform, it lands in assembly rather than in any section's
+  // materialize(), and until here nothing choosing the transform could see it:
+  // the choice was made on encoded bytes alone.
+  //
+  // The split DP cannot price this and says so -- boundaries are fixed before
+  // any section is offered a transform, so there is nothing to charge it
+  // against there. This decision is taken after the boundaries are known,
+  // which is precisely why the cost is available here and not there.
+  //
+  // Zero at the default weight, leaving the transform chosen on size as before.
+  const size_t keyDerivedDecodePenaltyBytes =
+      static_cast<size_t>(detail::subintsplit::decodeCostBits(
+                              detail::subintsplit::
+                                  kKeyDerivedTransformNanosPerRowPerSection,
+                              valueCount,
+                              options.subIntSplitDecodeWeight) /
+                          8.0);
+
   transformInfo.transformIds.assign(splitCount, 0);
   transformInfo.codebooks.assign(splitCount, {});
   transformInfo.primaryIndices.assign(splitCount, {});
@@ -1563,6 +1589,11 @@ std::string_view SubIntSplitEncoding<T>::encode(
     std::vector<std::string_view> sections;
     detail::SubIntSplitTransformInfo info;
     size_t totalBytes{0};
+    // What the search minimises: the attempt's bytes plus the size-equivalent
+    // of the decode a row-permuting transform adds. Equal to totalBytes at the
+    // default decode weight of zero, so the plan chosen is byte for byte the
+    // plan chosen before unless a caller asks for decode to count.
+    size_t costBytes{0};
   };
   //
   // Returns nothing when the plan it is building has already grown past
@@ -1631,8 +1662,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
       }
       attempt.sections[s] = plainEncoded[s];
       attempt.totalBytes += plainEncoded[s].size();
+      attempt.costBytes += plainEncoded[s].size();
     }
-    if (!improvesOnBest(attempt.totalBytes, bound)) {
+    if (!improvesOnBest(attempt.costBytes, bound)) {
       return std::nullopt;
     }
 
@@ -1668,6 +1700,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
       // candidate has to be strictly smaller to displace it, which keeps the
       // untransformed result the default whenever a transform does not pay.
       size_t bestBytes = plain.size();
+      size_t bestCost = plain.size();
       std::string_view bestEncoded = plain;
       const subintsplit::SectionTransform* bestTransform = nullptr;
       std::vector<uint64_t> bestCodebook;
@@ -1705,9 +1738,15 @@ std::string_view SubIntSplitEncoding<T>::encode(
             primaryIndices);
         const std::string_view alternative = encodeSection(s, sb, transformed);
         const size_t total = alternative.size() + stateBytes;
+        // Only a transform that keys on another section moves rows, and only
+        // moving rows costs the reader the scatter back. A value transform
+        // rewrites in place and is priced on its bytes alone.
+        const size_t cost = total +
+            (candidate->needsKeySection() ? keyDerivedDecodePenaltyBytes : 0);
 
-        if (total < bestBytes || options.subIntSplitForceApply) {
+        if (cost < bestCost || options.subIntSplitForceApply) {
           bestBytes = total;
+          bestCost = cost;
           bestEncoded = alternative;
           bestTransform = candidate;
           bestCodebook = std::move(codebook);
@@ -1726,12 +1765,14 @@ std::string_view SubIntSplitEncoding<T>::encode(
         }
         attempt.sections[s] = bestEncoded;
         attempt.totalBytes += bestBytes;
+        attempt.costBytes += bestCost;
       } else {
         attempt.sections[s] = plain;
         attempt.totalBytes += plain.size();
+        attempt.costBytes += plain.size();
       }
 
-      if (!improvesOnBest(attempt.totalBytes, bound)) {
+      if (!improvesOnBest(attempt.costBytes, bound)) {
         return std::nullopt;
       }
     }
@@ -1766,7 +1807,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
         // nothing left to compare: anything that would not have displaced the
         // incumbent was abandoned rather than finished.
         auto attempt = attemptWithKey(
-            candidate, best.has_value() ? best->totalBytes : kNoBound);
+            candidate, best.has_value() ? best->costBytes : kNoBound);
         if (attempt.has_value()) {
           best = std::move(attempt);
         }
