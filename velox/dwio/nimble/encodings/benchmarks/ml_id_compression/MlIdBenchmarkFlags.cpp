@@ -195,6 +195,13 @@ DEFINE_double(
     "Sets Encoding::Options::selectionScreenMargin. Only read when "
     "--mlidc_selection_screen_rows is set.");
 
+DEFINE_uint32(
+    mlidc_sis_section_threads,
+    0,
+    "Threads SubIntSplit encodes its sections on, through "
+    "Encoding::Options::subIntSplitSectionExecutor. Zero, the default, encodes "
+    "them on the calling thread, which is production behaviour.");
+
 DEFINE_string(
     mlidc_sis_withdraw_nested_encodings,
     "",
