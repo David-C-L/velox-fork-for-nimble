@@ -248,6 +248,9 @@ class MetricCollector {
     if (hasFlag(flags, MetricFlag::UniqueCount) ||
         hasFlag(flags, MetricFlag::FrequencyTiers)) {
       out.uniqueCount = counts.frequencies.uniqueCount;
+      out.singletonCount = counts.frequencies.singletonCount;
+      out.doubletonCount = counts.frequencies.doubletonCount;
+      out.countedRows = count;
     }
     if (hasFlag(flags, MetricFlag::DominantValue)) {
       out.dominantCount = counts.frequencies.dominantCount;
@@ -465,6 +468,11 @@ class MetricCollector {
       SegmentMetrics scanned = scanAll(values);
       if (doUniq) {
         scanned.uniqueCount = supplied->uniqueCount;
+        // The stream cardinality estimate's only input. Dropping these reads
+        // as "no singletons", which pins the estimate to the sample's count.
+        scanned.singletonCount = supplied->singletonCount;
+        scanned.doubletonCount = supplied->doubletonCount;
+        scanned.countedRows = n;
       }
       if (doDominant) {
         scanned.dominantCount = supplied->dominantCount;

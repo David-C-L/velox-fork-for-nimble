@@ -95,16 +95,18 @@ void expectPartitionMatchesCounting(
       EXPECT_EQ(given.sumAbsDelta, counted.sumAbsDelta) << where;
       EXPECT_EQ(given.monotonicCount, counted.monotonicCount) << where;
       EXPECT_EQ(given.maxDelta, counted.maxDelta) << where;
-      EXPECT_EQ(given.singletonCount, givenFrequencies.singletonCount) << where;
-      EXPECT_EQ(given.doubletonCount, givenFrequencies.doubletonCount) << where;
-      EXPECT_EQ(given.countedRows, givenFrequencies.countedRows) << where;
-
-      // The counter's own singleton and doubleton counts, which neither
-      // supplied path forwards, against the counting path's.
-      EXPECT_EQ(rangeCounts.frequencies.singletonCount, counted.singletonCount)
+      // The singleton and doubleton counts are the stream cardinality
+      // estimate's only input, so both supplied paths must forward them. A path
+      // that drops them does not fail loudly: the estimate silently falls back
+      // to the sample's distinct count and Dictionary is priced on it.
+      EXPECT_EQ(given.singletonCount, counted.singletonCount) << where;
+      EXPECT_EQ(given.doubletonCount, counted.doubletonCount) << where;
+      EXPECT_EQ(given.countedRows, counted.countedRows) << where;
+      EXPECT_EQ(givenFrequencies.singletonCount, counted.singletonCount)
           << where;
-      EXPECT_EQ(rangeCounts.frequencies.doubletonCount, counted.doubletonCount)
+      EXPECT_EQ(givenFrequencies.doubletonCount, counted.doubletonCount)
           << where;
+      EXPECT_EQ(givenFrequencies.countedRows, counted.countedRows) << where;
     }
   }
 }
@@ -206,6 +208,37 @@ TEST(SubIntSplitSelectorTest, PartitionHandlesASegmentOfOneValue) {
   EXPECT_EQ(counter.frequencies(23).uniqueCount, 1u);
   EXPECT_EQ(counter.frequencies(23).dominantCount, samples.size());
   expectPartitionMatchesCounting(samples, 24);
+}
+
+// The grid prices Dictionary on the stream's estimated cardinality, and the
+// grid only ever reaches the metrics through the counter. A near-unique sample
+// of a much longer stream must therefore extrapolate there exactly as it does
+// through the counting path, rather than reporting the sample's own count.
+TEST(SubIntSplitSelectorTest, RangeCountsExtrapolateStreamCardinality) {
+  constexpr size_t kCount = 2'048;
+  constexpr size_t kStreamRows = 524'288;
+  constexpr int kBits = 40;
+  std::mt19937_64 rng(5);
+  std::vector<uint64_t> samples(kCount);
+  for (auto& sample : samples) {
+    sample = rng() & ((uint64_t{1} << kBits) - 1);
+  }
+  samples[1] = samples[0];
+
+  const auto flags = allCostModelRequiredFlags();
+  MetricCollector collector;
+  const SegmentMetrics counted = collector.compute(samples, flags);
+  BitRangeCounter counter(samples);
+  counter.reset(0);
+  const SegmentMetrics given =
+      collector.compute(samples, flags, counter.counts(kBits - 1));
+
+  const double countedEstimate =
+      estimatedStreamUniqueCount(counted, kCount, kBits, kStreamRows);
+  EXPECT_GT(countedEstimate, static_cast<double>(counted.uniqueCount));
+  EXPECT_EQ(
+      estimatedStreamUniqueCount(given, kCount, kBits, kStreamRows),
+      countedEstimate);
 }
 
 // A column whose low bits repeat heavily and whose high bits run, which is the
