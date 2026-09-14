@@ -112,7 +112,8 @@ DEFINE_int32(
     mlidc_sis_decode_read_path,
     0,
     "Encoding::Options::subIntSplitDecodeReadPath: the reader decode is costed "
-    "for when --mlidc_sis_decode_weight is non-zero. 0 cursor, 1 view.");
+    "for when --mlidc_sis_decode_weight is non-zero. 0 cursor, 1 view, both "
+    "with construction amortised; 2 cursor and 3 view paying construction.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,
@@ -202,10 +203,11 @@ DEFINE_double(
 
 DEFINE_uint32(
     mlidc_sis_section_threads,
-    0,
+    4,
     "Threads SubIntSplit encodes its sections on, through "
-    "Encoding::Options::subIntSplitSectionExecutor. Zero, the default, encodes "
-    "them on the calling thread, which is production behaviour.");
+    "Encoding::Options::subIntSplitSectionExecutor. Four by default; zero "
+    "encodes them on the calling thread. Encode wall time is then not "
+    "comparable with single-threaded codecs: compare the reported CPU time.");
 
 DEFINE_string(
     mlidc_sis_withdraw_nested_encodings,

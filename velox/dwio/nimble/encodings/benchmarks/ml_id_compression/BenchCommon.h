@@ -1419,6 +1419,29 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   }
 
   {
+    // SIS/hybrid+view with construction timed, the like-for-like arm for plans
+    // priced on a read path that pays for opening the stream.
+    EncoderEntry<T> entry;
+    entry.name = "SIS/hybrid+view+ctor";
+    entry.family = "SubIntSplit";
+    entry.variant = "hybrid_view_ctor";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = true;
+    entry.randomAccess = true;
+    entry.factory = [](const Vector<T>& data, const Encoding::Options& opts) {
+      Encoding::Options hybridOptions = opts;
+      hybridOptions.subIntSplitHybridPlanner = true;
+      auto impl =
+          std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      impl->encodeWith(data, hybridOptions, /*realNestedSelection=*/true);
+      impl->setTimeViewConstruction(true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  {
     EncoderEntry<T> entry;
     entry.name = "SIS/key_derived+view+ctor";
     entry.family = "SubIntSplit";

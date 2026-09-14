@@ -322,15 +322,16 @@ class Encoding {
     uint8_t subIntSplitDecodeAccessPattern{0};
 
     /// The reader section decode is costed for when subIntSplitDecodeWeight is
-    /// non-zero: 0 the cursor (SubIntSplitEncoding::materialize), 1 the view
-    /// (SubIntSplitEncodingView). Matches detail::subintsplit::DecodeReadPath.
+    /// non-zero. Matches detail::subintsplit::DecodeReadPath: 0 the cursor
+    /// (SubIntSplitEncoding::materialize) and 1 the view
+    /// (SubIntSplitEncodingView), both with construction amortised; 2 and 3 the
+    /// same readers paying each section's construction on every read.
     ///
-    /// The two pay for different things. A view builds a materializing
-    /// fallback for sections whose encoding has no view, decoding the whole
-    /// section when it is opened, so FrequencyPartition, FOR, Delta and
-    /// MainlyConstant sections cost two to five times more to read through a
-    /// view than their cursor rates say, and plans priced on cursor rates were
-    /// measured reading several times slower through views.
+    /// Choose by how streams are read. A section that falls back to a
+    /// materializing view costs almost nothing to read once opened and nearly
+    /// everything to open, and building a FrequencyPartition section costs
+    /// about 25 ns per row on either reader, so pricing opens for a reader that
+    /// amortises them buys faster opens with slower reads.
     uint8_t subIntSplitDecodeReadPath{0};
 
     /// Whether these options are the ones a SubIntSplit section is being

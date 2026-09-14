@@ -412,15 +412,41 @@ TEST(SubIntSplitSelectorTest, ViewPathPricesSectionsForTheViewItBuilds) {
   const auto bulkRate = [](EncodingType type, DecodeReadPath path) {
     return decodeRate(type, DecodeAccessPattern::Bulk, path).baseNanosPerRow;
   };
+  // A materialized fallback costs almost nothing per read once opened and
+  // nearly everything when opened, so which of the two a reader pays decides
+  // whether the section is cheap or dear.
+  EXPECT_LT(
+      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::View), 1.0);
   EXPECT_GT(
-      bulkRate(EncodingType::FOR, DecodeReadPath::View),
+      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::ViewWithOpen),
+      20.0);
+  EXPECT_GT(
+      bulkRate(EncodingType::FOR, DecodeReadPath::ViewWithOpen),
       bulkRate(EncodingType::FOR, DecodeReadPath::Cursor) * 1.5);
   EXPECT_GT(
       bulkRate(EncodingType::MainlyConstant, DecodeReadPath::View),
-      bulkRate(EncodingType::MainlyConstant, DecodeReadPath::Cursor) * 2.0);
+      bulkRate(EncodingType::MainlyConstant, DecodeReadPath::Cursor) * 1.5);
   EXPECT_LT(
-      bulkRate(EncodingType::FixedBitWidth, DecodeReadPath::View),
+      bulkRate(EncodingType::FixedBitWidth, DecodeReadPath::ViewWithOpen),
       bulkRate(EncodingType::FixedBitWidth, DecodeReadPath::Cursor) * 1.5);
+
+  // The cursor pays FrequencyPartition's construction too, but only when
+  // opening is charged; amortised pricing is unchanged.
+  EXPECT_GT(
+      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::CursorWithOpen),
+      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::Cursor) + 20.0);
+  // A probe's cost does not carry the open.
+  EXPECT_DOUBLE_EQ(
+      decodeRate(
+          EncodingType::FrequencyPartition,
+          DecodeAccessPattern::Point,
+          DecodeReadPath::CursorWithOpen)
+          .baseNanosPerRow,
+      decodeRate(
+          EncodingType::FrequencyPartition,
+          DecodeAccessPattern::Point,
+          DecodeReadPath::Cursor)
+          .baseNanosPerRow);
 
   // View point rates are absolute and carry the per-section probe overhead,
   // so no measured section probes for less than that overhead.
