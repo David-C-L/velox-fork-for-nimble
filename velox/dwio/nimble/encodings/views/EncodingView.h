@@ -22,6 +22,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <utility>
 
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Exceptions.h"
@@ -47,6 +48,17 @@ class EncodingView {
 
   /// Reads physical values in the given row range into a typed output buffer.
   virtual void read(uint32_t offset, uint32_t length, void* output) const = 0;
+
+  /// Reads every (offset, length) range in `ranges`, in the order given, into
+  /// one typed output buffer with room for the sum of their lengths.
+  ///
+  /// Equivalent to calling read() or readAt() once per range, but hands the
+  /// view the whole list at once, so an encoding whose point reads cost far
+  /// more per row than a bulk decode can decode a dense stretch once instead
+  /// of probing it row by row.
+  virtual void readRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      void* output) const = 0;
 
   /// Hands back dense ids for rows [offset, offset + length), and the table of
   /// values those ids stand for, when this encoding already holds its values
@@ -156,6 +168,18 @@ class TypedEncodingView : public EncodingView {
     readPhysical(offset, length, static_cast<physicalType*>(output));
   }
 
+  void readRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
+    readRanges(ranges, static_cast<void*>(output));
+  }
+
+  void readRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      void* output) const final {
+    readPhysicalRanges(ranges, static_cast<physicalType*>(output));
+  }
+
  protected:
   TypedEncodingView(
       std::string_view data,
@@ -217,6 +241,23 @@ class TypedEncodingView : public EncodingView {
       }
 
       output[outputOffset++] = readPhysicalAt(firstIndex);
+    }
+  }
+
+  // Reads each range on its own, a single row through the point read and
+  // anything longer through the range read. Right for an encoding whose point
+  // read is about as cheap per row as its bulk decode, which is most of them;
+  // one where it is not overrides this to plan across the list.
+  virtual void readPhysicalRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
+    for (const auto& [offset, length] : ranges) {
+      if (length == 1) {
+        *output = readPhysicalAt(offset);
+      } else {
+        readPhysical(offset, length, output);
+      }
+      output += length;
     }
   }
 

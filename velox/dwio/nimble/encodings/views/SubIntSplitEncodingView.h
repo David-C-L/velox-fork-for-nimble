@@ -633,6 +633,171 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // Plans a scattered read across the whole range list, which a per-range
+  // loop cannot: a row read on its own costs a virtual probe per section, one
+  // to two orders of magnitude more than the same row costs inside a bulk
+  // decode, so reading a dense stretch in one go and discarding the rows
+  // between the wanted ones is far cheaper than probing each wanted one.
+  void readPhysicalRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const final {
+    for (const auto& [offset, length] : ranges) {
+      this->checkReadRange(offset, length);
+    }
+    // No Sequential transform is written any more, so a blocked stream is
+    // only ever old data. Its per-row reads already share one reconstructed
+    // block through BlockCache, which leaves nothing for a plan to add.
+    if (blockedSection_) {
+      TypedEncodingView<T>::readPhysicalRanges(ranges, output);
+      return;
+    }
+    if (transformInfo_.anyTransform()) {
+      readTransformedRanges(ranges, output);
+      return;
+    }
+    readUntransformedRanges(ranges, output);
+  }
+
+  // Groups nearby ranges and decodes each group's covering span once.
+  //
+  // Bridging a gap of g rows costs g rows of bulk decode; not bridging it
+  // costs one more read call, which is about one probe, so a gap is worth
+  // bridging exactly when it is at most kProbeCostInDecodedRows. Grouping by
+  // that local rule makes every group cheaper to decode whole than piecewise
+  // without needing a density test over the group. A group is also capped at
+  // kViewChunkSize rows, so its staging buffer stays in L1 next to the
+  // section scratch readPhysical() uses for the same rows.
+  void readUntransformedRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
+    alignas(64) physicalType staged[kViewChunkSize];
+    size_t rangeIndex = 0;
+    while (rangeIndex < ranges.size()) {
+      const auto [groupOffset, groupFirstLength] = ranges[rangeIndex];
+      if (groupFirstLength == 0) {
+        ++rangeIndex;
+        continue;
+      }
+      // Anything this long gains nothing from staging: readPhysical() already
+      // decodes it chunk by chunk straight into the output.
+      if (groupFirstLength >= kViewChunkSize) {
+        readPhysical(groupOffset, groupFirstLength, output);
+        output += groupFirstLength;
+        ++rangeIndex;
+        continue;
+      }
+      uint32_t groupEnd = groupOffset + groupFirstLength;
+      size_t groupLast = rangeIndex;
+      for (size_t next = rangeIndex + 1; next < ranges.size(); ++next) {
+        const auto [nextOffset, nextLength] = ranges[next];
+        if (nextLength == 0) {
+          // Taken into the group so the copy loop below skips it in order.
+          groupLast = next;
+          continue;
+        }
+        // A range that starts before the group's end is out of order or
+        // overlapping, and starts a group of its own rather than being
+        // assumed to lie inside this one's span.
+        if (nextOffset < groupEnd ||
+            nextOffset - groupEnd > kProbeCostInDecodedRows ||
+            static_cast<uint64_t>(nextOffset) + nextLength - groupOffset >
+                kViewChunkSize) {
+          break;
+        }
+        groupEnd = nextOffset + nextLength;
+        groupLast = next;
+      }
+
+      if (groupLast == rangeIndex) {
+        if (groupFirstLength == 1) {
+          *output = readOneRow(groupOffset);
+        } else {
+          readPhysical(groupOffset, groupFirstLength, output);
+        }
+        output += groupFirstLength;
+        ++rangeIndex;
+        continue;
+      }
+
+      readPhysical(groupOffset, groupEnd - groupOffset, staged);
+      for (; rangeIndex <= groupLast; ++rangeIndex) {
+        const auto [offset, length] = ranges[rangeIndex];
+        std::copy_n(staged + (offset - groupOffset), length, output);
+        output += length;
+      }
+    }
+  }
+
+  // Chooses between one whole-column decode and reading each range the way
+  // readPhysical() would read it alone.
+  //
+  // A transformed stream cannot decode an arbitrary span cheaply the way an
+  // untransformed one can: its bulk path is a whole-column decode, because a
+  // permuted section's rows are scattered across the column and a Gathered
+  // one's inverse needs rows outside the span. So the choice is made once for
+  // the list, by pricing each range at what readPhysical() would charge for
+  // it on its own, in units of one row of whole-column decode, and decoding
+  // the column once when that total reaches its row count. Pricing ranges
+  // rather than rows matters: four ranges of a quarter column each cost four
+  // whole-column decodes read one at a time, and one read together.
+  void readTransformedRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
+    // One range is exactly what readPhysical() plans for, and it can decode
+    // a whole-column request straight into the output.
+    if (ranges.size() == 1) {
+      readPhysical(ranges[0].first, ranges[0].second, output);
+      return;
+    }
+    const uint64_t rowCount = this->rowCount_;
+    uint64_t piecewiseCost = 0;
+    for (const auto& [offset, rangeLength] : ranges) {
+      const uint64_t length = rangeLength;
+      if (permutedSection_) {
+        if (length < kMinSpanLength) {
+          piecewiseCost += length * kProbeCostInDecodedRows;
+        } else if (
+            length * kSpanAdvantageNumerator <
+            rowCount * kSpanAdvantageDenominator) {
+          // readPermutedSpan() levels with a whole-column decode at half the
+          // column, which makes one of its rows cost about two decoded ones.
+          piecewiseCost +=
+              length * kSpanAdvantageNumerator / kSpanAdvantageDenominator;
+        } else {
+          piecewiseCost += rowCount;
+        }
+      } else if (length * kGatherAdvantage < rowCount) {
+        piecewiseCost += length * kProbeCostInDecodedRows;
+      } else {
+        piecewiseCost += rowCount;
+      }
+      if (piecewiseCost >= rowCount) {
+        break;
+      }
+    }
+    if (piecewiseCost < rowCount) {
+      TypedEncodingView<T>::readPhysicalRanges(ranges, output);
+      return;
+    }
+
+    // Fully overwritten by readPhysicalBlock() below before being read.
+    thread_local velox::raw_vector<physicalType> whole;
+    whole.resize(this->rowCount_);
+    readPhysicalBlock(0, this->rowCount_, whole.data());
+    for (const auto& [offset, length] : ranges) {
+      std::copy_n(whole.data() + offset, length, output);
+      output += length;
+    }
+  }
+
+  // What one row read on its own costs, in rows of bulk decode. Measured on
+  // the six 524288-row paper columns, where a hot point probe through the
+  // view took 110 to 710 ns and bulk decode 1.1 to 5.9 ns a row: a ratio of
+  // 69 to 147. Set below that range, because near the crossover either
+  // choice costs about the same, and a ratio set too high decodes gaps that
+  // a column with cheap probes should have skipped.
+  static constexpr uint64_t kProbeCostInDecodedRows = 64;
+
   // The position map for one view, held per thread. Keyed on the view, since
   // one thread may read several.
   struct PositionCache {
