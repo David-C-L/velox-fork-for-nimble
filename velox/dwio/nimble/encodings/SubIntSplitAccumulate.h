@@ -31,6 +31,7 @@
 #endif
 
 #include "velox/dwio/nimble/common/Exceptions.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 
 namespace facebook::nimble::detail {
@@ -38,9 +39,16 @@ namespace facebook::nimble::detail {
 // Section header: bitStart(1B) + bitEnd(1B) + encodedSize(4B).
 inline constexpr uint32_t kSubIntSplitSectionHeaderSize = 6;
 
-// splitCount(1B) + reserved order byte(1B) + one header per section.
+// splitCount(1B) + flag byte(1B) + one header per section.
 inline uint32_t subIntSplitSpecificHeaderSize(uint8_t splitCount) noexcept {
   return 2u + static_cast<uint32_t>(splitCount) * kSubIntSplitSectionHeaderSize;
+}
+
+// Bytes the row frame block occupies, zero for a stream without a frame so
+// that such a stream is byte-identical to one written before frames existed.
+inline uint32_t subIntSplitRowFrameHeaderSize(
+    const SubIntSplitRowFrame& frame) noexcept {
+  return frame.active() ? kSubIntSplitRowFrameHeaderSize : 0;
 }
 
 // Storage byte width for a section of the given bit width, matching the
@@ -122,16 +130,18 @@ struct SubIntSplitSection {
   std::string_view stream;
 };
 
-// Walks the SubIntSplit header: splitCount, a reserved order byte, one
-// {bitStart, bitEnd, encodedSize} triple per section, then the section payloads
-// back to back in LSB-first order.
+// Walks the SubIntSplit header: splitCount, a flag byte, the row frame block
+// when the flag byte announces one, the transform block when it announces
+// that, one {bitStart, bitEnd, encodedSize} triple per section, then the
+// section payloads back to back in LSB-first order.
 //
 // Shared by the encoding and the view so a wire format change cannot reach only
 // one of them. `data` is the whole stream, `dataOffset` its prefix size.
 inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
     std::string_view data,
     uint32_t dataOffset,
-    SubIntSplitTransformInfo* transformInfo = nullptr) {
+    SubIntSplitTransformInfo* transformInfo = nullptr,
+    SubIntSplitRowFrame* rowFrame = nullptr) {
   const char* pos = data.data() + dataOffset;
   // Every field below comes off the wire, so a corrupt or truncated stream
   // reaches here as arbitrary bytes. Without these checks a bad length walks
@@ -152,11 +162,29 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   // more sections than bits.
   NIMBLE_CHECK(
       splitCount <= 64, "SubIntSplit stream declares too many sections.");
-  // Zero here means no transform, which is what every stream written before
-  // transforms existed carries, so those parse exactly as before.
-  const uint8_t transformPresent = encoding::read<uint8_t>(pos);
+  // Zero here means neither a frame nor a transform, which is what every
+  // stream written before either existed carries, so those parse exactly as
+  // before.
+  const uint8_t flags = encoding::read<uint8_t>(pos);
+  NIMBLE_CHECK_FILE(
+      (flags & ~(kSubIntSplitSectionTransformFlag | kSubIntSplitRowFrameFlag)) ==
+          0,
+      fmt::format("Unsupported SubIntSplit header flags: {}", flags));
 
-  if (transformPresent != 0) {
+  SubIntSplitRowFrame parsedFrame;
+  if ((flags & kSubIntSplitRowFrameFlag) != 0) {
+    requireBytes(kSubIntSplitRowFrameHeaderSize);
+    NIMBLE_CHECK_FILE(
+        encoding::read<uint8_t>(pos) == kSubIntSplitRowFrameGuard,
+        "SubIntSplit row frame block is corrupt.");
+    parsedFrame.slope = encoding::read<uint64_t>(pos);
+    parsedFrame.base = encoding::read<uint64_t>(pos);
+  }
+  if (rowFrame != nullptr) {
+    *rowFrame = parsedFrame;
+  }
+
+  if ((flags & kSubIntSplitSectionTransformFlag) != 0) {
     SubIntSplitTransformInfo parsed;
     requireBytes(5 + splitCount);
     parsed.keySection = encoding::read<uint8_t>(pos);

@@ -16,6 +16,7 @@
 #include "velox/dwio/nimble/encodings/tests/EncodingViewTestUtils.h"
 
 #include <bit>
+#include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -154,6 +155,70 @@ TEST_F(SubIntSplitEncodingViewTest, readsRangeLists) {
     expectRangeListsMatch<uint32_t>(compressionType);
     expectRangeListsMatch<int64_t>(compressionType);
     expectRangeListsMatch<uint64_t>(compressionType);
+  }
+}
+
+// A stream stored as its distance from a line through the rows has to add the
+// line back on every view read path: point, range, arbitrary indices and range
+// lists, with and without section transforms layered over the residuals.
+TEST_F(SubIntSplitEncodingViewTest, readsThroughRowFrame) {
+  constexpr uint32_t kFrameRows = 40'000;
+  std::mt19937 generator{5};
+  nimble::Vector<uint64_t> values{pool_.get()};
+  values.reserve(kFrameRows);
+  for (uint32_t row = 0; row < kFrameRows; ++row) {
+    // A tag that ignores the rows, a counter, and a field that tracks the
+    // counter to within eight either way.
+    const uint64_t tag = generator() % 12;
+    const uint64_t tracking = row < 8 ? row : row + generator() % 16 - 8;
+    values.push_back((tag << 56) | (uint64_t{row} << 28) | tracking);
+  }
+
+  for (const bool autoTransform : {false, true}) {
+    for (const auto compressionType :
+         {nimble::CompressionType::Uncompressed,
+          nimble::CompressionType::Zstd}) {
+      SCOPED_TRACE(fmt::format(
+          "autoTransform={} compression={}", autoTransform, compressionType));
+      nimble::Encoding::Options options;
+      options.subIntSplitAutoTransform = autoTransform;
+      auto serialized =
+          nimble::test::Encoder<nimble::SubIntSplitEncoding<uint64_t>>::encode(
+              *buffer_,
+              values,
+              compressionType,
+              options,
+              /*realNestedSelection=*/true);
+      nimble::detail::SubIntSplitRowFrame frame;
+      nimble::detail::parseSubIntSplitSections(
+          serialized, nimble::Encoding::kPrefixSize, nullptr, &frame);
+      ASSERT_EQ(frame.slope, (uint64_t{1} << 28) + 1);
+
+      auto view = nimble::createEncodingView(serialized, pool_.get(), options);
+      ASSERT_NE(view, nullptr);
+      ASSERT_EQ(view->rowCount(), kFrameRows);
+      for (const auto position : probePositions(kFrameRows)) {
+        uint64_t value{0};
+        view->readAt(position, &value);
+        ASSERT_EQ(value, values[position]) << "row " << position;
+      }
+      const std::vector<uint32_t> indices{39'999, 3, 4, 5, 5, 17'000, 0};
+      std::vector<uint64_t> gathered(indices.size());
+      view->readAt(indices, gathered.data());
+      for (size_t i = 0; i < indices.size(); ++i) {
+        ASSERT_EQ(gathered[i], values[indices[i]]) << "index " << indices[i];
+      }
+      for (const auto [offset, length] :
+           std::vector<std::pair<uint32_t, uint32_t>>{
+               {0, 1}, {1'023, 5'000}, {0, kFrameRows}, {39'990, 10}}) {
+        std::vector<uint64_t> actual(length);
+        view->read(offset, length, actual.data());
+        for (uint32_t i = 0; i < length; ++i) {
+          ASSERT_EQ(actual[i], values[offset + i]) << "row " << (offset + i);
+        }
+      }
+      nimble::test::expectRangeListReads(*view, values);
+    }
   }
 }
 

@@ -163,7 +163,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         "SubIntSplitEncodingView built over a stream that is not SubIntSplit.");
 
     const auto parsed = detail::parseSubIntSplitSections(
-        data, this->dataOffset_, &transformInfo_);
+        data, this->dataOffset_, &transformInfo_, &rowFrame_);
     NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
     // Validated before any section is built: a transform this reader does not
     // know would otherwise be skipped, and the values it returned would look
@@ -297,12 +297,42 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   T readTypedAt(uint32_t index) const final {
     NIMBLE_CHECK_LT(index, this->rowCount_);
+    physicalType value = readResidualAt(index);
+    if (rowFrame_.active()) {
+      value = static_cast<physicalType>(
+          value +
+          detail::subIntSplitRowFramePrediction<physicalType>(
+              rowFrame_, index));
+    }
+    return detail::castFromPhysicalType<T>(value);
+  }
+
+  // Everything below the three read overrides works on residuals, the values
+  // as the sections store them, and the overrides add the row frame back once
+  // on the way out. Internal reads therefore call the residual forms rather
+  // than the overrides, which would add the frame a second time.
+  physicalType readResidualAt(uint32_t index) const {
     // Only a Sequential transform makes a row unreachable on its own: undoing
     // it is a chain through the block, so the block has to be rebuilt.
     if (blockedSection_) {
-      return detail::castFromPhysicalType<T>(readThroughBlock(index));
+      return readThroughBlock(index);
     }
-    return detail::castFromPhysicalType<T>(readOneRow(index));
+    return readOneRow(index);
+  }
+
+  // Reads each range on its own, the way TypedEncodingView's default range
+  // list read does, but in residuals.
+  void readResidualRangesSeparately(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
+    for (const auto& [offset, length] : ranges) {
+      if (length == 1) {
+        *output = readResidualAt(offset);
+      } else {
+        readResidualRange(offset, length, output);
+      }
+      output += length;
+    }
   }
 
   // Reads one row where every transform present can address it directly: a
@@ -470,6 +500,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   void readPhysical(uint32_t offset, uint32_t length, physicalType* output)
       const final {
     this->checkReadRange(offset, length);
+    readResidualRange(offset, length, output);
+    if (rowFrame_.active()) {
+      detail::addSubIntSplitRowFrame(rowFrame_, offset, output, length);
+    }
+  }
+
+  void readResidualRange(
+      uint32_t offset,
+      uint32_t length,
+      physicalType* output) const {
     if (length == 0) {
       return;
     }
@@ -644,11 +684,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     for (const auto& [offset, length] : ranges) {
       this->checkReadRange(offset, length);
     }
+    readResidualRanges(ranges, output);
+    if (rowFrame_.active()) {
+      for (const auto& [offset, length] : ranges) {
+        detail::addSubIntSplitRowFrame(rowFrame_, offset, output, length);
+        output += length;
+      }
+    }
+  }
+
+  void readResidualRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
     // No Sequential transform is written any more, so a blocked stream is
     // only ever old data. Its per-row reads already share one reconstructed
     // block through BlockCache, which leaves nothing for a plan to add.
     if (blockedSection_) {
-      TypedEncodingView<T>::readPhysicalRanges(ranges, output);
+      readResidualRangesSeparately(ranges, output);
       return;
     }
     if (transformInfo_.anyTransform()) {
@@ -681,7 +733,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       // Anything this long gains nothing from staging: readPhysical() already
       // decodes it chunk by chunk straight into the output.
       if (groupFirstLength >= kViewChunkSize) {
-        readPhysical(groupOffset, groupFirstLength, output);
+        readResidualRange(groupOffset, groupFirstLength, output);
         output += groupFirstLength;
         ++rangeIndex;
         continue;
@@ -712,14 +764,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         if (groupFirstLength == 1) {
           *output = readOneRow(groupOffset);
         } else {
-          readPhysical(groupOffset, groupFirstLength, output);
+          readResidualRange(groupOffset, groupFirstLength, output);
         }
         output += groupFirstLength;
         ++rangeIndex;
         continue;
       }
 
-      readPhysical(groupOffset, groupEnd - groupOffset, staged);
+      readResidualRange(groupOffset, groupEnd - groupOffset, staged);
       for (; rangeIndex <= groupLast; ++rangeIndex) {
         const auto [offset, length] = ranges[rangeIndex];
         std::copy_n(staged + (offset - groupOffset), length, output);
@@ -746,7 +798,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // One range is exactly what readPhysical() plans for, and it can decode
     // a whole-column request straight into the output.
     if (ranges.size() == 1) {
-      readPhysical(ranges[0].first, ranges[0].second, output);
+      readResidualRange(ranges[0].first, ranges[0].second, output);
       return;
     }
     const uint64_t rowCount = this->rowCount_;
@@ -776,7 +828,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
     }
     if (piecewiseCost < rowCount) {
-      TypedEncodingView<T>::readPhysicalRanges(ranges, output);
+      readResidualRangesSeparately(ranges, output);
       return;
     }
 
@@ -1459,6 +1511,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   // Per-section transform metadata from the header, indexed by wire position.
   detail::SubIntSplitTransformInfo transformInfo_;
+  // Predictor the encoder subtracted before planning, inactive when it did
+  // not. Added back by the three read overrides and nowhere else.
+  detail::SubIntSplitRowFrame rowFrame_;
   // True where some section carries a Sequential transform, which is what
   // forces reads onto the block path.
   bool blockedSection_{false};

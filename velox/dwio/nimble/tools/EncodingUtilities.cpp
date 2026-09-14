@@ -17,6 +17,9 @@
 #include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/common/Varint.h"
 #include "velox/dwio/nimble/encodings/FsstEncoding.h"
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
+#endif
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingUtils.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
@@ -425,27 +428,21 @@ void traverseEncodings(
     // SubIntSplit integration (re-enabled for
     // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    case EncodingType::SubIntSplit: {
-      const char* pos = stream.data() + dataOffset;
-      const uint8_t splitCount = encoding::read<uint8_t>(pos);
-      encoding::read<uint8_t>(pos); // reserved
-
-      std::vector<uint32_t> sectionBytes(splitCount);
-      for (uint8_t s = 0; s < splitCount; ++s) {
-        encoding::read<uint8_t>(pos); // bitStart
-        encoding::read<uint8_t>(pos); // bitEnd
-        sectionBytes[s] = encoding::readUint32(pos);
-      }
-
-      for (uint8_t s = 0; s < splitCount; ++s) {
+    case EncodingType::SubIntSplit:
+    case EncodingType::SubIntSplitReordered: {
+      // Walked by the parser the encoding and its view share, so an optional
+      // header block, like the row frame or the transform block, cannot
+      // desynchronise this walk from the stream.
+      const auto sections =
+          detail::parseSubIntSplitSections(stream, dataOffset);
+      for (size_t s = 0; s < sections.size(); ++s) {
         traverseEncodings(
-            {pos, sectionBytes[s]},
+            sections[s].stream,
             level + 1,
-            s,
-            folly::to<std::string>("Section", static_cast<int>(s)),
+            static_cast<uint32_t>(s),
+            folly::to<std::string>("Section", s),
             useVarintRowCount,
             visitor);
-        pos += sectionBytes[s];
       }
       break;
     }

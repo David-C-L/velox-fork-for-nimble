@@ -91,6 +91,7 @@ add_library(
   SubIntSplitSampler.h
   SubIntSplitMetrics.h
   SubIntSplitEstimator.h
+  SubIntSplitRowFrame.h
   SubIntSplitEncoding.h
   SubIntSplitDecodeProfile.h
   SubIntSplitDecodeCost.h

@@ -47,6 +47,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitPlanRefiner.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
@@ -77,7 +78,9 @@
 //
 // Binary layout (after the standard Encoding prefix):
 //   [1 byte]  splitCount (number of sections, 1..64)
-//   [1 byte]  reserved (future: BitSplitOrder; currently 0)
+//   [1 byte]  flags: bit 0 section transforms, bit 1 row frame
+//   [17 bytes, only with a row frame]  {guard(1B), slope(8B), base(8B)}
+//   [transform block, only with section transforms]
 //   [splitCount × 6 bytes]  {bitStart(1B), bitEnd(1B), encodedSize(4B)}
 //   [section_0_bytes][section_1_bytes]...[section_{N-1}_bytes]
 //
@@ -228,6 +231,23 @@ class SubIntSplitEncoding
   // call in the bulk paths below is timed into it when non-null.
   SubIntSplitDecodeProfile* decodeProfile_{nullptr};
 
+  // Encodes `values` with `rowFrame` already subtracted from them, and records
+  // the frame in the header so reads add it back.
+  static std::string_view encodeResiduals(
+      EncodingSelection<physicalType>& selection,
+      std::span<const physicalType> values,
+      Buffer& buffer,
+      const Encoding::Options& options,
+      const detail::SubIntSplitRowFrame& rowFrame);
+
+  // Decodes the next `rowCount` values as the sections store them, before the
+  // row frame is added back.
+  void materializeResiduals(uint32_t rowCount, physicalType* output);
+
+  // Predictor the encoder subtracted before planning, inactive when it did
+  // not. Every value leaving this class has it added back.
+  detail::SubIntSplitRowFrame rowFrame_;
+
   // Per-section transform metadata from the header. Empty ids mean the stream
   // predates transforms, or chose none.
   detail::SubIntSplitTransformInfo transformInfo_;
@@ -361,7 +381,7 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
       scratchBuf_{&pool},
       decodeBuf_{&pool} {
   const auto parsed = detail::parseSubIntSplitSections(
-      data, this->dataOffset(), &transformInfo_);
+      data, this->dataOffset(), &transformInfo_, &rowFrame_);
   NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
   // Validate every id before decoding anything: a transform this reader does
   // not know would otherwise be skipped, returning transformed values as
@@ -452,6 +472,17 @@ void SubIntSplitEncoding<T>::skip(uint32_t rowCount) {
 template <typename T>
 void SubIntSplitEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
   physicalType* output = static_cast<physicalType*>(buffer);
+  const uint32_t firstRow = row_;
+  materializeResiduals(rowCount, output);
+  if (rowFrame_.active()) {
+    detail::addSubIntSplitRowFrame(rowFrame_, firstRow, output, rowCount);
+  }
+}
+
+template <typename T>
+void SubIntSplitEncoding<T>::materializeResiduals(
+    uint32_t rowCount,
+    physicalType* output) {
 
   // Lazily size the scratch buffer on the first call. The scratch must hold one
   // chunk's worth of section values at the widest possible storage type.
@@ -587,7 +618,8 @@ void SubIntSplitEncoding<T>::readWithVisitor(
         // declines -- no AVX2, a non-deterministic filter, a hook -- and
         // without this it would answer those reads with transformed values
         // and no error.
-        if (transformInfo_.anyTransform()) {
+        // A row frame is likewise added back only by materialize().
+        if (transformInfo_.anyTransform() || rowFrame_.active()) {
           physicalType value = 0;
           materialize(1, &value);
           return value;
@@ -1260,6 +1292,63 @@ std::string_view SubIntSplitEncoding<T>::encode(
     std::span<const physicalType> values,
     Buffer& buffer,
     const Encoding::Options& options) {
+  const auto rowFrame = options.subIntSplitRowFrame
+      ? detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values)
+      : detail::SubIntSplitRowFrame{};
+  if (!rowFrame.active()) {
+    return encodeResiduals(selection, values, buffer, options, rowFrame);
+  }
+  std::vector<physicalType> residuals;
+  detail::subintsplit::subtractSubIntSplitRowFrame<physicalType>(
+      rowFrame, values, residuals);
+
+  // Fitting only says the column follows a line, not that sections encode the
+  // distance from it more cheaply than the values themselves: a column that is
+  // exactly a counter already costs nothing through Delta. So both are priced
+  // with the planner's own DP over the same inventory, and the frame is kept
+  // only when its estimate, header included, is smaller. A preserve-mode
+  // encode replays boundaries without running the DP, so it has nothing to
+  // price with and takes the frame whenever one fits. That can pair a frame
+  // with boundaries planned on the values; the stream still round-trips, it
+  // is only priced less carefully than a planned one.
+  const auto modeConfig = selection.getConfig(
+      std::string(detail::subintsplit::kSplitModeConfigKey));
+  const bool preserve = modeConfig.has_value() &&
+      *modeConfig == detail::subintsplit::kSplitModePreserve;
+  if (!preserve) {
+    constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+    auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
+    selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
+    selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
+    const auto estimateBits = [&](std::span<const physicalType> candidate) {
+      std::vector<uint64_t> sample;
+      detail::subintsplit::sampleIntoU64<physicalType>(
+          candidate, sample, detail::subintsplit::defaultSamplerConfig());
+      return detail::subintsplit::selectSplitsRestricted(
+                 sample,
+                 kBits,
+                 static_cast<uint32_t>(candidate.size()),
+                 options.subIntSplitAllowedEncodings,
+                 selectorConfig)
+          .totalSizeBits;
+    };
+    const double frameBits = estimateBits(residuals) +
+        8.0 * detail::kSubIntSplitRowFrameHeaderSize;
+    if (frameBits >= estimateBits(values)) {
+      return encodeResiduals(
+          selection, values, buffer, options, detail::SubIntSplitRowFrame{});
+    }
+  }
+  return encodeResiduals(selection, residuals, buffer, options, rowFrame);
+}
+
+template <typename T>
+std::string_view SubIntSplitEncoding<T>::encodeResiduals(
+    EncodingSelection<physicalType>& selection,
+    std::span<const physicalType> values,
+    Buffer& buffer,
+    const Encoding::Options& options,
+    const detail::SubIntSplitRowFrame& rowFrame) {
   const bool useVarint = options.useVarintRowCount;
   const uint32_t valueCount = static_cast<uint32_t>(values.size());
 
@@ -2040,6 +2129,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
       Encoding::serializePrefixSize(valueCount, useVarint);
   const uint32_t specificHeader =
       detail::subIntSplitSpecificHeaderSize(splitCount) +
+      detail::subIntSplitRowFrameHeaderSize(rowFrame) +
       detail::subIntSplitTransformHeaderSize(transformInfo);
   uint32_t sectionsSize = 0;
   for (const auto& sv : sectionData) {
@@ -2065,7 +2155,16 @@ std::string_view SubIntSplitEncoding<T>::encode(
       pos);
 
   encoding::write<uint8_t>(splitCount, pos);
-  encoding::write<uint8_t>(transformed ? uint8_t{1} : uint8_t{0}, pos);
+  const uint8_t flags =
+      (transformed ? detail::kSubIntSplitSectionTransformFlag : uint8_t{0}) |
+      (rowFrame.active() ? detail::kSubIntSplitRowFrameFlag : uint8_t{0});
+  encoding::write<uint8_t>(flags, pos);
+
+  if (rowFrame.active()) {
+    encoding::write<uint8_t>(detail::kSubIntSplitRowFrameGuard, pos);
+    encoding::write<uint64_t>(rowFrame.slope, pos);
+    encoding::write<uint64_t>(rowFrame.base, pos);
+  }
 
   if (transformed) {
     encoding::write<uint8_t>(transformInfo.keySection, pos);
@@ -2121,6 +2220,10 @@ std::string SubIntSplitEncoding<T>::debugString(int offset) const {
   if (transformInfo_.keySection !=
       detail::SubIntSplitTransformInfo::kNoKeySection) {
     result += " keySection=" + std::to_string(transformInfo_.keySection);
+  }
+  if (rowFrame_.active()) {
+    result += fmt::format(
+        " rowFrame=(slope={:#x} base={:#x})", rowFrame_.slope, rowFrame_.base);
   }
   result += "\n";
   for (size_t s = 0; s < sections_.size(); ++s) {

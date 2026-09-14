@@ -397,6 +397,18 @@ class Encoding {
     /// planning time.
     bool subIntSplitHybridPlanner{false};
 
+    /// Whether SubIntSplit may subtract a fitted slope * row + base from every
+    /// value before planning its sections (see SubIntSplitRowFrame.h). It is
+    /// fitted only where nearly every 1'024-row stride of the column's low bits
+    /// grows by the same multiple of the stride, and kept only where the
+    /// planner prices the residuals below the values. A read pays one
+    /// multiply-add per row.
+    ///
+    /// On by default. On the XMark pre/post ID column it took the hybrid plan
+    /// from 9.35 to 5.14 bits per value; none of the other five paper columns
+    /// fit a frame, so their streams are unchanged.
+    bool subIntSplitRowFrame{true};
+
     /// How many of the split DP's cheapest plans the hybrid planner re-prices,
     /// and separately how many bit-flip-restricted plans. Only read when
     /// subIntSplitHybridPlanner is set.
