@@ -108,6 +108,11 @@ DEFINE_int32(
     "Encoding::Options::subIntSplitDecodeAccessPattern: the read shape decode "
     "is costed for when --mlidc_sis_decode_weight is non-zero. 0 bulk, "
     "1 point, 2 gather, 3 range.");
+DEFINE_int32(
+    mlidc_sis_decode_read_path,
+    0,
+    "Encoding::Options::subIntSplitDecodeReadPath: the reader decode is costed "
+    "for when --mlidc_sis_decode_weight is non-zero. 0 cursor, 1 view.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,

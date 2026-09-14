@@ -303,6 +303,10 @@ inline std::string cacheArmIdentity(
   id += "|w" + std::to_string(options.subIntSplitDecodeWeight);
   id += "|p" +
       std::to_string(static_cast<int>(options.subIntSplitDecodeAccessPattern));
+  // The read path selects which rate table prices decode, so it moves plans
+  // exactly as the access pattern does.
+  id += "|rp" +
+      std::to_string(static_cast<int>(options.subIntSplitDecodeReadPath));
   // The size bound decides whether the weighted plan or the size-only one is
   // written, so it changes the bytes for the same reason the weight does.
   id += "|r" + std::to_string(options.subIntSplitMaxSizeRegression);

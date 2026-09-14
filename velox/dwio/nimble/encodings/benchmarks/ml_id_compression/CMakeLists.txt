@@ -104,6 +104,13 @@ nimble_add_ml_id_benchmark(
   MlIdDecodeSectionProfileBenchmark.cpp
 )
 
+# MlIdSectionDecodeRateBenchmark: times each SubIntSplit section on the cursor
+# and view paths, to fit decode rates per read path.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_section_decode_rate_benchmark
+  MlIdSectionDecodeRateBenchmark.cpp
+)
+
 # MlIdDecodeRangeBenchmark: contiguous-range decode across (start, length).
 nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_range_benchmark MlIdDecodeRangeBenchmark.cpp OPENZL

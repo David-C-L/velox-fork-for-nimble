@@ -309,6 +309,18 @@ class Encoding {
     /// to be fitted on.
     uint8_t subIntSplitDecodeAccessPattern{0};
 
+    /// The reader section decode is costed for when subIntSplitDecodeWeight is
+    /// non-zero: 0 the cursor (SubIntSplitEncoding::materialize), 1 the view
+    /// (SubIntSplitEncodingView). Matches detail::subintsplit::DecodeReadPath.
+    ///
+    /// The two pay for different things. A view builds a materializing
+    /// fallback for sections whose encoding has no view, decoding the whole
+    /// section when it is opened, so FrequencyPartition, FOR, Delta and
+    /// MainlyConstant sections cost two to five times more to read through a
+    /// view than their cursor rates say, and plans priced on cursor rates were
+    /// measured reading several times slower through views.
+    uint8_t subIntSplitDecodeReadPath{0};
+
     /// Whether these options are the ones a SubIntSplit section is being
     /// encoded with, rather than a column's own options.
     ///
