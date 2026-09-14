@@ -865,6 +865,55 @@ TEST_F(EncodingSizeEstimationTest, rleSmallForLongRuns) {
   EXPECT_LT(rleSize.value(), trivialSize.value());
 }
 
+TEST_F(EncodingSizeEstimationTest, rleRunLengthsNotWidenedByOneLongRun) {
+  // The writer hands run lengths to nested selection, which stores a stream
+  // of mostly-equal lengths with one outlier far below one fixed width per
+  // length. Pricing them as FixedBitWidth over [minRepeat, maxRepeat] lets the
+  // single long run set the width charged to every run, which quoted a
+  // snowflake section at 2.27x what RLE really wrote and lost it to a larger
+  // encoding.
+  using Est = detail::EncodingSizeEstimation<uint32_t>;
+  constexpr uint32_t kShortRuns{4'096};
+  constexpr uint32_t kLongRun{200'000};
+
+  std::vector<uint32_t> data;
+  data.reserve(kShortRuns + kLongRun);
+  for (uint32_t i = 0; i < kShortRuns; ++i) {
+    data.push_back(3 + (i & 1U));
+  }
+  data.insert(data.end(), kLongRun, 7);
+  const auto stats = Statistics<uint32_t>::create(data);
+  const uint64_t runCount = stats.consecutiveRepeatCount();
+  ASSERT_EQ(runCount, kShortRuns + 1);
+
+  const auto flatLengthsEstimate =
+      RLEEncoding<uint32_t>::estimateSize(data.size(), stats, defaultOptions_);
+  const auto estimate =
+      Est::estimateSize(EncodingType::RLE, data.size(), stats, defaultOptions_);
+  ASSERT_TRUE(estimate.has_value());
+
+  // The flat form charges 18 bits per length; stored as the common length
+  // plus one exception, a length costs a few bits at most.
+  EXPECT_LT(estimate.value(), flatLengthsEstimate - runCount * 14 / 8);
+}
+
+TEST_F(EncodingSizeEstimationTest, rleRunLengthsNeverPricedAboveFlatWidth) {
+  using Est = detail::EncodingSizeEstimation<uint32_t>;
+
+  std::vector<uint32_t> data;
+  for (uint32_t run = 0; run < 1'000; ++run) {
+    data.insert(data.end(), 1 + (run * 7919) % 300, run);
+  }
+  const auto stats = Statistics<uint32_t>::create(data);
+
+  const auto estimate =
+      Est::estimateSize(EncodingType::RLE, data.size(), stats, defaultOptions_);
+  ASSERT_TRUE(estimate.has_value());
+  EXPECT_LE(
+      estimate.value(),
+      RLEEncoding<uint32_t>::estimateSize(data.size(), stats, defaultOptions_));
+}
+
 TEST_F(EncodingSizeEstimationTest, fbwSmallForNarrowRange) {
   using Est = detail::EncodingSizeEstimation<uint32_t>;
 

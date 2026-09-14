@@ -223,6 +223,29 @@ class Statistics {
     return runValues_.emplace(std::move(values));
   }
 
+  /// Returns the length of each consecutive run in input order, aligned with
+  /// runValues(). Computed lazily and cached.
+  const std::vector<uint32_t>& runLengths() const {
+    if (runLengths_.has_value()) {
+      return runLengths_.value();
+    }
+    std::vector<uint32_t> lengths;
+    if (!data_.empty()) {
+      lengths.reserve(consecutiveRepeatCount());
+      uint32_t length{1};
+      for (size_t i = 1; i < data_.size(); ++i) {
+        if (data_[i] == data_[i - 1]) {
+          ++length;
+        } else {
+          lengths.push_back(length);
+          length = 1;
+        }
+      }
+      lengths.push_back(length);
+    }
+    return runLengths_.emplace(std::move(lengths));
+  }
+
   struct BlockStats {
     uint64_t count;
     uint64_t min;
@@ -349,6 +372,7 @@ class Statistics {
   mutable std::optional<std::optional<UniqueValueCounts<T, InputType>>>
       uniqueCounts_;
   mutable std::optional<std::vector<T>> runValues_;
+  mutable std::optional<std::vector<uint32_t>> runLengths_;
   mutable std::optional<BitFlipProfile> bitFlipProfile_;
   mutable std::optional<AdjacentPairStats> adjacentPairStats_;
 };

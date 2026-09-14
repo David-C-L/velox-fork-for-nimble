@@ -86,6 +86,26 @@ TEST(StatisticsTest, runValues) {
   EXPECT_TRUE(nimble::Statistics<int32_t>::create(empty).runValues().empty());
 }
 
+TEST(StatisticsTest, runLengths) {
+  const std::vector<int32_t> data = {1, 1, 2, 2, 1, 3, 3, 3};
+  const std::vector<uint32_t> expected = {2, 2, 1, 3};
+  for (const bool populateRunValuesFirst : {false, true}) {
+    SCOPED_TRACE(populateRunValuesFirst);
+    const auto statistics = nimble::Statistics<int32_t>::create(data);
+    if (populateRunValuesFirst) {
+      EXPECT_EQ(statistics.runValues().size(), expected.size());
+    }
+
+    const auto& runLengths = statistics.runLengths();
+    EXPECT_EQ(runLengths, expected);
+    EXPECT_EQ(&statistics.runLengths(), &runLengths);
+    EXPECT_EQ(runLengths.size(), statistics.consecutiveRepeatCount());
+  }
+
+  const std::vector<int32_t> empty;
+  EXPECT_TRUE(nimble::Statistics<int32_t>::create(empty).runLengths().empty());
+}
+
 TYPED_TEST(StatisticsNumericTests, create) {
   using T = TypeParam;
   using ValueType = typename T::valueType;

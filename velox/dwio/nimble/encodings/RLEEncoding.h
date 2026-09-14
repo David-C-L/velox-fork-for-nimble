@@ -622,11 +622,28 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
     //     estimated as FixedBitWidth over the original value range. String
     //     values are estimated as Dictionary over the run values.
     const uint64_t runCount = statistics.consecutiveRepeatCount();
-    // Run lengths are encoded as a FixedBitWidth child.
-    const uint64_t runLengthsEncodingSize =
+    return estimateSize(
+        rowCount,
+        statistics,
         FixedBitWidthEncoding<uint32_t>::estimateSize(
-            runCount, statistics.minRepeat(), statistics.maxRepeat(), options);
+            runCount, statistics.minRepeat(), statistics.maxRepeat(), options),
+        options);
+  }
 
+  /// Size estimate with the run-lengths stream priced by the caller.
+  ///
+  /// The writer hands run lengths to nested selection, which on real data
+  /// picks MainlyConstant or FrequencyPartition for them. This header cannot
+  /// price those (MainlyConstantEncoding.h includes it), so the overload above
+  /// falls back to one FixedBitWidth over [minRepeat, maxRepeat], where a single
+  /// long run sets the width charged to every length. Callers that can see the
+  /// nested encodings, such as EncodingSizeEstimation, pass the better price.
+  static uint64_t estimateSize(
+      uint64_t rowCount,
+      const Statistics<physicalType>& statistics,
+      uint64_t runLengthsEncodingSize,
+      const Encoding::Options& options) {
+    const uint64_t runCount = statistics.consecutiveRepeatCount();
     const uint64_t runValuesEncodingSize =
         estimateRunValuesSize(runCount, statistics, options);
     const uint64_t outerEncodingSize =

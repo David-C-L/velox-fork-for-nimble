@@ -85,6 +85,37 @@ struct EncodingSizeEstimation {
   }
 
  private:
+  // Prices RLE's run-lengths stream over the lengths themselves, with the
+  // encodings nested selection picks for it on real data. RLE's own estimate
+  // uses one FixedBitWidth over [minRepeat, maxRepeat], which on the snowflake
+  // [4..11] section quoted about 183 KB for lengths the writer stored in 22 KB
+  // as MainlyConstant, and lost the section to FOR. That flat price stays a
+  // candidate, so this never quotes above it.
+  static uint64_t estimateRunLengthsSize(
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options) {
+    const uint64_t runCount = statistics.consecutiveRepeatCount();
+    uint64_t bestSize = FixedBitWidthEncoding<uint32_t>::estimateSize(
+        runCount, statistics.minRepeat(), statistics.maxRepeat(), options);
+    if (runCount < 2) {
+      return bestSize;
+    }
+    const auto& runLengths = statistics.runLengths();
+    const auto runLengthsStatistics = Statistics<uint32_t>::create(
+        std::span<const uint32_t>{runLengths.data(), runLengths.size()});
+    bestSize = std::min(
+        bestSize,
+        MainlyConstantEncoding<uint32_t>::estimateSize(
+            runCount, runLengthsStatistics, options));
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+    bestSize = std::min(
+        bestSize,
+        FrequencyPartitionEncoding<uint32_t>::estimateSize(
+            runCount, runLengthsStatistics, options));
+#endif
+    return bestSize;
+  }
+
   static std::optional<uint64_t> estimateNumericSize(
       const EncodingType encodingType,
       const uint64_t entryCount,
@@ -116,7 +147,11 @@ struct EncodingSizeEstimation {
             entryCount, statistics, options);
       }
       case EncodingType::RLE: {
-        return RLEEncoding<T>::estimateSize(entryCount, statistics, options);
+        return RLEEncoding<T>::estimateSize(
+            entryCount,
+            statistics,
+            estimateRunLengthsSize(statistics, options),
+            options);
       }
       case EncodingType::Varint: {
         // Note: the condition below actually support floating point numbers as
