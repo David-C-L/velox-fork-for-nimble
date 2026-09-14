@@ -382,6 +382,88 @@ class FrequencyPartitionEncoding
 
     return outerSize + payloadSize;
   }
+
+  /// A size estimateSize never quotes below, for a stream of `rowCount` rows
+  /// holding at least `distinctLowerBound` distinct values, computed without
+  /// their counts. Every term of estimateSize grows with the distinct count and
+  /// with each tier's rows, so this prices the tiers that many distinct values
+  /// fill with every tier holding one row per entry, and no fallback rows.
+  /// Lets selection rule this encoding out of a near-unique stream without
+  /// counting the stream's distinct values.
+  static uint64_t estimateSizeLowerBound(
+      uint64_t rowCount,
+      uint64_t distinctLowerBound,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options = {}) {
+    if (rowCount == 0) {
+      return Encoding::kPrefixSize;
+    }
+    const uint64_t outerSize =
+        EncodingPrefix::serializedSize(rowCount, options.useVarintRowCount) + 4;
+    if (distinctLowerBound == 0) {
+      return outerSize;
+    }
+    constexpr uint32_t kKeyBitOptions[] = {1, 2, 4, 8, 16, 32};
+    constexpr uint32_t kMaxKeyBits = getMaxKeyBits();
+    uint64_t totalCapacity = 0;
+    for (const uint32_t keyBits : kKeyBitOptions) {
+      if (keyBits > kMaxKeyBits) {
+        break;
+      }
+      totalCapacity += getCapacity(keyBits);
+    }
+    const uint64_t ranked = std::min(distinctLowerBound, totalCapacity);
+
+    uint64_t payloadSize = 0;
+    uint64_t assigned = 0;
+    uint32_t tiersCreated = 0;
+    for (const uint32_t keyBits : kKeyBitOptions) {
+      if (keyBits > kMaxKeyBits || assigned >= ranked) {
+        break;
+      }
+      ++tiersCreated;
+      const uint64_t dictEntries =
+          std::min<uint64_t>(getCapacity(keyBits), ranked - assigned);
+      assigned += dictEntries;
+      const uint64_t dictSize = std::min(
+          TrivialEncoding<physicalType>::estimateSize(dictEntries),
+          FixedBitWidthEncoding<physicalType>::estimateSize(
+              dictEntries, statistics.min(), statistics.max(), options));
+      const uint64_t keysSize = std::min(
+          TrivialEncoding<uint32_t>::estimateSize(dictEntries),
+          FixedBitWidthEncoding<uint32_t>::estimateSize(
+              dictEntries, /*minValue=*/0, dictEntries - 1, options));
+      payloadSize += 4 + dictSize + 4 + keysSize;
+    }
+    payloadSize +=
+        2 * (4 + TrivialEncoding<uint32_t>::estimateSize(tiersCreated + 1));
+
+    const auto indexType =
+        static_cast<FreqPartIndexType>(options.frequencyPartitionIndex);
+    if (indexType != FreqPartIndexType::NoIndex && tiersCreated > 0) {
+      payloadSize += 1 + 1 + 4;
+      switch (indexType) {
+        case FreqPartIndexType::PerTierBitmaps:
+        case FreqPartIndexType::EliasFano: {
+          const uint64_t bitmapWords = (rowCount + 63) / 64;
+          payloadSize +=
+              static_cast<uint64_t>(tiersCreated) * (4 + bitmapWords * 8);
+          break;
+        }
+        case FreqPartIndexType::TierTagArray: {
+          payloadSize += 8;
+          payloadSize += static_cast<uint64_t>(std::llround(
+              static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
+                  rowCount, /*minValue=*/0, tiersCreated, options)) *
+              kFrequencyPartitionNestedIndexDiscount));
+          break;
+        }
+        case FreqPartIndexType::NoIndex:
+          break;
+      }
+    }
+    return outerSize + payloadSize;
+  }
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
   std::string debugString(int offset) const final;
