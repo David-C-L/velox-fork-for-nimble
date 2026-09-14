@@ -132,6 +132,7 @@
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -514,6 +515,11 @@ struct OracleCell {
   // selection; selectionBytes is what the writer will deliver.
   size_t selectionBytes{std::numeric_limits<size_t>::max()};
   EncodingType selectionEncoding{EncodingType::Trivial};
+  // What selection was quoted for the candidate it picks. Unlike the two byte
+  // counts above, a planner could know this without encoding anything, so a
+  // DP over it is a plan the writer could really compute: the planner costing
+  // ranges with the estimators selection uses instead of its own models.
+  size_t selectionEstimateBytes{std::numeric_limits<size_t>::max()};
   std::vector<OracleResult> results; // parallel to candidateEncodings()
 };
 
@@ -586,6 +592,10 @@ enum class OracleObjective {
   /// The bytes of the candidate selection will actually choose. Optimal for
   /// what the writer delivers, and so the plan to hold a model plan against.
   kSelectionRealistic,
+  /// Selection's estimate for the candidate it picks. Not an oracle: it uses
+  /// no measured bytes, so it is the plan a planner costing ranges with
+  /// EncodingSizeEstimation instead of SubIntSplitCostModels would choose.
+  kSelectionEstimate,
 };
 
 OracleDpResult oracleDp(
@@ -595,8 +605,15 @@ OracleDpResult oracleDp(
     double splitPenaltyBytes,
     OracleObjective objective = OracleObjective::kCellMinimum) {
   const auto cellBytes = [objective](const OracleCell& cell) {
-    return objective == OracleObjective::kCellMinimum ? cell.bestBytes
-                                                      : cell.selectionBytes;
+    switch (objective) {
+      case OracleObjective::kCellMinimum:
+        return cell.bestBytes;
+      case OracleObjective::kSelectionRealistic:
+        return cell.selectionBytes;
+      case OracleObjective::kSelectionEstimate:
+        return cell.selectionEstimateBytes;
+    }
+    return cell.bestBytes;
   };
   const auto cellEncoding = [objective](const OracleCell& cell) {
     return objective == OracleObjective::kCellMinimum ? cell.bestEncoding
@@ -1058,6 +1075,12 @@ int runBenchmark() {
       // boundaries are being chosen against a cost nothing pays, and the
       // question stops being which model to correct and becomes whether the
       // planner should score ranges with its own models at all.
+      // Time spent building Statistics and calling EncodingSizeEstimation over
+      // the grid: what costing ranges with the estimators would add to the
+      // writer's planning, since the encodes around it are oracle-only work.
+      uint64_t estimatorCostingNanos = 0;
+      // The same for the planner's own models, for comparison.
+      uint64_t costModelNanos = 0;
       int plannerAgreeCount = 0;
       int plannerComparableCells = 0;
       std::vector<double> plannerCellRatios;
@@ -1078,6 +1101,7 @@ int runBenchmark() {
           const int storageBytes = storageWidthBits(width) / 8;
 
           // Cost model metrics + per-encoding estimates.
+          const auto costModelStart = std::chrono::steady_clock::now();
           const SegmentMetrics metrics =
               collector.compute(sectionU64, requiredFlags);
           EncodingType modelBestEnc = EncodingType::Trivial;
@@ -1091,6 +1115,10 @@ int runBenchmark() {
               FLAGS_allow_huffman,
               FLAGS_allow_delta_block,
               modelBestEnc);
+          costModelNanos += static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - costModelStart)
+                  .count());
 
           ModelCell& mc = modelGrid[l][r];
           mc.bestBits = modelBestBits;
@@ -1180,20 +1208,34 @@ int runBenchmark() {
                     std::decay_t<decltype(sectionData.data()[0])>;
                 const auto values = std::span<const Storage>(
                     sectionData.data(), sectionData.size());
+                const auto timed = [&estimatorCostingNanos](auto&& fn) {
+                  const auto start = std::chrono::steady_clock::now();
+                  auto result = fn();
+                  estimatorCostingNanos += static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count());
+                  return result;
+                };
                 // Selection reads its estimates off Statistics, so build it
-                // once for the range rather than per candidate.
-                const auto statistics = Statistics<Storage>::create(values);
+                // once for the range rather than per candidate. The lazy
+                // aggregates it computes are charged to whichever estimate
+                // first asks for them, all inside the timed region.
+                const auto statistics =
+                    timed([&] { return Statistics<Storage>::create(values); });
                 // FixedBitWidth's estimate for this range, which is what
                 // effectiveReadFactor needs to decide whether Trivial's
                 // discount is earned. Computed once, as select() does.
                 const auto fixedBitWidthEstimate =
                     encodingAvailableAtWidth(
                         EncodingType::FixedBitWidth, storageBytes)
-                    ? facebook::nimble::detail::EncodingSizeEstimation<
-                          Storage>::estimateSize(EncodingType::FixedBitWidth,
-                                                 values,
-                                                 statistics,
-                                                 sectionOptions)
+                    ? timed([&] {
+                        return facebook::nimble::detail::EncodingSizeEstimation<
+                            Storage>::estimateSize(EncodingType::FixedBitWidth,
+                                                   values,
+                                                   statistics,
+                                                   sectionOptions);
+                      })
                     : std::optional<uint64_t>{};
                 double bestSelectionCost =
                     std::numeric_limits<double>::infinity();
@@ -1228,12 +1270,13 @@ int runBenchmark() {
                       bytes == std::numeric_limits<size_t>::max()) {
                     continue;
                   }
-                  const auto estimate =
-                      facebook::nimble::detail::EncodingSizeEstimation<
-                          Storage>::estimateSize(candidates[ci].type,
-                                                 values,
-                                                 statistics,
-                                                 sectionOptions);
+                  const auto estimate = timed([&] {
+                    return facebook::nimble::detail::EncodingSizeEstimation<
+                        Storage>::estimateSize(candidates[ci].type,
+                                               values,
+                                               statistics,
+                                               sectionOptions);
+                  });
                   if (!estimate.has_value()) {
                     continue;
                   }
@@ -1255,6 +1298,7 @@ int runBenchmark() {
                     bestSelectionCost = selectionCost;
                     oc.selectionBytes = bytes;
                     oc.selectionEncoding = candidates[ci].type;
+                    oc.selectionEstimateBytes = estimate.value();
                   }
                 }
               });
@@ -1527,6 +1571,19 @@ int runBenchmark() {
           fullCostScale,
           splitPenaltyBytes,
           OracleObjective::kSelectionRealistic);
+      // The planner costing ranges with selection's estimators. Uses no
+      // measured bytes, so unlike the two oracles it is a plan the writer could
+      // compute; scored on full_column_bytes like the model plans.
+      const OracleDpResult estimatorDp = oracleDp(
+          oracleGrid,
+          kBits,
+          fullCostScale,
+          splitPenaltyBytes,
+          OracleObjective::kSelectionEstimate);
+      std::cout << "  costing_time: cost_models="
+                << static_cast<double>(costModelNanos) / 1e6
+                << " ms, estimators=" << static_cast<double>(estimatorCostingNanos) / 1e6
+                << " ms over " << kBits * (kBits + 1) / 2 << " ranges\n";
 
       // Scores one plan: its measured bytes on the sample, its regret against
       // the best each of its own ranges could have reached, and what the whole
@@ -1722,6 +1779,13 @@ int runBenchmark() {
       scorePlan("oracle_dp", toSegmentPlans(oracleFullScale.segments));
       scorePlan(
           "oracle_dp_selection", toSegmentPlans(selectionOracle.segments));
+      // An empty plan would make encodeColumn fall back to the writer's own
+      // plan and score shipped bytes under this name, so refuse it loudly.
+      NIMBLE_CHECK(
+          !estimatorDp.segments.empty(),
+          "estimator_dp found no plan: {}",
+          ds.name);
+      scorePlan("estimator_dp", toSegmentPlans(estimatorDp.segments));
 
       // Per-cell accuracy summary for this dataset. Kept separate from the plan
       // rows: it describes the models, not any one plan.
