@@ -25,6 +25,7 @@
 #include <type_traits>
 #include <vector>
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include "velox/common/memory/Memory.h"
@@ -34,6 +35,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
+#include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 
@@ -603,6 +605,26 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTripsTreeIds) {
     uint64_t first = 0;
     encoding->materialize(1, &first);
     EXPECT_EQ(first, ids[0]);
+
+    // After a reset, alternating skips and reads whose spans straddle the
+    // 4'096-row materialize chunk, so each read starts at a row the cursor
+    // reached without decoding it.
+    encoding->reset();
+    uint64_t row = 0;
+    for (const auto& [skipRows, readRows] :
+         std::vector<std::pair<uint32_t, uint32_t>>{
+             {4'095, 3}, {1, 9'000}, {7'777, 1}, {0, 19'123}}) {
+      SCOPED_TRACE(fmt::format("row={} read={}", row + skipRows, readRows));
+      encoding->skip(skipRows);
+      row += skipRows;
+      std::vector<uint64_t> chunk(readRows);
+      encoding->materialize(readRows, chunk.data());
+      expectBitwiseEqual(
+          std::vector<uint64_t>(ids.begin() + row, ids.begin() + row + readRows),
+          chunk);
+      row += readRows;
+    }
+    ASSERT_EQ(row, ids.size());
   }
 
   // Signed values share the physical bits, and so the frame.
@@ -727,6 +749,92 @@ TEST(SubIntSplitEncodingTests, rowFrameEstimateBoundsEncodedSize) {
   EXPECT_GT(residualBits / 8.0, 0.5 * framedBytes);
   EXPECT_LT(valueBits / 8.0, 2.0 * unframedBytes);
   EXPECT_GT(valueBits / 8.0, 0.5 * unframedBytes);
+}
+
+// A replay reproduces the captured stream's frame decision rather than making
+// its own: the boundaries it replays were planned on either the residuals or
+// the values, and taking the other would store the column under a plan nobody
+// priced.
+TEST(SubIntSplitEncodingTests, rowFrameReplayFollowsCapturedLayout) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  const auto ids = makeTreeIds(40'000, 7);
+  const auto frameKey =
+      std::string(nimble::detail::subintsplit::kRowFrameConfigKey);
+
+  const std::string framed{encodeWithNonRecursiveSubIntSplit<uint64_t>(ids, buffer)};
+  ASSERT_TRUE(parseRowFrame(framed).active());
+  const auto framedLayout =
+      nimble::EncodingLayoutCapture::capture(framed, nimble::Encoding::Options{});
+  ASSERT_TRUE(framedLayout.config().get(frameKey).has_value());
+
+  const std::string replayed{
+      encodeWithReplayLayout<uint64_t>(framedLayout, ids, buffer)};
+  EXPECT_TRUE(parseRowFrame(replayed).active());
+  expectBitwiseEqual(ids, decodeAll<uint64_t>(replayed, *pool));
+  expectSameLayout(
+      framedLayout,
+      nimble::EncodingLayoutCapture::capture(
+          replayed, nimble::Encoding::Options{}));
+
+  // Replaying the captured layout stores exactly what the capture did: the
+  // section layouts it replays were chosen for the residuals, so a replay
+  // that dropped the frame would hand them values they were never chosen for.
+  EXPECT_EQ(replayed, framed);
+
+  // A stream written without a frame captures none, so its replay stays
+  // without one even though the frame option is on and one would fit.
+  nimble::Encoding::Options withoutFrame;
+  withoutFrame.subIntSplitRowFrame = false;
+  const std::string unframed{nimble::EncodingFactory::encode<uint64_t>(
+      std::make_unique<NonRecursiveSubIntSplitPolicy<uint64_t>>(),
+      ids,
+      buffer,
+      withoutFrame)};
+  ASSERT_FALSE(parseRowFrame(unframed).active());
+  const auto unframedLayout = nimble::EncodingLayoutCapture::capture(
+      unframed, nimble::Encoding::Options{});
+  EXPECT_FALSE(unframedLayout.config().get(frameKey).has_value());
+  const std::string replayedUnframed{
+      encodeWithReplayLayout<uint64_t>(unframedLayout, ids, buffer)};
+  EXPECT_FALSE(parseRowFrame(replayedUnframed).active());
+  expectBitwiseEqual(ids, decodeAll<uint64_t>(replayedUnframed, *pool));
+}
+
+// A reader from before frames must refuse a framed stream rather than return
+// residuals. That reader (SubIntSplitAccumulate.h at 52248c0d5, lines 157-168)
+// takes any nonzero byte after splitCount as announcing a transform block and
+// reads the next byte as the key section, which it accepts only as
+// kNoKeySection (0xFF) or an index below splitCount. A framed stream without
+// section transforms keeps the SubIntSplit encoding type, so the factory hands
+// it to exactly that parser. Replays those checks on the written bytes.
+TEST(SubIntSplitEncodingTests, rowFrameIsRejectedByPreFrameParser) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  const auto ids = makeTreeIds(40'000, 7);
+  const std::string encoded{encodeWithNonRecursiveSubIntSplit<uint64_t>(ids, buffer)};
+  ASSERT_TRUE(parseRowFrame(encoded).active());
+  ASSERT_EQ(
+      static_cast<nimble::EncodingType>(
+          encoded[nimble::EncodingPrefix::kEncodingTypeOffset]),
+      nimble::EncodingType::SubIntSplit);
+
+  const size_t splitCountOffset = nimble::Encoding::kPrefixSize;
+  const auto splitCount = static_cast<uint8_t>(encoded[splitCountOffset]);
+  const auto flags = static_cast<uint8_t>(encoded[splitCountOffset + 1]);
+  const auto keySectionAsReadByOldParser =
+      static_cast<uint8_t>(encoded[splitCountOffset + 2]);
+  constexpr uint8_t kOldNoKeySection = 0xFF;
+
+  EXPECT_NE(flags, 0);
+  EXPECT_EQ(flags & nimble::detail::kSubIntSplitSectionTransformFlag, 0);
+  const bool oldParserAcceptsKeySection =
+      keySectionAsReadByOldParser == kOldNoKeySection ||
+      keySectionAsReadByOldParser < splitCount;
+  EXPECT_FALSE(oldParserAcceptsKeySection);
+  EXPECT_EQ(keySectionAsReadByOldParser, nimble::detail::kSubIntSplitRowFrameGuard);
+  // The guard stays out of reach of any real split count.
+  EXPECT_GT(nimble::detail::kSubIntSplitRowFrameGuard, 64);
 }
 
 // The flag byte and the frame's guard come off the wire, so a reader has to

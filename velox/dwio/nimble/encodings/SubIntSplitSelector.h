@@ -482,21 +482,12 @@ inline std::vector<SegmentCost> buildSegmentCostGrid(
   return bestCost;
 }
 
-template <typename CostFn>
-inline SelectorResult selectSplitsImpl(
-    const std::vector<uint64_t>& samples,
-    int kBits,
-    size_t fullCount,
-    const SelectorConfig& cfg,
-    CostFn&& costFn) {
-  if (samples.empty() || kBits <= 0) {
-    return {};
-  }
-  kBits = std::min(kBits, 64);
-  const int sz = kBits;
-  const std::vector<SegmentCost> bestCost = buildSegmentCostGrid(
-      samples, sz, fullCount, std::forward<CostFn>(costFn));
-
+// Runs the split DP over a grid buildSegmentCostGrid already costed, so a
+// caller pricing the same sample more than once pays for the grid once.
+inline SelectorResult selectSplitsOverGrid(
+    const std::vector<SegmentCost>& bestCost,
+    int sz,
+    const SelectorConfig& cfg) {
   std::vector<double> dp(sz + 1, std::numeric_limits<double>::infinity());
   std::vector<int> prev(sz + 1, -1);
   std::vector<EncodingType> chosen(sz + 1, EncodingType::Trivial);
@@ -575,6 +566,23 @@ inline SelectorResult selectSplitsImpl(
       cfg.decodeWeighting.readPath,
       sectionNanos);
   return result;
+}
+
+template <typename CostFn>
+inline SelectorResult selectSplitsImpl(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const SelectorConfig& cfg,
+    CostFn&& costFn) {
+  if (samples.empty() || kBits <= 0) {
+    return {};
+  }
+  const int sz = std::min(kBits, 64);
+  return selectSplitsOverGrid(
+      buildSegmentCostGrid(samples, sz, fullCount, std::forward<CostFn>(costFn)),
+      sz,
+      cfg);
 }
 
 // Selects splits costing segments against `allowed` only. An empty set costs
@@ -718,6 +726,24 @@ inline std::vector<std::vector<SegmentPlan>> kBestSplits(
 // Shortlists split plans for the hybrid planner from one costing of the grid:
 // the k cheapest plans, then the k cheapest cut only at `cuts`. Plans may
 // repeat across the two lists; callers that re-price them cache by range.
+// Takes a grid the caller already costed, so the same sample is not costed
+// twice when the caller priced it for another decision first.
+inline std::vector<std::vector<SegmentPlan>> shortlistSplitsOverGrid(
+    const std::vector<SegmentCost>& grid,
+    int sz,
+    const SelectorConfig& cfg,
+    size_t k,
+    const std::vector<bool>& cuts) {
+  auto plans = kBestSplits(grid, sz, cfg, k);
+  if (!cuts.empty()) {
+    for (auto& plan : kBestSplits(grid, sz, cfg, k, cuts)) {
+      plans.push_back(std::move(plan));
+    }
+  }
+  return plans;
+}
+
+// shortlistSplitsOverGrid, costing the grid over `allowed` first.
 inline std::vector<std::vector<SegmentPlan>> shortlistSplitsRestricted(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -730,15 +756,13 @@ inline std::vector<std::vector<SegmentPlan>> shortlistSplitsRestricted(
     return {};
   }
   const int sz = std::min(kBits, 64);
-  const std::vector<SegmentCost> grid = buildSegmentCostGrid(
-      samples, sz, fullCount, restrictedSegmentCostFn(allowed, cfg));
-  auto plans = kBestSplits(grid, sz, cfg, k);
-  if (!cuts.empty()) {
-    for (auto& plan : kBestSplits(grid, sz, cfg, k, cuts)) {
-      plans.push_back(std::move(plan));
-    }
-  }
-  return plans;
+  return shortlistSplitsOverGrid(
+      buildSegmentCostGrid(
+          samples, sz, fullCount, restrictedSegmentCostFn(allowed, cfg)),
+      sz,
+      cfg,
+      k,
+      cuts);
 }
 
 } // namespace facebook::nimble::detail::subintsplit

@@ -231,14 +231,34 @@ class SubIntSplitEncoding
   // call in the bulk paths below is timed into it when non-null.
   SubIntSplitDecodeProfile* decodeProfile_{nullptr};
 
+  // A column's planner sample and the split grid costed over it. Costing the
+  // grid is most of what planning costs, so the row frame decision, which has
+  // to cost a grid for the values and for the residuals, hands the winner's to
+  // the encode instead of the encode costing it a third time.
+  struct PlanningSample {
+    std::vector<uint64_t> sample;
+    std::vector<detail::subintsplit::SegmentCost> grid;
+  };
+
+  // The configuration the split planner runs under for `options`.
+  static detail::subintsplit::SelectorConfig plannerSelectorConfig(
+      const Encoding::Options& options);
+
+  // Samples `values` and costs the split grid over the sample.
+  static PlanningSample costPlanningSample(
+      std::span<const physicalType> values,
+      const Encoding::Options& options);
+
   // Encodes `values` with `rowFrame` already subtracted from them, and records
-  // the frame in the header so reads add it back.
+  // the frame in the header so reads add it back. `planning`, when not null,
+  // is the sample and grid already costed for exactly these values.
   static std::string_view encodeResiduals(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
       Buffer& buffer,
       const Encoding::Options& options,
-      const detail::SubIntSplitRowFrame& rowFrame);
+      const detail::SubIntSplitRowFrame& rowFrame,
+      PlanningSample* planning);
 
   // Decodes the next `rowCount` values as the sections store them, before the
   // row frame is added back.
@@ -1296,50 +1316,119 @@ std::string_view SubIntSplitEncoding<T>::encode(
       ? detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values)
       : detail::SubIntSplitRowFrame{};
   if (!rowFrame.active()) {
-    return encodeResiduals(selection, values, buffer, options, rowFrame);
+    return encodeResiduals(
+        selection, values, buffer, options, rowFrame, nullptr);
   }
   std::vector<physicalType> residuals;
   detail::subintsplit::subtractSubIntSplitRowFrame<physicalType>(
       rowFrame, values, residuals);
 
+  // A preserve-mode encode replays boundaries without running the planner, so
+  // it has nothing to price a frame with. It takes one exactly when the stream
+  // its layout was captured from carried one: those boundaries were planned
+  // on that stream's residuals or values, and pairing them with the other
+  // would store the column under a plan nobody priced.
+  const auto modeConfig = selection.getConfig(
+      std::string(detail::subintsplit::kSplitModeConfigKey));
+  if (modeConfig.has_value() &&
+      *modeConfig == detail::subintsplit::kSplitModePreserve) {
+    const auto frameConfig = selection.getConfig(
+        std::string(detail::subintsplit::kRowFrameConfigKey));
+    const bool captured = frameConfig.has_value() &&
+        *frameConfig == detail::subintsplit::kRowFramePresent;
+    return captured
+        ? encodeResiduals(
+              selection, residuals, buffer, options, rowFrame, nullptr)
+        : encodeResiduals(
+              selection,
+              values,
+              buffer,
+              options,
+              detail::SubIntSplitRowFrame{},
+              nullptr);
+  }
+
   // Fitting only says the column follows a line, not that sections encode the
   // distance from it more cheaply than the values themselves: a column that is
   // exactly a counter already costs nothing through Delta. So both are priced
-  // with the planner's own DP over the same inventory, and the frame is kept
-  // only when its estimate, header included, is smaller. A preserve-mode
-  // encode replays boundaries without running the DP, so it has nothing to
-  // price with and takes the frame whenever one fits. That can pair a frame
-  // with boundaries planned on the values; the stream still round-trips, it
-  // is only priced less carefully than a planned one.
-  const auto modeConfig = selection.getConfig(
-      std::string(detail::subintsplit::kSplitModeConfigKey));
-  const bool preserve = modeConfig.has_value() &&
-      *modeConfig == detail::subintsplit::kSplitModePreserve;
-  if (!preserve) {
-    constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
-    auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
-    selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
-    selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
-    const auto estimateBits = [&](std::span<const physicalType> candidate) {
-      std::vector<uint64_t> sample;
-      detail::subintsplit::sampleIntoU64<physicalType>(
-          candidate, sample, detail::subintsplit::defaultSamplerConfig());
-      return detail::subintsplit::selectSplitsRestricted(
-                 sample,
-                 kBits,
-                 static_cast<uint32_t>(candidate.size()),
-                 options.subIntSplitAllowedEncodings,
-                 selectorConfig)
-          .totalSizeBits;
-    };
-    const double frameBits = estimateBits(residuals) +
-        8.0 * detail::kSubIntSplitRowFrameHeaderSize;
-    if (frameBits >= estimateBits(values)) {
-      return encodeResiduals(
-          selection, values, buffer, options, detail::SubIntSplitRowFrame{});
-    }
+  // with the planner's own DP over the same inventory and configuration, and
+  // the frame is kept only when its estimate, header included, is smaller.
+  // The loser's grid is discarded; the winner's is the one the encode plans
+  // on, which leaves the frame costing one grid more than planning without it.
+  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+  const auto selectorConfig = plannerSelectorConfig(options);
+  auto residualPlanning = costPlanningSample(residuals, options);
+  auto valuePlanning = costPlanningSample(values, options);
+  const double frameBits = detail::subintsplit::selectSplitsOverGrid(
+                               residualPlanning.grid, kBits, selectorConfig)
+                               .totalSizeBits +
+      8.0 * detail::kSubIntSplitRowFrameHeaderSize;
+  const double valueBits = detail::subintsplit::selectSplitsOverGrid(
+                               valuePlanning.grid, kBits, selectorConfig)
+                               .totalSizeBits;
+  if (frameBits >= valueBits) {
+    return encodeResiduals(
+        selection,
+        values,
+        buffer,
+        options,
+        detail::SubIntSplitRowFrame{},
+        &valuePlanning);
   }
-  return encodeResiduals(selection, residuals, buffer, options, rowFrame);
+  return encodeResiduals(
+      selection, residuals, buffer, options, rowFrame, &residualPlanning);
+}
+
+template <typename T>
+detail::subintsplit::SelectorConfig
+SubIntSplitEncoding<T>::plannerSelectorConfig(const Encoding::Options& options) {
+  // Huffman and DeltaBlock are both withdrawn by default, for the same
+  // reason: each was priced into where these boundaries fall while being
+  // unselectable for the sections they produce, so their cost models steered
+  // the planner toward splits nothing would read well. Both also cost a pass
+  // over the sample per grid cell, so withdrawing either buys encode time as
+  // well as better plans. See Encoding::Options::subIntSplitAllowHuffman and
+  // subIntSplitAllowDeltaBlock for what each cost and what withdrawing it
+  // bought.
+  //
+  // Each of these has to stay in step with nestedEncodingReadFactors, which
+  // decides what a section may actually be encoded as. A gate set here
+  // without the matching absence there gives the planner an encoding
+  // selection will not use; the reverse leaves the planner carving
+  // boundaries around one that is no longer available.
+  auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
+  selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
+  selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
+  // Zero by default, which leaves the DP minimising estimated bytes exactly
+  // as before. See Encoding::Options::subIntSplitDecodeWeight for what
+  // raising it prices and why the access pattern has to travel with it.
+  selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{
+      .weight = options.subIntSplitDecodeWeight,
+      .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
+          options.subIntSplitDecodeAccessPattern),
+      .readPath = static_cast<detail::subintsplit::DecodeReadPath>(
+          options.subIntSplitDecodeReadPath)};
+  return selectorConfig;
+}
+
+template <typename T>
+typename SubIntSplitEncoding<T>::PlanningSample
+SubIntSplitEncoding<T>::costPlanningSample(
+    std::span<const physicalType> values,
+    const Encoding::Options& options) {
+  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+  PlanningSample planning;
+  detail::subintsplit::sampleIntoU64<physicalType>(
+      values, planning.sample, detail::subintsplit::defaultSamplerConfig());
+  NIMBLE_CHECK(
+      !planning.sample.empty(), "SubIntSplit planner sample is empty.");
+  planning.grid = detail::subintsplit::buildSegmentCostGrid(
+      planning.sample,
+      kBits,
+      values.size(),
+      detail::subintsplit::restrictedSegmentCostFn(
+          options.subIntSplitAllowedEncodings, plannerSelectorConfig(options)));
+  return planning;
 }
 
 template <typename T>
@@ -1348,7 +1437,8 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     std::span<const physicalType> values,
     Buffer& buffer,
     const Encoding::Options& options,
-    const detail::SubIntSplitRowFrame& rowFrame) {
+    const detail::SubIntSplitRowFrame& rowFrame,
+    PlanningSample* planning) {
   const bool useVarint = options.useVarintRowCount;
   const uint32_t valueCount = static_cast<uint32_t>(values.size());
 
@@ -1375,38 +1465,16 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   } else {
     // Default behavior: recompute the split boundaries from the sampled data.
     std::vector<uint64_t> sampleBuf;
-    detail::subintsplit::sampleIntoU64<physicalType>(
-        values, sampleBuf, detail::subintsplit::defaultSamplerConfig());
+    if (planning != nullptr) {
+      sampleBuf = std::move(planning->sample);
+    } else {
+      detail::subintsplit::sampleIntoU64<physicalType>(
+          values, sampleBuf, detail::subintsplit::defaultSamplerConfig());
+    }
 
     // An empty allowed set costs every encoding, so this is the production
     // path unless a caller has deliberately narrowed the inventory.
-    //
-    // Huffman and DeltaBlock are both withdrawn by default, for the same
-    // reason: each was priced into where these boundaries fall while being
-    // unselectable for the sections they produce, so their cost models steered
-    // the planner toward splits nothing would read well. Both also cost a pass
-    // over the sample per grid cell, so withdrawing either buys encode time as
-    // well as better plans. See Encoding::Options::subIntSplitAllowHuffman and
-    // subIntSplitAllowDeltaBlock for what each cost and what withdrawing it
-    // bought.
-    //
-    // Each of these has to stay in step with nestedEncodingReadFactors, which
-    // decides what a section may actually be encoded as. A gate set here
-    // without the matching absence there gives the planner an encoding
-    // selection will not use; the reverse leaves the planner carving
-    // boundaries around one that is no longer available.
-    auto selectorConfig = detail::subintsplit::defaultSelectorConfig();
-    selectorConfig.allowHuffman = options.subIntSplitAllowHuffman;
-    selectorConfig.allowDeltaBlock = options.subIntSplitAllowDeltaBlock;
-    // Zero by default, which leaves the DP minimising estimated bytes exactly
-    // as before. See Encoding::Options::subIntSplitDecodeWeight for what
-    // raising it prices and why the access pattern has to travel with it.
-    selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{
-        .weight = options.subIntSplitDecodeWeight,
-        .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
-            options.subIntSplitDecodeAccessPattern),
-        .readPath = static_cast<detail::subintsplit::DecodeReadPath>(
-            options.subIntSplitDecodeReadPath)};
+    const auto selectorConfig = plannerSelectorConfig(options);
     // The hybrid planner replaces the DP's argmin with a shortlist re-priced
     // by section selection's own estimators and refined, bounded on size by
     // the same cap. See Encoding::Options::subIntSplitHybridPlanner. It costs
@@ -1433,14 +1501,21 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
             cuts[boundary] = true;
           }
         }
-        const auto shortlist = detail::subintsplit::shortlistSplitsRestricted(
-            sampleBuf,
-            kBits,
-            valueCount,
-            options.subIntSplitAllowedEncodings,
-            selectorConfig,
-            options.subIntSplitHybridShortlist,
-            cuts);
+        const auto shortlist = planning != nullptr
+            ? detail::subintsplit::shortlistSplitsOverGrid(
+                  planning->grid,
+                  kBits,
+                  selectorConfig,
+                  options.subIntSplitHybridShortlist,
+                  cuts)
+            : detail::subintsplit::shortlistSplitsRestricted(
+                  sampleBuf,
+                  kBits,
+                  valueCount,
+                  options.subIntSplitAllowedEncodings,
+                  selectorConfig,
+                  options.subIntSplitHybridShortlist,
+                  cuts);
         auto refined =
             detail::subintsplit::SubIntSplitPlanRefiner::refine<physicalType>(
                 values, kBits, shortlist, cuts, selectorConfig, options);
@@ -1452,12 +1527,15 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     }
 
     if (!planned) {
-      auto selectorResult = detail::subintsplit::selectSplitsRestricted(
-          sampleBuf,
-          kBits,
-          valueCount,
-          options.subIntSplitAllowedEncodings,
-          selectorConfig);
+      auto selectorResult = planning != nullptr
+          ? detail::subintsplit::selectSplitsOverGrid(
+                planning->grid, kBits, selectorConfig)
+          : detail::subintsplit::selectSplitsRestricted(
+                sampleBuf,
+                kBits,
+                valueCount,
+                options.subIntSplitAllowedEncodings,
+                selectorConfig);
 
       // What the weighted plan gave up in bytes, bounded against what size
       // alone would have stored the column in. The DP minimises size plus a

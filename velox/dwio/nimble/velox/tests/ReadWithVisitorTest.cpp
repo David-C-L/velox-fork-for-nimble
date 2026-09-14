@@ -234,6 +234,16 @@ std::unique_ptr<SubIntSplitEncoding<T>> makeReorderedSubIntSplitEncoding(
       memPool, encoded, [](uint32_t) { return nullptr; }, options);
 }
 
+// Packed IDs that follow a line through their rows: a tag that ignores the
+// rows, a counter, and a field within 15 of the counter. Long enough for
+// SubIntSplit to fit a row frame, so a read has to add the line back. `row` is
+// the value's position among the stored (non-null) values, which is what the
+// frame is fitted over.
+int64_t framedId(int64_t row) {
+  const int64_t tag = (row * 7'919) % 12;
+  return (tag << 56) | (row << 28) | (row + (row * 31) % 16);
+}
+
 // Records what a hook is handed, so a test can compare against the values that
 // were encoded.
 class RecordingValueHook final : public velox::ValueHook {
@@ -4994,6 +5004,238 @@ TEST_P(ReadWithVisitorTest, encodingLevelSubIntSplitReorderedHookSlowPath) {
   ASSERT_EQ(hook.values.size(), kRows);
   for (int i = 0; i < kRows; ++i) {
     EXPECT_EQ(hook.values[i], data[i]) << "row " << i;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SubIntSplitEncoding<int64_t> with a row frame, through each visitor path.
+// The frame is added back only by materialize(), so each path that reaches
+// values has to go through it: the dense fast path, the sparse fast path that
+// skips to a span and gathers from it, the scatter path with encoding-level
+// nulls where the stored position lags the row, and the hook slow path.
+// ---------------------------------------------------------------------------
+TEST_P(ReadWithVisitorTest, encodingLevelSubIntSplitRowFrameDense) {
+  constexpr int kRows = 20'000;
+  std::vector<int64_t> data(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    data[i] = framedId(i);
+  }
+
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>(kRows, [](auto i) { return framedId(i); })});
+  auto rowType = asRowType(input->type());
+  auto ctx = makeFileContext(input);
+  auto scanSpec = std::make_shared<common::ScanSpec>("root");
+  scanSpec->addAllChildFields(*rowType);
+  scanSpec->childByName("c0")->setFilter(
+      std::make_unique<common::AlwaysTrue>());
+  auto root = buildReader(*ctx, rowType, *scanSpec);
+  auto* structReader =
+      dynamic_cast<dwio::common::SelectiveStructColumnReaderBase*>(root.get());
+  auto* reader = static_cast<IntegerColumnReaderTestAccessor*>(
+      dynamic_cast<IntegerColumnReader*>(structReader->children()[0]));
+  ASSERT_NE(reader, nullptr);
+
+  std::vector<vector_size_t> rowVec(kRows);
+  std::iota(rowVec.begin(), rowVec.end(), 0);
+  RowSet rows(rowVec.data(), rowVec.size());
+  reader->doPrepareRead<int64_t>(0, rows, nullptr);
+
+  Buffer buffer(*pool());
+  auto encoding = makeSubIntSplitEncoding<int64_t>(data, buffer, *pool());
+  ASSERT_NE(encoding->debugString(0).find("rowFrame="), std::string::npos);
+
+  common::AlwaysTrue filter;
+  dwio::common::ExtractToReader extractValues(reader);
+  constexpr bool kIsDense = true;
+  DecoderVisitor<
+      int64_t,
+      common::AlwaysTrue,
+      dwio::common::ExtractToReader,
+      kIsDense>
+      visitor(filter, reader, rows, extractValues);
+  auto params = makeReadWithVisitorParams(visitor, rows, pool());
+  encoding->readWithVisitor(visitor, params);
+
+  ASSERT_EQ(reader->numValues(), kRows);
+  auto values = getValues<int64_t>(reader);
+  for (int i = 0; i < kRows; ++i) {
+    ASSERT_EQ(values[i], data[i]) << "row " << i;
+  }
+}
+
+TEST_P(ReadWithVisitorTest, encodingLevelSubIntSplitRowFrameSparseFilter) {
+  constexpr int kRows = 20'000;
+  std::vector<int64_t> data(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    data[i] = framedId(i);
+  }
+  // Tags 3 to 5, so the filter reads the frame's high bits back correctly.
+  const int64_t lower = int64_t{3} << 56;
+  const int64_t upper = (int64_t{6} << 56) - 1;
+
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>(kRows, [](auto i) { return framedId(i); })});
+  auto rowType = asRowType(input->type());
+  auto ctx = makeFileContext(input);
+  auto scanSpec = std::make_shared<common::ScanSpec>("root");
+  scanSpec->addAllChildFields(*rowType);
+  scanSpec->childByName("c0")->setFilter(
+      std::make_unique<common::BigintRange>(lower, upper, false));
+  auto root = buildReader(*ctx, rowType, *scanSpec);
+  auto* structReader =
+      dynamic_cast<dwio::common::SelectiveStructColumnReaderBase*>(root.get());
+  auto* reader = static_cast<IntegerColumnReaderTestAccessor*>(
+      dynamic_cast<IntegerColumnReader*>(structReader->children()[0]));
+  ASSERT_NE(reader, nullptr);
+
+  // Starts past the first transform-sized chunk, so the first span begins
+  // with a skip and the frame is evaluated at a row the cursor jumped to.
+  std::vector<vector_size_t> rowVec;
+  for (int i = 5'001; i < kRows; i += 3) {
+    rowVec.push_back(i);
+  }
+  RowSet rows(rowVec.data(), rowVec.size());
+  reader->doPrepareRead<int64_t>(0, rows, nullptr);
+
+  Buffer buffer(*pool());
+  auto encoding = makeSubIntSplitEncoding<int64_t>(data, buffer, *pool());
+  ASSERT_NE(encoding->debugString(0).find("rowFrame="), std::string::npos);
+
+  common::BigintRange filter(lower, upper, false);
+  dwio::common::ExtractToReader extractValues(reader);
+  constexpr bool kIsDense = false;
+  DecoderVisitor<
+      int64_t,
+      common::BigintRange,
+      dwio::common::ExtractToReader,
+      kIsDense>
+      visitor(filter, reader, rows, extractValues);
+  auto params = makeReadWithVisitorParams(visitor, rows, pool());
+  encoding->readWithVisitor(visitor, params);
+
+  std::vector<int64_t> expected;
+  for (const auto row : rowVec) {
+    if (data[row] >= lower && data[row] <= upper) {
+      expected.push_back(data[row]);
+    }
+  }
+  ASSERT_EQ(reader->numValues(), expected.size());
+  auto values = getValues<int64_t>(reader);
+  for (size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_EQ(values[i], expected[i]) << "passing value " << i;
+  }
+}
+
+TEST_P(ReadWithVisitorTest, encodingLevelSubIntSplitRowFrameWithNulls) {
+  constexpr int kRows = 25'000;
+  auto nulls = velox::allocateNulls(kRows, pool(), velox::bits::kNotNull);
+  auto* rawNulls = nulls->asMutable<uint64_t>();
+  std::vector<int64_t> nonNullData;
+  std::vector<int64_t> expectedAtRow(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    if (i % 5 == 0) {
+      velox::bits::setNull(rawNulls, i);
+    } else {
+      expectedAtRow[i] = framedId(static_cast<int64_t>(nonNullData.size()));
+      nonNullData.push_back(expectedAtRow[i]);
+    }
+  }
+
+  auto input = makeRowVector({makeFlatVector<int64_t>(
+      kRows, [&](auto i) { return expectedAtRow[i]; })});
+  auto rowType = asRowType(input->type());
+  auto ctx = makeFileContext(input);
+  auto scanSpec = std::make_shared<common::ScanSpec>("root");
+  scanSpec->addAllChildFields(*rowType);
+  scanSpec->childByName("c0")->setFilter(
+      std::make_unique<common::AlwaysTrue>());
+  auto root = buildReader(*ctx, rowType, *scanSpec);
+  auto* structReader =
+      dynamic_cast<dwio::common::SelectiveStructColumnReaderBase*>(root.get());
+  auto* reader = static_cast<IntegerColumnReaderTestAccessor*>(
+      dynamic_cast<IntegerColumnReader*>(structReader->children()[0]));
+  ASSERT_NE(reader, nullptr);
+
+  std::vector<vector_size_t> rowVec(kRows);
+  std::iota(rowVec.begin(), rowVec.end(), 0);
+  RowSet rows(rowVec.data(), rowVec.size());
+  reader->doPrepareRead<int64_t>(0, rows, nullptr);
+  reader->nullsInReadRange() = nulls;
+
+  Buffer buffer(*pool());
+  auto encoding =
+      makeSubIntSplitEncoding<int64_t>(nonNullData, buffer, *pool());
+  ASSERT_NE(encoding->debugString(0).find("rowFrame="), std::string::npos);
+
+  common::AlwaysTrue filter;
+  dwio::common::ExtractToReader extractValues(reader);
+  constexpr bool kIsDense = true;
+  DecoderVisitor<
+      int64_t,
+      common::AlwaysTrue,
+      dwio::common::ExtractToReader,
+      kIsDense>
+      visitor(filter, reader, rows, extractValues);
+  auto params = makeReadWithVisitorParams(visitor, rows, pool());
+  encoding->readWithVisitor(visitor, params);
+
+  ASSERT_EQ(reader->numValues(), kRows);
+  auto values = getValues<int64_t>(reader);
+  for (int i = 0; i < kRows; ++i) {
+    if (i % 5 != 0) {
+      ASSERT_EQ(values[i], expectedAtRow[i]) << "non-null row " << i;
+    }
+  }
+}
+
+TEST_P(ReadWithVisitorTest, encodingLevelSubIntSplitRowFrameHookSlowPath) {
+  constexpr int kRows = 20'000;
+  std::vector<int64_t> data(kRows);
+  for (int i = 0; i < kRows; ++i) {
+    data[i] = framedId(i);
+  }
+
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>(kRows, [](auto i) { return framedId(i); })});
+  auto rowType = asRowType(input->type());
+  auto ctx = makeFileContext(input);
+  auto scanSpec = std::make_shared<common::ScanSpec>("root");
+  scanSpec->addAllChildFields(*rowType);
+  scanSpec->childByName("c0")->setFilter(
+      std::make_unique<common::AlwaysTrue>());
+  auto root = buildReader(*ctx, rowType, *scanSpec);
+  auto* structReader =
+      dynamic_cast<dwio::common::SelectiveStructColumnReaderBase*>(root.get());
+  auto* reader = static_cast<IntegerColumnReaderTestAccessor*>(
+      dynamic_cast<IntegerColumnReader*>(structReader->children()[0]));
+  ASSERT_NE(reader, nullptr);
+
+  std::vector<vector_size_t> rowVec(kRows);
+  std::iota(rowVec.begin(), rowVec.end(), 0);
+  RowSet rows(rowVec.data(), rowVec.size());
+  reader->doPrepareRead<int64_t>(0, rows, nullptr);
+
+  Buffer buffer(*pool());
+  auto encoding = makeSubIntSplitEncoding<int64_t>(data, buffer, *pool());
+  ASSERT_NE(encoding->debugString(0).find("rowFrame="), std::string::npos);
+
+  common::AlwaysTrue filter;
+  RecordingValueHook hook;
+  dwio::common::ExtractToGenericHook extractValues(&hook);
+  constexpr bool kIsDense = true;
+  DecoderVisitor<
+      int64_t,
+      common::AlwaysTrue,
+      dwio::common::ExtractToGenericHook,
+      kIsDense>
+      visitor(filter, reader, rows, extractValues);
+  auto params = makeReadWithVisitorParams(visitor, rows, pool());
+  encoding->readWithVisitor(visitor, params);
+
+  ASSERT_EQ(hook.values.size(), kRows);
+  for (int i = 0; i < kRows; ++i) {
+    ASSERT_EQ(hook.values[i], data[i]) << "row " << i;
   }
 }
 

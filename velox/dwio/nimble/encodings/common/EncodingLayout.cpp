@@ -221,8 +221,9 @@ EncodingLayout EncodingLayoutCapture::capture(
       // a reordered stream a local walk would take the section headers from
       // the wrong offset and capture nonsense. A third reader of this header
       // is exactly what the shared one exists to prevent.
-      const auto sections =
-          detail::parseSubIntSplitSections(encoding, prefixSize);
+      detail::SubIntSplitRowFrame rowFrame;
+      const auto sections = detail::parseSubIntSplitSections(
+          encoding, prefixSize, nullptr, &rowFrame);
 
       children.reserve(sections.size());
       std::vector<detail::subintsplit::SegmentPlan> boundaryPlans;
@@ -239,10 +240,15 @@ EncodingLayout EncodingLayoutCapture::capture(
       // The captured type is the one the stream carries. Reporting a reordered
       // stream as plain SubIntSplit would describe a layout that decodes to
       // different values than the stream it came from.
+      auto config = detail::subintsplit::makePreserveSplitConfig(boundaryPlans);
+      if (rowFrame.active()) {
+        config.emplace(
+            std::string(detail::subintsplit::kRowFrameConfigKey),
+            std::string(detail::subintsplit::kRowFramePresent));
+      }
       return {
           encodingType,
-          EncodingLayout::Config{
-              detail::subintsplit::makePreserveSplitConfig(boundaryPlans)},
+          EncodingLayout::Config{std::move(config)},
           compressionType,
           std::move(children)};
     }
