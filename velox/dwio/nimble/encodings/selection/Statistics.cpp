@@ -104,8 +104,36 @@ SortedType<T> populateRangeUniqueCounts(
   }
 
   std::vector<uint64_t> counts(rangeSize);
-  for (const auto value : values) {
-    ++counts[denseRangeOffset(value, minValue)];
+  // Rows are spread over four tables in turn wherever they fit in cache and in
+  // 32-bit counts. A stream of few distinct values increments the same counter
+  // on consecutive rows, and a single table serialises those increments
+  // through store forwarding.
+  const size_t numValues = values.size();
+  if (rangeSize <= kMaxDenseRangeSize &&
+      numValues <= std::numeric_limits<uint32_t>::max()) {
+    std::vector<uint32_t> spread(4 * rangeSize);
+    auto* table0 = spread.data();
+    auto* table1 = table0 + rangeSize;
+    auto* table2 = table1 + rangeSize;
+    auto* table3 = table2 + rangeSize;
+    size_t i{0};
+    for (; i + 4 <= numValues; i += 4) {
+      ++table0[denseRangeOffset(values[i], minValue)];
+      ++table1[denseRangeOffset(values[i + 1], minValue)];
+      ++table2[denseRangeOffset(values[i + 2], minValue)];
+      ++table3[denseRangeOffset(values[i + 3], minValue)];
+    }
+    for (; i < numValues; ++i) {
+      ++table0[denseRangeOffset(values[i], minValue)];
+    }
+    for (size_t offset = 0; offset < rangeSize; ++offset) {
+      counts[offset] = static_cast<uint64_t>(table0[offset]) + table1[offset] +
+          table2[offset] + table3[offset];
+    }
+  } else {
+    for (const auto value : values) {
+      ++counts[denseRangeOffset(value, minValue)];
+    }
   }
 
   size_t distinct{0};
@@ -363,39 +391,31 @@ void Statistics<T, InputType>::populateMinMaxBlocks(uint16_t blockSize) const {
 template <typename T, typename InputType>
 void Statistics<T, InputType>::populateBucketCounts() const {
   using UnsignedT = typename std::make_unsigned<T>::type;
-  // Bucket counts are calculated in two phases. In phase one, we iterate on all
-  // entries, and (efficiently) count the occurrences based on the MSB (most
-  // significant bit) of the entry. In phase two, we merge the results of phase
-  // one, for each consecutive 7 bits.
-  // See benchmarks in
-  // velox/dwio/nimble/encodings/tests:bucket_benchmark for why this method is
-  // used.
-  std::array<uint64_t, std::numeric_limits<UnsignedT>::digits + 1> bitCounts{};
-  for (auto i = 0; i < data_.size(); ++i) {
-    ++(bitCounts
-           [std::numeric_limits<UnsignedT>::digits -
-            std::countl_zero(
-                static_cast<UnsignedT>(
-                    static_cast<UnsignedT>(data_[i]) -
-                    static_cast<UnsignedT>(min())))]);
-  }
-
-  std::vector<uint64_t> bucketCounts(sizeof(T) * 8 / 7 + 1, 0);
-  uint8_t start = 0;
-  uint8_t end = 8;
-  uint8_t iteration = 0;
-  while (start < bitCounts.size()) {
-    for (auto i = start; i < end; ++i) {
-      bucketCounts[iteration] += bitCounts[i];
+  // Bucket k holds the offsets from min whose bit width falls in [8, 15) for
+  // k = 1, [15, 22) for k = 2 and so on in steps of 7, with bucket 0 below 8
+  // and the last bucket cut at the type's width. An offset reaches bucket k
+  // exactly when it is at least 1 << 7k, so each bucket is the difference of
+  // two threshold counts, and a threshold count is a compare-and-sum over the
+  // rows that vectorises. Counting a bit width per row cannot, and its
+  // increments into a handful of counters stall on store forwarding.
+  const size_t numBuckets = sizeof(T) * 8 / 7 + 1;
+  const auto base = static_cast<UnsignedT>(min());
+  std::vector<uint64_t> reaching(numBuckets + 1, 0);
+  reaching[0] = data_.size();
+  for (size_t bucket = 1; bucket < numBuckets; ++bucket) {
+    const auto threshold = static_cast<UnsignedT>(UnsignedT{1} << (7 * bucket));
+    uint64_t count{0};
+    for (size_t i = 0; i < data_.size(); ++i) {
+      const auto offset = static_cast<UnsignedT>(
+          static_cast<UnsignedT>(data_[i]) - base);
+      count += offset >= threshold;
     }
-    ++iteration;
-    start = end;
-    end += 7;
-    if (bitCounts.size() < end) {
-      end = bitCounts.size();
-    }
+    reaching[bucket] = count;
   }
-
+  std::vector<uint64_t> bucketCounts(numBuckets);
+  for (size_t bucket = 0; bucket < numBuckets; ++bucket) {
+    bucketCounts[bucket] = reaching[bucket] - reaching[bucket + 1];
+  }
   bucketCounts_ = std::move(bucketCounts);
 }
 
@@ -417,24 +437,35 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
   using unsignedType = typename std::make_unsigned<T>::type;
   //
   // Written without a branch on the direction of each step, which on a stream
-  // that rises and falls at random would mispredict on half of them and keeps
-  // the loop from vectorising. A falling step contributes zero to the largest
-  // increase, which never exceeds a maximum that starts at zero.
-  uint64_t nonDecreasingCount{0};
-  uint64_t maxIncrease{0};
-  uint64_t sumAbsoluteDelta{0};
-  for (size_t i = 1; i < data_.size(); ++i) {
-    const uint64_t previous = static_cast<unsignedType>(data_[i - 1]);
-    const uint64_t value = static_cast<unsignedType>(data_[i]);
-    const bool rising = value >= previous;
-    const uint64_t delta = rising ? value - previous : previous - value;
-    sumAbsoluteDelta += delta;
-    nonDecreasingCount += rising;
-    maxIncrease = std::max(maxIncrease, rising ? delta : uint64_t{0});
+  // that rises and falls at random would mispredict on half of them, and in
+  // the type's own width with block totals that fit it, which is what lets the
+  // loop vectorise: a step between two values of a type is below its range, a
+  // falling step contributes zero to a largest increase that starts at zero,
+  // and a block of kBlock steps of at most 16 bits totals below 2^32.
+  constexpr size_t kBlock{4'096};
+  using BlockTotal = std::conditional_t<sizeof(T) <= 2, uint32_t, uint64_t>;
+  const size_t size = data_.size();
+  for (size_t start = 1; start < size; start += kBlock) {
+    const size_t end = std::min(size, start + kBlock);
+    BlockTotal blockSum{0};
+    uint32_t blockNonDecreasing{0};
+    unsignedType blockMaxIncrease{0};
+    for (size_t i = start; i < end; ++i) {
+      const auto previous = static_cast<unsignedType>(data_[i - 1]);
+      const auto value = static_cast<unsignedType>(data_[i]);
+      const bool rising = value >= previous;
+      const auto delta = static_cast<unsignedType>(
+          rising ? value - previous : previous - value);
+      blockSum += delta;
+      blockNonDecreasing += rising;
+      blockMaxIncrease = std::max(
+          blockMaxIncrease, rising ? delta : static_cast<unsignedType>(0));
+    }
+    stats.sumAbsoluteDelta += blockSum;
+    stats.nonDecreasingCount += blockNonDecreasing;
+    stats.maxIncrease =
+        std::max<uint64_t>(stats.maxIncrease, blockMaxIncrease);
   }
-  stats.nonDecreasingCount = nonDecreasingCount;
-  stats.maxIncrease = maxIncrease;
-  stats.sumAbsoluteDelta = sumAbsoluteDelta;
   adjacentPairStats_ = stats;
 }
 

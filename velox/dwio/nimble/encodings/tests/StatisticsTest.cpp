@@ -607,6 +607,68 @@ TYPED_TEST(StatisticsIntegerTests, buckets) {
   }
 }
 
+// Both are accumulated in blocks, so the reference below walks the rows one
+// at a time, over lengths that leave partial blocks and over values that reach
+// both ends of the type.
+TYPED_TEST(StatisticsIntegerTests, adjacentPairStatsAndMinMaxBlocks) {
+  using T = TypeParam;
+  using ValueType = typename T::valueType;
+  using UnsignedType = std::make_unsigned_t<ValueType>;
+
+  std::mt19937_64 rng{kShuffleSeed};
+  for (const size_t size :
+       {size_t{1}, size_t{2}, size_t{5'000}, size_t{9'000}}) {
+    SCOPED_TRACE(size);
+    std::vector<ValueType> data(size);
+    for (size_t i = 0; i < size; ++i) {
+      // Mostly the extremes, so steps span the whole range.
+      const uint64_t draw = rng();
+      data[i] = draw % 3 == 0 ? std::numeric_limits<ValueType>::max()
+          : draw % 3 == 1     ? std::numeric_limits<ValueType>::lowest()
+                              : static_cast<ValueType>(draw >> 8);
+    }
+    std::vector<UnsignedType> unsignedData(size);
+    for (size_t i = 0; i < size; ++i) {
+      unsignedData[i] = static_cast<UnsignedType>(data[i]);
+    }
+
+    uint64_t nonDecreasingCount{0};
+    uint64_t maxIncrease{0};
+    uint64_t sumAbsoluteDelta{0};
+    for (size_t i = 1; i < size; ++i) {
+      const uint64_t previous = static_cast<UnsignedType>(data[i - 1]);
+      const uint64_t value = static_cast<UnsignedType>(data[i]);
+      if (value >= previous) {
+        ++nonDecreasingCount;
+        maxIncrease = std::max(maxIncrease, value - previous);
+        sumAbsoluteDelta += value - previous;
+      } else {
+        sumAbsoluteDelta += previous - value;
+      }
+    }
+    const auto statistics = T::create({data});
+    const auto& pairs = statistics.adjacentPairStats();
+    EXPECT_EQ(nonDecreasingCount, pairs.nonDecreasingCount);
+    EXPECT_EQ(maxIncrease, pairs.maxIncrease);
+    EXPECT_EQ(sumAbsoluteDelta, pairs.sumAbsoluteDelta);
+
+    constexpr uint16_t kBlockSize{1'024};
+    const auto unsignedStatistics =
+        nimble::Statistics<UnsignedType>::create({unsignedData});
+    const auto& blocks = unsignedStatistics.minMaxBlocks(kBlockSize);
+    ASSERT_EQ((size + kBlockSize - 1) / kBlockSize, blocks.size());
+    for (size_t block = 0; block < blocks.size(); ++block) {
+      const size_t start = block * kBlockSize;
+      const size_t end = std::min(size, start + kBlockSize);
+      const auto [minIt, maxIt] = std::minmax_element(
+          unsignedData.begin() + start, unsignedData.begin() + end);
+      EXPECT_EQ(end - start, blocks[block].count);
+      EXPECT_EQ(*minIt, blocks[block].min);
+      EXPECT_EQ(*maxIt, blocks[block].max);
+    }
+  }
+}
+
 TYPED_TEST(StatisticsIntegerTests, bitFlipProfileConstant) {
   using T = TypeParam;
   using ValueType = typename T::valueType;

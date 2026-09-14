@@ -230,6 +230,35 @@ class FrequencyPartitionEncoding
       counts.push_back(unique.second);
     }
 
+    // A tier needs the sum of its counts, never their order, so tiers are
+    // split off with partitions rather than by sorting. Where the capacity
+    // table reaches past the cardinality, as it does for 64-bit values, sorting
+    // was a full sort of one count per distinct value. The counts of every
+    // tier that ends before the last one are split from the rest first, in one
+    // pass over all of them, and the narrower tiers are then split within that
+    // prefix.
+    size_t innerTiersEnd = 0;
+    {
+      uint64_t tierStart = 0;
+      for (const uint32_t keyBits : kKeyBitOptions) {
+        if (keyBits > kMaxKeyBits || tierStart >= ranked) {
+          break;
+        }
+        tierStart +=
+            std::min<uint64_t>(getCapacity(keyBits), ranked - tierStart);
+        if (tierStart < counts.size()) {
+          innerTiersEnd = static_cast<size_t>(tierStart);
+        }
+      }
+    }
+    if (innerTiersEnd > 0) {
+      std::nth_element(
+          counts.begin(),
+          counts.begin() + innerTiersEnd,
+          counts.end(),
+          std::greater<uint64_t>());
+    }
+
     uint64_t payloadSize = 0;
     uint64_t assigned = 0;
     uint64_t rowsInTiers = 0;
@@ -243,17 +272,14 @@ class FrequencyPartitionEncoding
       ++tiersCreated;
       const uint64_t dictEntries =
           std::min<uint64_t>(getCapacity(keyBits), ranked - assigned);
-      // A tier needs the sum of its counts, never their order, so each tier
-      // is partitioned off the front of what is left rather than the ranked
-      // prefix being sorted. Where the capacity table reaches past the
-      // cardinality, as it does for 64-bit values, sorting was a full sort of
-      // one count per distinct value.
-      const auto tierEnd = counts.begin() + (assigned + dictEntries);
-      if (tierEnd != counts.end()) {
+      // Inside the prefix split off above, so that only the widest tier pays
+      // a pass over every distinct value.
+      const size_t tierEnd = static_cast<size_t>(assigned + dictEntries);
+      if (tierEnd < innerTiersEnd) {
         std::nth_element(
             counts.begin() + assigned,
-            tierEnd,
-            counts.end(),
+            counts.begin() + tierEnd,
+            counts.begin() + innerTiersEnd,
             std::greater<uint64_t>());
       }
       uint64_t tierRows = 0;
