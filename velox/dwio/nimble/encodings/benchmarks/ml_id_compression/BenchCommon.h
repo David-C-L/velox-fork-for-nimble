@@ -1470,6 +1470,36 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
+  // SIS/realNested and its view, with split boundaries from the hybrid planner
+  // (Encoding::Options::subIntSplitHybridPlanner) instead of the DP's argmin.
+  // Everything else is the realNested arm, so the pair differs only by plan.
+  for (const bool view : {false, true}) {
+    EncoderEntry<T> entry;
+    entry.name = view ? "SIS/hybrid+view" : "SIS/hybrid";
+    entry.family = "SubIntSplit";
+    entry.variant = view ? "hybrid_view" : "hybrid";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = view;
+    entry.randomAccess = view;
+    entry.factory = [view](
+                        const Vector<T>& data, const Encoding::Options& opts) {
+      Encoding::Options hybridOptions = opts;
+      hybridOptions.subIntSplitHybridPlanner = true;
+      if (view) {
+        auto impl = std::make_unique<
+            NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->encodeWith(data, hybridOptions, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      }
+      auto impl =
+          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      impl->target.encode(data, hybridOptions, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
   // SIS/legacyCost and SIS/legacyCost+view are dropped, together with the
   // legacy inventory they were the only readers of. They pinned the cost
   // models SubIntSplit scored before Delta, FOR, PFOR, Huffman, DeltaBlock,

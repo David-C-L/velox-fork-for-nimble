@@ -353,6 +353,36 @@ class Encoding {
     /// thing on every column, which a weight does not.
     double subIntSplitMaxSizeRegression{0.05};
 
+    /// Chooses split boundaries with the hybrid planner instead of trusting the
+    /// split DP's argmin.
+    ///
+    /// The DP prices ranges with cost models that, measured against whole-
+    /// column encodes, name the cheapest encoding for a range about a fifth of
+    /// the time. The hybrid planner keeps the DP as a cheap shortlister: it
+    /// takes the subIntSplitHybridShortlist cheapest plans, plus plans cut only
+    /// at the bit-flip profile's gradient boundaries and the DP's own plan,
+    /// re-prices only the ranges those plans use with the estimators section
+    /// selection itself uses, on subIntSplitHybridRescoreSamples rows, and then
+    /// refines the winner by moving, merging and splitting boundaries under the
+    /// same pricing. Decode weighting and subIntSplitMaxSizeRegression apply to
+    /// the re-priced plans.
+    ///
+    /// Off by default. On seven ID columns it stored every column in no more
+    /// bytes than the DP's plan and up to 18% fewer, for roughly twice the
+    /// planning time.
+    bool subIntSplitHybridPlanner{false};
+
+    /// How many of the split DP's cheapest plans the hybrid planner re-prices,
+    /// and separately how many bit-flip-restricted plans. Only read when
+    /// subIntSplitHybridPlanner is set.
+    uint32_t subIntSplitHybridShortlist{8};
+
+    /// Rows sampled to re-price the hybrid planner's shortlisted ranges. Only
+    /// the ranges in shortlisted plans and refinement moves are priced at this
+    /// size, which is what keeps a larger sample affordable. Only read when
+    /// subIntSplitHybridPlanner is set.
+    uint32_t subIntSplitHybridRescoreSamples{16'384};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

@@ -42,6 +42,7 @@ add_library(
   SharedDictionaryCatalog.h
   SharedDictionaryEncoding.cpp
   SparseBoolEncoding.cpp
+  SubIntSplitPlanRefiner.cpp
   TrivialEncoding.cpp
   common/Encoding.cpp
   common/EncodingFactory.cpp

@@ -25,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "folly/container/F14Set.h"
@@ -42,7 +43,9 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitPlanRefiner.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
@@ -1310,45 +1313,91 @@ std::string_view SubIntSplitEncoding<T>::encode(
         .weight = options.subIntSplitDecodeWeight,
         .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
             options.subIntSplitDecodeAccessPattern)};
-    auto selectorResult = detail::subintsplit::selectSplitsRestricted(
-        sampleBuf,
-        kBits,
-        valueCount,
-        options.subIntSplitAllowedEncodings,
-        selectorConfig);
+    // The hybrid planner replaces the DP's argmin with a shortlist re-priced
+    // by section selection's own estimators and refined, bounded on size by
+    // the same cap. See Encoding::Options::subIntSplitHybridPlanner. It costs
+    // the grid once and takes the DP's own plan as the first of its shortlist,
+    // so it replaces the call below rather than adding to it.
+    bool planned = false;
+    if constexpr (
+        std::is_same_v<physicalType, uint32_t> ||
+        std::is_same_v<physicalType, uint64_t>) {
+      if (options.subIntSplitHybridPlanner) {
+        // Bit-flip gradient boundaries nominate plans and bound where
+        // refinement splits a segment. They do not constrain the DP, which
+        // was measured at 65% mean regret when they did.
+        const auto profileStatistics = Statistics<uint64_t>::create(
+            std::span<const uint64_t>(sampleBuf.data(), sampleBuf.size()));
+        std::vector<bool> cuts(kBits + 1, false);
+        cuts[0] = true;
+        cuts[kBits] = true;
+        for (const int boundary :
+             detail::subintsplit::bitFlipGradientBoundaries(
+                 profileStatistics.bitFlipProfile(),
+                 detail::subintsplit::TopLevelPolicyConfig{})) {
+          if (boundary > 0 && boundary < kBits) {
+            cuts[boundary] = true;
+          }
+        }
+        const auto shortlist = detail::subintsplit::shortlistSplitsRestricted(
+            sampleBuf,
+            kBits,
+            valueCount,
+            options.subIntSplitAllowedEncodings,
+            selectorConfig,
+            options.subIntSplitHybridShortlist,
+            cuts);
+        auto refined =
+            detail::subintsplit::SubIntSplitPlanRefiner::refine<physicalType>(
+                values, kBits, shortlist, cuts, selectorConfig, options);
+        if (!refined.segments.empty()) {
+          segments = std::move(refined.segments);
+          planned = true;
+        }
+      }
+    }
 
-    // What the weighted plan gave up in bytes, bounded against what size
-    // alone would have stored the column in. The DP minimises size plus a
-    // decode term in the same units, so on a column with structure it will
-    // keep buying decode with bytes for as long as the weight makes that
-    // arithmetic work, and there is no point at which it stops on its own.
-    //
-    // Costed rather than estimated: the size-only plan is a second run of the
-    // same DP over the same sample, which is the only way to know what was
-    // given up, since the weighted plan's own totalSizeBits says what it
-    // stores and not what it could have stored. Paid only when the weight is
-    // on, and the sample is the same one already extracted.
-    if (selectorConfig.decodeWeighting.weight != 0.0) {
-      auto sizeOnlyConfig = selectorConfig;
-      sizeOnlyConfig.decodeWeighting =
-          detail::subintsplit::DecodeCostWeighting{};
-      auto sizeOnly = detail::subintsplit::selectSplitsRestricted(
+    if (!planned) {
+      auto selectorResult = detail::subintsplit::selectSplitsRestricted(
           sampleBuf,
           kBits,
           valueCount,
           options.subIntSplitAllowedEncodings,
-          sizeOnlyConfig);
-      // Compared on estimated size alone, not on totalCost: bytes are what is
-      // being bounded, and totalCost is the objective that has just been shown
-      // not to bound them.
-      const double allowedSizeBits = sizeOnly.totalSizeBits *
-          (1.0 + options.subIntSplitMaxSizeRegression);
-      if (selectorResult.totalSizeBits > allowedSizeBits) {
-        selectorResult = std::move(sizeOnly);
-      }
-    }
+          selectorConfig);
 
-    segments = std::move(selectorResult.segments);
+      // What the weighted plan gave up in bytes, bounded against what size
+      // alone would have stored the column in. The DP minimises size plus a
+      // decode term in the same units, so on a column with structure it will
+      // keep buying decode with bytes for as long as the weight makes that
+      // arithmetic work, and there is no point at which it stops on its own.
+      //
+      // Costed rather than estimated: the size-only plan is a second run of the
+      // same DP over the same sample, which is the only way to know what was
+      // given up, since the weighted plan's own totalSizeBits says what it
+      // stores and not what it could have stored. Paid only when the weight is
+      // on, and the sample is the same one already extracted.
+      if (selectorConfig.decodeWeighting.weight != 0.0) {
+        auto sizeOnlyConfig = selectorConfig;
+        sizeOnlyConfig.decodeWeighting =
+            detail::subintsplit::DecodeCostWeighting{};
+        auto sizeOnly = detail::subintsplit::selectSplitsRestricted(
+            sampleBuf,
+            kBits,
+            valueCount,
+            options.subIntSplitAllowedEncodings,
+            sizeOnlyConfig);
+        // Compared on estimated size alone, not on totalCost: bytes are what is
+        // being bounded, and totalCost is the objective that has just been shown
+        // not to bound them.
+        const double allowedSizeBits = sizeOnly.totalSizeBits *
+            (1.0 + options.subIntSplitMaxSizeRegression);
+        if (selectorResult.totalSizeBits > allowedSizeBits) {
+          selectorResult = std::move(sizeOnly);
+        }
+      }
+
+      segments = std::move(selectorResult.segments);
+    }
   }
 
   NIMBLE_CHECK(

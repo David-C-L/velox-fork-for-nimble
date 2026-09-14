@@ -290,22 +290,20 @@ struct SelectorResult {
 // distinct values in a sample is a lower bound on the stream's and nothing
 // more, and without knowing how much larger the stream is there is no way to
 // say how much of one the sample saw.
+//
+// buildSegmentCostGrid costs every bit range [l..r] of `samples`, scaled to
+// `fullCount` rows, as a row-major sz*sz grid indexed l * sz + r;
+// selectSplitsImpl runs the DP over it. `samples` must be non-empty and `sz` in
+// [1, 64] for the grid.
 template <typename CostFn>
-inline SelectorResult selectSplitsImpl(
+inline std::vector<SegmentCost> buildSegmentCostGrid(
     const std::vector<uint64_t>& samples,
-    int kBits,
+    int sz,
     size_t fullCount,
-    const SelectorConfig& cfg,
     CostFn&& costFn) {
-  if (samples.empty() || kBits <= 0) {
-    return {};
-  }
-  kBits = std::min(kBits, 64);
-
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
   MetricCollector collector;
 
-  const int sz = kBits;
   std::vector<SegmentCost> bestCost(sz * sz);
 
   BitRangeExtractor extractor(samples);
@@ -357,6 +355,23 @@ inline SelectorResult selectSplitsImpl(
       bestCost[l * sz + r] = cell;
     }
   }
+  return bestCost;
+}
+
+template <typename CostFn>
+inline SelectorResult selectSplitsImpl(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const SelectorConfig& cfg,
+    CostFn&& costFn) {
+  if (samples.empty() || kBits <= 0) {
+    return {};
+  }
+  kBits = std::min(kBits, 64);
+  const int sz = kBits;
+  const std::vector<SegmentCost> bestCost = buildSegmentCostGrid(
+      samples, sz, fullCount, std::forward<CostFn>(costFn));
 
   std::vector<double> dp(sz + 1, std::numeric_limits<double>::infinity());
   std::vector<int> prev(sz + 1, -1);
@@ -437,6 +452,33 @@ inline SelectorResult selectSplitsImpl(
 
 // Selects splits costing segments against `allowed` only. An empty set costs
 // every encoding, so a caller can pass one through unconditionally.
+// The per-range cost function the split DP minimises, over `allowed` only.
+// Holds a reference to `allowed`, which must outlive it.
+inline auto restrictedSegmentCostFn(
+    const AllowedEncodings& allowed,
+    const SelectorConfig& cfg) {
+  return [&allowed,
+          allowHuffman = cfg.allowHuffman,
+          allowDeltaBlock = cfg.allowDeltaBlock,
+          weighting = cfg.decodeWeighting](
+             const SegmentMetrics& m,
+             size_t numValues,
+             size_t streamCount,
+             int bitWidth,
+             const std::vector<uint64_t>& segValues) noexcept {
+    return bestSegmentCost(
+        m,
+        numValues,
+        streamCount,
+        bitWidth,
+        segValues,
+        allowed,
+        allowHuffman,
+        allowDeltaBlock,
+        weighting);
+  };
+}
+
 inline SelectorResult selectSplitsRestricted(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -444,30 +486,7 @@ inline SelectorResult selectSplitsRestricted(
     const AllowedEncodings& allowed,
     const SelectorConfig& cfg = defaultSelectorConfig()) {
   return selectSplitsImpl(
-      samples,
-      kBits,
-      fullCount,
-      cfg,
-      [&allowed,
-       allowHuffman = cfg.allowHuffman,
-       allowDeltaBlock = cfg.allowDeltaBlock,
-       weighting = cfg.decodeWeighting](
-          const SegmentMetrics& m,
-          size_t numValues,
-          size_t streamCount,
-          int bitWidth,
-          const std::vector<uint64_t>& segValues) noexcept {
-        return bestSegmentCost(
-            m,
-            numValues,
-            streamCount,
-            bitWidth,
-            segValues,
-            allowed,
-            allowHuffman,
-            allowDeltaBlock,
-            weighting);
-      });
+      samples, kBits, fullCount, cfg, restrictedSegmentCostFn(allowed, cfg));
 }
 
 // Selects splits over the full encoding inventory.
@@ -487,6 +506,112 @@ inline SelectorResult selectSplits(
     const SelectorConfig& cfg = defaultSelectorConfig()) {
   static const AllowedEncodings kAll;
   return selectSplitsRestricted(samples, kBits, fullCount, kAll, cfg);
+}
+
+// The k cheapest segmentations of [0, sz) over `grid`, cheapest first, under
+// the same split penalty and minimum segment width as the DP.
+//
+// The DP keeps one predecessor per position and trusts its argmin. Keeping k
+// is what lets a planner hand a shortlist to a more accurate and more expensive
+// scorer instead: measured against whole-column encodes, the grid's costs name
+// the cheapest encoding for a range about a fifth of the time. When `cuts` is
+// non-empty a range may only start and end at positions it marks, which is how
+// bit-flip gradient boundaries nominate plans without constraining the DP.
+// Each segment carries its grid cell's encoding and costs.
+inline std::vector<std::vector<SegmentPlan>> kBestSplits(
+    const std::vector<SegmentCost>& grid,
+    int sz,
+    const SelectorConfig& cfg,
+    size_t k,
+    const std::vector<bool>& cuts = {}) {
+  struct Entry {
+    double cost;
+    int prevPosition;
+    size_t prevRank;
+  };
+  const auto isCut = [&cuts](int position) {
+    return cuts.empty() || cuts[position];
+  };
+  std::vector<std::vector<Entry>> best(sz + 1);
+  best[0].push_back({0.0, -1, 0});
+  for (int end = 1; end <= sz; ++end) {
+    if (!isCut(end)) {
+      continue;
+    }
+    std::vector<Entry> candidates;
+    for (int start = 0; start < end; ++start) {
+      if (end - start < cfg.minSegmentWidth || !isCut(start)) {
+        continue;
+      }
+      const double rangeCost = grid[start * sz + (end - 1)].weightedBits;
+      if (!std::isfinite(rangeCost)) {
+        continue;
+      }
+      const double penalty = start == 0 ? 0.0 : cfg.splitPenalty;
+      for (size_t rank = 0; rank < best[start].size(); ++rank) {
+        candidates.push_back(
+            {best[start][rank].cost + rangeCost + penalty, start, rank});
+      }
+    }
+    const size_t keep = std::min(k, candidates.size());
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + keep,
+        candidates.end(),
+        [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+    candidates.resize(keep);
+    best[end] = std::move(candidates);
+  }
+
+  std::vector<std::vector<SegmentPlan>> plans;
+  for (size_t rank = 0; rank < best[sz].size(); ++rank) {
+    std::vector<SegmentPlan> plan;
+    int position = sz;
+    size_t atRank = rank;
+    while (position > 0) {
+      const Entry& entry = best[position][atRank];
+      const SegmentCost& cell = grid[entry.prevPosition * sz + (position - 1)];
+      SegmentPlan segment;
+      segment.bitStart = entry.prevPosition;
+      segment.bitEnd = position - 1;
+      segment.encoding = cell.encoding;
+      segment.cost = cell.weightedBits;
+      segment.sizeCostBits = cell.sizeBits;
+      segment.decodeNanosPerRow = cell.decodeNanosPerRow;
+      plan.push_back(segment);
+      position = entry.prevPosition;
+      atRank = entry.prevRank;
+    }
+    std::reverse(plan.begin(), plan.end());
+    plans.push_back(std::move(plan));
+  }
+  return plans;
+}
+
+// Shortlists split plans for the hybrid planner from one costing of the grid:
+// the k cheapest plans, then the k cheapest cut only at `cuts`. Plans may
+// repeat across the two lists; callers that re-price them cache by range.
+inline std::vector<std::vector<SegmentPlan>> shortlistSplitsRestricted(
+    const std::vector<uint64_t>& samples,
+    int kBits,
+    size_t fullCount,
+    const AllowedEncodings& allowed,
+    const SelectorConfig& cfg,
+    size_t k,
+    const std::vector<bool>& cuts) {
+  if (samples.empty() || kBits <= 0) {
+    return {};
+  }
+  const int sz = std::min(kBits, 64);
+  const std::vector<SegmentCost> grid = buildSegmentCostGrid(
+      samples, sz, fullCount, restrictedSegmentCostFn(allowed, cfg));
+  auto plans = kBestSplits(grid, sz, cfg, k);
+  if (!cuts.empty()) {
+    for (auto& plan : kBestSplits(grid, sz, cfg, k, cuts)) {
+      plans.push_back(std::move(plan));
+    }
+  }
+  return plans;
 }
 
 } // namespace facebook::nimble::detail::subintsplit
