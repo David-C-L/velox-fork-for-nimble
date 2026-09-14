@@ -1315,7 +1315,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
     selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{
         .weight = options.subIntSplitDecodeWeight,
         .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
-            options.subIntSplitDecodeAccessPattern)};
+            options.subIntSplitDecodeAccessPattern),
+        .readPath = static_cast<detail::subintsplit::DecodeReadPath>(
+            options.subIntSplitDecodeReadPath)};
     // The hybrid planner replaces the DP's argmin with a shortlist re-priced
     // by section selection's own estimators and refined, bounded on size by
     // the same cap. See Encoding::Options::subIntSplitHybridPlanner. It costs

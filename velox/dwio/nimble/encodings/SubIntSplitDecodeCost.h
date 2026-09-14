@@ -51,6 +51,23 @@ enum class DecodeAccessPattern : uint8_t {
   Range = 3,
 };
 
+/// Which reader a plan is being costed for.
+///
+/// The two read the same sections through different objects and pay for
+/// different things. The cursor path constructs each section's Encoding once
+/// and decodes into the caller's buffer. The view path constructs an
+/// EncodingView per section, and where a section's encoding has none -- or its
+/// view cannot be built, as happens when compression nests below it -- a
+/// MaterializedEncodingView that decodes the whole section in its constructor.
+/// Measured per section, FrequencyPartition, FOR and Delta sections always took
+/// that fallback, and MainlyConstant's real view reads five times slower than
+/// its cursor, so a plan priced for one path can be several times off on the
+/// other.
+enum class DecodeReadPath : uint8_t {
+  Cursor = 0,
+  View = 1,
+};
+
 /// How well a rate is supported by measurement. A model that cannot say this
 /// invites its weakest numbers to be read as its strongest.
 enum class DecodeCostConfidence : uint8_t {
@@ -88,6 +105,15 @@ struct DecodeRate {
 /// section" even when the section is free to decode, which is the effect
 /// section attribution kept showing and the size model could not represent.
 inline constexpr double kAssemblyNanosPerRowPerSection = 0.38;
+
+/// The view path's kAssemblyNanosPerRowPerSection.
+///
+/// Measured as the gap between a whole SubIntSplitEncodingView read (built and
+/// read) and the sum of its sections read standalone through the same views in
+/// the same 1024-row chunks, divided by the section count, over 280
+/// untransformed plans on seven ID columns: median 0.24, with the section sums
+/// correlating with the whole reads at r = 0.998.
+inline constexpr double kViewAssemblyNanosPerRowPerSection = 0.24;
 
 /// Nanoseconds per row per section a key-derived plan pays on top of what its
 /// sections cost, for undoing the gather on the read side.
@@ -188,7 +214,7 @@ inline constexpr double kDecodeBitsPerNanosecond = 8.0;
 /// per section that Range pays over Bulk. Uncalibrated.
 inline constexpr double kNominalRangeLength = 128.0;
 
-/// The measured decode rate for `encodingType` under `pattern`.
+/// The cursor path's decode rate for `encodingType` under `pattern`.
 ///
 /// Bulk rates are least-squares fits of nanoseconds per row against encoded
 /// bytes per row over the per-section attribution of four columns
@@ -200,7 +226,7 @@ inline constexpr double kNominalRangeLength = 128.0;
 /// seven sections. The ordering between encodings is measured; the level is
 /// fitted on a single column and the per-section placement is an argument, not
 /// an observation. Treat them as a ranking.
-inline DecodeRate decodeRate(
+inline DecodeRate cursorDecodeRate(
     EncodingType encodingType,
     DecodeAccessPattern pattern) noexcept {
   // Bulk, fitted. Point count and R^2 are given per entry: an entry with three
@@ -354,8 +380,152 @@ inline DecodeRate decodeRate(
   return bulk();
 }
 
+/// The view path's decode rate for `encodingType` under `pattern`.
+///
+/// Measured by bench_section_decode_rate: every section of 140 SubIntSplit
+/// plans per column pair (seven ID columns; realNested and hybrid planners;
+/// decode weight 0, and 0.02 and 0.25 priced for either reader; RLE,
+/// FrequencyPartition or Delta withdrawn from sections to force the
+/// alternatives), each read standalone over 1M rows through
+/// detail::makeSectionView.
+///
+/// Bulk is construction plus one read() per 1024 rows in order, per row, because
+/// that is how SubIntSplitEncodingView's chunked kernel reads a section. A
+/// table fitted on single whole-section reads mispriced RLE, whose view then
+/// took a per-run path for every chunk and read short-run sections twelve times
+/// slower than one call; with that view fixed, chunks cost RLE 1.14 times a
+/// single read. Summed with kViewAssemblyNanosPerRowPerSection per section,
+/// these rates reproduce the whole-view reads of 280 untransformed plans at
+/// r = 0.998 (median whole over sum 1.09).
+///
+/// Point is nanoseconds per probe through readAt plus kViewProbeNanosPerSection,
+/// the median per-section gap between whole-view probes and their live
+/// sections' standalone probes over the same plans (r = 0.996). Unlike the
+/// cursor point rates these are absolute, not a ranking.
+///
+/// Untransformed Constant sections cost nothing: the view folds them into a
+/// single OR before reading anything. Entries are medians where cost did not
+/// track encoded size (R^2 below 0.5) and fits where it did. Encodings no plan
+/// selected keep the cursor path's rates.
+inline DecodeRate viewDecodeRate(
+    EncodingType encodingType,
+    DecodeAccessPattern pattern) noexcept {
+  const auto bulk = [&]() -> DecodeRate {
+    switch (encodingType) {
+      case EncodingType::Constant:
+        return {0.0, 0.0, DecodeCostConfidence::Measured};
+      // n=160, R^2 0.30 against size. Kept as a fit rather than a median
+      // because run count is what RLE's cost is made of on both readers; the
+      // spread is mostly sections whose compressed children force the
+      // materialized fallback at about 25 ns per row.
+      case EncodingType::RLE:
+        return {1.83, 11.90, DecodeCostConfidence::Measured};
+      // n=62, flat. All materialized fallbacks: construction resolves the tiers
+      // at about 25 ns per row before anything is read.
+      case EncodingType::FrequencyPartition:
+        return {28.04, 0.0, DecodeCostConfidence::Measured};
+      // n=36, flat, nearly all materialized: twice the cursor, for the
+      // full-width array the fallback allocates and fills.
+      case EncodingType::FOR:
+        return {2.08, 0.0, DecodeCostConfidence::Measured};
+      // n=30, flat, a real view.
+      case EncodingType::BlockBitPacking:
+        return {1.35, 0.0, DecodeCostConfidence::Measured};
+      // n=24, flat, identical to the cursor.
+      case EncodingType::FixedBitWidth:
+        return {0.69, 0.0, DecodeCostConfidence::Measured};
+      // n=15, R^2 1.00: a copy of the stored bytes.
+      case EncodingType::Trivial:
+        return {0.0, 0.09, DecodeCostConfidence::Measured};
+      // n=12, flat (R^2 0.19); 1.35x its single read.
+      case EncodingType::Dictionary:
+        return {2.01, 0.0, DecodeCostConfidence::Measured};
+      // n=11, R^2 0.89.
+      case EncodingType::SimdForBitpack:
+        return {1.97, 0.12, DecodeCostConfidence::Measured};
+      // n=11, all materialized, flat.
+      case EncodingType::Delta:
+        return {5.13, 0.0, DecodeCostConfidence::Measured};
+      // n=1: one reading, a real view at five times its cursor's 0.65.
+      case EncodingType::MainlyConstant:
+        return {3.22, 0.0, DecodeCostConfidence::Inferred};
+      default:
+        return cursorDecodeRate(encodingType, DecodeAccessPattern::Bulk);
+    }
+  };
+
+  const auto point = [&]() -> DecodeRate {
+    constexpr double kViewProbeNanosPerSection = 31.0;
+    const auto measured = [](double nanos) -> DecodeRate {
+      return {nanos + kViewProbeNanosPerSection,
+              0.0,
+              DecodeCostConfidence::Measured};
+    };
+    switch (encodingType) {
+      case EncodingType::Constant:
+        return {0.0, 0.0, DecodeCostConfidence::Measured};
+      // The dearest measured probe: a search over run ends.
+      case EncodingType::RLE:
+        return measured(146.2);
+      // Cheap per probe because construction already decoded everything; that
+      // cost is in the bulk entry.
+      case EncodingType::FrequencyPartition:
+        return measured(18.6);
+      case EncodingType::FOR:
+        return measured(17.1);
+      case EncodingType::BlockBitPacking:
+        return measured(42.4);
+      case EncodingType::FixedBitWidth:
+        return measured(35.5);
+      case EncodingType::Trivial:
+        return measured(31.0);
+      case EncodingType::SimdForBitpack:
+        return measured(75.4);
+      case EncodingType::Delta:
+        return measured(27.4);
+      case EncodingType::Dictionary:
+        return measured(58.5);
+      case EncodingType::MainlyConstant:
+        return {29.1 + kViewProbeNanosPerSection,
+                0.0,
+                DecodeCostConfidence::Inferred};
+      default: {
+        DecodeRate rate =
+            cursorDecodeRate(encodingType, DecodeAccessPattern::Point);
+        rate.baseNanosPerRow += kViewProbeNanosPerSection;
+        return rate;
+      }
+    }
+  };
+
+  switch (pattern) {
+    case DecodeAccessPattern::Bulk:
+      return bulk();
+    case DecodeAccessPattern::Point:
+    case DecodeAccessPattern::Gather:
+      return point();
+    case DecodeAccessPattern::Range: {
+      DecodeRate rate = bulk();
+      rate.baseNanosPerRow += point().baseNanosPerRow / kNominalRangeLength;
+      rate.confidence = DecodeCostConfidence::Unfitted;
+      return rate;
+    }
+  }
+  return bulk();
+}
+
+/// The decode rate for `encodingType` under `pattern`, on `readPath`.
+inline DecodeRate decodeRate(
+    EncodingType encodingType,
+    DecodeAccessPattern pattern,
+    DecodeReadPath readPath) noexcept {
+  return readPath == DecodeReadPath::View
+      ? viewDecodeRate(encodingType, pattern)
+      : cursorDecodeRate(encodingType, pattern);
+}
+
 /// Nanoseconds per row a section of `estimatedSizeBits` over `numValues` rows
-/// costs to decode, under `pattern`.
+/// costs to decode, under `pattern`, on `readPath`.
 ///
 /// The size estimate is the second input, which is what makes this free to
 /// evaluate inside the split grid: every candidate encoding is already priced
@@ -364,12 +534,13 @@ inline DecodeRate decodeRate(
 inline double decodeNanosPerRow(
     EncodingType encodingType,
     DecodeAccessPattern pattern,
+    DecodeReadPath readPath,
     double estimatedSizeBits,
     size_t numValues) noexcept {
   if (numValues == 0 || !std::isfinite(estimatedSizeBits)) {
     return 0.0;
   }
-  const DecodeRate rate = decodeRate(encodingType, pattern);
+  const DecodeRate rate = decodeRate(encodingType, pattern, readPath);
   const double bytesPerRow =
       estimatedSizeBits / 8.0 / static_cast<double>(numValues);
   return rate.baseNanosPerRow + rate.nanosPerEncodedByteRow * bytesPerRow;
@@ -397,6 +568,7 @@ decodeCostBits(double nanosPerRow, size_t numValues, double weight) noexcept {
 struct DecodeCostWeighting {
   double weight{0.0};
   DecodeAccessPattern accessPattern{DecodeAccessPattern::Bulk};
+  DecodeReadPath readPath{DecodeReadPath::Cursor};
 };
 
 /// The whole-plan decode cost of sections whose individual costs are
@@ -414,15 +586,19 @@ struct DecodeCostWeighting {
 /// probe.
 inline double combineSectionDecodeNanos(
     DecodeAccessPattern pattern,
+    DecodeReadPath readPath,
     std::span<const double> perSectionNanosPerRow) noexcept {
   double total = 0.0;
   for (const double nanos : perSectionNanosPerRow) {
     total += nanos;
   }
+  // The view path's probe overhead is folded into its point rates, like the
+  // cursor path's, so both charge nothing more per section on sparse patterns.
   const double perSectionOverhead = pattern == DecodeAccessPattern::Point ||
           pattern == DecodeAccessPattern::Gather
       ? kProbeNanosPerSection
-      : kAssemblyNanosPerRowPerSection;
+      : (readPath == DecodeReadPath::View ? kViewAssemblyNanosPerRowPerSection
+                                          : kAssemblyNanosPerRowPerSection);
   return total +
       perSectionOverhead * static_cast<double>(perSectionNanosPerRow.size());
 }

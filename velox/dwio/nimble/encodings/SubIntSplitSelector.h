@@ -415,6 +415,7 @@ inline SelectorResult selectSplitsImpl(
     result.totalSizeBits = fallback.sizeCostBits;
     result.totalDecodeNanosPerRow = combineSectionDecodeNanos(
         cfg.decodeWeighting.accessPattern,
+        cfg.decodeWeighting.readPath,
         std::span<const double>(&result.segments.back().decodeNanosPerRow, 1));
     return result;
   }
@@ -446,7 +447,9 @@ inline SelectorResult selectSplitsImpl(
     sectionNanos.push_back(segment.decodeNanosPerRow);
   }
   result.totalDecodeNanosPerRow = combineSectionDecodeNanos(
-      cfg.decodeWeighting.accessPattern, sectionNanos);
+      cfg.decodeWeighting.accessPattern,
+      cfg.decodeWeighting.readPath,
+      sectionNanos);
   return result;
 }
 

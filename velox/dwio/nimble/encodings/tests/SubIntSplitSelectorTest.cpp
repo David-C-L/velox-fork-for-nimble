@@ -327,17 +327,17 @@ TEST(SubIntSplitSelectorTest, DecodeWeightTradesSizeForDecode) {
 // able to reach different plans.
 TEST(SubIntSplitSelectorTest, PointAndBulkRankEncodingsDifferently) {
   EXPECT_GT(
-      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Point)
+      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Point, DecodeReadPath::Cursor)
           .baseNanosPerRow,
-      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Point)
+      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Point, DecodeReadPath::Cursor)
               .baseNanosPerRow *
           10.0);
   // On bulk the same pair is within a factor of two, which is why bulk alone
   // never declined it.
   EXPECT_LT(
-      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Bulk)
+      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Bulk, DecodeReadPath::Cursor)
           .baseNanosPerRow,
-      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Bulk)
+      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Bulk, DecodeReadPath::Cursor)
               .baseNanosPerRow *
           2.0);
 }
@@ -348,20 +348,30 @@ TEST(SubIntSplitSelectorTest, PointAndBulkRankEncodingsDifferently) {
 TEST(SubIntSplitSelectorTest, RleDecodeCostRisesWithEncodedSize) {
   constexpr size_t kRows = 100'000;
   const double fewRuns = decodeNanosPerRow(
-      EncodingType::RLE, DecodeAccessPattern::Bulk, 8.0 * 2'000, kRows);
+      EncodingType::RLE,
+      DecodeAccessPattern::Bulk,
+      DecodeReadPath::Cursor,
+      8.0 * 2'000,
+      kRows);
   const double manyRuns = decodeNanosPerRow(
-      EncodingType::RLE, DecodeAccessPattern::Bulk, 8.0 * 300'000, kRows);
+      EncodingType::RLE,
+      DecodeAccessPattern::Bulk,
+      DecodeReadPath::Cursor,
+      8.0 * 300'000,
+      kRows);
   EXPECT_GT(manyRuns, fewRuns * 4.0);
   // And a fixed-width section, whose cost is per row rather than per run, is
   // nearly indifferent to the same change.
   const double smallFixed = decodeNanosPerRow(
       EncodingType::FixedBitWidth,
       DecodeAccessPattern::Bulk,
+      DecodeReadPath::Cursor,
       8.0 * 2'000,
       kRows);
   const double largeFixed = decodeNanosPerRow(
       EncodingType::FixedBitWidth,
       DecodeAccessPattern::Bulk,
+      DecodeReadPath::Cursor,
       8.0 * 300'000,
       kRows);
   EXPECT_LT(largeFixed, smallFixed * 2.0);
@@ -373,13 +383,75 @@ TEST(SubIntSplitSelectorTest, RleDecodeCostRisesWithEncodedSize) {
 TEST(SubIntSplitSelectorTest, SectionDecodeCostsAddRatherThanMax) {
   const std::vector<double> sections{1.0, 2.0, 4.0};
   const double bulk = combineSectionDecodeNanos(
-      DecodeAccessPattern::Bulk, std::span<const double>(sections));
+      DecodeAccessPattern::Bulk,
+      DecodeReadPath::Cursor,
+      std::span<const double>(sections));
   EXPECT_DOUBLE_EQ(bulk, 7.0 + 3.0 * kAssemblyNanosPerRowPerSection);
   EXPECT_GT(bulk, 4.0);
 
   const double point = combineSectionDecodeNanos(
-      DecodeAccessPattern::Point, std::span<const double>(sections));
+      DecodeAccessPattern::Point,
+      DecodeReadPath::Cursor,
+      std::span<const double>(sections));
   EXPECT_DOUBLE_EQ(point, 7.0 + 3.0 * kProbeNanosPerSection);
+
+  // The view path assembles at its own measured per-section rate.
+  EXPECT_DOUBLE_EQ(
+      combineSectionDecodeNanos(
+          DecodeAccessPattern::Bulk,
+          DecodeReadPath::View,
+          std::span<const double>(sections)),
+      7.0 + 3.0 * kViewAssemblyNanosPerRowPerSection);
+}
+
+// A view pays for a section differently from a cursor. Sections whose encoding
+// has no usable view are decoded whole when the view is opened, and
+// MainlyConstant's real view is slower than its cursor, so both are priced
+// dearer on the view path; a section read the same way on both paths is not.
+TEST(SubIntSplitSelectorTest, ViewPathPricesSectionsForTheViewItBuilds) {
+  const auto bulkRate = [](EncodingType type, DecodeReadPath path) {
+    return decodeRate(type, DecodeAccessPattern::Bulk, path).baseNanosPerRow;
+  };
+  EXPECT_GT(
+      bulkRate(EncodingType::FOR, DecodeReadPath::View),
+      bulkRate(EncodingType::FOR, DecodeReadPath::Cursor) * 1.5);
+  EXPECT_GT(
+      bulkRate(EncodingType::MainlyConstant, DecodeReadPath::View),
+      bulkRate(EncodingType::MainlyConstant, DecodeReadPath::Cursor) * 2.0);
+  EXPECT_LT(
+      bulkRate(EncodingType::FixedBitWidth, DecodeReadPath::View),
+      bulkRate(EncodingType::FixedBitWidth, DecodeReadPath::Cursor) * 1.5);
+
+  // View point rates are absolute and carry the per-section probe overhead,
+  // so no measured section probes for less than that overhead.
+  EXPECT_GE(
+      decodeRate(
+          EncodingType::FixedBitWidth,
+          DecodeAccessPattern::Point,
+          DecodeReadPath::View)
+          .baseNanosPerRow,
+      31.0);
+}
+
+// The view path must be as inert at weight zero as the cursor path.
+TEST(SubIntSplitSelectorTest, DecodeWeightZeroOnTheViewPathReproducesSizeOnly) {
+  const auto samples = decodeCostSamples();
+  const auto baseline = selectSplits(samples, 32, samples.size());
+
+  SelectorConfig cfg = defaultSelectorConfig();
+  cfg.decodeWeighting = DecodeCostWeighting{
+      .weight = 0.0,
+      .accessPattern = DecodeAccessPattern::Bulk,
+      .readPath = DecodeReadPath::View};
+  const auto view = selectSplits(samples, 32, samples.size(), cfg);
+
+  ASSERT_EQ(view.segments.size(), baseline.segments.size());
+  for (size_t i = 0; i < baseline.segments.size(); ++i) {
+    EXPECT_EQ(view.segments[i].bitStart, baseline.segments[i].bitStart);
+    EXPECT_EQ(view.segments[i].bitEnd, baseline.segments[i].bitEnd);
+    EXPECT_EQ(view.segments[i].encoding, baseline.segments[i].encoding);
+  }
+  EXPECT_DOUBLE_EQ(view.totalCost, baseline.totalCost);
 }
 
 // An unrepresentable candidate must stay unrepresentable. Multiplying an
@@ -390,6 +462,7 @@ TEST(SubIntSplitSelectorTest, InfiniteSizeCandidatesNeverWin) {
       decodeNanosPerRow(
           EncodingType::Constant,
           DecodeAccessPattern::Bulk,
+          DecodeReadPath::Cursor,
           std::numeric_limits<double>::infinity(),
           1'000),
       0.0);

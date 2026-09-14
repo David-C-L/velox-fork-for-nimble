@@ -100,8 +100,16 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     // only outruns the extra search when the fill each call guards is small.
     // A Dictionary index stream already amortises the dispatch over long
     // fills, and taking the bulk read there costs it.
-    if (length * kBulkRunValueDenominator >=
-            this->rowCount_ * kBulkRunValueNumerator &&
+    //
+    // A read is short only in absolute terms. SubIntSplitEncodingView reads a
+    // section kViewChunkSize rows at a time, so gating on a fraction of the
+    // section kept every one of those chunks on the per-run path: a
+    // short-run section that read at 3 ns per row in one call read at 36 ns
+    // per row in 1024-row chunks. A read of kMinBulkRunValueLength rows or more
+    // amortises the second search whatever fraction of the section it is.
+    if ((length >= kMinBulkRunValueLength ||
+         length * kBulkRunValueDenominator >=
+             this->rowCount_ * kBulkRunValueNumerator) &&
         runEnds_.size() * kMaxAverageRunLength >= this->rowCount_) {
       readRunsInBulk(
           offset, length, static_cast<uint32_t>(it - runEnds_.begin()), output);
@@ -198,6 +206,12 @@ class RLEEncodingView final : public TypedEncodingView<T> {
   // below, so the boundary is not delicate and is not tuned finely.
   static constexpr uint32_t kBulkRunValueNumerator = 1;
   static constexpr uint32_t kBulkRunValueDenominator = 2;
+
+  // Rows at or above which a read takes the bulk run-value path regardless of
+  // the section's size. Below SubIntSplitEncodingView's 1024-row chunk, so its
+  // chunked reads qualify, and well above the 11- and 111-row span reads that
+  // measured a regression when they paid the second search.
+  static constexpr uint32_t kMinBulkRunValueLength = 512;
 
   // Longest average run for which the bulk run-value read still pays. The
   // permuted section that motivates it averages a few rows per run; the

@@ -788,7 +788,12 @@ inline SegmentCost bestSegmentCost(
       return;
     }
     const double decodeNanos =
-        decodeNanosPerRow(type, weighting.accessPattern, sizeBits, numValues);
+        decodeNanosPerRow(
+            type,
+            weighting.accessPattern,
+            weighting.readPath,
+            sizeBits,
+            numValues);
     const double weighted =
         sizeBits + decodeCostBits(decodeNanos, numValues, weighting.weight);
     if (weighted < best.weightedBits) {

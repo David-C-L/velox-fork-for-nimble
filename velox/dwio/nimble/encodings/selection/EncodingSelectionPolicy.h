@@ -550,6 +550,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         const double nanosPerRow = detail::subintsplit::decodeNanosPerRow(
             encodingType,
             decodePattern,
+            static_cast<detail::subintsplit::DecodeReadPath>(
+                options.subIntSplitDecodeReadPath),
             static_cast<double>(estimatedSize.value()) * 8.0,
             values.size());
         cost += detail::subintsplit::decodeCostBits(
