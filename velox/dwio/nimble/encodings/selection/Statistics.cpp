@@ -344,6 +344,18 @@ void Statistics<T, InputType>::populateUniques() const {
           std::in_place,
           populateRangeUniqueCounts<T>(
               data_, minValue, static_cast<size_t>(rangeDistance) + 1));
+    } else if (data_.size() <= kMaxHashDistinctCount) {
+      // A stream this short can never outgrow the bounded map, so hashing
+      // would count every row into a map grown by rehashing as it fills. The
+      // split planner's refiner prices thousands of 16,384-row slices of wide
+      // bit ranges this way, most of them near-unique, and the rehashing was
+      // about a sixth of what pricing them cost. The sort is bounded by the row count
+      // whatever the cardinality. Every reader of the counts is independent of
+      // their order: MainlyConstant breaks count ties by value, Huffman sorts
+      // the frequencies, and the rest read sizes or sums.
+      uniqueCounts_.emplace(
+          std::in_place,
+          populateSortedUniqueCounts<T>(data_, minValue, maxValue));
     } else if (
         auto hashCounts = populateBoundedHashUniqueCounts<T>(
             data_, kMaxHashDistinctCount)) {
