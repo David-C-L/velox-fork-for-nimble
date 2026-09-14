@@ -68,6 +68,11 @@ int runBenchmark() {
     }
   }
 
+  // A Nimble target builds its decoder when first read rather than inside the
+  // timed encode. OpenZL's target builds none, and the one read this driver
+  // makes, --validate, is outside the timing.
+  deferDecoderConstruction() = true;
+
   // No cache sweep here, so the state is fixed at hot.
   auto contextOrNull =
       makeSweepContext<Elem>(/*withOpenZL=*/true, CacheState::Hot, n);
