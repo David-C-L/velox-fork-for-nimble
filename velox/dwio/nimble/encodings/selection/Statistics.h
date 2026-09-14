@@ -287,6 +287,13 @@ class Statistics {
     if (runLengths_.has_value()) {
       return runLengths_.value();
     }
+    // Numbers build the lengths with the repeat metrics.
+    if constexpr (!nimble::isStringType<T>() && !nimble::isBoolType<T>()) {
+      if (!data_.empty()) {
+        populateRepeats();
+        return runLengths_.value();
+      }
+    }
     std::vector<uint32_t> lengths;
     if (!data_.empty()) {
       lengths.reserve(consecutiveRepeatCount());
