@@ -350,15 +350,34 @@ void computeDeltas(
       }
     }
   } else {
-    for (uint32_t i = 1; i < values.size(); ++i) {
-      if (FOLLY_LIKELY(values[i] >= values[i - 1])) {
-        isRestatements->emplace_back(false);
-        deltas->emplace_back(values[i] - values[i - 1]);
-      } else {
-        isRestatements->emplace_back(true);
-        restatements->emplace_back(values[i]);
-      }
+    // Every row writes its delta, its restatement and its flag, and only the
+    // cursor of the stream the row belongs to advances. Sized once up front
+    // instead of grown by appends, which copied each stream every time it
+    // doubled, and without a branch on the direction of each step, which a
+    // stream that rises and falls irregularly mispredicts. The restatements
+    // are sized for every row but written only up to their cursor, so the
+    // pages past it are never touched.
+    const size_t size = values.size();
+    const size_t deltasStart = deltas->size();
+    const size_t restatementsStart = restatements->size();
+    const size_t flagsStart = isRestatements->size();
+    deltas->resize(deltasStart + size);
+    restatements->resize(restatementsStart + size);
+    isRestatements->resize(flagsStart + size);
+    auto* deltaCursor = deltas->data() + deltasStart;
+    auto* restatementCursor = restatements->data() + restatementsStart;
+    auto* flags = isRestatements->data() + flagsStart - 1;
+    for (size_t i = 1; i < size; ++i) {
+      const bool rising = values[i] >= values[i - 1];
+      *deltaCursor = values[i] - values[i - 1];
+      *restatementCursor = values[i];
+      flags[i] = !rising;
+      deltaCursor += rising;
+      restatementCursor += !rising;
     }
+    deltas->resize(deltaCursor - deltas->data());
+    restatements->resize(restatementCursor - restatements->data());
+    isRestatements->resize(flagsStart + size - 1);
   }
 }
 

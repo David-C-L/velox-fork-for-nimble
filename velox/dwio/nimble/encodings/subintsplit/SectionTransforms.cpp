@@ -53,8 +53,33 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
   // Appended rather than sized and then overwritten, so no row is written
   // twice: once as a zero and once as itself.
   const auto rowCount = static_cast<uint32_t>(key.size());
+  const int keyBits = significantBits(key);
   std::vector<uint32_t> order;
   order.reserve(rowCount);
+
+  // A key that fits in 32 bits travels with its row, packed above it, so each
+  // pass reads the key from the item it is moving rather than from the key
+  // section at a random row. Rows start ascending and the sort is stable, so
+  // the permutation is the one sorting row indices by key gives. On a wide key
+  // that needs several passes, the indirect read was a cache miss per row per
+  // pass and most of what a key search cost.
+  if (keyBits <= 32) {
+    std::vector<uint64_t> packed;
+    packed.reserve(rowCount);
+    for (uint32_t row = 0; row < rowCount; ++row) {
+      packed.push_back((key[row] << 32) | row);
+    }
+    RadixSort<uint64_t> sorter;
+    sorter.sortStable(
+        std::span<uint64_t>(packed),
+        [](uint64_t item) { return item >> 32; },
+        keyBits);
+    for (const uint64_t item : packed) {
+      order.push_back(static_cast<uint32_t>(item));
+    }
+    return order;
+  }
+
   for (uint32_t row = 0; row < rowCount; ++row) {
     order.push_back(row);
   }
@@ -67,7 +92,7 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
   sorter.sortStable(
       std::span<uint32_t>(order),
       [key](uint32_t row) { return key[row]; },
-      significantBits(key));
+      keyBits);
   return order;
 }
 
