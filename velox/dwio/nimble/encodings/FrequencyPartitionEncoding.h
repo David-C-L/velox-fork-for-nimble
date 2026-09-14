@@ -105,7 +105,6 @@ class FrequencyPartitionEncoding
   using cppDataType = T;
   using physicalType = typename TypeTraits<T>::physicalType;
 
-  static const int kNumPartitionsOffset = Encoding::kPrefixSize;
   static constexpr uint8_t kFormatVersion = 1;
 
   // Multiplier applied to the undiscounted TierTagArray tag-stream estimate
@@ -843,7 +842,9 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
       fallbackWordPrefix_{this->pool_},
       tagBits_(0),
       tagArray_{this->pool_} {
-  const auto* pos = data.data() + kNumPartitionsOffset;
+  // Not kPrefixSize: encode() writes a varint row count when asked, which is
+  // a prefix of a different length. dataOffset() is that length.
+  const auto* pos = data.data() + this->dataOffset();
   const uint32_t numPartitions = encoding::readUint32(pos);
   const EncodingFactory encodingFactory(options);
 
