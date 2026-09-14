@@ -686,6 +686,38 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
       // added because they are what wins when the collapsed cardinality is at
       // either extreme. RLE and Constant are not: adjacent run values differ by
       // construction, so neither can apply to more than a single run.
+      //
+      // Collapsing runs keeps every distinct value too, so for integers, whose
+      // Dictionary price reads only the distinct count and min/max, the input's
+      // statistics give the same quote as statistics over the run values. Using
+      // them skips copying the run values and counting their distinct values a
+      // second time, which on a near-unique stream is as costly as the first.
+      //
+      // Dictionary's price only grows with the distinct count, so priced at a
+      // lower bound on that count it is a lower bound on itself. Where even
+      // that does not beat the plain encodings, Dictionary cannot be the
+      // cheapest and the distinct values are never counted: the quote is the
+      // one counting them would have given.
+      if constexpr (!isFloatingPointType<T>()) {
+        const uint64_t plainSize = std::min(
+            TrivialEncoding<physicalType>::estimateSize(runCount),
+            FixedBitWidthEncoding<physicalType>::estimateSize(
+                runCount, statistics, options));
+        const uint64_t dictionaryFloor =
+            DictionaryEncoding<physicalType>::estimateIntegralSize(
+                runCount,
+                statistics.distinctLowerBound(),
+                statistics.min(),
+                statistics.max(),
+                options);
+        if (dictionaryFloor >= plainSize) {
+          return plainSize;
+        }
+        return std::min(
+            plainSize,
+            DictionaryEncoding<physicalType>::estimateSize(
+                runCount, statistics, options));
+      }
       const auto& runValues = statistics.runValues();
       const std::span<const physicalType> runValuesSpan{
           runValues.data(), runValues.size()};

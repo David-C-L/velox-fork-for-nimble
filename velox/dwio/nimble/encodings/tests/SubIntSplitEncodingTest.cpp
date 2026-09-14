@@ -488,6 +488,26 @@ TYPED_TEST(SubIntSplitEncodingTest, recomputeRoundTripAndReplay) {
   expectBitwiseEqual(values, fullRoundTrip);
 }
 
+TYPED_TEST(SubIntSplitEncodingTest, hybridPlannerRoundTrips) {
+  using T = TypeParam;
+  for (const double decodeWeight : {0.0, 0.02}) {
+    SCOPED_TRACE(decodeWeight);
+    nimble::Encoding::Options options;
+    options.subIntSplitHybridPlanner = true;
+    options.subIntSplitDecodeWeight = decodeWeight;
+    for (const auto& values :
+         {makeStructuredValuesWithLowCardinalityNoise<T>(),
+          makeStructuredValues<T>()}) {
+      const auto encoded = nimble::EncodingFactory::encode<T>(
+          std::make_unique<NonRecursiveSubIntSplitPolicy<T>>(),
+          values,
+          *this->buffer_,
+          options);
+      expectBitwiseEqual(values, decodeAll<T>(encoded, *this->pool_));
+    }
+  }
+}
+
 TYPED_TEST(SubIntSplitEncodingTest, preserveRoundTripExplicitBoundaries) {
   using T = TypeParam;
   const auto values = makeStructuredValues<T>();
@@ -516,6 +536,69 @@ TYPED_TEST(SubIntSplitEncodingTest, preserveRoundTripExplicitBoundaries) {
 
   const auto decoded = decodeAll<T>(encoded, *this->pool_);
   expectBitwiseEqual(values, decoded);
+}
+
+namespace {
+
+// Low 48 bits uniformly random, high 16 bits one of four values held for 2,000
+// rows at a time: one segment over all 64 bits stores every row at full width,
+// while a cut at bit 48 leaves the high bits to RLE.
+std::vector<uint64_t> makeRandomLowRunHighValues() {
+  std::mt19937_64 rng{0x5eed};
+  std::vector<uint64_t> values(20'000);
+  for (size_t i = 0; i < values.size(); ++i) {
+    values[i] = ((uint64_t{i / 2'000} % 4) << 48) |
+        (rng() & ((uint64_t{1} << 48) - 1));
+  }
+  return values;
+}
+
+} // namespace
+
+// Refinement must find a boundary the shortlist missed when a bit-flip cut
+// marks it and splitting there is clearly cheaper.
+TEST(SubIntSplitEncodingTests, hybridRefinementSplitsAtACheaperBitFlipCut) {
+  const auto values = makeRandomLowRunHighValues();
+  const std::vector<std::vector<nimble::detail::subintsplit::SegmentPlan>>
+      shortlist{{{.bitStart = 0, .bitEnd = 63}}};
+  std::vector<bool> cuts(65, false);
+  cuts[0] = true;
+  cuts[48] = true;
+  cuts[64] = true;
+
+  const auto refined =
+      nimble::detail::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
+          values,
+          64,
+          shortlist,
+          cuts,
+          nimble::detail::subintsplit::defaultSelectorConfig(),
+          nimble::Encoding::Options{});
+
+  ASSERT_EQ(refined.segments.size(), 2);
+  EXPECT_EQ(refined.segments[0].bitEnd, 47);
+  EXPECT_EQ(refined.segments[1].bitStart, 48);
+}
+
+// A shortlisted plan that does not tile the bit positions is not priced, so
+// the writer falls back to the DP rather than encoding bits twice or never.
+TEST(SubIntSplitEncodingTests, hybridRefinementRejectsPlansThatDoNotTile) {
+  const auto values = makeRandomLowRunHighValues();
+  const std::vector<std::vector<nimble::detail::subintsplit::SegmentPlan>>
+      shortlist{
+          {{.bitStart = 0, .bitEnd = 31}},
+          {{.bitStart = 0, .bitEnd = 40}, {.bitStart = 32, .bitEnd = 63}}};
+
+  const auto refined =
+      nimble::detail::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
+          values,
+          64,
+          shortlist,
+          {},
+          nimble::detail::subintsplit::defaultSelectorConfig(),
+          nimble::Encoding::Options{});
+
+  EXPECT_TRUE(refined.segments.empty());
 }
 
 TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {

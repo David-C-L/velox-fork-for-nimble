@@ -99,6 +99,16 @@ namespace facebook::nimble::mlidc {
 // serialised bytes in an internal Buffer together with a live Encoding object
 // ready for decode operations.
 
+/// Whether NimbleBenchTarget::encode() leaves the decoder to be built on first
+/// use. The encode driver sets it: it times encode(), and building a decoder is
+/// not part of an encode, while OpenZL's target, timed beside these, builds
+/// none. Every other driver keeps the eager build, which keeps construction out
+/// of the reads they time.
+inline bool& deferDecoderConstruction() {
+  static bool defer{false};
+  return defer;
+}
+
 template <typename EncodingT>
 class NimbleBenchTarget {
  public:
@@ -113,9 +123,18 @@ class NimbleBenchTarget {
       bool realNestedSelection = false) {
     Buffer buf{*pool_};
     constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
-    const auto armId = cacheArmIdentity(options, realNestedSelection);
-    const auto key = encodeCacheKey<T>(data.data(), data.size(), armId, kType);
-    if (!loadCached(key, armId, kType, encoded_)) {
+    // The key hashes every input value and two fingerprints, so it is built
+    // only where a cache will read it. The encode driver times this call with
+    // the cache off, and hashing the column was charged to every Nimble arm's
+    // encode time and to no other target's.
+    const bool caching = !cacheDir().empty();
+    const auto armId = caching
+        ? cacheArmIdentity(options, realNestedSelection)
+        : std::string{};
+    const auto key = caching
+        ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
+        : std::string{};
+    if (!caching || !loadCached(key, armId, kType, encoded_)) {
       // Not test::Encoder::encode: its policy silently redirects any compressor
       // other than Zstd, and leaves nested sub-streams on the default one. See
       // SubstreamCompression.h.
@@ -126,28 +145,31 @@ class NimbleBenchTarget {
               parseCompressionType(FLAGS_mlidc_substream_compression),
               options,
               realNestedSelection));
-      storeCached(key, armId, kType, encoded_);
+      if (caching) {
+        storeCached(key, armId, kType, encoded_);
+      }
     }
-    // Construct the Encoding directly from the encoded bytes rather than
-    // re-encoding via createEncoding(), which would silently drop
-    // realNestedSelection and produce different encoded data.
-    encoding_ = std::make_unique<EncodingT>(
-        *pool_, std::string_view(encoded_), benchmarks::nullFactory(), options);
+    options_ = options;
+    encoding_.reset();
+    if (!deferDecoderConstruction()) {
+      decoder();
+    }
   }
 
   // reset + materialize all n rows into dst.
   void materializeAll(T* dst, uint32_t n) {
-    encoding_->reset();
-    encoding_->materialize(n, dst);
+    decoder().reset();
+    decoder().materialize(n, dst);
   }
 
   // reset + skip begin rows + materialize count rows into dst.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) {
-    encoding_->reset();
+    auto& encoding = decoder();
+    encoding.reset();
     if (begin > 0) {
-      encoding_->skip(begin);
+      encoding.skip(begin);
     }
-    encoding_->materialize(count, dst);
+    encoding.materialize(count, dst);
   }
 
   // Gather pattern: for each [begin, count) range in sorted order, skip then
@@ -156,14 +178,15 @@ class NimbleBenchTarget {
   void skipThenMaterialize(
       const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
       T* dst) {
-    encoding_->reset();
+    auto& encoding = decoder();
+    encoding.reset();
     uint32_t cursor = 0;
     for (auto& [begin, count] : ranges) {
       if (begin > cursor) {
-        encoding_->skip(begin - cursor);
+        encoding.skip(begin - cursor);
         cursor = begin;
       }
-      encoding_->materialize(count, dst);
+      encoding.materialize(count, dst);
       dst += count;
       cursor += count;
     }
@@ -184,12 +207,27 @@ class NimbleBenchTarget {
   }
 
   Encoding* encoding() {
-    return encoding_.get();
+    return &decoder();
   }
 
  private:
+  Encoding& decoder() {
+    if (encoding_ == nullptr) {
+      // Constructed directly from the encoded bytes rather than by
+      // re-encoding via createEncoding(), which would silently drop
+      // realNestedSelection and produce different encoded data.
+      encoding_ = std::make_unique<EncodingT>(
+          *pool_,
+          std::string_view(encoded_),
+          benchmarks::nullFactory(),
+          options_);
+    }
+    return *encoding_;
+  }
+
   std::shared_ptr<velox::memory::MemoryPool> pool_;
   std::string encoded_;
+  Encoding::Options options_;
   std::unique_ptr<Encoding> encoding_;
 };
 
@@ -321,9 +359,14 @@ class NimbleViewBenchTargetImpl
       bool realNestedSelection) {
     Buffer buf{*pool_};
     constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
-    const auto armId = cacheArmIdentity(opts, realNestedSelection);
-    const auto key = encodeCacheKey<T>(data.data(), data.size(), armId, kType);
-    if (!loadCached(key, armId, kType, encoded_)) {
+    // Keyed only where a cache will read the key; see NimbleBenchTarget.
+    const bool caching = !cacheDir().empty();
+    const auto armId =
+        caching ? cacheArmIdentity(opts, realNestedSelection) : std::string{};
+    const auto key = caching
+        ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
+        : std::string{};
+    if (!caching || !loadCached(key, armId, kType, encoded_)) {
       encoded_ = std::string(
           encodeWithCompression<EncodingT, T>(
               buf,
@@ -331,7 +374,9 @@ class NimbleViewBenchTargetImpl
               parseCompressionType(FLAGS_mlidc_substream_compression),
               opts,
               realNestedSelection));
-      storeCached(key, armId, kType, encoded_);
+      if (caching) {
+        storeCached(key, armId, kType, encoded_);
+      }
     }
     options_ = opts;
     view_ = createEncodingView(std::string_view(encoded_), pool_.get(), opts);
@@ -1465,6 +1510,36 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
       auto impl =
           std::make_unique<NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
       impl->encodeWith(data, opts, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  // SIS/realNested and its view, with split boundaries from the hybrid planner
+  // (Encoding::Options::subIntSplitHybridPlanner) instead of the DP's argmin.
+  // Everything else is the realNested arm, so the pair differs only by plan.
+  for (const bool view : {false, true}) {
+    EncoderEntry<T> entry;
+    entry.name = view ? "SIS/hybrid+view" : "SIS/hybrid";
+    entry.family = "SubIntSplit";
+    entry.variant = view ? "hybrid_view" : "hybrid";
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = view;
+    entry.randomAccess = view;
+    entry.factory = [view](
+                        const Vector<T>& data, const Encoding::Options& opts) {
+      Encoding::Options hybridOptions = opts;
+      hybridOptions.subIntSplitHybridPlanner = true;
+      if (view) {
+        auto impl = std::make_unique<
+            NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->encodeWith(data, hybridOptions, /*realNestedSelection=*/true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      }
+      auto impl =
+          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      impl->target.encode(data, hybridOptions, /*realNestedSelection=*/true);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
     encoders.push_back(std::move(entry));

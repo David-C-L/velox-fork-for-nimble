@@ -20,6 +20,8 @@
 
 #include <random>
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Vector.h"
@@ -361,6 +363,25 @@ TEST_F(TransformedEncodingTest, autoSelectionNeverCostsMoreThanNoTransform) {
   for (size_t i = 0; i < values.size(); ++i) {
     ASSERT_EQ(decoded[i], values[i]) << "row " << i;
   }
+}
+
+// Sections encoded concurrently are the sections encoded one after another:
+// each is encoded exactly as it would be alone and written in section order.
+TEST_F(TransformedEncodingTest, sectionExecutorEncodesTheSameBytes) {
+  const auto values = packedIdentifiers(65'536);
+
+  Buffer serialBuffer{*pool_};
+  const auto serial = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      serialBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+
+  folly::CPUThreadPoolExecutor executor{4};
+  Buffer concurrentBuffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitSectionExecutor = &executor;
+  const auto concurrent = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      concurrentBuffer, values, CompressionType::Uncompressed, options);
+
+  EXPECT_EQ(serial, concurrent);
 }
 
 // Leaving the option off must change nothing at all. This is the check that

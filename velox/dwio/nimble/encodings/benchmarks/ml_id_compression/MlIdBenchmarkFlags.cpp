@@ -181,6 +181,27 @@ DEFINE_bool(
     "stores a low-cardinality section well and reads it slowly, and a size-only "
     "objective cannot see the second half of that.");
 
+DEFINE_uint32(
+    mlidc_selection_screen_rows,
+    0,
+    "Sets Encoding::Options::selectionScreenRows on every Nimble target: "
+    "selection prices its costly candidates on this many sampled rows first "
+    "and prices them on the whole stream only where the sample does not rule "
+    "them out. Zero, the default, is production behaviour.");
+
+DEFINE_double(
+    mlidc_selection_screen_margin,
+    1.25,
+    "Sets Encoding::Options::selectionScreenMargin. Only read when "
+    "--mlidc_selection_screen_rows is set.");
+
+DEFINE_uint32(
+    mlidc_sis_section_threads,
+    0,
+    "Threads SubIntSplit encodes its sections on, through "
+    "Encoding::Options::subIntSplitSectionExecutor. Zero, the default, encodes "
+    "them on the calling thread, which is production behaviour.");
+
 DEFINE_string(
     mlidc_sis_withdraw_nested_encodings,
     "",

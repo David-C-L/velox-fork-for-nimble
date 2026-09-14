@@ -144,9 +144,13 @@ class RadixSort {
   }
 
  private:
-  // A digit no wider than this keeps the count table at 64K entries, 256KB,
-  // cleared once per pass rather than per element.
-  static constexpr int kMaxDigitBits = 16;
+  // A digit no wider than this keeps the count table at 4K entries, and with it
+  // the scatter's write positions, within cache. Sixteen-bit digits save a pass
+  // on wide keys and lose more than that to misses: sorting a million random
+  // keys on taz took 26.6 ms with 16-bit digits against 24.2 ms with this cap
+  // for 32-bit keys, 40.1 against 30.3 for 48-bit keys and 49.7 against 41.0
+  // for 64-bit keys, and was no slower at any other width or size measured.
+  static constexpr int kMaxDigitBits = 12;
   // Narrowing past this trades a pass for a table too small to be worth it on
   // any input large enough to reach for a radix sort.
   static constexpr int kMinDigitBits = 8;

@@ -32,6 +32,10 @@
 #include <string_view>
 #include <type_traits>
 
+namespace folly {
+class Executor;
+} // namespace folly
+
 /// The Encoding class defines an interface for interacting with encodings
 /// (aka vectors, aka arrays) of encoded data. The API is tailored for
 /// typical usage patterns within query engines, and is designed to be
@@ -164,6 +168,14 @@ class Encoding {
     /// choose. Costs one trial encode per candidate per section, so it buys
     /// compression with encode time.
     bool subIntSplitAutoTransform = false;
+
+    /// Executor SubIntSplit encodes its sections on concurrently. Null, the
+    /// default, encodes them one after another on the calling thread. Only
+    /// encodes that search no transform spread their sections, since a
+    /// transform search compares each section's encodes against a bound the
+    /// others move. The bytes are the same either way: each section is encoded
+    /// exactly as it would be alone and written in section order.
+    folly::Executor* subIntSplitSectionExecutor = nullptr;
 
     /// Section whose values order a key-derived permutation, and which is
     /// therefore stored unpermuted. 0xFF, the default, means the encoder tries
@@ -352,6 +364,58 @@ class Encoding {
     /// traces the compression/decode frontier in a unit that means the same
     /// thing on every column, which a weight does not.
     double subIntSplitMaxSizeRegression{0.05};
+
+    /// Chooses split boundaries with the hybrid planner instead of trusting the
+    /// split DP's argmin.
+    ///
+    /// The DP prices ranges with cost models that, measured against whole-
+    /// column encodes, name the cheapest encoding for a range about a fifth of
+    /// the time. The hybrid planner keeps the DP as a cheap shortlister: it
+    /// takes the subIntSplitHybridShortlist cheapest plans, plus plans cut only
+    /// at the bit-flip profile's gradient boundaries and the DP's own plan,
+    /// re-prices only the ranges those plans use with the estimators section
+    /// selection itself uses, on subIntSplitHybridRescoreSamples rows, and then
+    /// refines the winner by moving, merging and splitting boundaries under the
+    /// same pricing. Decode weighting and subIntSplitMaxSizeRegression apply to
+    /// the re-priced plans.
+    ///
+    /// Off by default. On seven ID columns it stored every column in no more
+    /// bytes than the DP's plan and up to 18% fewer, for roughly twice the
+    /// planning time.
+    bool subIntSplitHybridPlanner{false};
+
+    /// How many of the split DP's cheapest plans the hybrid planner re-prices,
+    /// and separately how many bit-flip-restricted plans. Only read when
+    /// subIntSplitHybridPlanner is set.
+    uint32_t subIntSplitHybridShortlist{8};
+
+    /// Rows sampled to re-price the hybrid planner's shortlisted ranges. Only
+    /// the ranges in shortlisted plans and refinement moves are priced at this
+    /// size, which is what keeps a larger sample affordable. Only read when
+    /// subIntSplitHybridPlanner is set.
+    uint32_t subIntSplitHybridRescoreSamples{16'384};
+
+    /// Rows a stream's costly candidates are first priced on, before selection
+    /// decides whether to price them on the whole stream. Zero, the default,
+    /// prices every candidate on every row.
+    ///
+    /// MainlyConstant, Dictionary, RLE, FrequencyPartition and Huffman price a
+    /// stream from its distinct values or its runs, and on a long near-unique
+    /// stream that costs more than every other estimate together while they
+    /// lose to plain bit packing. With this set, and the stream longer than
+    /// twice it, every candidate is priced on this many rows drawn in
+    /// contiguous blocks, and each costly one goes on to be priced on the
+    /// whole stream only where its sample cost is within
+    /// selectionScreenMargin of the cheapest sample cost. Everything priced on
+    /// the whole stream is chosen between exactly as it would be without the
+    /// screen, so the choice can change only where a candidate that loses the
+    /// sample by more than the margin would have won the stream.
+    uint32_t selectionScreenRows{0};
+
+    /// How far a costly candidate's sample cost may exceed the cheapest before
+    /// the screen drops it, as a ratio. Only read when selectionScreenRows is
+    /// set.
+    double selectionScreenMargin{1.25};
 
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production

@@ -215,6 +215,61 @@ TEST(SubIntSplitSelectorTest, DecodeWeightZeroReproducesTheSizeOnlyPlan) {
   EXPECT_DOUBLE_EQ(weighted.totalCost, baseline.totalCost);
 }
 
+// The hybrid planner's shortlist must contain the plan the DP would have
+// chosen, or turning it on could only ever lose that plan. Compared on cost
+// rather than boundaries, since equal-cost plans may be ranked either way.
+TEST(SubIntSplitSelectorTest, KBestSplitsStartsWithTheDpPlanAndRisesInCost) {
+  const auto samples = decodeCostSamples();
+  const auto cfg = defaultSelectorConfig();
+  const AllowedEncodings all;
+  const auto dp =
+      selectSplitsRestricted(samples, 32, samples.size(), all, cfg);
+  const auto grid = buildSegmentCostGrid(
+      samples, 32, samples.size(), restrictedSegmentCostFn(all, cfg));
+  const auto plans = kBestSplits(grid, 32, cfg, 4);
+
+  ASSERT_EQ(plans.size(), 4);
+  double previousCost = -std::numeric_limits<double>::infinity();
+  for (size_t rank = 0; rank < plans.size(); ++rank) {
+    SCOPED_TRACE(rank);
+    double cost = cfg.splitPenalty * static_cast<double>(plans[rank].size() - 1);
+    int nextBit = 0;
+    for (const auto& segment : plans[rank]) {
+      EXPECT_EQ(segment.bitStart, nextBit);
+      nextBit = segment.bitEnd + 1;
+      cost += segment.cost;
+    }
+    EXPECT_EQ(nextBit, 32);
+    EXPECT_GE(cost, previousCost);
+    previousCost = cost;
+    if (rank == 0) {
+      EXPECT_DOUBLE_EQ(cost, dp.totalCost);
+    }
+  }
+}
+
+TEST(SubIntSplitSelectorTest, KBestSplitsCutOnlyWhereAllowed) {
+  const auto samples = decodeCostSamples();
+  const auto cfg = defaultSelectorConfig();
+  const AllowedEncodings all;
+  const auto grid = buildSegmentCostGrid(
+      samples, 32, samples.size(), restrictedSegmentCostFn(all, cfg));
+  std::vector<bool> cuts(33, false);
+  cuts[0] = true;
+  cuts[16] = true;
+  cuts[32] = true;
+
+  // Only two segmentations exist: the whole range, and a cut at bit 16.
+  const auto plans = kBestSplits(grid, 32, cfg, 8, cuts);
+  EXPECT_EQ(plans.size(), 2);
+  for (const auto& plan : plans) {
+    for (const auto& segment : plan) {
+      EXPECT_TRUE(cuts[segment.bitStart]);
+      EXPECT_TRUE(cuts[segment.bitEnd + 1]);
+    }
+  }
+}
+
 // At weight zero a segment's weighted cost and its size are the same number,
 // which is what lets a caller read a size-only plan's cost off either field.
 //

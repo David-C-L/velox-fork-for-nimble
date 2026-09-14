@@ -20,13 +20,17 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
+#include "folly/Executor.h"
 #include "folly/container/F14Set.h"
 
 #include "velox/common/base/BitUtil.h"
@@ -42,7 +46,9 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitPlanRefiner.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
@@ -1310,45 +1316,91 @@ std::string_view SubIntSplitEncoding<T>::encode(
         .weight = options.subIntSplitDecodeWeight,
         .accessPattern = static_cast<detail::subintsplit::DecodeAccessPattern>(
             options.subIntSplitDecodeAccessPattern)};
-    auto selectorResult = detail::subintsplit::selectSplitsRestricted(
-        sampleBuf,
-        kBits,
-        valueCount,
-        options.subIntSplitAllowedEncodings,
-        selectorConfig);
+    // The hybrid planner replaces the DP's argmin with a shortlist re-priced
+    // by section selection's own estimators and refined, bounded on size by
+    // the same cap. See Encoding::Options::subIntSplitHybridPlanner. It costs
+    // the grid once and takes the DP's own plan as the first of its shortlist,
+    // so it replaces the call below rather than adding to it.
+    bool planned = false;
+    if constexpr (
+        std::is_same_v<physicalType, uint32_t> ||
+        std::is_same_v<physicalType, uint64_t>) {
+      if (options.subIntSplitHybridPlanner) {
+        // Bit-flip gradient boundaries nominate plans and bound where
+        // refinement splits a segment. They do not constrain the DP, which
+        // was measured at 65% mean regret when they did.
+        const auto profileStatistics = Statistics<uint64_t>::create(
+            std::span<const uint64_t>(sampleBuf.data(), sampleBuf.size()));
+        std::vector<bool> cuts(kBits + 1, false);
+        cuts[0] = true;
+        cuts[kBits] = true;
+        for (const int boundary :
+             detail::subintsplit::bitFlipGradientBoundaries(
+                 profileStatistics.bitFlipProfile(),
+                 detail::subintsplit::TopLevelPolicyConfig{})) {
+          if (boundary > 0 && boundary < kBits) {
+            cuts[boundary] = true;
+          }
+        }
+        const auto shortlist = detail::subintsplit::shortlistSplitsRestricted(
+            sampleBuf,
+            kBits,
+            valueCount,
+            options.subIntSplitAllowedEncodings,
+            selectorConfig,
+            options.subIntSplitHybridShortlist,
+            cuts);
+        auto refined =
+            detail::subintsplit::SubIntSplitPlanRefiner::refine<physicalType>(
+                values, kBits, shortlist, cuts, selectorConfig, options);
+        if (!refined.segments.empty()) {
+          segments = std::move(refined.segments);
+          planned = true;
+        }
+      }
+    }
 
-    // What the weighted plan gave up in bytes, bounded against what size
-    // alone would have stored the column in. The DP minimises size plus a
-    // decode term in the same units, so on a column with structure it will
-    // keep buying decode with bytes for as long as the weight makes that
-    // arithmetic work, and there is no point at which it stops on its own.
-    //
-    // Costed rather than estimated: the size-only plan is a second run of the
-    // same DP over the same sample, which is the only way to know what was
-    // given up, since the weighted plan's own totalSizeBits says what it
-    // stores and not what it could have stored. Paid only when the weight is
-    // on, and the sample is the same one already extracted.
-    if (selectorConfig.decodeWeighting.weight != 0.0) {
-      auto sizeOnlyConfig = selectorConfig;
-      sizeOnlyConfig.decodeWeighting =
-          detail::subintsplit::DecodeCostWeighting{};
-      auto sizeOnly = detail::subintsplit::selectSplitsRestricted(
+    if (!planned) {
+      auto selectorResult = detail::subintsplit::selectSplitsRestricted(
           sampleBuf,
           kBits,
           valueCount,
           options.subIntSplitAllowedEncodings,
-          sizeOnlyConfig);
-      // Compared on estimated size alone, not on totalCost: bytes are what is
-      // being bounded, and totalCost is the objective that has just been shown
-      // not to bound them.
-      const double allowedSizeBits = sizeOnly.totalSizeBits *
-          (1.0 + options.subIntSplitMaxSizeRegression);
-      if (selectorResult.totalSizeBits > allowedSizeBits) {
-        selectorResult = std::move(sizeOnly);
-      }
-    }
+          selectorConfig);
 
-    segments = std::move(selectorResult.segments);
+      // What the weighted plan gave up in bytes, bounded against what size
+      // alone would have stored the column in. The DP minimises size plus a
+      // decode term in the same units, so on a column with structure it will
+      // keep buying decode with bytes for as long as the weight makes that
+      // arithmetic work, and there is no point at which it stops on its own.
+      //
+      // Costed rather than estimated: the size-only plan is a second run of the
+      // same DP over the same sample, which is the only way to know what was
+      // given up, since the weighted plan's own totalSizeBits says what it
+      // stores and not what it could have stored. Paid only when the weight is
+      // on, and the sample is the same one already extracted.
+      if (selectorConfig.decodeWeighting.weight != 0.0) {
+        auto sizeOnlyConfig = selectorConfig;
+        sizeOnlyConfig.decodeWeighting =
+            detail::subintsplit::DecodeCostWeighting{};
+        auto sizeOnly = detail::subintsplit::selectSplitsRestricted(
+            sampleBuf,
+            kBits,
+            valueCount,
+            options.subIntSplitAllowedEncodings,
+            sizeOnlyConfig);
+        // Compared on estimated size alone, not on totalCost: bytes are what is
+        // being bounded, and totalCost is the objective that has just been shown
+        // not to bound them.
+        const double allowedSizeBits = sizeOnly.totalSizeBits *
+            (1.0 + options.subIntSplitMaxSizeRegression);
+        if (selectorResult.totalSizeBits > allowedSizeBits) {
+          selectorResult = std::move(sizeOnly);
+        }
+      }
+
+      segments = std::move(selectorResult.segments);
+    }
   }
 
   NIMBLE_CHECK(
@@ -1463,63 +1515,66 @@ std::string_view SubIntSplitEncoding<T>::encode(
   transformInfo.primaryIndices.assign(splitCount, {});
   transformInfo.keySection = detail::SubIntSplitTransformInfo::kNoKeySection;
 
-  // Encodes one section at its storage width. Called more than once per
-  // section, since choosing whether to transform means pricing both.
-  const auto encodeSection = [&](uint8_t s,
-                                 uint8_t storageBytes,
-                                 const std::vector<uint64_t>& sectionU64) {
+  // Encodes one section at its storage width, reading row i's section value
+  // from sectionValueAt(i). Called more than once per section when choosing
+  // whether to transform means pricing both.
+  const auto encodeSectionInto = [&](uint8_t s,
+                                     uint8_t storageBytes,
+                                     const auto& sectionValueAt,
+                                     Buffer& targetBuffer,
+                                     const Encoding::Options& targetOptions) {
     std::string_view encoded;
     switch (storageBytes) {
       case 1: {
         Vector<uint8_t> sectionValues{sectionPool, valueCount};
         for (uint32_t i = 0; i < valueCount; ++i) {
-          sectionValues[i] = static_cast<uint8_t>(sectionU64[i]);
+          sectionValues[i] = static_cast<uint8_t>(sectionValueAt(i));
         }
         encoded = selection.template encodeNested<uint8_t>(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint8_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 2: {
         Vector<uint16_t> sectionValues{sectionPool, valueCount};
         for (uint32_t i = 0; i < valueCount; ++i) {
-          sectionValues[i] = static_cast<uint16_t>(sectionU64[i]);
+          sectionValues[i] = static_cast<uint16_t>(sectionValueAt(i));
         }
         encoded = selection.template encodeNested<uint16_t>(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint16_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 4: {
         Vector<uint32_t> sectionValues{sectionPool, valueCount};
         for (uint32_t i = 0; i < valueCount; ++i) {
-          sectionValues[i] = static_cast<uint32_t>(sectionU64[i]);
+          sectionValues[i] = static_cast<uint32_t>(sectionValueAt(i));
         }
         encoded = selection.template encodeNested<uint32_t>(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint32_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 8: {
         Vector<uint64_t> sectionValues{sectionPool, valueCount};
         for (uint32_t i = 0; i < valueCount; ++i) {
-          sectionValues[i] = sectionU64[i];
+          sectionValues[i] = sectionValueAt(i);
         }
         encoded = selection.template encodeNested<uint64_t>(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint64_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       default: {
@@ -1527,6 +1582,18 @@ std::string_view SubIntSplitEncoding<T>::encode(
       }
     }
     return encoded;
+  };
+  const auto encodeSectionFrom = [&](uint8_t s,
+                                     uint8_t storageBytes,
+                                     const auto& sectionValueAt) {
+    return encodeSectionInto(
+        s, storageBytes, sectionValueAt, sectionBuffer, sectionOptions);
+  };
+  const auto encodeSection = [&](uint8_t s,
+                                 uint8_t storageBytes,
+                                 const std::vector<uint64_t>& sectionU64) {
+    return encodeSectionFrom(
+        s, storageBytes, [&sectionU64](uint32_t i) { return sectionU64[i]; });
   };
 
   // Rewrites one section with the transform, and reports what the state it
@@ -1595,13 +1662,72 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // split count: splitCount * splitCount extractions, each a pass over every
   // value, and as many full nested encodes. Only the transformed encode
   // genuinely varies with the key, and that one stays where it is.
+  //
+  // With no transform to price, nothing reads a section's 64-bit form after its
+  // plain encode, so the section is sliced straight into its storage width
+  // instead: that skips a column-length buffer per section, and the pass that
+  // fills it, for every arm that does not search transforms.
   std::vector<std::vector<uint64_t>> sectionValues64(splitCount);
   std::vector<uint8_t> sectionStorage(splitCount);
   std::vector<std::string_view> plainEncoded(splitCount);
-  for (uint8_t s = 0; s < splitCount; ++s) {
+  // Each concurrent section writes into a buffer of its own, which outlives
+  // the loop because plainEncoded views into it, and draws no scratch from the
+  // encoding buffer pool, which is not thread-safe.
+  std::vector<std::unique_ptr<Buffer>> concurrentBuffers;
+  if (candidates.empty() && options.subIntSplitSectionExecutor != nullptr &&
+      splitCount > 1) {
+    Encoding::Options concurrentOptions = sectionOptions;
+    concurrentOptions.encodingBufferPool = nullptr;
+    concurrentBuffers.resize(splitCount);
+    std::vector<std::exception_ptr> failures(splitCount);
+    std::latch remaining(splitCount);
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      const int width = segments[s].bitEnd - segments[s].bitStart + 1;
+      sectionStorage[s] = sectionStorageBytes(width);
+      concurrentBuffers[s] = std::make_unique<Buffer>(*sectionPool);
+      options.subIntSplitSectionExecutor->add([&, s, width]() {
+        try {
+          const auto& segment = segments[s];
+          const uint64_t mask =
+              (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+          plainEncoded[s] = encodeSectionInto(
+              s,
+              sectionStorage[s],
+              [&values, &segment, mask](uint32_t i) {
+                uint64_t value = 0;
+                __builtin_memcpy(&value, &values[i], sizeof(physicalType));
+                return (value >> segment.bitStart) & mask;
+              },
+              *concurrentBuffers[s],
+              concurrentOptions);
+        } catch (...) {
+          failures[s] = std::current_exception();
+        }
+        remaining.count_down();
+      });
+    }
+    remaining.wait();
+    for (const auto& failure : failures) {
+      if (failure) {
+        std::rethrow_exception(failure);
+      }
+    }
+  }
+  for (uint8_t s = 0; s < splitCount && concurrentBuffers.empty(); ++s) {
     const auto& seg = segments[s];
     const int width = seg.bitEnd - seg.bitStart + 1;
     sectionStorage[s] = sectionStorageBytes(width);
+    if (candidates.empty()) {
+      const uint64_t mask =
+          (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+      plainEncoded[s] = encodeSectionFrom(
+          s, sectionStorage[s], [&values, &seg, mask](uint32_t i) {
+            uint64_t value = 0;
+            __builtin_memcpy(&value, &values[i], sizeof(physicalType));
+            return (value >> seg.bitStart) & mask;
+          });
+      continue;
+    }
     sectionValues64[s] = extractSection(seg);
     plainEncoded[s] = encodeSection(s, sectionStorage[s], sectionValues64[s]);
   }

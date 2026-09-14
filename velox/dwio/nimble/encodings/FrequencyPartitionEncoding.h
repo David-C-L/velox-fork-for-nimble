@@ -19,7 +19,9 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -220,8 +222,7 @@ class FrequencyPartitionEncoding
     const uint64_t uniqueCount = uniqueCounts->size();
     // Only the values that reach a tier need ranking. Everything past the last
     // tier's capacity is unencoded at full width whatever its frequency, so the
-    // tail never has to be sorted -- which keeps this bounded by the capacity
-    // table rather than by the column's cardinality.
+    // tail is never ranked.
     const auto ranked =
         static_cast<size_t>(std::min<uint64_t>(uniqueCount, totalCapacity));
     std::vector<uint64_t> counts;
@@ -229,11 +230,35 @@ class FrequencyPartitionEncoding
     for (const auto& unique : uniqueCounts.value()) {
       counts.push_back(unique.second);
     }
-    std::partial_sort(
-        counts.begin(),
-        counts.begin() + ranked,
-        counts.end(),
-        std::greater<uint64_t>());
+
+    // A tier needs the sum of its counts, never their order, so tiers are
+    // split off with partitions rather than by sorting. Where the capacity
+    // table reaches past the cardinality, as it does for 64-bit values, sorting
+    // was a full sort of one count per distinct value. The counts of every
+    // tier that ends before the last one are split from the rest first, in one
+    // pass over all of them, and the narrower tiers are then split within that
+    // prefix.
+    size_t innerTiersEnd = 0;
+    {
+      uint64_t tierStart = 0;
+      for (const uint32_t keyBits : kKeyBitOptions) {
+        if (keyBits > kMaxKeyBits || tierStart >= ranked) {
+          break;
+        }
+        tierStart +=
+            std::min<uint64_t>(getCapacity(keyBits), ranked - tierStart);
+        if (tierStart < counts.size()) {
+          innerTiersEnd = static_cast<size_t>(tierStart);
+        }
+      }
+    }
+    if (innerTiersEnd > 0) {
+      std::nth_element(
+          counts.begin(),
+          counts.begin() + innerTiersEnd,
+          counts.end(),
+          std::greater<uint64_t>());
+    }
 
     uint64_t payloadSize = 0;
     uint64_t assigned = 0;
@@ -248,6 +273,16 @@ class FrequencyPartitionEncoding
       ++tiersCreated;
       const uint64_t dictEntries =
           std::min<uint64_t>(getCapacity(keyBits), ranked - assigned);
+      // Inside the prefix split off above, so that only the widest tier pays
+      // a pass over every distinct value.
+      const size_t tierEnd = static_cast<size_t>(assigned + dictEntries);
+      if (tierEnd < innerTiersEnd) {
+        std::nth_element(
+            counts.begin() + assigned,
+            counts.begin() + tierEnd,
+            counts.begin() + innerTiersEnd,
+            std::greater<uint64_t>());
+      }
       uint64_t tierRows = 0;
       for (uint64_t i = 0; i < dictEntries; ++i) {
         tierRows += counts[static_cast<size_t>(assigned + i)];
@@ -1505,10 +1540,41 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
       static_cast<FreqPartIndexType>(options.frequencyPartitionIndex);
   const uint32_t valueCount = static_cast<uint32_t>(values.size());
 
-  // Build frequency map
+  // Narrow values are counted in a table rather than hashed one row at a
+  // time. The map is still what the tiers are ranked from, because the sort
+  // below is not stable and so reads its tie order from the map's iteration
+  // order; inserting the distinct values in the order they first occur, which
+  // is the order counting them in the map would have inserted them, rebuilds
+  // exactly that map.
+  constexpr bool kCountsInTable = std::is_integral_v<physicalType> &&
+      !std::is_same_v<physicalType, bool> && sizeof(physicalType) <= 2;
+  constexpr size_t kTableSize =
+      kCountsInTable ? size_t{1} << (8 * sizeof(physicalType)) : 0;
+  const bool useTable = kCountsInTable && valueCount >= kTableSize / 16;
+  const auto tableIndex = [](const physicalType& value) -> size_t {
+    if constexpr (kCountsInTable) {
+      return static_cast<std::make_unsigned_t<physicalType>>(value);
+    } else {
+      return 0;
+    }
+  };
+
   folly::F14FastMap<physicalType, uint32_t> frequencyMap;
-  for (const auto& value : values) {
-    frequencyMap[value]++;
+  if (useTable) {
+    std::vector<uint32_t> counts(kTableSize, 0);
+    std::vector<physicalType> firstOccurrences;
+    for (const auto& value : values) {
+      if (counts[tableIndex(value)]++ == 0) {
+        firstOccurrences.push_back(value);
+      }
+    }
+    for (const auto& value : firstOccurrences) {
+      frequencyMap.emplace(value, counts[tableIndex(value)]);
+    }
+  } else {
+    for (const auto& value : values) {
+      frequencyMap[value]++;
+    }
   }
 
   // Sort by frequency (descending)
@@ -1533,7 +1599,6 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     uint32_t keyBits;
     uint32_t capacity;
     Vector<physicalType> dictionary;
-    folly::F14FastMap<physicalType, uint32_t> valueToKey;
 
     explicit TierAssignment(velox::memory::MemoryPool& pool)
         : keyBits(0), capacity(0), dictionary(&pool) {}
@@ -1560,21 +1625,38 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     tier.dictionary.reserve(numToAssign);
 
     for (uint32_t i = 0; i < numToAssign; ++i) {
-      const auto& value = freqVec[valuesAssigned + i].first;
-      tier.dictionary.push_back(value);
-      tier.valueToKey[value] = i;
+      tier.dictionary.push_back(freqVec[valuesAssigned + i].first);
     }
 
     valuesAssigned += numToAssign;
     tierAssignments.push_back(std::move(tier));
   }
 
-  // Build value-to-tier mapping
-  folly::F14FastMap<physicalType, uint32_t> valueToTier;
-  valueToTier.reserve(valuesAssigned);
+  // Each assigned value's tier and its key within the tier, looked up once per
+  // row to place the row and its key together. Values reaching no tier are
+  // absent from the map, or marked unassigned in the table.
+  struct Assignment {
+    uint32_t tier;
+    uint32_t key;
+  };
+  constexpr uint32_t kUnassigned = std::numeric_limits<uint32_t>::max();
+  std::vector<Assignment> assignmentTable;
+  folly::F14FastMap<physicalType, Assignment> assignmentMap;
+  if (useTable) {
+    assignmentTable.assign(kTableSize, Assignment{kUnassigned, 0});
+  } else {
+    assignmentMap.reserve(valuesAssigned);
+  }
   for (size_t tierIdx = 0; tierIdx < tierAssignments.size(); ++tierIdx) {
-    for (const auto& [value, key] : tierAssignments[tierIdx].valueToKey) {
-      valueToTier[value] = static_cast<uint32_t>(tierIdx);
+    const auto& dictionary = tierAssignments[tierIdx].dictionary;
+    for (size_t key = 0; key < dictionary.size(); ++key) {
+      const Assignment assignment{
+          static_cast<uint32_t>(tierIdx), static_cast<uint32_t>(key)};
+      if (useTable) {
+        assignmentTable[tableIndex(dictionary[key])] = assignment;
+      } else {
+        assignmentMap.emplace(dictionary[key], assignment);
+      }
     }
   }
 
@@ -1583,14 +1665,31 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
   for (auto& vec : tierRows) {
     vec.reserve(valueCount / tierRows.size());
   }
+  std::vector<Vector<uint32_t>> tierKeys;
+  tierKeys.reserve(tierAssignments.size());
+  for (size_t tierIdx = 0; tierIdx < tierAssignments.size(); ++tierIdx) {
+    tierKeys.emplace_back(pool);
+    tierKeys.back().reserve(valueCount / tierRows.size());
+  }
 
-  for (uint32_t row = 0; row < valueCount; ++row) {
-    const auto& value = values[row];
-    auto tierIt = valueToTier.find(value);
-    if (tierIt == valueToTier.end()) {
+  const auto placeRow = [&](uint32_t row, const Assignment& assignment) {
+    if (assignment.tier == kUnassigned) {
       tierRows.back().push_back(row);
     } else {
-      tierRows[tierIt->second].push_back(row);
+      tierRows[assignment.tier].push_back(row);
+      tierKeys[assignment.tier].push_back(assignment.key);
+    }
+  };
+  if (useTable) {
+    for (uint32_t row = 0; row < valueCount; ++row) {
+      placeRow(row, assignmentTable[tableIndex(values[row])]);
+    }
+  } else {
+    for (uint32_t row = 0; row < valueCount; ++row) {
+      const auto it = assignmentMap.find(values[row]);
+      placeRow(
+          row,
+          it == assignmentMap.end() ? Assignment{kUnassigned, 0} : it->second);
     }
   }
 
@@ -1637,15 +1736,9 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
         scopedBuffer.get(),
         options);
 
-    Vector<uint32_t> keys(pool);
-    keys.reserve(rows.size());
-    for (uint32_t row : rows) {
-      keys.push_back(tier.valueToKey.at(values[row]));
-    }
-
     serializedKeys[tierIdx] = selection.template encodeNested<uint32_t>(
         EncodingIdentifiers::FrequencyPartition::Keys1Bit + tierIdx,
-        {keys},
+        {tierKeys[tierIdx]},
         scopedBuffer.get(),
         options);
   }
