@@ -131,6 +131,17 @@ struct FrequencyCounts {
   size_t doubletonCount{0};
 };
 
+/// Everything about a segment that does not depend on the order of its rows
+/// beyond adjacency, for a caller that counts these for a bit range without
+/// scanning the range's extracted values.
+struct RangeCounts {
+  FrequencyCounts frequencies;
+  // Runs of equal adjacent values, at least one.
+  size_t runCount{0};
+  // See SegmentMetrics::bitWidthBuckets.
+  std::array<uint32_t, 10> bitWidthBuckets{};
+};
+
 // Keeps the eight largest frequencies offered to it, descending and
 // zero-padded.
 //
@@ -212,7 +223,74 @@ class MetricCollector {
     return computeImpl(values, flags, &counts);
   }
 
+  /// As above, and takes the run count and the bit-width histogram as well,
+  /// leaving only the order-dependent scan metrics to compute from `values`.
+  SegmentMetrics compute(
+      const std::vector<uint64_t>& values,
+      MetricFlags flags,
+      const RangeCounts& counts) {
+    const size_t count = values.size();
+    if (count == 0 || !hasFlag(flags, MetricFlag::MinMax) ||
+        !hasFlag(flags, MetricFlag::RunStats) ||
+        !hasFlag(flags, MetricFlag::BitWidthHistogram) ||
+        !hasFlag(flags, MetricFlag::DeltaStats)) {
+      return computeImpl(values, flags, &counts.frequencies);
+    }
+    SegmentMetrics out = scanMinMaxAndDeltas(values);
+    out.runCount = counts.runCount;
+    out.avgRunLength =
+        static_cast<double>(count) / static_cast<double>(out.runCount);
+    out.bitWidthBuckets = counts.bitWidthBuckets;
+    // The same fields, and only those, that computeImpl's supplied-counts
+    // path fills, so that the two agree on every field and the planner sees
+    // identical metrics whichever the grid takes.
+    if (hasFlag(flags, MetricFlag::UniqueCount) ||
+        hasFlag(flags, MetricFlag::FrequencyTiers)) {
+      out.uniqueCount = counts.frequencies.uniqueCount;
+    }
+    if (hasFlag(flags, MetricFlag::DominantValue)) {
+      out.dominantCount = counts.frequencies.dominantCount;
+    }
+    if (hasFlag(flags, MetricFlag::FrequencyTiers)) {
+      fillCoverage(counts.frequencies.largest, count, out.topKCoverage);
+    }
+    return out;
+  }
+
  private:
+  // The scan metrics that depend on row order beyond adjacency: extremes and
+  // the delta statistics. Integer accumulations only, so reassociating them
+  // is exact; see scanAll.
+  static SegmentMetrics scanMinMaxAndDeltas(
+      const std::vector<uint64_t>& values) {
+    const size_t count = values.size();
+    const uint64_t first = values[0];
+    uint64_t minimum = first;
+    uint64_t maximum = first;
+    uint64_t sumAbsDelta = 0;
+    uint64_t monotonic = 0;
+    uint64_t maxDelta = 0;
+    for (size_t i = 1; i < count; ++i) {
+      const uint64_t previous = values[i - 1];
+      const uint64_t value = values[i];
+      minimum = std::min(minimum, value);
+      maximum = std::max(maximum, value);
+      const bool rising = value >= previous;
+      const uint64_t delta = rising ? value - previous : previous - value;
+      sumAbsDelta += delta;
+      monotonic += static_cast<uint64_t>(rising);
+      maxDelta = std::max(maxDelta, rising ? delta : uint64_t{0});
+    }
+    SegmentMetrics out;
+    out.min = minimum;
+    out.max = maximum;
+    out.range = maximum - minimum;
+    out.sumAbsDelta = sumAbsDelta;
+    out.monotonicCount = monotonic;
+    out.maxDelta = maxDelta;
+    return out;
+  }
+
   // Cumulative coverage of the top 1, 2, 4 and 8 values, from the eight
   // largest frequencies. Shared by every path so that supplying counts and
   // counting them cannot drift apart in the arithmetic.

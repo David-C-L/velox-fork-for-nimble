@@ -36,18 +36,18 @@ using namespace facebook::nimble::detail::subintsplit;
 namespace {
 
 // Compares the two ways of reaching a segment's metrics, over every bit range
-// the selector's inner loop visits, stepping the partition exactly as that loop
+// the selector's inner loop visits, stepping the counter exactly as that loop
 // does. The flag-checked counting path is the reference: it is what every
 // measurement on this encoder was made against.
 //
 // Both halves of the split are under test here. The three-argument call takes
-// the frequency metrics from the partition and the rest from the specialised
+// the frequency metrics from the counter and the rest from the specialised
 // scan; the two-argument call counts and scans in one flag-checked loop. Every
 // field has to agree, so the comparison is over all of them rather than over
 // the frequency metrics alone.
 //
-// This is the test that matters, because the way a partition maintained across
-// the loop goes wrong is not arithmetic but lockstep. If the partition and the
+// This is the test that matters, because the way a counter maintained across
+// the loop goes wrong is not arithmetic but lockstep. If the counter and the
 // extractor ever describe different ranges, the metrics are correct for a range
 // nobody asked about, the planner optimises the wrong thing, and every symptom
 // is downstream of here. A drift of one column fails this immediately, rather
@@ -59,20 +59,23 @@ void expectPartitionMatchesCounting(
   MetricCollector counting;
   MetricCollector supplied;
   BitRangeExtractor extractor(samples);
-  BitRangePartition partition;
+  BitRangeCounter counter(samples);
 
   for (int l = 0; l < bits; ++l) {
     extractor.reset(l);
-    partition.reset(samples, l);
+    counter.reset(l);
     for (int r = l; r < bits; ++r) {
       extractor.extend(r);
-      if (r > l) {
-        partition.extend(r);
-      }
       const std::vector<uint64_t>& segValues = extractor.values();
       const SegmentMetrics counted = counting.compute(segValues, flags);
+      const RangeCounts rangeCounts = counter.counts(r);
       const SegmentMetrics given =
-          supplied.compute(segValues, flags, partition.counts());
+          supplied.compute(segValues, flags, rangeCounts);
+      // The frequencies alone, through the path that scans for everything
+      // else, so that both of the collector's supplied-counts paths are held
+      // to the counting path.
+      const SegmentMetrics givenFrequencies =
+          supplied.compute(segValues, flags, rangeCounts.frequencies);
 
       const std::string where =
           "bits [" + std::to_string(l) + ", " + std::to_string(r) + "]";
@@ -92,13 +95,23 @@ void expectPartitionMatchesCounting(
       EXPECT_EQ(given.sumAbsDelta, counted.sumAbsDelta) << where;
       EXPECT_EQ(given.monotonicCount, counted.monotonicCount) << where;
       EXPECT_EQ(given.maxDelta, counted.maxDelta) << where;
+      EXPECT_EQ(given.singletonCount, givenFrequencies.singletonCount) << where;
+      EXPECT_EQ(given.doubletonCount, givenFrequencies.doubletonCount) << where;
+      EXPECT_EQ(given.countedRows, givenFrequencies.countedRows) << where;
+
+      // The counter's own singleton and doubleton counts, which neither
+      // supplied path forwards, against the counting path's.
+      EXPECT_EQ(rangeCounts.frequencies.singletonCount, counted.singletonCount)
+          << where;
+      EXPECT_EQ(rangeCounts.frequencies.doubletonCount, counted.doubletonCount)
+          << where;
     }
   }
 }
 
 // Repeats are what make the frequency metrics say anything: uniform samples
 // turn almost every group into a singleton almost at once, which is the one
-// case a partition finds easy. Three fields of different cardinality also give
+// case a counter finds easy. Three fields of different cardinality also give
 // the grid ranges that straddle a field boundary, which is where a bit range
 // holds part of one field and part of another.
 TEST(SubIntSplitSelectorTest, PartitionCountsMatchCountingAtEveryRange) {
@@ -113,7 +126,7 @@ TEST(SubIntSplitSelectorTest, PartitionCountsMatchCountingAtEveryRange) {
 }
 
 // Ranges wider than sixteen bits are the ones the counting path serves with a
-// hash map rather than a direct histogram, so this puts the partition against
+// hash map rather than a direct histogram, so this puts the counter against
 // that path in particular.
 TEST(SubIntSplitSelectorTest, PartitionCountsMatchCountingOnWideRanges) {
   constexpr int kBits = 40;
@@ -126,8 +139,26 @@ TEST(SubIntSplitSelectorTest, PartitionCountsMatchCountingOnWideRanges) {
   expectPartitionMatchesCounting(samples, kBits);
 }
 
+// The full 64-bit grid the encoder walks, on an identifier-shaped sample: a
+// slowly rising high field, a small middle field and random low bits, so that
+// ranges reaching bit 63 and left edges that merge rather than sort are both
+// covered. The sample count is not a multiple of 64, which puts the counter's
+// sentinel inside a word rather than at its start.
+TEST(SubIntSplitSelectorTest, RangeCountsMatchCountingOverSixtyFourBits) {
+  constexpr size_t kCount = 1'000;
+  std::mt19937_64 rng(64);
+  std::vector<uint64_t> samples(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    samples[i] = ((uint64_t{1} << 62) + (i / 16) * (uint64_t{1} << 22)) |
+        ((rng() % 5) << 12) | (rng() & 0xFFF);
+  }
+  samples[3] = ~uint64_t{0};
+  samples[4] = 0;
+  expectPartitionMatchesCounting(samples, 64);
+}
+
 // Once every group holds one sample, no wider range can split anything, so the
-// partition stops working and hands back what it already had. That cache is
+// counter stops working and hands back what it already had. That cache is
 // held across cells rather than within one, which makes it the piece most
 // likely to be subtly wrong: a cache that survived a reset would report the
 // previous left edge's answer for the new one.
@@ -141,20 +172,21 @@ TEST(SubIntSplitSelectorTest, PartitionRecountsAfterAllGroupsAreSingletons) {
   std::vector<uint64_t> samples(kCount);
   std::iota(samples.begin(), samples.end(), uint64_t{0});
 
-  BitRangePartition partition;
-  partition.reset(samples, 0);
-  for (int r = 1; r < 32; ++r) {
-    partition.extend(r);
+  BitRangeCounter counter(samples);
+  counter.reset(0);
+  for (int r = 0; r < 31; ++r) {
+    counter.frequencies(r);
   }
-  EXPECT_EQ(partition.counts().uniqueCount, kCount);
-  EXPECT_EQ(partition.counts().dominantCount, 1u);
+  EXPECT_EQ(counter.frequencies(31).uniqueCount, kCount);
+  EXPECT_EQ(counter.frequencies(31).dominantCount, 1u);
 
-  partition.reset(samples, 8);
-  for (int r = 9; r < 32; ++r) {
-    partition.extend(r);
+  // Not the next left edge, so the counter sorts afresh rather than merging.
+  counter.reset(8);
+  for (int r = 8; r < 31; ++r) {
+    counter.frequencies(r);
   }
-  EXPECT_EQ(partition.counts().uniqueCount, 1u);
-  EXPECT_EQ(partition.counts().dominantCount, kCount);
+  EXPECT_EQ(counter.frequencies(31).uniqueCount, 1u);
+  EXPECT_EQ(counter.frequencies(31).dominantCount, kCount);
 
   // And the whole grid on this shape, so the short-circuit is checked against
   // the counting path at every width rather than only at its ends.
@@ -166,13 +198,13 @@ TEST(SubIntSplitSelectorTest, PartitionRecountsAfterAllGroupsAreSingletons) {
 // the other side.
 TEST(SubIntSplitSelectorTest, PartitionHandlesASegmentOfOneValue) {
   const std::vector<uint64_t> samples(64, uint64_t{0xABCD});
-  BitRangePartition partition;
-  partition.reset(samples, 0);
-  for (int r = 1; r < 24; ++r) {
-    partition.extend(r);
+  BitRangeCounter counter(samples);
+  counter.reset(0);
+  for (int r = 0; r < 23; ++r) {
+    counter.frequencies(r);
   }
-  EXPECT_EQ(partition.counts().uniqueCount, 1u);
-  EXPECT_EQ(partition.counts().dominantCount, samples.size());
+  EXPECT_EQ(counter.frequencies(23).uniqueCount, 1u);
+  EXPECT_EQ(counter.frequencies(23).dominantCount, samples.size());
   expectPartitionMatchesCounting(samples, 24);
 }
 
