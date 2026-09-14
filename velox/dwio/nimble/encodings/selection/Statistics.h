@@ -349,45 +349,6 @@ class Statistics {
   Statistics() = default;
   std::span<const InputType> data_;
 
-  class BlockStatsAccumulator {
-   public:
-    explicit BlockStatsAccumulator(uint16_t blockSize)
-        : blockSize_{blockSize} {}
-
-    void add(uint64_t val) {
-      if (val < blockMin_) {
-        blockMin_ = val;
-      }
-      if (val > blockMax_) {
-        blockMax_ = val;
-      }
-      if (++blockCount_ == blockSize_) {
-        flush();
-      }
-    }
-
-    std::vector<BlockStats> finish() {
-      flush();
-      return std::move(result_);
-    }
-
-   private:
-    void flush() {
-      if (blockCount_ > 0) {
-        result_.push_back({blockCount_, blockMin_, blockMax_});
-      }
-      blockCount_ = 0;
-      blockMin_ = std::numeric_limits<uint64_t>::max();
-      blockMax_ = 0;
-    }
-
-    const uint16_t blockSize_;
-    uint64_t blockCount_ = 0;
-    uint64_t blockMin_ = std::numeric_limits<uint64_t>::max();
-    uint64_t blockMax_ = 0;
-    std::vector<BlockStats> result_;
-  };
-
   void populateRepeats(bool collectRunValues = false) const;
   void populateUniques() const;
   void populateMinMax() const;

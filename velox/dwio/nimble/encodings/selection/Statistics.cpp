@@ -335,11 +335,29 @@ void Statistics<T, InputType>::populateUniques() const {
 template <typename T, typename InputType>
 void Statistics<T, InputType>::populateMinMaxBlocks(uint16_t blockSize) const {
   static_assert(std::is_unsigned_v<T>);
-  BlockStatsAccumulator acc(blockSize);
-  for (const auto& v : data_) {
-    acc.add(static_cast<uint64_t>(static_cast<T>(v)));
+  // Block by block rather than value by value, so the min and max of each
+  // block are two reductions over a contiguous span that the compiler can
+  // vectorise, where per-value bookkeeping of the block boundary could not be.
+  // A block size of zero never closes a block, which leaves one block.
+  const size_t size = data_.size();
+  const size_t step = blockSize == 0 ? std::max<size_t>(size, 1) : blockSize;
+  std::vector<BlockStats> blocks;
+  blocks.reserve((size + step - 1) / step);
+  for (size_t start = 0; start < size; start += step) {
+    const size_t end = std::min(size, start + step);
+    T blockMin = static_cast<T>(data_[start]);
+    T blockMax = blockMin;
+    for (size_t i = start + 1; i < end; ++i) {
+      const T value = static_cast<T>(data_[i]);
+      blockMin = std::min(blockMin, value);
+      blockMax = std::max(blockMax, value);
+    }
+    blocks.push_back(
+        {static_cast<uint64_t>(end - start),
+         static_cast<uint64_t>(blockMin),
+         static_cast<uint64_t>(blockMax)});
   }
-  minMaxBlocks_ = acc.finish();
+  minMaxBlocks_ = std::move(blocks);
 }
 
 template <typename T, typename InputType>
@@ -397,18 +415,26 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
   // that read this store their deltas in. A signed comparison here would report
   // steps no delta stream can hold.
   using unsignedType = typename std::make_unsigned<T>::type;
+  //
+  // Written without a branch on the direction of each step, which on a stream
+  // that rises and falls at random would mispredict on half of them and keeps
+  // the loop from vectorising. A falling step contributes zero to the largest
+  // increase, which never exceeds a maximum that starts at zero.
+  uint64_t nonDecreasingCount{0};
+  uint64_t maxIncrease{0};
+  uint64_t sumAbsoluteDelta{0};
   for (size_t i = 1; i < data_.size(); ++i) {
-    const auto previous = static_cast<unsignedType>(data_[i - 1]);
-    const auto value = static_cast<unsignedType>(data_[i]);
+    const uint64_t previous = static_cast<unsignedType>(data_[i - 1]);
+    const uint64_t value = static_cast<unsignedType>(data_[i]);
     const bool rising = value >= previous;
-    const uint64_t delta = rising ? static_cast<uint64_t>(value - previous)
-                                  : static_cast<uint64_t>(previous - value);
-    stats.sumAbsoluteDelta += delta;
-    if (rising) {
-      ++stats.nonDecreasingCount;
-      stats.maxIncrease = std::max(stats.maxIncrease, delta);
-    }
+    const uint64_t delta = rising ? value - previous : previous - value;
+    sumAbsoluteDelta += delta;
+    nonDecreasingCount += rising;
+    maxIncrease = std::max(maxIncrease, rising ? delta : uint64_t{0});
   }
+  stats.nonDecreasingCount = nonDecreasingCount;
+  stats.maxIncrease = maxIncrease;
+  stats.sumAbsoluteDelta = sumAbsoluteDelta;
   adjacentPairStats_ = stats;
 }
 
