@@ -188,6 +188,19 @@ DEFINE_int64(
     65536,
     "Rows sampled for re-scoring the hybrid shortlist. Only ranges appearing "
     "in shortlisted plans are costed at this size.");
+DEFINE_bool(
+    hybrid_cheap_shortlist,
+    false,
+    "Build the hybrid shortlist without costing every range with selection's "
+    "estimators: the planner's models, the bit-flip boundaries costed by the "
+    "models, and the writer's plan. The estimator grid is what a writer could "
+    "not afford, so this is the shortlist a production planner would have.");
+DEFINE_bool(
+    hybrid_refine_bitflip_splits,
+    false,
+    "Restrict the hybrid refinement's split moves to bit-flip gradient "
+    "boundaries instead of every interior bit. Splits dominate refinement "
+    "cost.");
 DEFINE_bool(validate, false, "Sanity-check oracle encode calls do not throw");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
 DEFINE_bool(
@@ -1885,14 +1898,17 @@ int runBenchmark() {
             kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
               return modelGrid[l][r].bestBits * fullCostScale;
             }));
-        addPlans(
-            "estimators",
-            kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
-              const size_t bytes = oracleGrid[l][r].selectionEstimateBytes;
-              return bytes == std::numeric_limits<size_t>::max()
-                  ? std::numeric_limits<double>::infinity()
-                  : static_cast<double>(bytes) * 8.0 * fullCostScale;
-            }));
+        if (!FLAGS_hybrid_cheap_shortlist) {
+          addPlans(
+              "estimators",
+              kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
+                const size_t bytes = oracleGrid[l][r].selectionEstimateBytes;
+                return bytes == std::numeric_limits<size_t>::max()
+                    ? std::numeric_limits<double>::infinity()
+                    : static_cast<double>(bytes) * 8.0 * fullCostScale;
+              }));
+        }
+        std::vector<bool> isCut;
         // Bit-flip hints as a shortlist source rather than a constraint.
         // Restricting the whole DP to the profile's gradient boundaries was
         // measured at 65% mean regret, so here they only nominate plans: the
@@ -1900,7 +1916,7 @@ int runBenchmark() {
         {
           const auto profileStatistics = Statistics<uint64_t>::create(
               std::span<const uint64_t>(samples.data(), samples.size()));
-          std::vector<bool> isCut(kBits + 1, false);
+          isCut.assign(kBits + 1, false);
           isCut[0] = true;
           isCut[kBits] = true;
           for (const int boundary : bitFlipGradientBoundaries(
@@ -1912,9 +1928,14 @@ int runBenchmark() {
           addPlans(
               "bitflip",
               kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
+                if (!isCut[l] || !isCut[r + 1]) {
+                  return std::numeric_limits<double>::infinity();
+                }
+                if (FLAGS_hybrid_cheap_shortlist) {
+                  return modelGrid[l][r].bestBits * fullCostScale;
+                }
                 const size_t bytes = oracleGrid[l][r].selectionEstimateBytes;
-                return !isCut[l] || !isCut[r + 1] ||
-                        bytes == std::numeric_limits<size_t>::max()
+                return bytes == std::numeric_limits<size_t>::max()
                     ? std::numeric_limits<double>::infinity()
                     : static_cast<double>(bytes) * 8.0 * fullCostScale;
               }));
@@ -2084,6 +2105,9 @@ int runBenchmark() {
           // Split a segment in two at any interior bit.
           for (size_t i = 0; i < refined.size(); ++i) {
             for (int cut = refined[i].first; cut < refined[i].second; ++cut) {
+              if (FLAGS_hybrid_refine_bitflip_splits && !isCut[cut + 1]) {
+                continue;
+              }
               RangePlan split = refined;
               split[i].second = cut;
               split.insert(
