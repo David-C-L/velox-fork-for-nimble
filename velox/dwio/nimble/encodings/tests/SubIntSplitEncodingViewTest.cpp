@@ -107,6 +107,25 @@ class SubIntSplitEncodingViewTest : public nimble::test::EncodingViewTest {
       }
     }
   }
+
+  // Long enough that a bridged group reaches the view's 1024-row chunk cap
+  // several times over and still leaves a ragged last chunk.
+  template <typename T>
+  void expectRangeListsMatch(nimble::CompressionType compressionType) {
+    SCOPED_TRACE(fmt::format("compression={}", compressionType));
+    const auto values = makeStructuredValues<T>(pool_.get(), 20'011);
+    auto serialized =
+        nimble::test::Encoder<nimble::SubIntSplitEncoding<T>>::encode(
+            *buffer_,
+            values,
+            compressionType,
+            nimble::Encoding::Options{},
+            /*realNestedSelection=*/true);
+    auto view = nimble::createEncodingView(serialized, pool_.get(), {});
+    ASSERT_NE(view, nullptr);
+    ASSERT_EQ(view->encodingType(), nimble::EncodingType::SubIntSplit);
+    nimble::test::expectRangeListReads(*view, values);
+  }
 };
 
 TEST_F(SubIntSplitEncodingViewTest, readsEveryWidth) {
@@ -122,6 +141,20 @@ TEST_F(SubIntSplitEncodingViewTest, readsEveryWidth) {
 TEST_F(SubIntSplitEncodingViewTest, readsWithCompressedSubStreams) {
   expectViewMatches<uint64_t>(nimble::CompressionType::Zstd);
   expectViewMatches<int64_t>(nimble::CompressionType::Zstd);
+}
+
+// A range-list read bridges short gaps between ranges with one staged bulk
+// decode, so its rows reach the output by a different path from a per-range
+// loop: every list shape has to come back exactly as a loop would return it,
+// including over compressed sub-streams, whose sections are materialized.
+TEST_F(SubIntSplitEncodingViewTest, readsRangeLists) {
+  for (const auto compressionType :
+       {nimble::CompressionType::Uncompressed, nimble::CompressionType::Zstd}) {
+    expectRangeListsMatch<int32_t>(compressionType);
+    expectRangeListsMatch<uint32_t>(compressionType);
+    expectRangeListsMatch<int64_t>(compressionType);
+    expectRangeListsMatch<uint64_t>(compressionType);
+  }
 }
 
 TEST_F(SubIntSplitEncodingViewTest, rejectsNonSubIntSplitStream) {

@@ -415,19 +415,15 @@ class NimbleViewBenchTargetImpl
     }
   }
 
-  // No cursor, so no skip: each range is resolved from its own index. That is
-  // the whole point of a view on a gather workload.
+  // No cursor, so no skip: each range is resolved from its own index. The
+  // whole list goes to the view in one call, the way a reader holding a
+  // selection's row ranges would pass it, so a view can plan across ranges
+  // rather than answer them one by one. That also makes it the like-for-like
+  // counterpart of a block codec that decompresses once and copies ranges out.
   void skipThenMaterialize(
       const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
       T* dst) override {
-    for (const auto& [begin, count] : ranges) {
-      if (count == 1) {
-        view_->readAt(begin, dst);
-      } else {
-        view_->read(begin, count, dst);
-      }
-      dst += count;
-    }
+    view_->readRanges(ranges, dst);
   }
 
   size_t payloadSize() const override {

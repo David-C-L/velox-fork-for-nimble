@@ -29,6 +29,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
+#include "velox/dwio/nimble/encodings/tests/EncodingViewTestUtils.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
 
@@ -518,6 +519,40 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
     if (i < 331) {
       break;
     }
+  }
+}
+
+// A range-list read on a transformed stream chooses once, for the whole list,
+// between reading each range the way a single-range read would and decoding
+// the column once and copying the ranges out. Both choices have to return the
+// source rows for every transform family: KeyDerived through the position
+// map, the relabellings in place, and BitPlane gathered. The lists include
+// sparse ones that stay per range and dense ones that decode the column, and
+// the untransformed stream is read the same way as the baseline.
+TEST_F(TransformedEncodingTest, rangeListsAgreeWithTheSourceValues) {
+  const auto values = packedIdentifiers(20'011);
+  std::vector<TransformId> transforms{TransformId::None};
+  const auto underTest = transformsUnderTest();
+  transforms.insert(transforms.end(), underTest.begin(), underTest.end());
+  for (auto id : transforms) {
+    SCOPED_TRACE(toString(id));
+    Buffer buffer{*pool_};
+    Encoding::Options options;
+    if (id != TransformId::None) {
+      options.subIntSplitTransform = static_cast<uint8_t>(id);
+      options.subIntSplitKeySection = 1;
+      options.subIntSplitForceApply = true;
+    }
+    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+        buffer, values, CompressionType::Uncompressed, options);
+
+    detail::SubIntSplitTransformInfo info;
+    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    ASSERT_EQ(info.anyTransform(), id != TransformId::None)
+        << toString(id) << " was not applied as requested";
+
+    SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
+    test::expectRangeListReads(view, values);
   }
 }
 
