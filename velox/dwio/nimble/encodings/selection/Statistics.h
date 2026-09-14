@@ -235,6 +235,26 @@ class Statistics {
     return uniqueCounts_.value();
   }
 
+  /// A lower bound on the number of distinct values: the number of distinct
+  /// offsets from min in their low kDistinctBoundBits bits. Exact where the
+  /// unique counts are already built, or where every offset fits in those
+  /// bits. Otherwise costs one pass and a bitmap that fits in L2, a fraction of
+  /// what counting the distinct values costs, which is what makes it worth
+  /// asking before an estimate that only needs to know the count is not small.
+  uint64_t distinctLowerBound() const {
+    static_assert(nimble::isIntegralType<T>());
+    if (uniqueCounts_.has_value() && uniqueCounts_->has_value()) {
+      return uniqueCounts_->value().size();
+    }
+    if (!distinctLowerBound_.has_value()) {
+      populateDistinctLowerBound();
+    }
+    return distinctLowerBound_.value();
+  }
+
+  /// Low bits of the offsets from min that distinctLowerBound() tells apart.
+  static constexpr int kDistinctBoundBits{20};
+
   /// Returns one value per consecutive run in input order. The sequence is
   /// computed lazily and cached independently from aggregate repeat metrics.
   const std::vector<T>& runValues() const {
@@ -357,6 +377,7 @@ class Statistics {
   void populateStringLength() const;
   void populateBitFlipProfile() const;
   void populateAdjacentPairStats() const;
+  void populateDistinctLowerBound() const;
 
   mutable std::optional<uint64_t> consecutiveRepeatCount_;
   mutable std::optional<uint64_t> minRepeat_;
@@ -374,6 +395,7 @@ class Statistics {
   mutable std::optional<std::vector<uint32_t>> runLengths_;
   mutable std::optional<BitFlipProfile> bitFlipProfile_;
   mutable std::optional<AdjacentPairStats> adjacentPairStats_;
+  mutable std::optional<uint64_t> distinctLowerBound_;
 };
 
 } // namespace facebook::nimble

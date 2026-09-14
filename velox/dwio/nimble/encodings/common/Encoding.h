@@ -383,6 +383,28 @@ class Encoding {
     /// subIntSplitHybridPlanner is set.
     uint32_t subIntSplitHybridRescoreSamples{16'384};
 
+    /// Rows a stream's costly candidates are first priced on, before selection
+    /// decides whether to price them on the whole stream. Zero, the default,
+    /// prices every candidate on every row.
+    ///
+    /// MainlyConstant, Dictionary, RLE, FrequencyPartition and Huffman price a
+    /// stream from its distinct values or its runs, and on a long near-unique
+    /// stream that costs more than every other estimate together while they
+    /// lose to plain bit packing. With this set, and the stream longer than
+    /// twice it, every candidate is priced on this many rows drawn in
+    /// contiguous blocks, and each costly one goes on to be priced on the
+    /// whole stream only where its sample cost is within
+    /// selectionScreenMargin of the cheapest sample cost. Everything priced on
+    /// the whole stream is chosen between exactly as it would be without the
+    /// screen, so the choice can change only where a candidate that loses the
+    /// sample by more than the margin would have won the stream.
+    uint32_t selectionScreenRows{0};
+
+    /// How far a costly candidate's sample cost may exceed the cheapest before
+    /// the screen drops it, as a ratio. Only read when selectionScreenRows is
+    /// set.
+    double selectionScreenMargin{1.25};
+
     /// EXPERIMENTATION: Allows ALP to participate in nested floating-point
     /// encoding selection. False by default; do not enable for production
     /// until ALP is production-ready.

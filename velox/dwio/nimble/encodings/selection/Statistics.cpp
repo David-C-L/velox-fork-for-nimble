@@ -470,6 +470,35 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
 }
 
 template <typename T, typename InputType>
+void Statistics<T, InputType>::populateDistinctLowerBound() const {
+  static_assert(nimble::isIntegralType<T>());
+  static_assert(std::is_same_v<T, InputType>);
+  using UnsignedT = std::make_unsigned_t<T>;
+  if (data_.empty()) {
+    distinctLowerBound_ = 0;
+    return;
+  }
+  const auto base = static_cast<UnsignedT>(min());
+  const int bits = std::min<int>(
+      kDistinctBoundBits,
+      static_cast<int>(std::bit_width(
+          static_cast<uint64_t>(static_cast<UnsignedT>(
+              static_cast<UnsignedT>(max()) - base)))));
+  const uint64_t mask = (uint64_t{1} << bits) - 1;
+  std::vector<uint64_t> seen(((uint64_t{1} << bits) + 63) / 64, 0);
+  for (const auto value : data_) {
+    const uint64_t offset =
+        static_cast<UnsignedT>(static_cast<UnsignedT>(value) - base) & mask;
+    seen[offset >> 6] |= uint64_t{1} << (offset & 63);
+  }
+  uint64_t distinct{0};
+  for (const uint64_t word : seen) {
+    distinct += std::popcount(word);
+  }
+  distinctLowerBound_ = distinct;
+}
+
+template <typename T, typename InputType>
 void Statistics<T, InputType>::populateStringLength() const {
   uint64_t totalBytes = 0;
   std::string_view minString = data_[0];
@@ -616,6 +645,16 @@ template void Statistics<int32_t>::populateBitFlipProfile() const;
 template void Statistics<uint32_t>::populateBitFlipProfile() const;
 template void Statistics<int64_t>::populateBitFlipProfile() const;
 template void Statistics<uint64_t>::populateBitFlipProfile() const;
+
+// populateDistinctLowerBound works on integral types only
+template void Statistics<int8_t>::populateDistinctLowerBound() const;
+template void Statistics<uint8_t>::populateDistinctLowerBound() const;
+template void Statistics<int16_t>::populateDistinctLowerBound() const;
+template void Statistics<uint16_t>::populateDistinctLowerBound() const;
+template void Statistics<int32_t>::populateDistinctLowerBound() const;
+template void Statistics<uint32_t>::populateDistinctLowerBound() const;
+template void Statistics<int64_t>::populateDistinctLowerBound() const;
+template void Statistics<uint64_t>::populateDistinctLowerBound() const;
 
 // populateAdjacentPairStats works on integral types only
 template void Statistics<int8_t>::populateAdjacentPairStats() const;

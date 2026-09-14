@@ -398,6 +398,37 @@ TYPED_TEST(StatisticsIntegerTests, uniqueCountsAcrossCountingStrategies) {
   }
 }
 
+// Exact while the offsets from min fit in the bits it tells apart, a lower
+// bound past that, and the exact count once the unique counts exist.
+TYPED_TEST(StatisticsIntegerTests, distinctLowerBound) {
+  using T = TypeParam;
+  using ValueType = typename T::valueType;
+  using UnsignedType = std::make_unsigned_t<ValueType>;
+
+  std::vector<ValueType> narrow;
+  for (int i = 0; i < 1'000; ++i) {
+    narrow.push_back(static_cast<ValueType>(
+        static_cast<UnsignedType>(std::numeric_limits<ValueType>::lowest()) +
+        static_cast<UnsignedType>(i % 97)));
+  }
+  const auto narrowStatistics = T::create({narrow});
+  EXPECT_EQ(97, narrowStatistics.distinctLowerBound());
+
+  if constexpr (sizeof(ValueType) >= 4) {
+    // Distinct values that collide in their low bits: the bound sees 3 of 6.
+    const uint64_t high = uint64_t{1}
+        << nimble::Statistics<ValueType>::kDistinctBoundBits;
+    std::vector<ValueType> wide;
+    for (uint64_t i = 0; i < 6; ++i) {
+      wide.push_back(static_cast<ValueType>((i % 3) + (i / 3) * high));
+    }
+    const auto wideStatistics = T::create({wide});
+    EXPECT_EQ(3, wideStatistics.distinctLowerBound());
+    EXPECT_EQ(6, wideStatistics.uniqueCounts().value().size());
+    EXPECT_EQ(6, wideStatistics.distinctLowerBound());
+  }
+}
+
 template <typename T>
 void verifyString(
     std::function<T(std::vector<std::string> data)> genStatisticsType) {

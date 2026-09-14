@@ -17,6 +17,8 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <limits>
+#include <span>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -300,6 +302,112 @@ inline float effectiveReadFactor(
   return trivialKeepsItsDiscount ? tableReadFactor : 1.0f;
 }
 
+/// Whether selection's screen may withhold `encodingType` from pricing on the
+/// whole stream. These are the candidates that price a stream from its
+/// distinct values or its runs; see Encoding::Options::selectionScreenRows.
+inline bool isScreenedBySample(EncodingType encodingType) {
+  switch (encodingType) {
+    case EncodingType::MainlyConstant:
+    case EncodingType::Dictionary:
+    case EncodingType::RLE:
+    case EncodingType::Huffman:
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+    case EncodingType::FrequencyPartition:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Numeric body of screenCandidatesBySample.
+template <typename T>
+void screenNumericCandidatesBySample(
+    std::span<const typename TypeTraits<T>::physicalType> values,
+    std::vector<std::pair<EncodingType, float>>& candidates,
+    const Encoding::Options& options) {
+  using physicalType = typename TypeTraits<T>::physicalType;
+  const size_t sampleRows = options.selectionScreenRows;
+  if (sampleRows == 0 || values.size() <= 2 * sampleRows ||
+      std::none_of(candidates.begin(), candidates.end(), [](const auto& entry) {
+        return isScreenedBySample(entry.first);
+      })) {
+    return;
+  }
+
+  // Contiguous blocks spread over the stream, so that runs, frames and local
+  // ranges survive in the sample the way they occur in the stream.
+  constexpr size_t kBlocks{8};
+  const size_t blockRows = std::max<size_t>(sampleRows / kBlocks, 1);
+  const size_t stride = values.size() / kBlocks;
+  std::vector<physicalType> sample;
+  sample.reserve(kBlocks * blockRows);
+  for (size_t block = 0; block < kBlocks; ++block) {
+    const auto first = values.begin() + block * stride;
+    sample.insert(sample.end(), first, first + blockRows);
+  }
+  const std::span<const physicalType> sampleValues{sample};
+  const auto sampleStatistics = Statistics<physicalType>::create(sampleValues);
+
+  std::optional<uint64_t> fixedBitWidthSize;
+  if (std::any_of(candidates.begin(), candidates.end(), [](const auto& entry) {
+        return entry.first == EncodingType::FixedBitWidth;
+      })) {
+    fixedBitWidthSize = detail::EncodingSizeEstimation<T>::estimateSize(
+        EncodingType::FixedBitWidth, sampleValues, sampleStatistics, options);
+  }
+  std::vector<std::optional<double>> sampleCosts;
+  sampleCosts.reserve(candidates.size());
+  double cheapest = std::numeric_limits<double>::max();
+  for (const auto& [encodingType, readFactor] : candidates) {
+    const auto estimatedSize = detail::EncodingSizeEstimation<T>::estimateSize(
+        encodingType, sampleValues, sampleStatistics, options);
+    if (!estimatedSize.has_value()) {
+      sampleCosts.emplace_back();
+      continue;
+    }
+    const double cost = static_cast<double>(estimatedSize.value()) *
+        effectiveReadFactor(
+            encodingType, readFactor, estimatedSize.value(), fixedBitWidthSize);
+    sampleCosts.emplace_back(cost);
+    cheapest = std::min(cheapest, cost);
+  }
+
+  const double bound = cheapest * options.selectionScreenMargin;
+  size_t kept{0};
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!isScreenedBySample(candidates[i].first) ||
+        !sampleCosts[i].has_value() || sampleCosts[i].value() <= bound) {
+      candidates[kept++] = candidates[i];
+    }
+  }
+  candidates.resize(kept);
+}
+
+/// Drops from `candidates` each costly candidate whose price on a sample of
+/// `values` exceeds the cheapest candidate's sample price by more than
+/// Encoding::Options::selectionScreenMargin. Leaves `candidates` untouched
+/// when the screen is off or the stream is too short to be worth sampling.
+///
+/// Nothing that survives is priced differently: select() goes on to price the
+/// survivors on the whole stream as before. A costly candidate the sample
+/// could not price at all is kept, since a sample can rule out an encoding the
+/// stream admits.
+template <typename T>
+void screenCandidatesBySample(
+    std::span<const typename TypeTraits<T>::physicalType> values,
+    std::vector<std::pair<EncodingType, float>>& candidates,
+    const Encoding::Options& options) {
+  using physicalType = typename TypeTraits<T>::physicalType;
+  // Numbers only, which is what the screen has been measured on. Booleans
+  // cannot be sampled into a span at all.
+  if constexpr (!isNumericType<physicalType>() || isBoolType<physicalType>()) {
+    return;
+  } else {
+    screenNumericCandidatesBySample<T>(values, candidates, options);
+  }
+}
+
 /// Manual encoding selection implementation.
 /// Uses a manually crafted model to choose the most appropriate encoding based
 /// on the provided statistics.
@@ -348,6 +456,14 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
               })) {
         candidateEncodingReadFactors.emplace_back(EncodingType::ALP, 1.0);
       }
+    }
+
+    // Not while decode is priced: the screen compares sizes, and would drop a
+    // candidate that loses on size and wins once its decode is counted.
+    if (!options.subIntSplitSectionSelection ||
+        options.subIntSplitDecodeWeight == 0.0) {
+      screenCandidatesBySample<T>(
+          values, candidateEncodingReadFactors, options);
     }
 
     // Fast path: when there are no candidate encodings, fall back to Trivial.

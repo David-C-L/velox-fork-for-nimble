@@ -27,6 +27,8 @@
 #include <gflags/gflags.h>
 
 DECLARE_string(mlidc_sis_withdraw_nested_encodings);
+DECLARE_uint32(mlidc_selection_screen_rows);
+DECLARE_double(mlidc_selection_screen_margin);
 
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/common/Vector.h"
@@ -249,7 +251,14 @@ std::string_view encodeWithCompression(
       std::make_unique<BenchEncodingSelectionPolicy<T>>(
           compressionType, realNestedSelection)};
 
-  return E::encode(selection, physicalValues, buffer, options);
+  // Applied here, where every Nimble target's encode passes, rather than per
+  // arm, so that one flag changes every arm alike.
+  nimble::Encoding::Options flaggedOptions = options;
+  if (FLAGS_mlidc_selection_screen_rows != 0) {
+    flaggedOptions.selectionScreenRows = FLAGS_mlidc_selection_screen_rows;
+    flaggedOptions.selectionScreenMargin = FLAGS_mlidc_selection_screen_margin;
+  }
+  return E::encode(selection, physicalValues, buffer, flaggedOptions);
 }
 
 } // namespace facebook::nimble::mlidc
