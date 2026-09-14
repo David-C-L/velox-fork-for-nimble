@@ -20,6 +20,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -28,6 +30,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "folly/Executor.h"
 #include "folly/container/F14Set.h"
 
 #include "velox/common/base/BitUtil.h"
@@ -1515,9 +1518,11 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // Encodes one section at its storage width, reading row i's section value
   // from sectionValueAt(i). Called more than once per section when choosing
   // whether to transform means pricing both.
-  const auto encodeSectionFrom = [&](uint8_t s,
+  const auto encodeSectionInto = [&](uint8_t s,
                                      uint8_t storageBytes,
-                                     const auto& sectionValueAt) {
+                                     const auto& sectionValueAt,
+                                     Buffer& targetBuffer,
+                                     const Encoding::Options& targetOptions) {
     std::string_view encoded;
     switch (storageBytes) {
       case 1: {
@@ -1529,8 +1534,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint8_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 2: {
@@ -1542,8 +1547,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint16_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 4: {
@@ -1555,8 +1560,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint32_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       case 8: {
@@ -1568,8 +1573,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
             static_cast<NestedEncodingIdentifier>(s),
             std::span<const uint64_t>(
                 sectionValues.data(), sectionValues.size()),
-            sectionBuffer,
-            sectionOptions);
+            targetBuffer,
+            targetOptions);
         break;
       }
       default: {
@@ -1577,6 +1582,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
       }
     }
     return encoded;
+  };
+  const auto encodeSectionFrom = [&](uint8_t s,
+                                     uint8_t storageBytes,
+                                     const auto& sectionValueAt) {
+    return encodeSectionInto(
+        s, storageBytes, sectionValueAt, sectionBuffer, sectionOptions);
   };
   const auto encodeSection = [&](uint8_t s,
                                  uint8_t storageBytes,
@@ -1659,7 +1670,50 @@ std::string_view SubIntSplitEncoding<T>::encode(
   std::vector<std::vector<uint64_t>> sectionValues64(splitCount);
   std::vector<uint8_t> sectionStorage(splitCount);
   std::vector<std::string_view> plainEncoded(splitCount);
-  for (uint8_t s = 0; s < splitCount; ++s) {
+  // Each concurrent section writes into a buffer of its own, which outlives
+  // the loop because plainEncoded views into it, and draws no scratch from the
+  // encoding buffer pool, which is not thread-safe.
+  std::vector<std::unique_ptr<Buffer>> concurrentBuffers;
+  if (candidates.empty() && options.subIntSplitSectionExecutor != nullptr &&
+      splitCount > 1) {
+    Encoding::Options concurrentOptions = sectionOptions;
+    concurrentOptions.encodingBufferPool = nullptr;
+    concurrentBuffers.resize(splitCount);
+    std::vector<std::exception_ptr> failures(splitCount);
+    std::latch remaining(splitCount);
+    for (uint8_t s = 0; s < splitCount; ++s) {
+      const int width = segments[s].bitEnd - segments[s].bitStart + 1;
+      sectionStorage[s] = sectionStorageBytes(width);
+      concurrentBuffers[s] = std::make_unique<Buffer>(*sectionPool);
+      options.subIntSplitSectionExecutor->add([&, s, width]() {
+        try {
+          const auto& segment = segments[s];
+          const uint64_t mask =
+              (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+          plainEncoded[s] = encodeSectionInto(
+              s,
+              sectionStorage[s],
+              [&values, &segment, mask](uint32_t i) {
+                uint64_t value = 0;
+                __builtin_memcpy(&value, &values[i], sizeof(physicalType));
+                return (value >> segment.bitStart) & mask;
+              },
+              *concurrentBuffers[s],
+              concurrentOptions);
+        } catch (...) {
+          failures[s] = std::current_exception();
+        }
+        remaining.count_down();
+      });
+    }
+    remaining.wait();
+    for (const auto& failure : failures) {
+      if (failure) {
+        std::rethrow_exception(failure);
+      }
+    }
+  }
+  for (uint8_t s = 0; s < splitCount && concurrentBuffers.empty(); ++s) {
     const auto& seg = segments[s];
     const int width = seg.bitEnd - seg.bitStart + 1;
     sectionStorage[s] = sectionStorageBytes(width);

@@ -32,6 +32,10 @@
 #include <string_view>
 #include <type_traits>
 
+namespace folly {
+class Executor;
+} // namespace folly
+
 /// The Encoding class defines an interface for interacting with encodings
 /// (aka vectors, aka arrays) of encoded data. The API is tailored for
 /// typical usage patterns within query engines, and is designed to be
@@ -164,6 +168,14 @@ class Encoding {
     /// choose. Costs one trial encode per candidate per section, so it buys
     /// compression with encode time.
     bool subIntSplitAutoTransform = false;
+
+    /// Executor SubIntSplit encodes its sections on concurrently. Null, the
+    /// default, encodes them one after another on the calling thread. Only
+    /// encodes that search no transform spread their sections, since a
+    /// transform search compares each section's encodes against a bound the
+    /// others move. The bytes are the same either way: each section is encoded
+    /// exactly as it would be alone and written in section order.
+    folly::Executor* subIntSplitSectionExecutor = nullptr;
 
     /// Section whose values order a key-derived permutation, and which is
     /// therefore stored unpermuted. 0xFF, the default, means the encoder tries
