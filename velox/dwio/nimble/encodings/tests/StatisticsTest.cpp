@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -337,6 +338,63 @@ TYPED_TEST(StatisticsIntegerTests, uniqueCountsDenseRange) {
     }
     EXPECT_EQ(test.expectedMin, statistics.min());
     EXPECT_EQ(test.expectedMax, statistics.max());
+  }
+}
+
+// Counting picks a table, a hash map or a sort by range and cardinality. Each
+// case below lands on a different one, and all must agree with a plain count.
+TYPED_TEST(StatisticsIntegerTests, uniqueCountsAcrossCountingStrategies) {
+  using T = TypeParam;
+  using ValueType = typename T::valueType;
+  using UnsignedType = std::make_unsigned_t<ValueType>;
+
+  struct Test {
+    std::string_view name;
+    uint64_t distinct;
+    uint64_t step;
+  };
+  // Stepped so that the range is wide even where the distinct count is small,
+  // and anchored at the type's lowest value so that offsets from min cross
+  // zero in the signed types.
+  const uint64_t typeMax = std::numeric_limits<UnsignedType>::max();
+  const std::vector<Test> tests = {
+      {"few distinct over a wide range", 300, 97},
+      {"many distinct over a narrow range", 40'000, 1},
+      {"many distinct over a wide range", 40'000, typeMax / 40'000},
+  };
+
+  std::mt19937 rng{kShuffleSeed};
+  for (const auto& test : tests) {
+    SCOPED_TRACE(test.name);
+    const uint64_t step = std::max<uint64_t>(test.step, 1);
+    const uint64_t distinct = std::min(test.distinct, typeMax / step + 1);
+    std::vector<ValueType> data;
+    std::map<ValueType, uint64_t> expected;
+    for (uint64_t i = 0; i < distinct; ++i) {
+      const auto value = static_cast<ValueType>(static_cast<UnsignedType>(
+          static_cast<uint64_t>(static_cast<UnsignedType>(
+              std::numeric_limits<ValueType>::lowest())) +
+          i * step));
+      // Counts of one to three, so that the counts tie as well as differ.
+      const uint64_t repeats = i % 3 + 1;
+      for (uint64_t repeat = 0; repeat < repeats; ++repeat) {
+        data.push_back(value);
+      }
+      expected[value] += repeats;
+    }
+    std::shuffle(data.begin(), data.end(), rng);
+
+    const auto statistics = T::create({data});
+    const auto& uniqueCounts = statistics.uniqueCounts().value();
+    std::map<ValueType, uint64_t> actual;
+    for (const auto& [value, count] : uniqueCounts) {
+      EXPECT_TRUE(actual.emplace(value, count).second);
+    }
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(expected.size(), uniqueCounts.size());
+    for (const auto& [value, count] : expected) {
+      EXPECT_EQ(count, uniqueCounts.at(value));
+    }
   }
 }
 

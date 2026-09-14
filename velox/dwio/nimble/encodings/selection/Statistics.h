@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <span>
@@ -28,28 +29,43 @@
 
 namespace facebook::nimble {
 
+/// Each distinct value of a stream with the number of rows holding it.
+///
+/// Held either as a hash map or as a vector sorted by value. Which one a
+/// stream gets is a cost decision made in Statistics and nothing else: the
+/// entries are the same, only the order they iterate in differs, and every
+/// consumer is indifferent to that order: MainlyConstant breaks count ties by
+/// value, and the other estimators read only the number of entries and the
+/// multiset of counts.
 template <typename T, typename InputType = T>
 class UniqueValueCounts {
  public:
   using MapType = absl::flat_hash_map<T, uint64_t>;
+  using value_type = typename MapType::value_type;
+
+  /// Entries in ascending value order, each value appearing once.
+  using SortedType = std::vector<value_type>;
 
   struct Iterator {
     using iterator_category = std::forward_iterator_tag;
     using value_type = typename MapType::value_type;
     using difference_type = typename MapType::difference_type;
     using const_reference = typename MapType::const_reference;
-    using const_iterator = typename MapType::const_iterator;
 
     const_reference operator*() const {
-      return *iterator_;
+      return sortedEntry_ != nullptr ? *sortedEntry_ : *mapIterator_;
     }
-    const_iterator operator->() const {
-      return iterator_;
+    const value_type* operator->() const {
+      return &**this;
     }
 
     // Prefix increment
     Iterator& operator++() {
-      ++iterator_;
+      if (sortedEntry_ != nullptr) {
+        ++sortedEntry_;
+      } else {
+        ++mapIterator_;
+      }
       return *this;
     }
 
@@ -61,17 +77,23 @@ class UniqueValueCounts {
     }
 
     friend bool operator==(const Iterator& a, const Iterator& b) {
-      return a.iterator_ == b.iterator_;
+      return a.sortedEntry_ == b.sortedEntry_ &&
+          (a.sortedEntry_ != nullptr || a.mapIterator_ == b.mapIterator_);
     }
     friend bool operator!=(const Iterator& a, const Iterator& b) {
-      return a.iterator_ != b.iterator_;
+      return !(a == b);
     }
 
    private:
     explicit Iterator(typename MapType::const_iterator iterator)
-        : iterator_{iterator} {}
+        : mapIterator_{iterator} {}
+    explicit Iterator(const value_type* sortedEntry)
+        : sortedEntry_{sortedEntry} {}
 
-    typename MapType::const_iterator iterator_;
+    typename MapType::const_iterator mapIterator_{};
+    // Null when iterating the map. Statistics never builds an empty sorted
+    // vector, whose data pointer may itself be null.
+    const value_type* sortedEntry_{nullptr};
 
     friend class UniqueValueCounts<T, InputType>;
   };
@@ -79,6 +101,16 @@ class UniqueValueCounts {
   using const_iterator = Iterator;
 
   uint64_t at(T key) const noexcept {
+    if (sorted_) {
+      const auto it = std::lower_bound(
+          sortedCounts_.begin(),
+          sortedCounts_.end(),
+          key,
+          [](const value_type& entry, const T& value) {
+            return entry.first < value;
+          });
+      return it != sortedCounts_.end() && it->first == key ? it->second : 0;
+    }
     auto it = uniqueCounts_.find(key);
     if (it == uniqueCounts_.end()) {
       return 0;
@@ -87,38 +119,44 @@ class UniqueValueCounts {
   }
 
   size_t size() const noexcept {
-    return uniqueCounts_.size();
+    return sorted_ ? sortedCounts_.size() : uniqueCounts_.size();
   }
 
   uint64_t uniqueStringBytes() const noexcept {
     static_assert(nimble::isStringType<T>());
     uint64_t totalBytes = 0;
-    for (const auto& unique : uniqueCounts_) {
+    for (const auto& unique : *this) {
       totalBytes += unique.first.size();
     }
     return totalBytes;
   }
 
   const_iterator begin() const noexcept {
-    return Iterator{uniqueCounts_.cbegin()};
+    return sorted_ ? Iterator{sortedCounts_.data()}
+                   : Iterator{uniqueCounts_.cbegin()};
   }
   const_iterator cbegin() const noexcept {
-    return Iterator{uniqueCounts_.cbegin()};
+    return begin();
   }
 
   const_iterator end() const noexcept {
-    return Iterator{uniqueCounts_.cend()};
+    return sorted_ ? Iterator{sortedCounts_.data() + sortedCounts_.size()}
+                   : Iterator{uniqueCounts_.cend()};
   }
   const_iterator cend() const noexcept {
-    return Iterator{uniqueCounts_.cend()};
+    return end();
   }
 
   UniqueValueCounts() = default;
   explicit UniqueValueCounts(MapType&& uniqueCounts)
       : uniqueCounts_{std::move(uniqueCounts)} {}
+  explicit UniqueValueCounts(SortedType&& sortedCounts)
+      : sortedCounts_{std::move(sortedCounts)}, sorted_{true} {}
 
  private:
   MapType uniqueCounts_;
+  SortedType sortedCounts_;
+  bool sorted_{false};
 };
 
 template <typename T, typename InputType = T>

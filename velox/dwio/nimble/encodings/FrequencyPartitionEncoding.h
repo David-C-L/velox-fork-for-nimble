@@ -221,8 +221,7 @@ class FrequencyPartitionEncoding
     const uint64_t uniqueCount = uniqueCounts->size();
     // Only the values that reach a tier need ranking. Everything past the last
     // tier's capacity is unencoded at full width whatever its frequency, so the
-    // tail never has to be sorted -- which keeps this bounded by the capacity
-    // table rather than by the column's cardinality.
+    // tail is never ranked.
     const auto ranked =
         static_cast<size_t>(std::min<uint64_t>(uniqueCount, totalCapacity));
     std::vector<uint64_t> counts;
@@ -230,11 +229,6 @@ class FrequencyPartitionEncoding
     for (const auto& unique : uniqueCounts.value()) {
       counts.push_back(unique.second);
     }
-    std::partial_sort(
-        counts.begin(),
-        counts.begin() + ranked,
-        counts.end(),
-        std::greater<uint64_t>());
 
     uint64_t payloadSize = 0;
     uint64_t assigned = 0;
@@ -249,6 +243,19 @@ class FrequencyPartitionEncoding
       ++tiersCreated;
       const uint64_t dictEntries =
           std::min<uint64_t>(getCapacity(keyBits), ranked - assigned);
+      // A tier needs the sum of its counts, never their order, so each tier
+      // is partitioned off the front of what is left rather than the ranked
+      // prefix being sorted. Where the capacity table reaches past the
+      // cardinality, as it does for 64-bit values, sorting was a full sort of
+      // one count per distinct value.
+      const auto tierEnd = counts.begin() + (assigned + dictEntries);
+      if (tierEnd != counts.end()) {
+        std::nth_element(
+            counts.begin() + assigned,
+            tierEnd,
+            counts.end(),
+            std::greater<uint64_t>());
+      }
       uint64_t tierRows = 0;
       for (uint64_t i = 0; i < dictEntries; ++i) {
         tierRows += counts[static_cast<size_t>(assigned + i)];

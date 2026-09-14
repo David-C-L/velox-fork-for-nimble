@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/common/RadixSort.h"
 #include "velox/dwio/nimble/common/StatsUtil.h"
 #include "velox/dwio/nimble/common/Types.h"
 
@@ -29,6 +30,15 @@ namespace facebook::nimble {
 namespace {
 
 constexpr uint32_t kMaxDenseRangeSize{4096};
+
+// Ranges below this are counted with a table where the stream has enough rows
+// to amortise clearing and scanning it, which covers every long 16-bit stream.
+constexpr uint64_t kMaxTableRangeSize{65'536};
+
+// Distinct values past which counting abandons the hash map for a sort. The
+// map stays within L2 up to here, which is where hashing each row is still
+// cheaper than a radix pass over all of them.
+constexpr size_t kMaxHashDistinctCount{16'384};
 
 template <typename T, typename InputType>
 using MapType = typename UniqueValueCounts<T, InputType>::MapType;
@@ -78,14 +88,18 @@ MapType<T, InputType> populateHashUniqueCounts(
 }
 
 template <typename T>
-MapType<T, T> populateRangeUniqueCounts(
+using SortedType = typename UniqueValueCounts<T, T>::SortedType;
+
+// Counts over [minValue, minValue + rangeSize) with a table indexed by offset,
+// which emits the entries already in value order.
+template <typename T>
+SortedType<T> populateRangeUniqueCounts(
     std::span<const T> values,
     T minValue,
-    uint32_t rangeSize) {
+    size_t rangeSize) {
+  SortedType<T> uniqueCounts;
   if (rangeSize == 1) {
-    MapType<T, T> uniqueCounts;
-    uniqueCounts.reserve(1);
-    uniqueCounts.emplace(minValue, static_cast<uint64_t>(values.size()));
+    uniqueCounts.emplace_back(minValue, static_cast<uint64_t>(values.size()));
     return uniqueCounts;
   }
 
@@ -94,12 +108,75 @@ MapType<T, T> populateRangeUniqueCounts(
     ++counts[denseRangeOffset(value, minValue)];
   }
 
-  MapType<T, T> uniqueCounts;
-  uniqueCounts.reserve(std::min<size_t>(rangeSize, values.size()));
-  for (uint32_t offset = 0; offset < rangeSize; ++offset) {
+  size_t distinct{0};
+  for (const auto count : counts) {
+    distinct += count > 0;
+  }
+  uniqueCounts.reserve(distinct);
+  for (size_t offset = 0; offset < rangeSize; ++offset) {
     if (counts[offset] > 0) {
-      uniqueCounts.emplace(
-          integralValueAtOffset(minValue, offset), counts[offset]);
+      uniqueCounts.emplace_back(
+          integralValueAtOffset(minValue, static_cast<uint32_t>(offset)),
+          counts[offset]);
+    }
+  }
+  return uniqueCounts;
+}
+
+// Counts by sorting a copy of the values. A hash map spends a cache miss per
+// distinct value once it outgrows the cache, and on a near-unique stream of a
+// million rows that is most of what building Statistics costs; a radix sort
+// over the offsets from min touches memory sequentially and needs only as many
+// passes as the range has bits.
+template <typename T>
+SortedType<T> populateSortedUniqueCounts(
+    std::span<const T> values,
+    T minValue,
+    T maxValue) {
+  using UnsignedT = std::make_unsigned_t<T>;
+  const UnsignedT base = static_cast<UnsignedT>(minValue);
+  std::vector<UnsignedT> offsets(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    offsets[i] = static_cast<UnsignedT>(values[i]) - base;
+  }
+  RadixSort<UnsignedT> sorter;
+  sorter.sortStable(
+      std::span<UnsignedT>(offsets),
+      [](UnsignedT offset) { return offset; },
+      std::bit_width(
+          static_cast<UnsignedT>(static_cast<UnsignedT>(maxValue) - base)));
+
+  size_t distinct{1};
+  for (size_t i = 1; i < offsets.size(); ++i) {
+    distinct += offsets[i] != offsets[i - 1];
+  }
+  SortedType<T> uniqueCounts;
+  uniqueCounts.reserve(distinct);
+  size_t runStart{0};
+  for (size_t i = 1; i <= offsets.size(); ++i) {
+    if (i == offsets.size() || offsets[i] != offsets[runStart]) {
+      uniqueCounts.emplace_back(
+          static_cast<T>(static_cast<UnsignedT>(offsets[runStart] + base)),
+          static_cast<uint64_t>(i - runStart));
+      runStart = i;
+    }
+  }
+  return uniqueCounts;
+}
+
+// Hash counts while the distinct values stay few enough for the map to live in
+// cache, and returns nothing once they outgrow that, leaving the stream to the
+// sort. The prefix hashed before giving up is bounded by the limit, not by the
+// row count, on any stream whose distinct values arrive early.
+template <typename T>
+std::optional<MapType<T, T>> populateBoundedHashUniqueCounts(
+    std::span<const T> values,
+    size_t distinctLimit) {
+  MapType<T, T> uniqueCounts;
+  for (const auto value : values) {
+    ++uniqueCounts[value];
+    if (uniqueCounts.size() > distinctLimit) {
+      return std::nullopt;
     }
   }
   return uniqueCounts;
@@ -224,13 +301,31 @@ void Statistics<T, InputType>::populateUniques() const {
       nimble::isIntegralType<T>() && std::is_same_v<T, InputType>) {
     const T minValue = min();
     const T maxValue = max();
+    // Cheapest first: a table while the range is small against the rows, a
+    // hash map while the distinct values are few, and a sort otherwise.
+    const uint64_t rangeDistance = integralRangeDistance(maxValue, minValue);
     if (const auto rangeSize =
             denseRangeSize(minValue, maxValue, data_.size())) {
-      uniqueCounts =
-          populateRangeUniqueCounts<T>(data_, minValue, rangeSize.value());
+      uniqueCounts_.emplace(
+          std::in_place,
+          populateRangeUniqueCounts<T>(data_, minValue, rangeSize.value()));
+    } else if (
+        rangeDistance <
+        std::min<uint64_t>(kMaxTableRangeSize, data_.size() * 8)) {
+      uniqueCounts_.emplace(
+          std::in_place,
+          populateRangeUniqueCounts<T>(
+              data_, minValue, static_cast<size_t>(rangeDistance) + 1));
+    } else if (
+        auto hashCounts = populateBoundedHashUniqueCounts<T>(
+            data_, kMaxHashDistinctCount)) {
+      uniqueCounts_.emplace(std::in_place, std::move(hashCounts.value()));
     } else {
-      uniqueCounts = populateHashUniqueCounts<T, InputType>(data_);
+      uniqueCounts_.emplace(
+          std::in_place,
+          populateSortedUniqueCounts<T>(data_, minValue, maxValue));
     }
+    return;
   } else {
     uniqueCounts = populateHashUniqueCounts<T, InputType>(data_);
   }
