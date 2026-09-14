@@ -234,6 +234,55 @@ uint64_t countTrueValues(std::span<const bool> values) {
 
 template <typename T, typename InputType>
 void Statistics<T, InputType>::populateRepeats(bool collectRunValues) const {
+  // Numbers take the run lengths in the same pass and read the repeat metrics
+  // off them. The only estimator asking a number stream for its repeats, RLE's,
+  // asks for the lengths next, which used to be a second pass over the rows;
+  // and the scalar loop below branches on every row, which mispredicts on a
+  // stream whose runs are short and irregular. Booleans keep the loop: RLE
+  // prices their lengths from the repeat metrics alone, so building the
+  // lengths would fault in a buffer nothing reads.
+  if constexpr (!nimble::isStringType<T>() && !nimble::isBoolType<T>()) {
+    if (!collectRunValues) {
+      const size_t size = data_.size();
+      // Counted first, in a pass that vectorises, so that the lengths are
+      // allocated for the runs rather than for the rows: a stream of long runs
+      // would otherwise clear and fault in a row-sized buffer for a handful.
+      size_t transitions{0};
+      for (size_t i = 1; i < size; ++i) {
+        transitions += static_cast<size_t>(data_[i] != data_[i - 1]);
+      }
+      const size_t runs = transitions + 1;
+      std::vector<uint32_t> lengths(runs);
+      // Every row is written as the end of the current run, and the run index
+      // only advances past it where the next row differs, so the ends of runs
+      // are collected without a branch. The index never passes the last run.
+      size_t run{0};
+      for (size_t i = 1; i < size; ++i) {
+        lengths[run] = static_cast<uint32_t>(i);
+        run += static_cast<size_t>(data_[i] != data_[i - 1]);
+      }
+      lengths[runs - 1] = static_cast<uint32_t>(size);
+      uint64_t minRepeat = std::numeric_limits<uint64_t>::max();
+      uint64_t maxRepeat = 0;
+      uint32_t previousEnd{0};
+      for (auto& length : lengths) {
+        const uint32_t end = length;
+        length = end - previousEnd;
+        previousEnd = end;
+        minRepeat = std::min<uint64_t>(minRepeat, length);
+        maxRepeat = std::max<uint64_t>(maxRepeat, length);
+      }
+      minRepeat_ = minRepeat;
+      maxRepeat_ = maxRepeat;
+      consecutiveRepeatCount_ = runs;
+      totalStringsRepeatLength_ = 0;
+      if (!runLengths_.has_value()) {
+        runLengths_ = std::move(lengths);
+      }
+      return;
+    }
+  }
+
   uint64_t consecutiveRepeatCount = 0;
   uint64_t minRepeat = std::numeric_limits<uint64_t>::max();
   uint64_t maxRepeat = 0;
@@ -344,6 +393,18 @@ void Statistics<T, InputType>::populateUniques() const {
           std::in_place,
           populateRangeUniqueCounts<T>(
               data_, minValue, static_cast<size_t>(rangeDistance) + 1));
+    } else if (data_.size() <= kMaxHashDistinctCount) {
+      // A stream this short can never outgrow the bounded map, so hashing
+      // would count every row into a map grown by rehashing as it fills. The
+      // split planner's refiner prices thousands of 16,384-row slices of wide
+      // bit ranges this way, most of them near-unique, and the rehashing was
+      // about a sixth of what pricing them cost. The sort is bounded by the row count
+      // whatever the cardinality. Every reader of the counts is independent of
+      // their order: MainlyConstant breaks count ties by value, Huffman sorts
+      // the frequencies, and the rest read sizes or sums.
+      uniqueCounts_.emplace(
+          std::in_place,
+          populateSortedUniqueCounts<T>(data_, minValue, maxValue));
     } else if (
         auto hashCounts = populateBoundedHashUniqueCounts<T>(
             data_, kMaxHashDistinctCount)) {

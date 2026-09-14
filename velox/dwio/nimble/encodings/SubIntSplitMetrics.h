@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h" // @manual=fbsource//third-party/abseil-cpp:container__flat_hash_map
+#include "velox/common/base/SimdUtil.h"
 
 // Lightweight per-segment metric collection for SubIntSplitEncoding's DP
 // planner. Deliberately minimal: only the statistics needed by the cost
@@ -131,6 +132,17 @@ struct FrequencyCounts {
   size_t doubletonCount{0};
 };
 
+/// Everything about a segment that does not depend on the order of its rows
+/// beyond adjacency, for a caller that counts these for a bit range without
+/// scanning the range's extracted values.
+struct RangeCounts {
+  FrequencyCounts frequencies;
+  // Runs of equal adjacent values, at least one.
+  size_t runCount{0};
+  // See SegmentMetrics::bitWidthBuckets.
+  std::array<uint32_t, 10> bitWidthBuckets{};
+};
+
 // Keeps the eight largest frequencies offered to it, descending and
 // zero-padded.
 //
@@ -212,7 +224,116 @@ class MetricCollector {
     return computeImpl(values, flags, &counts);
   }
 
+  /// As above, and takes the run count and the bit-width histogram as well,
+  /// leaving only the order-dependent scan metrics to compute from `values`.
+  SegmentMetrics compute(
+      const std::vector<uint64_t>& values,
+      MetricFlags flags,
+      const RangeCounts& counts) {
+    const size_t count = values.size();
+    if (count == 0 || !hasFlag(flags, MetricFlag::MinMax) ||
+        !hasFlag(flags, MetricFlag::RunStats) ||
+        !hasFlag(flags, MetricFlag::BitWidthHistogram) ||
+        !hasFlag(flags, MetricFlag::DeltaStats)) {
+      return computeImpl(values, flags, &counts.frequencies);
+    }
+    SegmentMetrics out = scanMinMaxAndDeltas(values);
+    out.runCount = counts.runCount;
+    out.avgRunLength =
+        static_cast<double>(count) / static_cast<double>(out.runCount);
+    out.bitWidthBuckets = counts.bitWidthBuckets;
+    // The same fields, and only those, that computeImpl's supplied-counts
+    // path fills, so that the two agree on every field and the planner sees
+    // identical metrics whichever the grid takes.
+    if (hasFlag(flags, MetricFlag::UniqueCount) ||
+        hasFlag(flags, MetricFlag::FrequencyTiers)) {
+      out.uniqueCount = counts.frequencies.uniqueCount;
+    }
+    if (hasFlag(flags, MetricFlag::DominantValue)) {
+      out.dominantCount = counts.frequencies.dominantCount;
+    }
+    if (hasFlag(flags, MetricFlag::FrequencyTiers)) {
+      fillCoverage(counts.frequencies.largest, count, out.topKCoverage);
+    }
+    return out;
+  }
+
  private:
+  // The scan metrics that depend on row order beyond adjacency: extremes and
+  // the delta statistics. Integer accumulations only, so reassociating them
+  // is exact; see scanAll.
+  //
+  // Vectorised over signed 64-bit lanes, which is exact while every value is
+  // below 2^63: adjacent differences then fit in a signed word, a difference
+  // is non-negative exactly when the pair rises, and signed and unsigned
+  // extremes agree. Every bit range the split grid prices narrower than 64
+  // bits qualifies, and the loop checks rather than assumes it, rescanning
+  // unsigned otherwise. The scalar form of this loop kept its counters in
+  // memory and was most of what pricing a range cost.
+  static SegmentMetrics scanMinMaxAndDeltas(
+      const std::vector<uint64_t>& values) {
+    using Batch = xsimd::batch<int64_t>;
+    const size_t count = values.size();
+    const auto* signedValues = reinterpret_cast<const int64_t*>(values.data());
+    uint64_t minimum = values[0];
+    uint64_t maximum = values[0];
+    uint64_t sumAbsDelta = 0;
+    uint64_t monotonic = 0;
+    uint64_t maxDelta = 0;
+    size_t next = 1;
+    if (count > Batch::size) {
+      const auto zero = Batch::broadcast(0);
+      const auto one = Batch::broadcast(1);
+      auto orOfValues = Batch::broadcast(signedValues[0]);
+      auto minimumBatch = orOfValues;
+      auto maximumBatch = orOfValues;
+      auto sumBatch = zero;
+      auto risingBatch = zero;
+      auto maxDeltaBatch = zero;
+      for (; next + Batch::size <= count; next += Batch::size) {
+        const auto value = Batch::load_unaligned(signedValues + next);
+        const auto previous = Batch::load_unaligned(signedValues + next - 1);
+        orOfValues = orOfValues | value;
+        minimumBatch = xsimd::min(minimumBatch, value);
+        maximumBatch = xsimd::max(maximumBatch, value);
+        const auto delta = value - previous;
+        const auto falling = delta < zero;
+        sumBatch = sumBatch + xsimd::select(falling, zero - delta, delta);
+        risingBatch = risingBatch + xsimd::select(falling, zero, one);
+        maxDeltaBatch =
+            xsimd::max(maxDeltaBatch, xsimd::select(falling, zero, delta));
+      }
+      if (xsimd::reduce_min(orOfValues) >= 0) {
+        minimum = static_cast<uint64_t>(xsimd::reduce_min(minimumBatch));
+        maximum = static_cast<uint64_t>(xsimd::reduce_max(maximumBatch));
+        sumAbsDelta = static_cast<uint64_t>(xsimd::reduce_add(sumBatch));
+        monotonic = static_cast<uint64_t>(xsimd::reduce_add(risingBatch));
+        maxDelta = static_cast<uint64_t>(xsimd::reduce_max(maxDeltaBatch));
+      } else {
+        next = 1;
+      }
+    }
+    for (size_t i = next; i < count; ++i) {
+      const uint64_t previous = values[i - 1];
+      const uint64_t value = values[i];
+      minimum = std::min(minimum, value);
+      maximum = std::max(maximum, value);
+      const bool rising = value >= previous;
+      const uint64_t delta = rising ? value - previous : previous - value;
+      sumAbsDelta += delta;
+      monotonic += static_cast<uint64_t>(rising);
+      maxDelta = std::max(maxDelta, rising ? delta : uint64_t{0});
+    }
+    SegmentMetrics out;
+    out.min = minimum;
+    out.max = maximum;
+    out.range = maximum - minimum;
+    out.sumAbsDelta = sumAbsDelta;
+    out.monotonicCount = monotonic;
+    out.maxDelta = maxDelta;
+    return out;
+  }
+
   // Cumulative coverage of the top 1, 2, 4 and 8 values, from the eight
   // largest frequencies. Shared by every path so that supplying counts and
   // counting them cannot drift apart in the arithmetic.

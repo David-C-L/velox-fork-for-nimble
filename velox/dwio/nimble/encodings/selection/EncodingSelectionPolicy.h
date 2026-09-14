@@ -302,6 +302,34 @@ inline float effectiveReadFactor(
   return trivialKeepsItsDiscount ? tableReadFactor : 1.0f;
 }
 
+/// Whether `encodingType` is certain to cost at least `minCost` under
+/// selection's size-only comparison, from a lower bound on its estimate, so that
+/// selection may skip estimating it. Skipping changes nothing selection returns:
+/// a candidate wins only by costing strictly less than every earlier one, and a
+/// cost is the estimate times the read factor, both of which the bound's cost
+/// cannot exceed. Trivial is never skipped, since its read factor depends on its
+/// estimate.
+template <typename T>
+bool candidateCannotWin(
+    EncodingType encodingType,
+    float readFactor,
+    double minCost,
+    std::span<const typename TypeTraits<T>::physicalType> values,
+    const Statistics<typename TypeTraits<T>::physicalType>& statistics,
+    const Encoding::Options& options) {
+  if (encodingType == EncodingType::Trivial ||
+      minCost == std::numeric_limits<double>::max()) {
+    return false;
+  }
+  const auto lowerBound =
+      detail::EncodingSizeEstimation<T>::estimateSizeLowerBound(
+          encodingType, values, statistics, options);
+  // The same expression select() costs an estimate with, so that a bound equal
+  // to the estimate rounds to the same cost.
+  return lowerBound.has_value() &&
+      static_cast<double>(lowerBound.value() * readFactor) >= minCost;
+}
+
 /// Whether selection's screen may withhold `encodingType` from pricing on the
 /// whole stream. These are the candidates that price a stream from its
 /// distinct values or its runs; see Encoding::Options::selectionScreenRows.
@@ -519,6 +547,11 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     // minimal cost.
     for (const auto& entry : candidateEncodingReadFactors) {
       const auto encodingType = entry.first;
+      if (decodeWeight == 0.0 &&
+          candidateCannotWin<T>(
+              encodingType, entry.second, minCost, values, statistics, options)) {
+        continue;
+      }
       const auto estimatedSize =
           detail::EncodingSizeEstimation<T>::estimateSize(
               encodingType, values, statistics, options);

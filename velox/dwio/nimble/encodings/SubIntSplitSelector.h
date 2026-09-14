@@ -17,10 +17,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -129,129 +131,255 @@ class BitRangeExtractor {
   int bitEnd_;
 };
 
-// Incremental equality partition over the same bit ranges BitRangeExtractor
-// walks.
+// Counts, for every bit range [bitStart, bitEnd] of a sample, the metrics that
+// need no pass over the range's extracted values: the frequencies of its
+// distinct values, its runs, and its bit-width histogram. The split grid visits
+// 2,080 ranges of a 64-bit sample, and scanning, partitioning and histogramming
+// each one separately was most of what planning a split cost. Here each metric
+// is prepared once per left edge, or once per sample, and read per range.
 //
-// The extractor keeps a segment's values in row order, which run counting and
-// the delta statistics read. This keeps the same values grouped by equality,
-// which is what the frequency metrics read and what row order cannot give.
-// Neither structure serves the other's purpose, so both run.
+// Frequencies. Two samples are equal on [bitStart, bitEnd] exactly when they
+// agree on those bits. Reverse each sample's bits from bitStart up, so that
+// bitStart is the most significant, and sort: samples equal on a range are then
+// contiguous, and adjacent sorted keys fall in different groups for the range
+// exactly when their common prefix is shorter than its width. So the groups at
+// every width follow from one sorted order and the prefix length of each
+// adjacent pair, and the multiset of group sizes is the multiset of
+// frequencies a hash map would count. Widening the range can only add group
+// boundaries, so they are added incrementally as bitEnd rises. Moving the left
+// edge up one bit drops the leading bit of every key, which leaves two sorted
+// halves to merge rather than a sort to redo.
 //
-// Why the counts it reports are the counts a hash map would report, rather
-// than an approximation of them: two samples fall in the same group exactly
-// when they agree on the bits the range covers, and their extracted values are
-// equal exactly when they agree on those same bits. The groups therefore ARE
-// the equivalence classes of the extracted value, so the multiset of group
-// sizes IS the multiset of frequencies, and unique count, dominant count and
-// the coverage tiers follow from it directly. That argument is the reason to
-// believe this; the tests exist to catch the implementation failing to match
-// the argument, which is a different thing from establishing it.
+// Runs. Adjacent rows differ on a range exactly when their XOR has a set bit in
+// it, that is, when the XOR's lowest set bit at or above bitStart lies within
+// the width. One histogram of that position per left edge gives the run count
+// at every width.
 //
-// Widening a range by one bit can only split a group, never merge two, so each
-// step refines the partition in place instead of rebuilding it.
-class BitRangePartition {
+// Bit widths. A value's bit width is at least k exactly when the range holds a
+// set bit at relative position k - 1 or above. Counting, once per sample, the
+// samples with a set bit anywhere in [low, high] for every bit pair turns the
+// histogram of any range into ten table reads.
+class BitRangeCounter {
  public:
-  // Starts a fresh left edge: every sample in one group, split by bitStart, so
-  // the partition describes the one-bit range [bitStart, bitStart].
-  void reset(const std::vector<uint64_t>& samples, int bitStart) {
-    values_.assign(samples.begin(), samples.end());
-    starts_.clear();
-    countsDirty_ = true;
-    if (values_.empty()) {
-      return;
+  explicit BitRangeCounter(const std::vector<uint64_t>& samples)
+      : samples_{samples} {
+    const size_t numSamples = samples_.size();
+    // setBitCounts_[high * 64 + low]: samples whose highest set bit at or below
+    // `high` is at or above `low`.
+    setBitCounts_.assign(64 * 64, 0);
+    std::array<uint32_t, 65> widthCounts{};
+    for (int high = 0; high < 64; ++high) {
+      const uint64_t mask =
+          high == 63 ? ~uint64_t{0} : ((uint64_t{1} << (high + 1)) - 1);
+      widthCounts.fill(0);
+      for (size_t i = 0; i < numSamples; ++i) {
+        ++widthCounts[std::bit_width(samples_[i] & mask)];
+      }
+      uint32_t atLeast = 0;
+      for (int low = high; low >= 0; --low) {
+        atLeast += widthCounts[low + 1];
+        setBitCounts_[high * 64 + low] = atLeast;
+      }
     }
-    starts_.push_back(0);
-    splitGroups(bitStart);
   }
 
-  // Widens the range by one bit. Free once every group is a singleton, because
-  // no bit can split a group of one: the partition, and so every count taken
-  // from it, is already final for every wider range on this left edge.
-  void extend(int bit) {
-    if (starts_.size() == values_.size()) {
-      return;
+  // Starts the left edge at `bitStart`. Cheapest when called for consecutive
+  // left edges in ascending order, which is how the grid walks them.
+  void reset(int bitStart) {
+    const size_t numSamples = samples_.size();
+    if (bitStart_ >= 0 && bitStart == bitStart_ + 1) {
+      const auto firstOne = std::partition_point(
+          keys_.begin(), keys_.end(), [](uint64_t key) {
+            return (key >> 63) == 0;
+          });
+      for (auto& key : keys_) {
+        key <<= 1;
+      }
+      mergeBuffer_.resize(numSamples);
+      std::merge(
+          keys_.begin(),
+          firstOne,
+          firstOne,
+          keys_.end(),
+          mergeBuffer_.begin());
+      keys_.swap(mergeBuffer_);
+    } else {
+      keys_.resize(numSamples);
+      for (size_t i = 0; i < numSamples; ++i) {
+        keys_[i] = reverseBits(samples_[i]) << bitStart;
+      }
+      std::sort(keys_.begin(), keys_.end());
     }
-    splitGroups(bit);
-    countsDirty_ = true;
+    bitStart_ = bitStart;
+
+    // Adjacent sorted pairs ordered by common prefix length, so that the group
+    // boundaries of each width are a contiguous run of this order.
+    std::array<uint32_t, 65> prefixCounts{};
+    prefixLengths_.resize(numSamples);
+    for (size_t i = 1; i < numSamples; ++i) {
+      const auto length =
+          static_cast<uint8_t>(std::countl_zero(keys_[i - 1] ^ keys_[i]));
+      prefixLengths_[i] = length;
+      ++prefixCounts[length];
+    }
+    boundaryStarts_[0] = 0;
+    for (int length = 0; length <= 64; ++length) {
+      boundaryStarts_[length + 1] =
+          boundaryStarts_[length] + prefixCounts[length];
+    }
+    boundariesByWidth_.resize(numSamples > 0 ? numSamples - 1 : 0);
+    std::array<uint32_t, 66> next = boundaryStarts_;
+    for (size_t i = 1; i < numSamples; ++i) {
+      boundariesByWidth_[next[prefixLengths_[i]]++] = static_cast<uint32_t>(i);
+    }
+
+    // Bit i set where a group starts at sorted position i. Position 0 always
+    // starts one, and position numSamples is set as a sentinel end.
+    groupStarts_.assign(numSamples / 64 + 1, 0);
+    setGroupStart(0);
+    setGroupStart(numSamples);
+    boundariesAdded_ = 0;
+    frequenciesCurrent_ = false;
+
+    // Runs.
+    std::array<uint32_t, 65> transitionCounts{};
+    for (size_t i = 1; i < numSamples; ++i) {
+      const uint64_t differing = (samples_[i] ^ samples_[i - 1]) >> bitStart;
+      ++transitionCounts[std::countr_zero(differing)];
+    }
+    transitionsBelow_[0] = 0;
+    for (int width = 0; width < 64; ++width) {
+      transitionsBelow_[width + 1] =
+          transitionsBelow_[width] + transitionCounts[width];
+    }
   }
 
-  // Frequency metrics for the range covered so far.
-  const FrequencyCounts& counts() {
-    if (countsDirty_) {
-      recomputeCounts();
-      countsDirty_ = false;
+  // Frequencies for [bitStart, bitEnd]. `bitEnd` must not fall between calls
+  // on one left edge.
+  const FrequencyCounts& frequencies(int bitEnd) {
+    const int width = bitEnd - bitStart_ + 1;
+    const uint32_t boundaries = boundaryStarts_[width];
+    if (frequenciesCurrent_ && boundaries == boundariesAdded_) {
+      return frequencies_;
     }
-    return counts_;
+    for (; boundariesAdded_ < boundaries; ++boundariesAdded_) {
+      setGroupStart(boundariesByWidth_[boundariesAdded_]);
+    }
+    recomputeFrequencies();
+    frequenciesCurrent_ = true;
+    return frequencies_;
+  }
+
+  RangeCounts counts(int bitEnd) {
+    RangeCounts result;
+    result.frequencies = frequencies(bitEnd);
+    const int width = bitEnd - bitStart_ + 1;
+    result.runCount = transitionsBelow_[width] + 1;
+
+    // valuesAtLeast[k]: samples whose bit width on the range is at least 7k.
+    const auto numSamples = static_cast<uint32_t>(samples_.size());
+    std::array<uint32_t, 11> valuesAtLeast{};
+    valuesAtLeast[0] = numSamples;
+    for (int bucket = 1; bucket <= 9; ++bucket) {
+      if (7 * bucket <= width) {
+        valuesAtLeast[bucket] =
+            setBitCounts_[bitEnd * 64 + bitStart_ + 7 * bucket - 1];
+      }
+    }
+    for (int bucket = 0; bucket < 10; ++bucket) {
+      result.bitWidthBuckets[bucket] =
+          valuesAtLeast[bucket] - valuesAtLeast[bucket + 1];
+    }
+    return result;
   }
 
  private:
-  void splitGroups(int bit) {
-    const uint64_t mask = uint64_t{1} << bit;
-    const size_t groupCount = starts_.size();
-    nextStarts_.clear();
-    for (size_t group = 0; group < groupCount; ++group) {
-      const size_t start = starts_[group];
-      const size_t end =
-          group + 1 < groupCount ? starts_[group + 1] : values_.size();
-      // Zeros forward, ones backward, meeting in the middle. This reverses the
-      // ones among themselves, which looks like a bug in a partition and is
-      // not one here: nothing reads the order within a group, only its size.
-      // Not having to be stable is what keeps this to a single pass with no
-      // scratch buffer, where a stable partition would need both.
-      size_t low = start;
-      size_t high = end;
-      while (low < high) {
-        if ((values_[low] & mask) == 0) {
-          ++low;
-        } else {
-          --high;
-          std::swap(values_[low], values_[high]);
-        }
-      }
-      if (low > start) {
-        nextStarts_.push_back(static_cast<uint32_t>(start));
-      }
-      if (end > low) {
-        nextStarts_.push_back(static_cast<uint32_t>(low));
-      }
-    }
-    starts_.swap(nextStarts_);
+  static uint64_t reverseBits(uint64_t value) noexcept {
+    value = ((value >> 1) & 0x5555'5555'5555'5555) |
+        ((value & 0x5555'5555'5555'5555) << 1);
+    value = ((value >> 2) & 0x3333'3333'3333'3333) |
+        ((value & 0x3333'3333'3333'3333) << 2);
+    value = ((value >> 4) & 0x0F0F'0F0F'0F0F'0F0F) |
+        ((value & 0x0F0F'0F0F'0F0F'0F0F) << 4);
+    return __builtin_bswap64(value);
   }
 
-  void recomputeCounts() {
-    counts_ = FrequencyCounts{};
-    const size_t groupCount = starts_.size();
-    counts_.uniqueCount = groupCount;
+  void setGroupStart(size_t position) noexcept {
+    groupStarts_[position / 64] |= uint64_t{1} << (position % 64);
+  }
+
+  // Position of the first bit at or after `from` that is set in the group
+  // starts, or clear when `wantClear`. The sentinel at numSamples bounds the
+  // search for a set bit; a search for a clear bit returns numSamples when
+  // there is none before it.
+  size_t findBit(size_t from, bool wantClear) const noexcept {
+    const size_t numSamples = samples_.size();
+    size_t word = from / 64;
+    uint64_t bits = wantClear ? ~groupStarts_[word] : groupStarts_[word];
+    bits &= ~uint64_t{0} << (from % 64);
+    while (bits == 0) {
+      ++word;
+      if (word >= groupStarts_.size()) {
+        return numSamples;
+      }
+      bits = wantClear ? ~groupStarts_[word] : groupStarts_[word];
+    }
+    return std::min(word * 64 + std::countr_zero(bits), numSamples);
+  }
+
+  // Group sizes from the boundaries: a group of size s >= 2 is a run of s - 1
+  // clear bits after its start, and every group not found that way holds one
+  // sample. So the walk costs the groups with repeats, not every group.
+  void recomputeFrequencies() {
+    const size_t numSamples = samples_.size();
+    frequencies_ = FrequencyCounts{};
+    const size_t groupCount = boundariesAdded_ + 1;
+    frequencies_.uniqueCount = groupCount;
     LargestFrequencies largest;
-    uint32_t dominant = 0;
-    for (size_t group = 0; group < groupCount; ++group) {
-      const size_t end =
-          group + 1 < groupCount ? starts_[group + 1] : values_.size();
-      const auto size = static_cast<uint32_t>(end - starts_[group]);
-      if (size > dominant) {
-        dominant = size;
+    uint32_t dominant = 1;
+    size_t repeatedGroups = 0;
+    size_t position = 1;
+    while (position < numSamples) {
+      const size_t runStart = findBit(position, /*wantClear=*/true);
+      if (runStart >= numSamples) {
+        break;
       }
-      // A group of one is a value seen once, and of two a value seen twice.
-      // The partition already knows every group's size, so the frequencies the
-      // cardinality estimate needs cost two comparisons in a loop that runs
-      // anyway.
-      counts_.singletonCount += (size == 1) ? 1 : 0;
-      counts_.doubletonCount += (size == 2) ? 1 : 0;
+      const size_t runEnd = findBit(runStart, /*wantClear=*/false);
+      const auto size = static_cast<uint32_t>(runEnd - runStart + 1);
+      dominant = std::max(dominant, size);
+      frequencies_.doubletonCount += (size == 2) ? 1 : 0;
       largest.offer(size);
+      ++repeatedGroups;
+      position = runEnd + 1;
     }
-    counts_.dominantCount = dominant;
-    counts_.largest = largest.values();
+    frequencies_.singletonCount = groupCount - repeatedGroups;
+    for (size_t i = 0; i < std::min<size_t>(frequencies_.singletonCount, 8);
+         ++i) {
+      largest.offer(1);
+    }
+    frequencies_.dominantCount = dominant;
+    frequencies_.largest = largest.values();
   }
 
-  // The samples themselves, permuted so that each group is contiguous. Holding
-  // values rather than indices keeps every read sequential, and at the sample
-  // sizes the selector uses the whole array sits in the first-level cache.
-  std::vector<uint64_t> values_;
-  // Where each group starts. The last group runs to values_.size().
-  std::vector<uint32_t> starts_;
-  std::vector<uint32_t> nextStarts_;
-  FrequencyCounts counts_;
-  bool countsDirty_{true};
+  const std::vector<uint64_t>& samples_;
+  std::vector<uint32_t> setBitCounts_;
+  int bitStart_{-1};
+  // Samples' bits from bitStart_ up, reversed and sorted.
+  std::vector<uint64_t> keys_;
+  std::vector<uint64_t> mergeBuffer_;
+  // prefixLengths_[i]: common prefix length of keys_[i - 1] and keys_[i].
+  std::vector<uint8_t> prefixLengths_;
+  // Sorted positions i >= 1, ascending by prefix length; those with a prefix
+  // shorter than w are the first boundaryStarts_[w].
+  std::vector<uint32_t> boundariesByWidth_;
+  std::array<uint32_t, 66> boundaryStarts_{};
+  std::vector<uint64_t> groupStarts_;
+  uint32_t boundariesAdded_{0};
+  FrequencyCounts frequencies_;
+  bool frequenciesCurrent_{false};
+  // transitionsBelow_[w]: adjacent row pairs that differ within the first w
+  // bits of the range.
+  std::array<uint32_t, 65> transitionsBelow_{};
 };
 
 struct SelectorResult {
@@ -309,9 +437,9 @@ inline std::vector<SegmentCost> buildSegmentCostGrid(
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
 
-  // A partition cannot describe a capped count. Capping freezes the running
-  // maximum at whichever element crossed the cap, which is a property of the
-  // order the values arrived in, and a partition discards that order by
+  // BitRangeCounter cannot describe a capped count. Capping freezes the
+  // running maximum at whichever element crossed the cap, which is a property
+  // of the order the values arrived in, and sorting discards that order by
   // design. It never has to here: capping needs more distinct values than a
   // sample this size can hold.
   //
@@ -319,26 +447,22 @@ inline std::vector<SegmentCost> buildSegmentCostGrid(
   // more than the cap is not doing anything wrong, and this hands them the
   // counting path they get today rather than failing on them. Please do not
   // tighten it into a check on the grounds that it reads like one.
-  const bool partitionCounts = numSamples <= MetricCollector::kUniqueCountCap;
-  BitRangePartition partition;
+  const bool rangeCounts = numSamples <= MetricCollector::kUniqueCountCap;
+  std::optional<BitRangeCounter> counter;
+  if (rangeCounts) {
+    counter.emplace(samples);
+  }
 
   for (int l = 0; l < sz; ++l) {
     extractor.reset(l);
-    if (partitionCounts) {
-      partition.reset(samples, l);
+    if (rangeCounts) {
+      counter->reset(l);
     }
     for (int r = l; r < sz; ++r) {
       extractor.extend(r);
-      // reset() already covers the one-bit range at r == l, so the partition
-      // widens only from the second column on. The two structures describe the
-      // same bit range at every step, and nothing checks that they do beyond
-      // this pairing, so they are stepped side by side rather than apart.
-      if (partitionCounts && r > l) {
-        partition.extend(r);
-      }
       const std::vector<uint64_t>& segValues = extractor.values();
-      const SegmentMetrics metrics = partitionCounts
-          ? collector.compute(segValues, requiredFlags, partition.counts())
+      const SegmentMetrics metrics = rangeCounts
+          ? collector.compute(segValues, requiredFlags, counter->counts(r))
           : collector.compute(segValues, requiredFlags);
       const int bitWidth = r - l + 1;
 

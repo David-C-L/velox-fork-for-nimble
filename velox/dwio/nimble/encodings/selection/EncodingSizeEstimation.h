@@ -84,7 +84,107 @@ struct EncodingSizeEstimation {
         "Unable to estimate size for type {}.", folly::demangle(typeid(T)));
   }
 
+  /// A size estimateSize never quotes below for `encodingType`, for the
+  /// encodings whose estimate counts the stream's distinct values, where the
+  /// bound can be had without counting them: MainlyConstant, Dictionary and
+  /// FrequencyPartition on an integer stream whose range is too wide to count
+  /// in a table. nullopt otherwise. Counting a near-unique stream's distinct
+  /// values is most of what selecting its encoding costs, and a bound is enough
+  /// to show that none of the three can win there.
+  static std::optional<uint64_t> estimateSizeLowerBound(
+      const EncodingType encodingType,
+      std::span<const physicalType> values,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options) {
+    if constexpr (
+        !isIntegralType<T>() || !isIntegralType<physicalType>() ||
+        isBoolType<physicalType>()) {
+      return std::nullopt;
+    } else {
+      if (encodingType != EncodingType::MainlyConstant &&
+          encodingType != EncodingType::Dictionary
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+          && encodingType != EncodingType::FrequencyPartition
+#endif
+      ) {
+        return std::nullopt;
+      }
+      // Below this range Statistics counts distinct values in a table, which
+      // costs less than the pass the bound takes.
+      constexpr uint64_t kMinBoundedRange{65'536};
+      const uint64_t rowCount = values.size();
+      if (rowCount == 0 ||
+          static_cast<uint64_t>(statistics.max() - statistics.min()) <
+              kMinBoundedRange) {
+        return std::nullopt;
+      }
+      const uint64_t distinctLowerBound = statistics.distinctLowerBound();
+      switch (encodingType) {
+        case EncodingType::Dictionary: {
+          // Grows with the distinct count and reads nothing else of the counts.
+          return DictionaryEncoding<T>::estimateIntegralSize(
+              rowCount,
+              distinctLowerBound,
+              statistics.min(),
+              statistics.max(),
+              options);
+        }
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+        case EncodingType::FrequencyPartition: {
+          return FrequencyPartitionEncoding<physicalType>::
+              estimateSizeLowerBound(
+                  rowCount, distinctLowerBound, statistics, options);
+        }
+#endif
+        default: {
+          return mainlyConstantSizeLowerBound(
+              values, statistics, distinctLowerBound, options);
+        }
+      }
+    }
+  }
+
  private:
+  // MainlyConstantEncodingBase::estimateSize for numbers, with the common value
+  // unknown. With D distinct values the common one occurs at most
+  // rowCount - (D - 1) times, so at least D - 1 rows are uncommon; and whichever
+  // value is common, the others span at least the smaller of max - (second
+  // smallest) and (second largest) - min. Both prices grow with those two
+  // quantities, so priced at them they bound the estimate from below.
+  static std::optional<uint64_t> mainlyConstantSizeLowerBound(
+      std::span<const physicalType> values,
+      const Statistics<physicalType>& statistics,
+      uint64_t distinctLowerBound,
+      const Encoding::Options& options) {
+    // Three distinct values guarantee a second smallest and a second largest.
+    if (distinctLowerBound < 3) {
+      return std::nullopt;
+    }
+    const physicalType minValue = statistics.min();
+    const physicalType maxValue = statistics.max();
+    physicalType secondSmallest = maxValue;
+    physicalType secondLargest = minValue;
+    for (const physicalType value : values) {
+      secondSmallest =
+          std::min(secondSmallest, value == minValue ? maxValue : value);
+      secondLargest =
+          std::max(secondLargest, value == maxValue ? minValue : value);
+    }
+    const uint64_t uncommonRange = std::min<uint64_t>(
+        static_cast<uint64_t>(maxValue - secondSmallest),
+        static_cast<uint64_t>(secondLargest - minValue));
+    const uint64_t uncommonCount = distinctLowerBound - 1;
+    const uint64_t otherValuesSize = std::min(
+        TrivialEncoding<physicalType>::estimateSize(uncommonCount),
+        FixedBitWidthEncoding<physicalType>::estimateSize(
+            uncommonCount, 0, uncommonRange, options));
+    const uint64_t isCommonEncodingSize =
+        SparseBoolEncoding::estimateSize(values.size(), uncommonCount, options);
+    const uint64_t outerEncodingSize = EncodingPrefix::kFixedPrefixSize +
+        2 * sizeof(uint32_t) + sizeof(physicalType);
+    return outerEncodingSize + otherValuesSize + isCommonEncodingSize;
+  }
+
   // Prices RLE's run-lengths stream over the lengths themselves, with the
   // encodings nested selection picks for it on real data. RLE's own estimate
   // uses one FixedBitWidth over [minRepeat, maxRepeat], which on the snowflake

@@ -127,6 +127,16 @@ class RangePricer {
     std::optional<uint64_t> sizeSelectedSize;
     EncodingType sizeSelectedEncoding = EncodingType::Trivial;
     for (const auto& [encodingType, tableReadFactor] : candidates_) {
+      if (decodeWeight == 0.0 &&
+          candidateCannotWin<Storage>(
+              encodingType,
+              tableReadFactor,
+              minCost,
+              values,
+              statistics,
+              sectionOptions_)) {
+        continue;
+      }
       const auto estimatedSize =
           detail::EncodingSizeEstimation<Storage>::estimateSize(
               encodingType, values, statistics, sectionOptions_);
