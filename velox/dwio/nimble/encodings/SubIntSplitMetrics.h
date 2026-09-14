@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h" // @manual=fbsource//third-party/abseil-cpp:container__flat_hash_map
+#include "velox/common/base/SimdUtil.h"
 
 // Lightweight per-segment metric collection for SubIntSplitEncoding's DP
 // planner. Deliberately minimal: only the statistics needed by the cost
@@ -261,16 +262,58 @@ class MetricCollector {
   // The scan metrics that depend on row order beyond adjacency: extremes and
   // the delta statistics. Integer accumulations only, so reassociating them
   // is exact; see scanAll.
+  //
+  // Vectorised over signed 64-bit lanes, which is exact while every value is
+  // below 2^63: adjacent differences then fit in a signed word, a difference
+  // is non-negative exactly when the pair rises, and signed and unsigned
+  // extremes agree. Every bit range the split grid prices narrower than 64
+  // bits qualifies, and the loop checks rather than assumes it, rescanning
+  // unsigned otherwise. The scalar form of this loop kept its counters in
+  // memory and was most of what pricing a range cost.
   static SegmentMetrics scanMinMaxAndDeltas(
       const std::vector<uint64_t>& values) {
+    using Batch = xsimd::batch<int64_t>;
     const size_t count = values.size();
-    const uint64_t first = values[0];
-    uint64_t minimum = first;
-    uint64_t maximum = first;
+    const auto* signedValues = reinterpret_cast<const int64_t*>(values.data());
+    uint64_t minimum = values[0];
+    uint64_t maximum = values[0];
     uint64_t sumAbsDelta = 0;
     uint64_t monotonic = 0;
     uint64_t maxDelta = 0;
-    for (size_t i = 1; i < count; ++i) {
+    size_t next = 1;
+    if (count > Batch::size) {
+      const auto zero = Batch::broadcast(0);
+      const auto one = Batch::broadcast(1);
+      auto orOfValues = Batch::broadcast(signedValues[0]);
+      auto minimumBatch = orOfValues;
+      auto maximumBatch = orOfValues;
+      auto sumBatch = zero;
+      auto risingBatch = zero;
+      auto maxDeltaBatch = zero;
+      for (; next + Batch::size <= count; next += Batch::size) {
+        const auto value = Batch::load_unaligned(signedValues + next);
+        const auto previous = Batch::load_unaligned(signedValues + next - 1);
+        orOfValues = orOfValues | value;
+        minimumBatch = xsimd::min(minimumBatch, value);
+        maximumBatch = xsimd::max(maximumBatch, value);
+        const auto delta = value - previous;
+        const auto falling = delta < zero;
+        sumBatch = sumBatch + xsimd::select(falling, zero - delta, delta);
+        risingBatch = risingBatch + xsimd::select(falling, zero, one);
+        maxDeltaBatch =
+            xsimd::max(maxDeltaBatch, xsimd::select(falling, zero, delta));
+      }
+      if (xsimd::reduce_min(orOfValues) >= 0) {
+        minimum = static_cast<uint64_t>(xsimd::reduce_min(minimumBatch));
+        maximum = static_cast<uint64_t>(xsimd::reduce_max(maximumBatch));
+        sumAbsDelta = static_cast<uint64_t>(xsimd::reduce_add(sumBatch));
+        monotonic = static_cast<uint64_t>(xsimd::reduce_add(risingBatch));
+        maxDelta = static_cast<uint64_t>(xsimd::reduce_max(maxDeltaBatch));
+      } else {
+        next = 1;
+      }
+    }
+    for (size_t i = next; i < count; ++i) {
       const uint64_t previous = values[i - 1];
       const uint64_t value = values[i];
       minimum = std::min(minimum, value);
