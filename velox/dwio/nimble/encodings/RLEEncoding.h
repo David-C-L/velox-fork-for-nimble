@@ -686,6 +686,20 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
       // added because they are what wins when the collapsed cardinality is at
       // either extreme. RLE and Constant are not: adjacent run values differ by
       // construction, so neither can apply to more than a single run.
+      //
+      // Collapsing runs keeps every distinct value too, so for integers, whose
+      // Dictionary price reads only the distinct count and min/max, the input's
+      // statistics give the same quote as statistics over the run values. Using
+      // them skips copying the run values and counting their distinct values a
+      // second time, which on a near-unique stream is as costly as the first.
+      if constexpr (!isFloatingPointType<T>()) {
+        return std::min(
+            {TrivialEncoding<physicalType>::estimateSize(runCount),
+             FixedBitWidthEncoding<physicalType>::estimateSize(
+                 runCount, statistics, options),
+             DictionaryEncoding<physicalType>::estimateSize(
+                 runCount, statistics, options)});
+      }
       const auto& runValues = statistics.runValues();
       const std::span<const physicalType> runValuesSpan{
           runValues.data(), runValues.size()};
