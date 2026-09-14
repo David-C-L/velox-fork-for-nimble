@@ -136,6 +136,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <span>
 #include <sstream>
@@ -166,6 +167,7 @@
 #include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
@@ -174,6 +176,18 @@
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 
+DEFINE_int32(
+    hybrid_shortlist,
+    0,
+    "When positive, also scores a hybrid plan: the k cheapest segmentations "
+    "under the planner's models and under selection's estimators, plus the "
+    "writer's own plan, re-scored with selection's estimators on a larger "
+    "sample (--hybrid_rescore_samples), cheapest estimate kept.");
+DEFINE_int64(
+    hybrid_rescore_samples,
+    65536,
+    "Rows sampled for re-scoring the hybrid shortlist. Only ranges appearing "
+    "in shortlisted plans are costed at this size.");
 DEFINE_bool(validate, false, "Sanity-check oracle encode calls do not throw");
 DEFINE_bool(dry_run, false, "Print sweep plan and exit");
 DEFINE_bool(
@@ -757,6 +771,71 @@ inline std::vector<SegmentPlan> toSegmentPlans(
     plan.bitEnd = segment.bitEnd;
     plan.encoding = segment.encoding;
     plans.push_back(plan);
+  }
+  return plans;
+}
+
+// A segmentation of the bit positions as inclusive [bitStart, bitEnd] ranges,
+// lowest bit first.
+using RangePlan = std::vector<std::pair<int, int>>;
+
+// The k cheapest segmentations of [0, sz) under `rangeCost`, cheapest first,
+// charging `splitPenalty` per boundary as selectSplitsImpl does.
+//
+// The writer's DP keeps one predecessor per position and trusts its argmin.
+// On the grid that argmin names the truly cheapest encoding for a range a
+// fifth of the time, so the plan it returns is a guess worth checking rather
+// than an answer. Keeping k predecessors per position is what lets a planner
+// hand a shortlist to a more expensive scorer. Ranges whose cost is not finite
+// are never used.
+template <typename RangeCost>
+std::vector<RangePlan> kBestSegmentations(
+    int sz,
+    size_t k,
+    double splitPenalty,
+    RangeCost&& rangeCost) {
+  struct Entry {
+    double cost;
+    int prevPosition;
+    size_t prevRank;
+  };
+  std::vector<std::vector<Entry>> best(sz + 1);
+  best[0].push_back({0.0, -1, 0});
+  for (int end = 1; end <= sz; ++end) {
+    std::vector<Entry> candidates;
+    for (int start = 0; start < end; ++start) {
+      const double range = rangeCost(start, end - 1);
+      if (!std::isfinite(range)) {
+        continue;
+      }
+      const double penalty = start == 0 ? 0.0 : splitPenalty;
+      for (size_t rank = 0; rank < best[start].size(); ++rank) {
+        candidates.push_back(
+            {best[start][rank].cost + range + penalty, start, rank});
+      }
+    }
+    const size_t keep = std::min(k, candidates.size());
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + keep,
+        candidates.end(),
+        [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+    candidates.resize(keep);
+    best[end] = std::move(candidates);
+  }
+  std::vector<RangePlan> plans;
+  for (size_t rank = 0; rank < best[sz].size(); ++rank) {
+    RangePlan plan;
+    int position = sz;
+    size_t atRank = rank;
+    while (position > 0) {
+      const Entry& entry = best[position][atRank];
+      plan.emplace_back(entry.prevPosition, position - 1);
+      position = entry.prevPosition;
+      atRank = entry.prevRank;
+    }
+    std::reverse(plan.begin(), plan.end());
+    plans.push_back(std::move(plan));
   }
   return plans;
 }
@@ -1786,6 +1865,254 @@ int runBenchmark() {
           "estimator_dp found no plan: {}",
           ds.name);
       scorePlan("estimator_dp", toSegmentPlans(estimatorDp.segments));
+
+      // The hybrid planner: shortlist cheaply at this sample, then re-score
+      // only the shortlisted ranges with selection's estimators on a larger
+      // sample. Costing every range at the larger size is what the grid shows
+      // is accurate and what is too slow to ship; a shortlist bounds it.
+      if (FLAGS_hybrid_shortlist > 0) {
+        const size_t k = static_cast<size_t>(FLAGS_hybrid_shortlist);
+        const double splitPenaltyBits = selectorCfg.splitPenalty;
+        std::vector<std::pair<std::string, RangePlan>> shortlist;
+        const auto addPlans = [&](const std::string& source,
+                                  std::vector<RangePlan> plans) {
+          for (auto& plan : plans) {
+            shortlist.emplace_back(source, std::move(plan));
+          }
+        };
+        addPlans(
+            "models",
+            kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
+              return modelGrid[l][r].bestBits * fullCostScale;
+            }));
+        addPlans(
+            "estimators",
+            kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
+              const size_t bytes = oracleGrid[l][r].selectionEstimateBytes;
+              return bytes == std::numeric_limits<size_t>::max()
+                  ? std::numeric_limits<double>::infinity()
+                  : static_cast<double>(bytes) * 8.0 * fullCostScale;
+            }));
+        // Bit-flip hints as a shortlist source rather than a constraint.
+        // Restricting the whole DP to the profile's gradient boundaries was
+        // measured at 65% mean regret, so here they only nominate plans: the
+        // k cheapest under the estimators that cut nowhere else.
+        {
+          const auto profileStatistics = Statistics<uint64_t>::create(
+              std::span<const uint64_t>(samples.data(), samples.size()));
+          std::vector<bool> isCut(kBits + 1, false);
+          isCut[0] = true;
+          isCut[kBits] = true;
+          for (const int boundary : bitFlipGradientBoundaries(
+                   profileStatistics.bitFlipProfile(), TopLevelPolicyConfig{})) {
+            if (boundary > 0 && boundary < kBits) {
+              isCut[boundary] = true;
+            }
+          }
+          addPlans(
+              "bitflip",
+              kBestSegmentations(kBits, k, splitPenaltyBits, [&](int l, int r) {
+                const size_t bytes = oracleGrid[l][r].selectionEstimateBytes;
+                return !isCut[l] || !isCut[r + 1] ||
+                        bytes == std::numeric_limits<size_t>::max()
+                    ? std::numeric_limits<double>::infinity()
+                    : static_cast<double>(bytes) * 8.0 * fullCostScale;
+              }));
+        }
+        RangePlan writerRanges;
+        for (const auto& segment : writerPlan) {
+          writerRanges.emplace_back(segment.bitStart, segment.bitEnd);
+        }
+        shortlist.emplace_back("writer", std::move(writerRanges));
+
+        const auto rescoreStart = std::chrono::steady_clock::now();
+        SamplerConfig rescoreCfg = samplerCfg;
+        rescoreCfg.maxSamples = std::min<size_t>(
+            n, static_cast<size_t>(FLAGS_hybrid_rescore_samples));
+        std::vector<uint64_t> rescoreSamples;
+        sampleIntoU64(physical, rescoreSamples, rescoreCfg);
+        const double rescoreScale = static_cast<double>(n) /
+            static_cast<double>(rescoreSamples.size());
+
+        // Selection's estimate, in bytes, for the candidate it would pick on
+        // one range of the larger sample, with the encoding it names. Cached,
+        // since shortlisted plans share most of their ranges.
+        std::map<std::pair<int, int>, std::pair<double, EncodingType>> rescored;
+        const auto rescoreRange = [&](int l, int r) {
+          const auto key = std::make_pair(l, r);
+          if (const auto it = rescored.find(key); it != rescored.end()) {
+            return it->second;
+          }
+          const int width = r - l + 1;
+          const uint64_t mask =
+              width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+          std::vector<uint64_t> sectionU64(rescoreSamples.size());
+          for (size_t i = 0; i < rescoreSamples.size(); ++i) {
+            sectionU64[i] = (rescoreSamples[i] >> l) & mask;
+          }
+          const int storageBytes = storageWidthBits(width) / 8;
+          std::pair<double, EncodingType> result{
+              std::numeric_limits<double>::infinity(), EncodingType::Trivial};
+          withNarrowedSection(
+              width, sectionU64, *pool, [&](const auto& sectionData) {
+                using Storage = std::decay_t<decltype(sectionData.data()[0])>;
+                const auto values = std::span<const Storage>(
+                    sectionData.data(), sectionData.size());
+                const auto statistics = Statistics<Storage>::create(values);
+                const auto fixedBitWidthEstimate =
+                    facebook::nimble::detail::EncodingSizeEstimation<
+                        Storage>::estimateSize(EncodingType::FixedBitWidth,
+                                               values,
+                                               statistics,
+                                               sectionOptions);
+                double bestSelectionCost =
+                    std::numeric_limits<double>::infinity();
+                for (const auto& candidate : candidates) {
+                  if (allowed.count(candidate.type) == 0 ||
+                      !encodingAvailableAtWidth(candidate.type, storageBytes)) {
+                    continue;
+                  }
+                  const auto readFactor = sectionReadFactor(candidate.type);
+                  if (!readFactor.has_value()) {
+                    continue;
+                  }
+                  const auto estimate =
+                      facebook::nimble::detail::EncodingSizeEstimation<
+                          Storage>::estimateSize(candidate.type,
+                                                 values,
+                                                 statistics,
+                                                 sectionOptions);
+                  if (!estimate.has_value()) {
+                    continue;
+                  }
+                  const double selectionCost =
+                      static_cast<double>(estimate.value()) *
+                      static_cast<double>(effectiveReadFactor(
+                          candidate.type,
+                          readFactor.value(),
+                          estimate.value(),
+                          fixedBitWidthEstimate));
+                  if (selectionCost < bestSelectionCost) {
+                    bestSelectionCost = selectionCost;
+                    result = {
+                        static_cast<double>(estimate.value()), candidate.type};
+                  }
+                }
+              });
+          rescored.emplace(key, result);
+          return result;
+        };
+
+        double bestPlanBits = std::numeric_limits<double>::infinity();
+        size_t bestIndex = 0;
+        for (size_t p = 0; p < shortlist.size(); ++p) {
+          double planBits = splitPenaltyBits *
+              static_cast<double>(shortlist[p].second.size() - 1);
+          for (const auto& [l, r] : shortlist[p].second) {
+            planBits += rescoreRange(l, r).first * 8.0 * rescoreScale;
+          }
+          if (planBits < bestPlanBits) {
+            bestPlanBits = planBits;
+            bestIndex = p;
+          }
+        }
+        const double rescoreMs =
+            static_cast<double>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - rescoreStart)
+                    .count()) /
+            1e3;
+
+        const auto toPlan = [&](const RangePlan& ranges) {
+          std::vector<SegmentPlan> plan;
+          for (const auto& [l, r] : ranges) {
+            SegmentPlan segment;
+            segment.bitStart = l;
+            segment.bitEnd = r;
+            segment.encoding = rescoreRange(l, r).second;
+            plan.push_back(segment);
+          }
+          return plan;
+        };
+        const size_t rangesAfterShortlist = rescored.size();
+        std::cout << "  hybrid: shortlist=" << shortlist.size()
+                  << " plans, distinct_ranges=" << rangesAfterShortlist
+                  << ", rescore_rows=" << rescoreSamples.size()
+                  << ", rescore_ms=" << rescoreMs
+                  << ", picked=" << shortlist[bestIndex].first << "\n";
+        scorePlan("hybrid", toPlan(shortlist[bestIndex].second));
+
+        // Local refinement of the picked plan under the same re-scoring. The
+        // plans the shortlist misses mostly differ from its best by where a
+        // boundary sits, not by how many there are, and a shortlist drawn from
+        // the small sample's grid cannot see which neighbour is right. Each
+        // move is priced from the range cache, so it costs only the ranges it
+        // introduces. First improvement wins; stops when no move improves.
+        const auto refineStart = std::chrono::steady_clock::now();
+        const auto planCost = [&](const RangePlan& ranges) {
+          double bits =
+              splitPenaltyBits * static_cast<double>(ranges.size() - 1);
+          for (const auto& [l, r] : ranges) {
+            bits += rescoreRange(l, r).first * 8.0 * rescoreScale;
+          }
+          return bits;
+        };
+        RangePlan refined = shortlist[bestIndex].second;
+        double refinedBits = planCost(refined);
+        int moves = 0;
+        for (bool improved = true; improved && moves < 64;) {
+          improved = false;
+          std::vector<RangePlan> neighbours;
+          for (size_t i = 0; i + 1 < refined.size(); ++i) {
+            // Shift the boundary between segments i and i + 1.
+            for (int delta : {-3, -2, -1, 1, 2, 3}) {
+              const int cut = refined[i].second + delta;
+              if (cut < refined[i].first || cut >= refined[i + 1].second) {
+                continue;
+              }
+              RangePlan moved = refined;
+              moved[i].second = cut;
+              moved[i + 1].first = cut + 1;
+              neighbours.push_back(std::move(moved));
+            }
+            // Merge segments i and i + 1.
+            RangePlan merged = refined;
+            merged[i].second = merged[i + 1].second;
+            merged.erase(merged.begin() + i + 1);
+            neighbours.push_back(std::move(merged));
+          }
+          // Split a segment in two at any interior bit.
+          for (size_t i = 0; i < refined.size(); ++i) {
+            for (int cut = refined[i].first; cut < refined[i].second; ++cut) {
+              RangePlan split = refined;
+              split[i].second = cut;
+              split.insert(
+                  split.begin() + i + 1, {cut + 1, refined[i].second});
+              neighbours.push_back(std::move(split));
+            }
+          }
+          for (auto& neighbour : neighbours) {
+            const double bits = planCost(neighbour);
+            if (bits < refinedBits) {
+              refinedBits = bits;
+              refined = std::move(neighbour);
+              improved = true;
+              ++moves;
+              break;
+            }
+          }
+        }
+        const double refineMs =
+            static_cast<double>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - refineStart)
+                    .count()) /
+            1e3;
+        std::cout << "  hybrid_refined: moves=" << moves
+                  << ", new_ranges=" << rescored.size() - rangesAfterShortlist
+                  << ", refine_ms=" << refineMs << "\n";
+        scorePlan("hybrid_refined", toPlan(refined));
+      }
 
       // Per-cell accuracy summary for this dataset. Kept separate from the plan
       // rows: it describes the models, not any one plan.
