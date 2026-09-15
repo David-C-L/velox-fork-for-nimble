@@ -114,6 +114,12 @@ DEFINE_int32(
     "Encoding::Options::subIntSplitDecodeReadPath: the reader decode is costed "
     "for when --mlidc_sis_decode_weight is non-zero. 0 cursor, 1 view, both "
     "with construction amortised; 2 cursor and 3 view paying construction.");
+DEFINE_int32(
+    mlidc_sis_admission,
+    0,
+    "Encoding::Options::subIntSplitAdmission: how selection decides whether "
+    "SubIntSplit competes. 0 the size estimate, 1 the bit-flip profile's "
+    "gradient guard, 2 the gradient guard plus the entropy guard.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,

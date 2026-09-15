@@ -83,6 +83,7 @@ DECLARE_bool(mlidc_assemble_direct);
 DECLARE_double(mlidc_sis_decode_weight);
 DECLARE_int32(mlidc_sis_decode_access_pattern);
 DECLARE_int32(mlidc_sis_decode_read_path);
+DECLARE_int32(mlidc_sis_admission);
 DECLARE_double(mlidc_sis_max_size_regression);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);

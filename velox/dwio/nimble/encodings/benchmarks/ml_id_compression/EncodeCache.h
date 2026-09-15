@@ -310,6 +310,9 @@ inline std::string cacheArmIdentity(
   // The size bound decides whether the weighted plan or the size-only one is
   // written, so it changes the bytes for the same reason the weight does.
   id += "|r" + std::to_string(options.subIntSplitMaxSizeRegression);
+  // Admission decides whether nested streams may pick SubIntSplit, so it can
+  // move the bytes of any arm.
+  id += "|adm" + std::to_string(static_cast<int>(options.subIntSplitAdmission));
   id += "|v" + std::to_string(options.useVarintRowCount ? 1 : 0);
   // deltaZigzagAnchorStride is deliberately absent: it does not exist on this
   // branch, and an option that no encoding here reads cannot change the bytes.
