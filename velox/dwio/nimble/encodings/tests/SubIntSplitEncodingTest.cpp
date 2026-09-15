@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -262,17 +263,23 @@ class ExtendedSubIntSplitPolicy final
   // ManualEncodingSelectionPolicy::createImpl() is protected, so its
   // special-cased SubIntSplit child candidates can only be exercised by
   // inheriting it (rather than delegating to a sibling instance).
-  ExtendedSubIntSplitPolicy()
+  // `config` reaches the SubIntSplit encoder as its selection config, which is
+  // how a test pins boundaries while keeping the writer's section candidates.
+  explicit ExtendedSubIntSplitPolicy(
+      nimble::EncodingLayout::Config config = nimble::EncodingLayout::Config{})
       : nimble::ManualEncodingSelectionPolicy<T>(
             filteredReadFactors(),
             std::nullopt,
-            std::nullopt) {}
+            std::nullopt),
+        config_{std::move(config)} {}
 
   nimble::EncodingSelectionResult select(
       std::span<const physicalType> /* values */,
       const nimble::Statistics<physicalType>& /* statistics */,
       const nimble::Encoding::Options& /* options */) override {
-    return {.encodingType = nimble::EncodingType::SubIntSplit};
+    return {
+        .encodingType = nimble::EncodingType::SubIntSplit,
+        .encodingConfig = config_};
   }
 
   nimble::EncodingSelectionResult selectNullable(
@@ -298,6 +305,8 @@ class ExtendedSubIntSplitPolicy final
         readFactors.end());
     return readFactors;
   }
+
+  const nimble::EncodingLayout::Config config_;
 };
 
 template <typename T>
@@ -658,9 +667,11 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTrips32Bit) {
   expectBitwiseEqual(values, decodeAll<uint32_t>(encoded, *pool));
 }
 
-// Streams written before the row frame became a transform must still decode,
-// and the transform must write them unchanged, so one written at dac77caca is
-// kept verbatim.
+// Streams written before the row frame became a transform must still decode, so
+// one written at dac77caca is kept verbatim. The writer no longer reproduces it:
+// the whole-value floor stores the same residuals as one section, 10 bytes
+// smaller than the two-section plan written then, and it must still carry the
+// frame.
 TEST(SubIntSplitEncodingTests, rowFrameStreamWrittenBeforeTransformLayerDecodes) {
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
@@ -676,11 +687,12 @@ TEST(SubIntSplitEncodingTests, rowFrameStreamWrittenBeforeTransformLayerDecodes)
       "4e000000000000";
   const std::string written{encodeWithNonRecursiveSubIntSplit(values, buffer)};
   ASSERT_TRUE(parseRowFrame(written).active());
-  EXPECT_EQ(folly::hexlify(written), kWrittenAtDac77caca);
+  expectBitwiseEqual(values, decodeAll<uint32_t>(written, *pool));
 
   std::string golden;
   ASSERT_TRUE(folly::unhexlify(kWrittenAtDac77caca, golden));
   expectBitwiseEqual(values, decodeAll<uint32_t>(golden, *pool));
+  EXPECT_LT(written.size(), golden.size());
 }
 
 // Columns that do not follow a line must not be charged a planner pass, and
@@ -1195,6 +1207,118 @@ TEST(SubIntSplitEncodingTests, invalidSectionBitRangeThrows) {
   corrupted[headerPos] = static_cast<char>(0);
   corrupted[headerPos + 1] = static_cast<char>(200);
   EXPECT_THROW(decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException);
+}
+
+namespace {
+
+// Bytes of `values` stored as one whole-value SubIntSplit section whose
+// encoding section selection chooses, header included.
+template <typename T>
+size_t wholeValueSectionBytes(
+    const std::vector<T>& values,
+    nimble::Buffer& buffer) {
+  const std::vector<nimble::detail::subintsplit::SegmentPlan> wholeValue{
+      {.bitStart = 0, .bitEnd = static_cast<int>(sizeof(T) * 8) - 1}};
+  return nimble::EncodingFactory::encode<T>(
+             std::make_unique<ExtendedSubIntSplitPolicy<T>>(
+                 nimble::EncodingLayout::Config{
+                     nimble::detail::subintsplit::makePreserveSplitConfig(
+                         wholeValue)}),
+             values,
+             buffer)
+      .size();
+}
+
+// Runs of whole values drawn from `drawValue`, each 1 to 16 rows long.
+std::vector<uint64_t> makeValueRuns(
+    uint32_t numRows,
+    std::mt19937_64& generator,
+    const std::function<uint64_t()>& drawValue) {
+  std::vector<uint64_t> values;
+  values.reserve(numRows);
+  while (values.size() < numRows) {
+    const uint64_t value = drawValue();
+    const uint32_t length = 1 + generator() % 16;
+    for (uint32_t i = 0; i < length && values.size() < numRows; ++i) {
+      values.push_back(value);
+    }
+  }
+  return values;
+}
+
+} // namespace
+
+// A UUIDv7's low half: two constant variant bits over 62 random ones. Nothing
+// stores it in fewer bits than packing the 62, and the stream must not store
+// it in more. It used to: the planner priced one FOR section at 59 bits per
+// value, section selection took Delta on an estimate its read factor carried
+// past FixedBitWidth, and Delta wrote more than the raw column.
+TEST(
+    SubIntSplitEncodingTests,
+    wholeValueFloorBoundsConstantTopBitsOverRandomBits) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  std::mt19937_64 generator{29};
+  std::vector<uint64_t> values(65'536);
+  for (auto& value : values) {
+    value = (uint64_t{0b10} << 62) | (generator() >> 2);
+  }
+
+  const auto encoded = encodeWithExtendedSubIntSplit<uint64_t>(values, buffer);
+  expectBitwiseEqual(values, decodeAll<uint64_t>(encoded, *pool));
+
+  const auto statistics =
+      nimble::Statistics<uint64_t>::create(std::span<const uint64_t>(values));
+  const size_t packedBytes = nimble::Encoding::kPrefixSize +
+      nimble::detail::subIntSplitSpecificHeaderSize(1) +
+      nimble::FixedBitWidthEncoding<uint64_t>::estimateSize(
+          values.size(),
+          statistics,
+          nimble::detail::subintsplit::sectionEncodingOptions({}));
+  EXPECT_LE(encoded.size(), packedBytes);
+}
+
+// Millisecond timestamps with repeats: whole values in runs, each run a few
+// milliseconds after the last. The planner splits them into sections that each
+// pay for the run boundaries again, and one whole-value section stores them
+// smaller, so the stream must be no larger than that section.
+TEST(SubIntSplitEncodingTests, wholeValueFloorBoundsRunsOfWholeValues) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  std::mt19937_64 generator{31};
+  uint64_t millisecond = uint64_t{1} << 40;
+  const auto values =
+      makeValueRuns(131'072, generator, [&generator, &millisecond] {
+        millisecond += generator() % 50;
+        return millisecond;
+      });
+
+  // What the planner alone would store: its own boundaries, replayed, which the
+  // floor leaves alone.
+  auto plannerConfig = nimble::detail::subintsplit::defaultSelectorConfig();
+  plannerConfig.allowHuffman = false;
+  plannerConfig.allowDeltaBlock = false;
+  std::vector<uint64_t> sample;
+  nimble::detail::subintsplit::sampleIntoU64<uint64_t>(
+      std::span<const uint64_t>(values), sample);
+  const auto planned = nimble::detail::subintsplit::selectSplitsRestricted(
+      sample, 64, values.size(), {}, plannerConfig);
+  ASSERT_GT(planned.segments.size(), 1u);
+  const size_t plannedBytes = nimble::EncodingFactory::encode<uint64_t>(
+                                  std::make_unique<ExtendedSubIntSplitPolicy<uint64_t>>(
+                                      nimble::EncodingLayout::Config{
+                                          nimble::detail::subintsplit::
+                                              makePreserveSplitConfig(
+                                                  planned.segments)}),
+                                  values,
+                                  buffer)
+                                  .size();
+  const size_t wholeValueBytes = wholeValueSectionBytes(values, buffer);
+  ASSERT_GT(plannedBytes, wholeValueBytes);
+
+  const auto encoded = encodeWithExtendedSubIntSplit<uint64_t>(values, buffer);
+  expectBitwiseEqual(values, decodeAll<uint64_t>(encoded, *pool));
+  EXPECT_LE(encoded.size(), wholeValueBytes);
 }
 
 TEST(SubIntSplitEncodingTests, fullWidthSingleSectionRoundTrip) {
