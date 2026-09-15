@@ -519,11 +519,37 @@ inline std::string describeSubIntSplitSectionChoices(
   const Encoding::Options sectionOptions =
       nimbleDetail::subintsplit::sectionEncodingOptions(Encoding::Options{});
 
+  // Which fit produced the frame, refitted on the decoded column since the
+  // stream records only the line: "line" when fitSubIntSplitRowFrame
+  // reproduces it (a slope * row + base fitted over 1,024-row strides), "step"
+  // when fitSubIntSplitStepFrame does (the adjacent step most rows take, base
+  // zero), "none" without a frame.
+  std::string frameKind = "none";
+  if (rowFrame.active()) {
+    const auto kindOf = [&]<typename P>() {
+      std::vector<P> original(rows);
+      root->materialize(rows, original.data());
+      const std::span<const P> span{original};
+      const auto line = nimbleDetail::subintsplit::fitSubIntSplitRowFrame(span);
+      if (line.active() && line.slope == rowFrame.slope &&
+          line.base == rowFrame.base) {
+        return std::string("line");
+      }
+      const auto step = nimbleDetail::subintsplit::fitSubIntSplitStepFrame(span);
+      return step.slope == rowFrame.slope && step.base == rowFrame.base
+          ? std::string("step")
+          : std::string("unknown");
+    };
+    frameKind = valueBits == 32 ? kindOf.template operator()<uint32_t>()
+                                : kindOf.template operator()<uint64_t>();
+  }
   std::string out = folly::to<std::string>(
       "#frameSlope=",
       rowFrame.slope,
       " frameBase=",
       rowFrame.base,
+      " frameKind=",
+      frameKind,
       " keySection=",
       transformInfo.anyTransform() ? static_cast<int>(transformInfo.keySection)
                                    : -1,
