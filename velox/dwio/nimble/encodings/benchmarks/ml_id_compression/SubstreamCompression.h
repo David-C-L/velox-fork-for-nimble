@@ -202,9 +202,16 @@ class BenchEncodingSelectionPolicy
                 }),
             readFactors.end());
       }
-      return nimble::ManualEncodingSelectionPolicyFactory{
-          std::move(readFactors), compressionOptionsFor(compressionType_)}
-          .createPolicy(type);
+      // Built with its identifier, as ManualEncodingSelectionPolicy::createImpl
+      // builds a writer's nested policy, so that the policy knows it selects
+      // for a nested stream and honours subIntSplitInNestedStreams.
+      UNIQUE_PTR_FACTORY(
+          type,
+          nimble::ManualEncodingSelectionPolicy,
+          std::move(readFactors),
+          compressionOptionsFor(compressionType_),
+          nestedEncodingIdentifier,
+          std::nullopt);
     }
     UNIQUE_PTR_FACTORY(
         type,

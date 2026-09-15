@@ -410,6 +410,16 @@ class Encoding {
     /// over every pair. Only read when subIntSplitAdmission is not 0.
     uint32_t subIntSplitAdmissionProfilePairs{0};
 
+    /// Whether selection may choose SubIntSplit for a nested stream: an RLE's
+    /// run values, a Dictionary's alphabet, a FrequencyPartition tier. True
+    /// keeps the writer's candidate list. False leaves SubIntSplit to
+    /// top-level selection only, so an encoding's size can be told apart from
+    /// that of the SubIntSplit streams nested in it; on bing_quadkey RLE
+    /// stores 22.83 bits per value only because its run values are
+    /// SubIntSplit. A SubIntSplit section never chooses SubIntSplit whatever
+    /// this says.
+    bool subIntSplitInNestedStreams{true};
+
     /// Whether SubIntSplit may subtract a fitted slope * row + base from every
     /// value before planning its sections (see SubIntSplitRowFrame.h). It is
     /// fitted only where nearly every 1'024-row stride of the column's low bits

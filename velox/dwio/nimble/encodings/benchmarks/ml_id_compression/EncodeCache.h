@@ -290,6 +290,7 @@ inline std::string cacheArmIdentity(
   id += "|a" + std::to_string(options.subIntSplitAutoTransform ? 1 : 0);
   id += "|h" + std::to_string(options.subIntSplitAllowHuffman ? 1 : 0);
   id += "|d" + std::to_string(options.subIntSplitAllowDeltaBlock ? 1 : 0);
+  id += "|n" + std::to_string(options.subIntSplitInNestedStreams ? 1 : 0);
   // A restricted inventory changes which encodings the planner may pick, so
   // it changes the bytes. Without this the withdrawn and unrestricted arms
   // share one cache entry, and the withdrawal would appear to change

@@ -486,6 +486,20 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       }
     }
 
+    // A nested stream (one this policy was created for by a parent encoding)
+    // is not offered SubIntSplit when the caller withholds it; see
+    // Encoding::Options::subIntSplitInNestedStreams.
+    if (identifier_.has_value() && !options.subIntSplitInNestedStreams) {
+      candidateEncodingReadFactors.erase(
+          std::remove_if(
+              candidateEncodingReadFactors.begin(),
+              candidateEncodingReadFactors.end(),
+              [](const auto& entry) {
+                return entry.first == EncodingType::SubIntSplit;
+              }),
+          candidateEncodingReadFactors.end());
+    }
+
     // A bit-flip admission decides SubIntSplit from the profile alone: an
     // admitted stream is left with SubIntSplit as its only candidate, and a
     // rejected one loses it. The default admission leaves the list alone.

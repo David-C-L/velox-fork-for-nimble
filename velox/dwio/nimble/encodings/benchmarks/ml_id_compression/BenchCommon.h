@@ -1791,6 +1791,63 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
+  // The whitebox baselines are pure: none of their nested streams may be
+  // SubIntSplit, so a baseline's bytes are that encoding's and any gain from
+  // nesting SubIntSplit is charged to SubIntSplit. The writer's own selection
+  // does nest it, and on bing_quadkey RLE reached 22.83 bits per value only
+  // through SubIntSplit run values, which read as RLE beating SubIntSplit. The
+  // "+nestedSIS" arms keep the writer's candidates for the encodings where
+  // nesting has been seen to matter, so the difference stays measurable.
+  {
+    const std::vector<std::string> pureArms{
+        "Trivial",
+        "FixedBitWidth",
+        "Dictionary",
+        "RLE",
+        "MainlyConstant",
+        "Huffman",
+        "RLE/view",
+        "FixedBitWidth/view",
+        "MainlyConstant/view",
+        "Dictionary/view",
+        "PFOR/view",
+        "SimdForBitpack/view",
+        "FPE/fpe_noindex",
+        "FPE/fpe_pertier",
+        "FPE/fpe_tagtag",
+        "FPE/fpe_elias",
+        "FPE/fpe_tagtag_resolved",
+    };
+    const std::vector<std::string> nestedArms{
+        "RLE", "Dictionary", "MainlyConstant", "FPE/fpe_pertier"};
+    const auto withNestedStreams = [](EncoderEntry<T> entry, bool allowed) {
+      entry.factory = [factory = std::move(entry.factory), allowed](
+                          const Vector<T>& data, const Encoding::Options& opts) {
+        Encoding::Options o = opts;
+        o.subIntSplitInNestedStreams = allowed;
+        return factory(data, o);
+      };
+      return entry;
+    };
+    std::vector<EncoderEntry<T>> nested;
+    for (auto& entry : encoders) {
+      if (std::find(nestedArms.begin(), nestedArms.end(), entry.name) !=
+          nestedArms.end()) {
+        auto copy = withNestedStreams(entry, true);
+        copy.name += "+nestedSIS";
+        copy.variant += "_nested_sis";
+        nested.push_back(std::move(copy));
+      }
+      if (std::find(pureArms.begin(), pureArms.end(), entry.name) !=
+          pureArms.end()) {
+        entry = withNestedStreams(std::move(entry), false);
+      }
+    }
+    for (auto& entry : nested) {
+      encoders.push_back(std::move(entry));
+    }
+  }
+
   // Applied last so it wraps whatever the entries above produced.
   const auto outerType = parseCompressionType(FLAGS_mlidc_outer_compression);
   for (auto& entry : encoders) {
