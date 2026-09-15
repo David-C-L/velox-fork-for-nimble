@@ -232,13 +232,16 @@ class KeyDerivedTransform : public SectionTransform {
     // TransformContext. Rebuilding them means hashing every row and sorting
     // the runs to recover bookkeeping that was already there, and profiling
     // put that at a third of the instructions on one column. `given` reflects
-    // whether the caller supplied that whole bundle: keyRunIds is either
-    // fully populated alongside the rest, or entirely empty, never partial.
+    // whether the caller supplied that whole bundle. The context documents
+    // each field as independently optional, and the view hands over run ids
+    // and values without sorted ranks or run starts, so run ids alone do not
+    // imply the rest: indexing an empty keyRunStart read past the end.
     KeyDerivedScratch localScratch;
     KeyDerivedScratch& scratch = context.keyDerivedScratch != nullptr
         ? *context.keyDerivedScratch
         : localScratch;
-    const bool given = !context.keyRunIds.empty();
+    const bool given = !context.keyRunIds.empty() &&
+        !context.keyRunSortedRank.empty() && !context.keyRunStart.empty();
     if (!given) {
       buildKeyRunState(keys, scratch.local);
     }
