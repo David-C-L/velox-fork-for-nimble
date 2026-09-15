@@ -667,6 +667,102 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTrips32Bit) {
   expectBitwiseEqual(values, decodeAll<uint32_t>(encoded, *pool));
 }
 
+namespace {
+
+// A UUIDv7's high half, as RFC 9562 lays it out with a dedicated counter: a
+// millisecond timestamp, the version nibble, and a 12-bit counter that restarts
+// at random below 2^11 on each new millisecond and counts up by one within it.
+// Arrivals average two per millisecond.
+std::vector<uint64_t> makeTimestampCounterIds(uint32_t numRows, uint32_t seed) {
+  std::mt19937_64 generator{seed};
+  std::exponential_distribution<double> arrivalGap{2.0};
+  double time = 1'735'689'600'000.0;
+  uint64_t millisecond = 0;
+  uint64_t counter = 0;
+  std::vector<uint64_t> ids(numRows);
+  for (auto& id : ids) {
+    time += arrivalGap(generator);
+    const auto now = static_cast<uint64_t>(time);
+    if (now != millisecond) {
+      millisecond = now;
+      counter = generator() & 0x7FF;
+    } else {
+      counter = (counter + 1) & 0xFFF;
+    }
+    id = (millisecond << 16) | (uint64_t{0x7} << 12) | counter;
+  }
+  return ids;
+}
+
+} // namespace
+
+// Such IDs follow no line through the stream, but most adjacent rows step by
+// one, so a step frame turns each millisecond into a run of one residual. It is
+// kept because it encodes smaller, and every read path adds it back.
+TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
+  using nimble::detail::subintsplit::fitSubIntSplitRowFrame;
+  using nimble::detail::subintsplit::fitSubIntSplitStepFrame;
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  const auto ids = makeTimestampCounterIds(65'536, 5);
+  EXPECT_FALSE(fitSubIntSplitRowFrame(std::span<const uint64_t>(ids)).active());
+  const auto fitted = fitSubIntSplitStepFrame(std::span<const uint64_t>(ids));
+  EXPECT_EQ(fitted.slope, 1u);
+  EXPECT_EQ(fitted.base, 0u);
+
+  for (const bool hybrid : {false, true}) {
+    SCOPED_TRACE(hybrid);
+    nimble::Encoding::Options options;
+    options.subIntSplitHybridPlanner = hybrid;
+    const auto encoded = nimble::EncodingFactory::encode<uint64_t>(
+        std::make_unique<ExtendedSubIntSplitPolicy<uint64_t>>(),
+        ids,
+        buffer,
+        options);
+    EXPECT_EQ(parseRowFrame(encoded).slope, 1u);
+    nimble::Encoding::Options withoutFrame = options;
+    withoutFrame.subIntSplitRowFrame = false;
+    const auto unframed = nimble::EncodingFactory::encode<uint64_t>(
+        std::make_unique<ExtendedSubIntSplitPolicy<uint64_t>>(),
+        ids,
+        buffer,
+        withoutFrame);
+    EXPECT_LT(encoded.size(), unframed.size());
+    expectBitwiseEqual(ids, decodeAll<uint64_t>(encoded, *pool));
+
+    auto encoding = decodeEncoding<uint64_t>(encoded, *pool);
+    uint64_t row = 0;
+    for (const auto& [skipRows, readRows] :
+         std::vector<std::pair<uint32_t, uint32_t>>{
+             {4'095, 3}, {1, 9'000}, {7'777, 1}, {0, 44'659}}) {
+      SCOPED_TRACE(fmt::format("row={} read={}", row + skipRows, readRows));
+      encoding->skip(skipRows);
+      row += skipRows;
+      std::vector<uint64_t> chunk(readRows);
+      encoding->materialize(readRows, chunk.data());
+      expectBitwiseEqual(
+          std::vector<uint64_t>(ids.begin() + row, ids.begin() + row + readRows),
+          chunk);
+      row += readRows;
+    }
+    ASSERT_EQ(row, ids.size());
+  }
+
+  // No common step: hashes, and sorted values with uneven gaps.
+  std::mt19937_64 generator{13};
+  std::vector<uint64_t> hashes(40'000);
+  std::vector<uint64_t> unevenSorted(40'000);
+  uint64_t sorted = 0;
+  for (size_t row = 0; row < hashes.size(); ++row) {
+    hashes[row] = generator();
+    sorted += generator() % 100'000;
+    unevenSorted[row] = sorted;
+  }
+  EXPECT_FALSE(fitSubIntSplitStepFrame(std::span<const uint64_t>(hashes)).active());
+  EXPECT_FALSE(
+      fitSubIntSplitStepFrame(std::span<const uint64_t>(unevenSorted)).active());
+}
+
 // Streams written before the row frame became a transform must still decode, so
 // one written at dac77caca is kept verbatim. The writer no longer reproduces it:
 // the whole-value floor stores the same residuals as one section, 10 bytes

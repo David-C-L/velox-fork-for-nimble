@@ -30,6 +30,7 @@
 // range reads keep their cost.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -199,6 +200,85 @@ SubIntSplitRowFrame fitSubIntSplitRowFrame(
     return frame;
   }
   return {};
+}
+
+/// Share of adjacent row pairs that must step by one common non-zero amount for
+/// a step frame to be fitted.
+inline constexpr double kStepFrameMinShare = 0.25;
+
+/// Fits a row frame whose slope is the non-zero step that adjacent rows most
+/// often take, or returns an inactive one when no step is common enough.
+///
+/// fitSubIntSplitRowFrame asks whether a column follows one line across the
+/// stream. This asks whether it follows many short lines of the same slope,
+/// broken wherever something else in the value moves. A UUIDv7's high half is
+/// the case: its 12-bit counter counts up by one within a millisecond and
+/// restarts at random in the next, so 57% of adjacent rows step by exactly one
+/// while no 1,024-row stride grows by a consistent amount. Subtracting
+/// slope * row turns each such stretch into repeats of one value, which
+/// sections store as runs. The base is zero: the frame is kept on encoded
+/// bytes, not on a borrow-free residual, so there is nothing for it to protect.
+///
+/// Needs as many rows as fitSubIntSplitRowFrame, so the two are offered the
+/// same columns.
+template <typename PhysicalType>
+SubIntSplitRowFrame fitSubIntSplitStepFrame(
+    std::span<const PhysicalType> values) {
+  if (values.size() < 2 ||
+      (values.size() - 1) / kRowFrameStride < kRowFrameMinStrides) {
+    return {};
+  }
+  const auto stepAt = [&values](size_t row) {
+    return static_cast<PhysicalType>(values[row + 1] - values[row]);
+  };
+
+  // Misra-Gries with three counters keeps every step taken by more than a
+  // quarter of the pairs among its candidates, in one pass and constant
+  // memory. A second pass counts the candidates exactly.
+  constexpr size_t kCandidates = 3;
+  std::array<PhysicalType, kCandidates> candidates{};
+  std::array<uint64_t, kCandidates> weights{};
+  const size_t numPairs = values.size() - 1;
+  for (size_t row = 0; row < numPairs; ++row) {
+    const PhysicalType step = stepAt(row);
+    if (step == 0) {
+      continue;
+    }
+    bool placed = false;
+    for (size_t i = 0; i < kCandidates && !placed; ++i) {
+      if (weights[i] > 0 && candidates[i] == step) {
+        ++weights[i];
+        placed = true;
+      }
+    }
+    for (size_t i = 0; i < kCandidates && !placed; ++i) {
+      if (weights[i] == 0) {
+        candidates[i] = step;
+        weights[i] = 1;
+        placed = true;
+      }
+    }
+    if (!placed) {
+      for (auto& weight : weights) {
+        --weight;
+      }
+    }
+  }
+
+  std::array<uint64_t, kCandidates> counts{};
+  for (size_t row = 0; row < numPairs; ++row) {
+    const PhysicalType step = stepAt(row);
+    for (size_t i = 0; i < kCandidates; ++i) {
+      counts[i] += (weights[i] > 0 && candidates[i] == step) ? 1 : 0;
+    }
+  }
+  const auto best = static_cast<size_t>(
+      std::max_element(counts.begin(), counts.end()) - counts.begin());
+  if (static_cast<double>(counts[best]) <
+      kStepFrameMinShare * static_cast<double>(numPairs)) {
+    return {};
+  }
+  return {.slope = static_cast<uint64_t>(candidates[best]), .base = 0};
 }
 
 /// Writes value - (slope * row + base) for every row of `values` into

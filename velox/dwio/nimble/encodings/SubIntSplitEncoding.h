@@ -1401,6 +1401,9 @@ std::string_view SubIntSplitEncoding<T>::encode(
   constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
   detail::SubIntSplitRowFrame rowFrame;
   std::vector<physicalType> residuals;
+  // Whether the frame came from adjacent steps rather than from a line through
+  // the stream, which decides how it is priced below.
+  bool stepFrame = false;
   if (options.subIntSplitRowFrame) {
     const auto* frameTransform =
         subintsplit::transformFor(subintsplit::TransformId::RowFrame);
@@ -1413,8 +1416,12 @@ std::string_view SubIntSplitEncoding<T>::encode(
     // Fitted in place first, so a column that follows no line, which is most
     // of them, is not copied to 64-bit words just to learn that. apply()
     // takes the fitted line from the state rather than fitting again.
-    const auto fitted =
+    const auto lineFrame =
         detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values);
+    stepFrame = !lineFrame.active();
+    const auto fitted = stepFrame
+        ? detail::subintsplit::fitSubIntSplitStepFrame<physicalType>(values)
+        : lineFrame;
     if (fitted.active()) {
       subintsplit::TransformState frameState;
       frameState.codebook = {fitted.slope, fitted.base};
@@ -1453,6 +1460,31 @@ std::string_view SubIntSplitEncoding<T>::encode(
               options,
               detail::SubIntSplitRowFrame{},
               nullptr);
+  }
+
+  // A step frame is kept on encoded bytes. What it produces is runs, and the
+  // planner's run models misrank exactly that: on a UUIDv7's high half they
+  // priced the residuals 4% above the values, and the residuals encode 26 to
+  // 29% smaller. Both
+  // are encoded, into a scratch buffer so the loser takes no space in the
+  // stream, which doubles encode time on the columns a step frame fits and on
+  // no others.
+  if (stepFrame) {
+    Buffer scratch{buffer.getMemoryPool()};
+    const auto framed =
+        encodeResiduals(selection, residuals, scratch, options, rowFrame, nullptr);
+    const auto unframed = encodeResiduals(
+        selection,
+        values,
+        scratch,
+        options,
+        detail::SubIntSplitRowFrame{},
+        nullptr);
+    const std::string_view smaller =
+        framed.size() < unframed.size() ? framed : unframed;
+    char* reserved = buffer.reserve(smaller.size());
+    std::memcpy(reserved, smaller.data(), smaller.size());
+    return {reserved, smaller.size()};
   }
 
   // Fitting only says the column follows a line, not that sections encode the
