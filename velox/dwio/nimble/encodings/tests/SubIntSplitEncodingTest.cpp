@@ -697,8 +697,10 @@ std::vector<uint64_t> makeTimestampCounterIds(uint32_t numRows, uint32_t seed) {
 } // namespace
 
 // Such IDs follow no line through the stream, but most adjacent rows step by
-// one, so a step frame turns each millisecond into a run of one residual. It is
-// kept because it encodes smaller, and every read path adds it back.
+// one, so a step frame turns each millisecond into a run of one residual. The
+// residuals are offered to the whole-value floor beside the values, so the
+// stream is never larger for the offer, and where the frame is kept every read
+// path adds it back.
 TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
   using nimble::detail::subintsplit::fitSubIntSplitRowFrame;
   using nimble::detail::subintsplit::fitSubIntSplitStepFrame;
@@ -719,7 +721,6 @@ TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
         ids,
         buffer,
         options);
-    EXPECT_EQ(parseRowFrame(encoded).slope, 1u);
     nimble::Encoding::Options withoutFrame = options;
     withoutFrame.subIntSplitRowFrame = false;
     const auto unframed = nimble::EncodingFactory::encode<uint64_t>(
@@ -727,7 +728,10 @@ TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
         ids,
         buffer,
         withoutFrame);
-    EXPECT_LT(encoded.size(), unframed.size());
+    EXPECT_LE(encoded.size(), unframed.size());
+    const auto frame = parseRowFrame(encoded);
+    EXPECT_TRUE(!frame.active() || (frame.slope == 1u && frame.base == 0u));
+    EXPECT_EQ(frame.active(), encoded.size() < unframed.size());
     expectBitwiseEqual(ids, decodeAll<uint64_t>(encoded, *pool));
 
     auto encoding = decodeEncoding<uint64_t>(encoded, *pool);

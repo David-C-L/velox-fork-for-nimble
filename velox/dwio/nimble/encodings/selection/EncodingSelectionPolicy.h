@@ -20,6 +20,7 @@
 #include <limits>
 #include <span>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -724,6 +725,24 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
   const std::vector<std::pair<EncodingType, float>>&
   candidateEncodingReadFactors() const {
     return candidateEncodingReadFactors_;
+  }
+
+  std::unique_ptr<EncodingSelectionPolicy<T>> narrowed(
+      const std::function<bool(EncodingType)>& keep) const override {
+    std::vector<std::pair<EncodingType, float>> kept;
+    for (const auto& entry : candidateEncodingReadFactors_) {
+      if (keep(entry.first)) {
+        kept.push_back(entry);
+      }
+    }
+    // Nested streams are offered what createImpl would offer them.
+    return std::make_unique<ManualEncodingSelectionPolicy<T>>(
+        std::move(kept),
+        compressionOptions_,
+        identifier_,
+        nestedEncodingReadFactorsOverride_.has_value()
+            ? nestedEncodingReadFactorsOverride_.value()
+            : candidateEncodingReadFactors_);
   }
 
  protected:

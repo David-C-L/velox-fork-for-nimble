@@ -158,47 +158,6 @@ inline double wholeValueEstimateSlack(EncodingType encodingType) {
   }
 }
 
-/// Selects FixedBitWidth for a whole-value section, keeping the compression
-/// the section's own selection would have applied. FixedBitWidth has no nested
-/// streams, so this policy is never asked for a child policy.
-template <typename T>
-class FixedBitWidthSelectionPolicy final : public EncodingSelectionPolicy<T> {
- public:
-  explicit FixedBitWidthSelectionPolicy(
-      std::function<std::unique_ptr<CompressionPolicy>()>
-          compressionPolicyFactory)
-      : compressionPolicyFactory_{std::move(compressionPolicyFactory)} {}
-
-  EncodingSelectionResult select(
-      std::span<const T> /* values */,
-      const Statistics<T>& /* statistics */,
-      const Encoding::Options& /* options */) override {
-    return {
-        .encodingType = EncodingType::FixedBitWidth,
-        .compressionPolicyFactory = compressionPolicyFactory_};
-  }
-
-  EncodingSelectionResult selectNullable(
-      std::span<const T> /* values */,
-      std::span<const bool> /* nulls */,
-      const Statistics<T>& /* statistics */,
-      const Encoding::Options& /* options */) override {
-    NIMBLE_UNREACHABLE("A whole-value section has no nulls.");
-  }
-
- protected:
-  std::unique_ptr<EncodingSelectionPolicyBase> createImpl(
-      EncodingType /* parentEncodingType */,
-      NestedEncodingIdentifier /* identifier */,
-      DataType /* nestedDataType */) override {
-    NIMBLE_UNREACHABLE("FixedBitWidth has no nested streams.");
-  }
-
- private:
-  const std::function<std::unique_ptr<CompressionPolicy>()>
-      compressionPolicyFactory_;
-};
-
 } // namespace facebook::nimble::detail::subintsplit
 
 namespace facebook::nimble {
@@ -320,20 +279,40 @@ class SubIntSplitEncoding
   // Encodes `values` with `rowFrame` already subtracted from them, and records
   // the frame in the header so reads add it back. `planning`, when not null,
   // is the sample and grid already costed for exactly these values.
+  // `stepFrame`, when not null, is a step frame fitted to the same column, and
+  // `stepResiduals` the column with it subtracted: the whole-value floor may
+  // store those residuals as its one section instead.
   static std::string_view encodeResiduals(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
       Buffer& buffer,
       const Encoding::Options& options,
       const detail::SubIntSplitRowFrame& rowFrame,
-      PlanningSample* planning);
+      PlanningSample* planning,
+      const detail::SubIntSplitRowFrame* stepFrame,
+      std::span<const physicalType> stepResiduals);
 
   // Encodes `values` as one whole-value section when that stores them in
-  // fewer than `bytesToBeat` bytes, and returns nothing otherwise. Tries the
-  // encoding section selection picks for the whole value, unless
-  // `planIsWholeValue` says the plan already is that section, and
-  // FixedBitWidth, whose estimate is exact. Each is kept only on its encoded
-  // bytes.
+  // fewer than `bytesToBeat` bytes, and returns nothing otherwise. Tries
+  // FixedBitWidth, whose estimate is exact, and, unless `planIsWholeValue`
+  // says the plan already is one section, section selection's pick for the
+  // whole value, priced on a sample and encoded only where the sample says it
+  // can win. Each is kept only on its encoded bytes.
+  // What section selection's pick is quoted for storing `values` as one
+  // whole-value section, priced on contiguous blocks of them
+  // and scaled to all of them: the encoding, its quote, and the quote divided
+  // by how far that encoding's estimate has been measured above what it
+  // writes. Nothing when no such encoding can be priced.
+  struct SampledWholeValue {
+    EncodingType encoding;
+    double estimatedBytes;
+    double lowerBoundBytes;
+  };
+  static std::optional<SampledWholeValue> sampleWholeValue(
+      EncodingSelectionPolicy<physicalType>& sectionPolicy,
+      std::span<const physicalType> values,
+      const Encoding::Options& sectionOptions);
+
   static std::optional<std::string_view> encodeWholeValueFloor(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
@@ -1434,7 +1413,7 @@ std::string_view SubIntSplitEncoding<T>::encode(
   }
   if (!rowFrame.active()) {
     return encodeResiduals(
-        selection, values, buffer, options, rowFrame, nullptr);
+        selection, values, buffer, options, rowFrame, nullptr, nullptr, {});
   }
 
   // A preserve-mode encode replays boundaries without running the planner, so
@@ -1452,39 +1431,96 @@ std::string_view SubIntSplitEncoding<T>::encode(
         *frameConfig == detail::subintsplit::kRowFramePresent;
     return captured
         ? encodeResiduals(
-              selection, residuals, buffer, options, rowFrame, nullptr)
+              selection,
+              residuals,
+              buffer,
+              options,
+              rowFrame,
+              nullptr,
+              nullptr,
+              {})
         : encodeResiduals(
               selection,
               values,
               buffer,
               options,
               detail::SubIntSplitRowFrame{},
-              nullptr);
+              nullptr,
+              nullptr,
+              {});
   }
 
-  // A step frame is kept on encoded bytes. What it produces is runs, and the
-  // planner's run models misrank exactly that: on a UUIDv7's high half they
-  // priced the residuals 4% above the values, and the residuals encode 26 to
-  // 29% smaller. Both
-  // are encoded, into a scratch buffer so the loser takes no space in the
-  // stream, which doubles encode time on the columns a step frame fits and on
-  // no others.
+  // A step frame produces runs of whole values, which the planner's run
+  // models misprice: on a UUIDv7's high half they priced the residuals 4%
+  // above the values, which one RLE section then stored in 58% of the values'
+  // bytes. So the two streams are compared on the whole-value quotes the floor
+  // uses, from a sample, and where one is decisively cheaper only it is
+  // planned and encoded; the residuals are still offered to the floor as one
+  // whole-value section when the values are planned. Encoding both in full on
+  // every such column took 3.7 to 5.6 times the base encode time on uuidv7_hi.
   if (stepFrame) {
-    Buffer scratch{buffer.getMemoryPool()};
-    const auto framed =
-        encodeResiduals(selection, residuals, scratch, options, rowFrame, nullptr);
-    const auto unframed = encodeResiduals(
+    auto sectionPolicy = std::unique_ptr<EncodingSelectionPolicy<physicalType>>(
+        static_cast<EncodingSelectionPolicy<physicalType>*>(
+            selection
+                .template createNestedPolicy<physicalType>(
+                    selection.encodingType(), NestedEncodingIdentifier{0})
+                .release()));
+    const auto sectionOptions =
+        detail::subintsplit::sectionEncodingOptions(options);
+    const auto framedQuote =
+        sampleWholeValue(*sectionPolicy, residuals, sectionOptions);
+    const auto valuesQuote =
+        sampleWholeValue(*sectionPolicy, values, sectionOptions);
+    // Where the quotes are within a factor of two of each other the sample
+    // cannot tell the streams apart, and both are planned and encoded, into a
+    // scratch buffer so the loser takes no space in the stream. A decisive
+    // quote plans only its stream: deciding on quotes within that factor lost
+    // up to 1.06 bits per value on an RLE's run values nested in uuidv7_hi.
+    constexpr double kDecisiveQuoteRatio = 2.0;
+    const bool decisive = framedQuote.has_value() && valuesQuote.has_value() &&
+        std::max(framedQuote->lowerBoundBytes, valuesQuote->lowerBoundBytes) >=
+            kDecisiveQuoteRatio *
+                std::min(
+                    framedQuote->lowerBoundBytes, valuesQuote->lowerBoundBytes);
+    if (!decisive) {
+      Buffer scratch{buffer.getMemoryPool()};
+      const auto framed = encodeResiduals(
+          selection, residuals, scratch, options, rowFrame, nullptr, nullptr, {});
+      const auto unframed = encodeResiduals(
+          selection,
+          values,
+          scratch,
+          options,
+          detail::SubIntSplitRowFrame{},
+          nullptr,
+          nullptr,
+          {});
+      const std::string_view smaller =
+          framed.size() < unframed.size() ? framed : unframed;
+      char* reserved = buffer.reserve(smaller.size());
+      std::memcpy(reserved, smaller.data(), smaller.size());
+      return {reserved, smaller.size()};
+    }
+    if (framedQuote->lowerBoundBytes < valuesQuote->lowerBoundBytes) {
+      return encodeResiduals(
+          selection,
+          residuals,
+          buffer,
+          options,
+          rowFrame,
+          nullptr,
+          nullptr,
+          {});
+    }
+    return encodeResiduals(
         selection,
         values,
-        scratch,
+        buffer,
         options,
         detail::SubIntSplitRowFrame{},
-        nullptr);
-    const std::string_view smaller =
-        framed.size() < unframed.size() ? framed : unframed;
-    char* reserved = buffer.reserve(smaller.size());
-    std::memcpy(reserved, smaller.data(), smaller.size());
-    return {reserved, smaller.size()};
+        nullptr,
+        &rowFrame,
+        residuals);
   }
 
   // Fitting only says the column follows a line, not that sections encode the
@@ -1511,10 +1547,19 @@ std::string_view SubIntSplitEncoding<T>::encode(
         buffer,
         options,
         detail::SubIntSplitRowFrame{},
-        &valuePlanning);
+        &valuePlanning,
+        nullptr,
+        {});
   }
   return encodeResiduals(
-      selection, residuals, buffer, options, rowFrame, &residualPlanning);
+      selection,
+      residuals,
+      buffer,
+      options,
+      rowFrame,
+      &residualPlanning,
+      nullptr,
+      {});
 }
 
 template <typename T>
@@ -1576,7 +1621,12 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     Buffer& buffer,
     const Encoding::Options& options,
     const detail::SubIntSplitRowFrame& rowFrame,
-    PlanningSample* planning) {
+    PlanningSample* planning,
+    const detail::SubIntSplitRowFrame* stepFrame,
+    std::span<const physicalType> stepResiduals) {
+  // The frame the stream records: `rowFrame`, unless the floor stores the step
+  // frame's residuals instead.
+  detail::SubIntSplitRowFrame writtenFrame = rowFrame;
   const bool useVarint = options.useVarintRowCount;
   const uint32_t valueCount = static_cast<uint32_t>(values.size());
 
@@ -2369,7 +2419,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     // A replayed layout is an instruction, not a plan, so it is left alone.
     const bool replayed = modeConfig.has_value() &&
         *modeConfig == detail::subintsplit::kSplitModePreserve;
-    const auto floor = !replayed && bytesToBeat > singleSectionHeader
+    auto floor = !replayed && bytesToBeat > singleSectionHeader
         ? encodeWholeValueFloor(
               selection,
               values,
@@ -2379,6 +2429,28 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
               splitCount == 1 && !transformInfo.anyTransform(),
               !rowFrame.active())
         : std::nullopt;
+    // The step frame's residuals pay for the frame block on top of the
+    // section, and have to beat whatever the values' floor already reached.
+    const uint64_t framedHeader =
+        singleSectionHeader + detail::kSubIntSplitRowFrameHeaderSize;
+    const uint64_t framedBytesToBeat = floor.has_value()
+        ? floor->size() + singleSectionHeader
+        : bytesToBeat;
+    const auto framedFloor = !replayed && stepFrame != nullptr &&
+            framedBytesToBeat > framedHeader
+        ? encodeWholeValueFloor(
+              selection,
+              stepResiduals,
+              sectionBuffer,
+              sectionOptions,
+              framedBytesToBeat - framedHeader,
+              /*planIsWholeValue=*/false,
+              /*valuesAreColumn=*/false)
+        : std::nullopt;
+    if (framedFloor.has_value()) {
+      floor = framedFloor;
+      writtenFrame = *stepFrame;
+    }
     if (floor.has_value()) {
       segments.assign(1, {.bitStart = 0, .bitEnd = kBits - 1});
       splitCount = 1;
@@ -2394,7 +2466,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       Encoding::serializePrefixSize(valueCount, useVarint);
   const uint32_t specificHeader =
       detail::subIntSplitSpecificHeaderSize(splitCount) +
-      detail::subIntSplitRowFrameHeaderSize(rowFrame) +
+      detail::subIntSplitRowFrameHeaderSize(writtenFrame) +
       detail::subIntSplitTransformHeaderSize(transformInfo);
   uint32_t sectionsSize = 0;
   for (const auto& sv : sectionData) {
@@ -2422,13 +2494,13 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   encoding::write<uint8_t>(splitCount, pos);
   const uint8_t flags =
       (transformed ? detail::kSubIntSplitSectionTransformFlag : uint8_t{0}) |
-      (rowFrame.active() ? detail::kSubIntSplitRowFrameFlag : uint8_t{0});
+      (writtenFrame.active() ? detail::kSubIntSplitRowFrameFlag : uint8_t{0});
   encoding::write<uint8_t>(flags, pos);
 
-  if (rowFrame.active()) {
+  if (writtenFrame.active()) {
     encoding::write<uint8_t>(detail::kSubIntSplitRowFrameGuard, pos);
-    encoding::write<uint64_t>(rowFrame.slope, pos);
-    encoding::write<uint64_t>(rowFrame.base, pos);
+    encoding::write<uint64_t>(writtenFrame.slope, pos);
+    encoding::write<uint64_t>(writtenFrame.base, pos);
   }
 
   if (transformed) {
@@ -2473,31 +2545,15 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
 }
 
 template <typename T>
-std::optional<std::string_view> SubIntSplitEncoding<T>::encodeWholeValueFloor(
-    EncodingSelection<physicalType>& selection,
+std::optional<typename SubIntSplitEncoding<T>::SampledWholeValue>
+SubIntSplitEncoding<T>::sampleWholeValue(
+    EncodingSelectionPolicy<physicalType>& sectionPolicy,
     std::span<const physicalType> values,
-    Buffer& sectionBuffer,
-    const Encoding::Options& sectionOptions,
-    uint64_t bytesToBeat,
-    bool planIsWholeValue,
-    bool valuesAreColumn) {
-  // A whole-value section is stored at the physical type's own width, so the
-  // section's values are the column's values and need no slicing.
-  const auto sectionPolicy = [&selection]() {
-    return std::unique_ptr<EncodingSelectionPolicy<physicalType>>(
-        static_cast<EncodingSelectionPolicy<physicalType>*>(
-            selection
-                .template createNestedPolicy<physicalType>(
-                    selection.encodingType(), NestedEncodingIdentifier{0})
-                .release()));
-  };
-
-  // Selection prices the whole value on contiguous blocks spread over the
-  // column rather than on the column itself. Pricing it in full costs as much
-  // as the rest of the encode on the columns measured, halving encode
-  // throughput on every one of them to guard the few where the plan loses, so
-  // the full pricing is left to the trial encode below, which runs only where
-  // the sample says the whole value could win.
+    const Encoding::Options& sectionOptions) {
+  // Priced on contiguous blocks spread over the column rather than on the
+  // column: pricing distinct values and runs over every row cost as much as
+  // the rest of the encode. The planner's own 2,048-row sample is too small
+  // for these estimates, whose alphabet overhead does not scale with rows.
   constexpr size_t kSampleBlocks{8};
   constexpr size_t kSampleBlockRows{8'192};
   std::vector<physicalType> sample;
@@ -2512,37 +2568,97 @@ std::optional<std::string_view> SubIntSplitEncoding<T>::encodeWholeValueFloor(
     priced = sample;
   }
   const auto sampleStatistics = Statistics<physicalType>::create(priced);
-  const auto selected =
-      sectionPolicy()->select(priced, sampleStatistics, sectionOptions);
-  const double sampleScale =
+  // Every encoding a section may take is priced, as section selection would
+  // price the whole value, except RLE where the sample averages fewer than two
+  // rows a run. Without runs an RLE stream is its values stream plus lengths,
+  // and on run-free columns RLE's quote, whose slack is 2.5 because its
+  // estimate runs 2.27x over where runs exist, admitted trials that all lost,
+  // at up to 86 ms each. Narrowing further was measured and rejected: offering
+  // only the encodings the planner misprices (FrequencyPartition, Dictionary,
+  // RLE, MainlyConstant) lost a whole-value BlockBitPacking section that
+  // stored publicbi_npi's Dictionary indices 5,057 bytes smaller than their
+  // plan.
+  const bool hasRuns =
+      2 * sampleStatistics.consecutiveRepeatCount() <= priced.size();
+  const auto trialPolicy =
+      sectionPolicy.narrowed([hasRuns](EncodingType encodingType) {
+        return encodingType != EncodingType::RLE || hasRuns;
+      });
+  if (trialPolicy == nullptr) {
+    return std::nullopt;
+  }
+  const auto picked =
+      trialPolicy->select(priced, sampleStatistics, sectionOptions);
+  if (!picked.estimatedSize.has_value()) {
+    return std::nullopt;
+  }
+  const double estimatedBytes = static_cast<double>(*picked.estimatedSize) *
       static_cast<double>(values.size()) / static_cast<double>(priced.size());
+  return SampledWholeValue{
+      .encoding = picked.encodingType,
+      .estimatedBytes = estimatedBytes,
+      .lowerBoundBytes = estimatedBytes /
+          detail::subintsplit::wholeValueEstimateSlack(picked.encodingType)};
+}
+
+template <typename T>
+std::optional<std::string_view> SubIntSplitEncoding<T>::encodeWholeValueFloor(
+    EncodingSelection<physicalType>& selection,
+    std::span<const physicalType> values,
+    Buffer& sectionBuffer,
+    const Encoding::Options& sectionOptions,
+    uint64_t bytesToBeat,
+    bool planIsWholeValue,
+    bool valuesAreColumn) {
+  // A whole-value section is stored at the physical type's own width, so the
+  // section's values are the column's values and need no slicing. Its
+  // candidates, their read factors, their compression and their children's
+  // candidates are the ones a section would be offered, taken from the policy
+  // a section is selected by. A policy that cannot be narrowed to one encoding
+  // gets no floor.
+  auto sectionPolicy = std::unique_ptr<EncodingSelectionPolicy<physicalType>>(
+      static_cast<EncodingSelectionPolicy<physicalType>*>(
+          selection
+              .template createNestedPolicy<physicalType>(
+                  selection.encodingType(), NestedEncodingIdentifier{0})
+              .release()));
+  const auto policyOffering = [&sectionPolicy](EncodingType encodingType) {
+    return sectionPolicy->narrowed([encodingType](EncodingType candidate) {
+      return candidate == encodingType;
+    });
+  };
+
+  auto fixedBitWidthPolicy = policyOffering(EncodingType::FixedBitWidth);
+  if (fixedBitWidthPolicy == nullptr) {
+    return std::nullopt;
+  }
 
   std::optional<std::string_view> floor;
-  // Selection's own pick is encoded only where its estimate comes within that
-  // estimator's known bias of the plan, so that a whole value is not encoded a
-  // second time on columns it cannot win. See wholeValueEstimateSlack.
-  //
-  // Delta and Varint are passed over. Every other encoding a section may take
-  // reaches a row without replaying the rows before it, through its own view or
-  // a materialized one, and a guard that stored the whole column as one of
-  // those two would trade that away for bytes. That trade is the planner's to
-  // make section by section, where the decode weight can see it.
-  const bool replaysPrecedingRows = selected.encodingType == EncodingType::Delta ||
-      selected.encodingType == EncodingType::Varint;
-  if (!planIsWholeValue && !replaysPrecedingRows &&
-      selected.estimatedSize.has_value() &&
-      static_cast<double>(*selected.estimatedSize) * sampleScale <
-          detail::subintsplit::wholeValueEstimateSlack(selected.encodingType) *
-              static_cast<double>(bytesToBeat)) {
-    const auto encoded = EncodingFactory::encode<physicalType>(
-        sectionPolicy(), values, sectionBuffer, sectionOptions);
-    const EncodingType encodedType = EncodingPrefix::encodingType(encoded);
-    if (encoded.size() < bytesToBeat && encodedType != EncodingType::Delta &&
-        encodedType != EncodingType::Varint) {
-      floor = encoded;
-      bytesToBeat = encoded.size();
+  // The candidates sampleWholeValue prices, and why only those, are
+  // documented there.
+  if (!planIsWholeValue) {
+    // Encoded only where the quote, divided by how far that estimator has been
+    // measured above what it writes, still undercuts the plan. See
+    // wholeValueEstimateSlack.
+    const auto sampled =
+        sampleWholeValue(*sectionPolicy, values, sectionOptions);
+    // Delta and Varint are never taken: a whole column in either replays
+    // every earlier row to reach one.
+    if (sampled.has_value() && sampled->encoding != EncodingType::Delta &&
+        sampled->encoding != EncodingType::Varint &&
+        sampled->lowerBoundBytes < static_cast<double>(bytesToBeat)) {
+      const auto encoded = EncodingFactory::encode<physicalType>(
+          policyOffering(sampled->encoding),
+          values,
+          sectionBuffer,
+          sectionOptions);
+      if (encoded.size() < bytesToBeat) {
+        floor = encoded;
+        bytesToBeat = encoded.size();
+      }
     }
   }
+
   // FixedBitWidth's size is exact and needs only the range, which the column's
   // statistics already hold when these are its values.
   std::optional<Statistics<physicalType>> residualStatistics;
@@ -2554,8 +2670,7 @@ std::optional<std::string_view> SubIntSplitEncoding<T>::encodeWholeValueFloor(
   if (FixedBitWidthEncoding<physicalType>::estimateSize(
           values.size(), statistics, sectionOptions) < bytesToBeat) {
     const auto encoded = EncodingFactory::encode<physicalType>(
-        std::make_unique<detail::subintsplit::FixedBitWidthSelectionPolicy<
-            physicalType>>(selected.compressionPolicyFactory),
+        std::move(fixedBitWidthPolicy),
         values,
         sectionBuffer,
         sectionOptions);
