@@ -18,8 +18,11 @@
 Reads CSVs written by nimble_ml_id_admission_benchmark. A column is a positive
 when the smallest arm named in --sis_arms is more than --margin smaller than
 the smallest arm outside the SubIntSplit family and outside openzl. The
-heuristic's prediction is policy_selects_sis (--decision=policy) or
-estimate_admits (--decision=estimate).
+heuristic's prediction is policy_selects_sis (--decision=policy),
+estimate_admits (--decision=estimate), or a bit-flip admission row's decision
+(--decision=bitflip|bitflip_entropy, at --profile_pairs). Ground-truth encoder
+rows may come from different CSVs than the heuristic rows, e.g. an earlier
+sweep at the same commit.
 
   admission_confusion.py out/*.csv --sis_arms SIS/realNested,SIS/hybrid
 """
@@ -35,11 +38,14 @@ def main():
     parser.add_argument("csvs", nargs="+")
     parser.add_argument("--sis_arms", default="SIS/realNested,SIS/hybrid")
     parser.add_argument("--margin", type=float, default=0.01)
-    parser.add_argument("--decision", choices=["policy", "estimate"], default="policy")
+    parser.add_argument("--decision", choices=["policy", "estimate", "bitflip", "bitflip_entropy"],
+                        default="policy")
+    parser.add_argument("--profile_pairs", default="0")
     args = parser.parse_args()
     sisArms = args.sis_arms.split(",")
 
     heuristic = {}
+    admission = {}
     arms = defaultdict(dict)
     encodeNanos = defaultdict(dict)
     for path in args.csvs:
@@ -50,6 +56,8 @@ def main():
                 dataset = row["dataset"]
                 if row["row_kind"] == "heuristic":
                     heuristic[dataset] = row
+                elif row["row_kind"] == "admission":
+                    admission[(dataset, row["admission_mode"], row["profile_pairs"])] = row
                 elif row["row_kind"] == "encoder":
                     arms[dataset][row["encoding"]] = int(row["payload_bytes"])
                     encodeNanos[dataset][row["encoding"]] = int(row["encode_ns"])
@@ -70,12 +78,18 @@ def main():
         sisArm = min(present, key=lambda arm: arms[dataset][arm])
         otherArm = min(others, key=others.get)
         actual = arms[dataset][sisArm] < (1.0 - args.margin) * others[otherArm]
-        key = "policy_selects_sis" if args.decision == "policy" else "estimate_admits"
-        predicted = heuristic[dataset][key] == "1"
+        if args.decision in ("policy", "estimate"):
+            key = "policy_selects_sis" if args.decision == "policy" else "estimate_admits"
+            predicted = heuristic[dataset][key] == "1"
+            decisionNanos = heuristic[dataset]["heuristic_ns"]
+        else:
+            row = admission[(dataset, args.decision, args.profile_pairs)]
+            predicted = row["decision"] == "1"
+            decisionNanos = row["decision_ns"]
         cells[(predicted, actual)].append(dataset)
         print(f"{dataset},{int(predicted)},{int(actual)},{sisArm},"
               f"{arms[dataset][sisArm]},{otherArm},{others[otherArm]},"
-              f"{heuristic[dataset]['heuristic_ns']},{encodeNanos[dataset][sisArm]}")
+              f"{decisionNanos},{encodeNanos[dataset][sisArm]}")
 
     truePositive = len(cells[(True, True)])
     falsePositive = len(cells[(True, False)])

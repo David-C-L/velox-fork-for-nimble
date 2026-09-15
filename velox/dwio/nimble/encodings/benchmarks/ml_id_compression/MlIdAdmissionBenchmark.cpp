@@ -32,12 +32,21 @@
 //     --mlidc_encoders=Trivial,FixedBitWidth,Dictionary,RLE,MainlyConstant,PFOR/view,SimdForBitpack/view,FPE/fpe_pertier,SIS/realNested,SIS/hybrid
 //     --mlidc_output_csv=<out>/<name>.csv
 // then, over all columns:
-//   admission_confusion.py <out>/*.csv [--decision policy|estimate]
+//   admission_confusion.py <out>/*.csv [--decision policy|estimate|<mode>]
+//
+// Each column also gets one row_kind=admission row per bit-flip admission
+// mode (bitflip, bitflip_entropy) and profile pair cap in
+// --admission_profile_pairs: the gate's decision, what computing the profile
+// and gating costs (decision_ns), and what select() costs and picks with that
+// Encoding::Options::subIntSplitAdmission (select_ns, policy_encoding).
+// --admission_skip_encoders drops the ground-truth encodes, for reruns that
+// take ground truth from an earlier sweep at the same commit.
 // Run without --mlidc_encode_cache_dir, so encode_ns times a real encode.
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -45,9 +54,12 @@
 #include <string>
 #include <vector>
 
+#include <folly/Conv.h>
+#include <folly/String.h>
 #include <gflags/gflags.h>
 
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/DriverSweep.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
@@ -58,6 +70,14 @@ DEFINE_int32(
     admission_repeats,
     5,
     "Timed repeats of the heuristic; the median is reported.");
+DEFINE_string(
+    admission_profile_pairs,
+    "0,65536,16384,4096,1024",
+    "Pair caps the bit-flip admission modes are measured at; 0 is every pair.");
+DEFINE_bool(
+    admission_skip_encoders,
+    false,
+    "Skip the ground-truth encodes and write heuristic and admission rows only.");
 
 constexpr std::string_view kDriver = "bench_admission";
 
@@ -75,6 +95,21 @@ int64_t elapsedNanos(Clock::time_point start) {
 int64_t median(std::vector<int64_t> samples) {
   std::sort(samples.begin(), samples.end());
   return samples[samples.size() / 2];
+}
+
+// The profile count before per-bit counts moved to 8-bit lanes, timed to show
+// what that change is worth.
+template <typename T>
+std::array<uint64_t, 64> countFlipsBitByBit(std::span<const T> values) {
+  std::array<uint64_t, 64> counts{};
+  constexpr int kBits = sizeof(T) * 8;
+  for (size_t i = 0; i + 1 < values.size(); ++i) {
+    const T flipped = values[i] ^ values[i + 1];
+    for (int b = 0; b < kBits; ++b) {
+      counts[b] += (flipped >> b) & T{1};
+    }
+  }
+  return counts;
 }
 
 template <typename Elem>
@@ -113,6 +148,14 @@ int runBenchmark() {
       "policy_encoding",
       "statistics_ns",
       "heuristic_ns",
+      "admission_mode",
+      "profile_pairs",
+      "decision",
+      "decision_ns",
+      "select_ns",
+      "active_flip_entropy",
+      "gradient_boundaries",
+      "bit_by_bit_profile_ns",
       "skipped"};
   const std::string csvPath = FLAGS_mlidc_output_csv.empty()
       ? "bench_admission.csv"
@@ -120,6 +163,14 @@ int runBenchmark() {
   CsvResultWriter csv(csvPath, csvColumns);
 
   const int repeats = std::max(FLAGS_admission_repeats, 1);
+  std::vector<uint32_t> profilePairCaps;
+  {
+    std::vector<std::string> parts;
+    folly::split(',', FLAGS_admission_profile_pairs, parts);
+    for (const auto& part : parts) {
+      profilePairCaps.push_back(folly::to<uint32_t>(part));
+    }
+  }
   for (const auto& dataset : context.datasets) {
     auto data = dataset.generate(numRows, seed);
     const std::span<const physicalType> values{
@@ -130,6 +181,7 @@ int runBenchmark() {
     // apart because every candidate shares them.
     std::vector<int64_t> statisticsNanos;
     std::vector<int64_t> heuristicNanos;
+    std::vector<int64_t> estimateNanos;
     bool estimateAdmits = false;
     EncodingType selected = EncodingType::Trivial;
     for (int repeat = 0; repeat < repeats; ++repeat) {
@@ -141,12 +193,14 @@ int runBenchmark() {
           ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
           CompressionOptions{},
           std::nullopt};
-      selected = policy.select(values, statistics, Encoding::Options{})
-                     .encodingType;
+      selected =
+          policy.select(values, statistics, Encoding::Options{}).encodingType;
       heuristicNanos.push_back(elapsedNanos(start));
+      start = Clock::now();
       estimateAdmits = SubIntSplitEncoding<Elem>::estimateSize(
                            values.size(), statistics, Encoding::Options{})
                            .has_value();
+      estimateNanos.push_back(elapsedNanos(start));
     }
 
     csv.beginRow();
@@ -162,12 +216,91 @@ int runBenchmark() {
     csv.set("policy_encoding", toString(selected));
     csv.set("statistics_ns", median(statisticsNanos));
     csv.set("heuristic_ns", median(heuristicNanos));
+    csv.set("decision_ns", median(estimateNanos));
+    std::vector<int64_t> bitByBitNanos;
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+      const auto start = Clock::now();
+      volatile uint64_t lowBitFlips = countFlipsBitByBit(values)[0];
+      (void)lowBitFlips;
+      bitByBitNanos.push_back(elapsedNanos(start));
+    }
+    csv.set("bit_by_bit_profile_ns", median(bitByBitNanos));
     csv.set("skipped", int64_t{0});
     csv.endRow();
+
+    using nimble::detail::subintsplit::SubIntSplitAdmission;
+    const nimble::detail::subintsplit::TopLevelPolicyConfig admissionConfig;
+    struct AdmissionModeName {
+      SubIntSplitAdmission mode;
+      std::string_view name;
+    };
+    constexpr AdmissionModeName kAdmissionModes[] = {
+        {SubIntSplitAdmission::kBitFlip, "bitflip"},
+        {SubIntSplitAdmission::kBitFlipEntropy, "bitflip_entropy"},
+    };
+    for (const auto& [mode, modeName] : kAdmissionModes) {
+      for (const uint32_t pairCap : profilePairCaps) {
+        std::vector<int64_t> decisionNanos;
+        std::vector<int64_t> selectNanos;
+        bool admitted = false;
+        BitFlipProfile profile;
+        EncodingType modeSelected = EncodingType::Trivial;
+        Encoding::Options options;
+        options.subIntSplitAdmission = static_cast<uint8_t>(mode);
+        options.subIntSplitAdmissionProfilePairs = pairCap;
+        for (int repeat = 0; repeat < repeats; ++repeat) {
+          auto start = Clock::now();
+          profile = computeBitFlipProfile(values, pairCap);
+          admitted = nimble::detail::subintsplit::bitFlipAdmits(
+              profile, mode, admissionConfig);
+          decisionNanos.push_back(elapsedNanos(start));
+          // Fresh statistics, so a full-profile select pays for its profile.
+          const auto statistics = Statistics<physicalType>::create(values);
+          start = Clock::now();
+          ManualEncodingSelectionPolicy<Elem> policy{
+              ManualEncodingSelectionPolicyFactory::
+                  defaultEncodingReadFactors(),
+              CompressionOptions{},
+              std::nullopt};
+          modeSelected =
+              policy.select(values, statistics, options).encodingType;
+          selectNanos.push_back(elapsedNanos(start));
+        }
+        const auto boundaries =
+            nimble::detail::subintsplit::bitFlipGradientBoundaries(
+                profile, admissionConfig);
+        csv.beginRow();
+        csv.set("driver", std::string(kDriver));
+        csv.set("dtype", elemTypeName<Elem>());
+        csv.set("dataset", dataset.name);
+        csv.set("N", static_cast<int64_t>(numRows));
+        csv.set("row_kind", "admission");
+        csv.set("admission_mode", std::string(modeName));
+        csv.set("profile_pairs", static_cast<int64_t>(pairCap));
+        csv.set("decision", int64_t{admitted ? 1 : 0});
+        csv.set(
+            "policy_selects_sis",
+            int64_t{modeSelected == EncodingType::SubIntSplit ? 1 : 0});
+        csv.set("policy_encoding", toString(modeSelected));
+        csv.set("decision_ns", median(decisionNanos));
+        csv.set("select_ns", median(selectNanos));
+        csv.set(
+            "active_flip_entropy",
+            nimble::detail::subintsplit::activeBitFlipEntropy(profile));
+        csv.set(
+            "gradient_boundaries", static_cast<int64_t>(boundaries.size()) - 2);
+        csv.set("skipped", int64_t{0});
+        csv.endRow();
+      }
+    }
     std::cout << dataset.name << ": estimate_admits=" << estimateAdmits
               << " policy=" << toString(selected)
               << " heuristic_ns=" << median(heuristicNanos) << "\n";
 
+    if (FLAGS_admission_skip_encoders) {
+      csv.flush();
+      continue;
+    }
     // Ground truth. Encode time is wall time of the arm's factory, which is
     // the full selection plus encode for a SubIntSplit arm; run without an
     // encode cache so it is not a cache read.
@@ -211,7 +344,8 @@ int main(int argc, char** argv) {
 
 #include <iostream>
 int main() {
-  std::cerr << "bench_admission requires NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS\n";
+  std::cerr
+      << "bench_admission requires NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS\n";
   return 1;
 }
 
