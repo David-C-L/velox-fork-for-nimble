@@ -1312,16 +1312,40 @@ std::string_view SubIntSplitEncoding<T>::encode(
     std::span<const physicalType> values,
     Buffer& buffer,
     const Encoding::Options& options) {
-  const auto rowFrame = options.subIntSplitRowFrame
-      ? detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values)
-      : detail::SubIntSplitRowFrame{};
+  // The row frame is the one whole-value transform: it is fitted and
+  // subtracted through the transform layer before any section exists, and is
+  // admitted there only because every row stays addressable through it.
+  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+  detail::SubIntSplitRowFrame rowFrame;
+  std::vector<physicalType> residuals;
+  if (options.subIntSplitRowFrame) {
+    const auto* frameTransform =
+        subintsplit::transformFor(subintsplit::TransformId::RowFrame);
+    NIMBLE_DCHECK(
+        frameTransform->transformsWholeValue() &&
+            frameTransform->positionMapping() ==
+                subintsplit::PositionMapping::InPlace &&
+            frameTransform->supportsPointAccess(),
+        "A whole-value transform must keep every row addressable.");
+    // Fitted in place first, so a column that follows no line, which is most
+    // of them, is not copied to 64-bit words just to learn that. apply()
+    // takes the fitted line from the state rather than fitting again.
+    const auto fitted =
+        detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values);
+    if (fitted.active()) {
+      subintsplit::TransformState frameState;
+      frameState.codebook = {fitted.slope, fitted.base};
+      std::vector<uint64_t> words(values.begin(), values.end());
+      frameTransform->apply(
+          words, subintsplit::TransformContext{.width = kBits}, frameState);
+      rowFrame = fitted;
+      residuals.assign(words.begin(), words.end());
+    }
+  }
   if (!rowFrame.active()) {
     return encodeResiduals(
         selection, values, buffer, options, rowFrame, nullptr);
   }
-  std::vector<physicalType> residuals;
-  detail::subintsplit::subtractSubIntSplitRowFrame<physicalType>(
-      rowFrame, values, residuals);
 
   // A preserve-mode encode replays boundaries without running the planner, so
   // it has nothing to price a frame with. It takes one exactly when the stream
@@ -1355,7 +1379,6 @@ std::string_view SubIntSplitEncoding<T>::encode(
   // the frame is kept only when its estimate, header included, is smaller.
   // The loser's grid is discarded; the winner's is the one the encode plans
   // on, which leaves the frame costing one grid more than planning without it.
-  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
   const auto selectorConfig = plannerSelectorConfig(options);
   auto residualPlanning = costPlanningSample(residuals, options);
   auto valuePlanning = costPlanningSample(values, options);
@@ -1617,6 +1640,10 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   const auto requestedTransform =
       static_cast<subintsplit::TransformId>(options.subIntSplitTransform);
   const auto* transform = subintsplit::transformFor(requestedTransform);
+  NIMBLE_CHECK(
+      transform == nullptr || !transform->transformsWholeValue(),
+      "A whole-value transform cannot be applied to one section; the row "
+      "frame is enabled by subIntSplitRowFrame.");
   const uint8_t keySection = options.subIntSplitKeySection;
 
   // Transforms the per-section search may choose between when the caller asks

@@ -68,9 +68,16 @@ enum class TransformId : uint8_t {
   // them, which is what a reader should do with a transform it cannot invert.
   /// Bit-plane transposition.
   BitPlane = 7,
+  /// Subtracts a fitted line, slope * row + base, from every whole value
+  /// before the column is split. Recorded by the stream's row-frame header
+  /// flag rather than in the per-section id array, so it lies outside the
+  /// range kTransformIdCount bounds and transformForRaw rejects it there.
+  RowFrame = 8,
 };
 
-/// One past the highest defined id, for validating what comes off the wire.
+/// One past the highest id a section's transform byte may carry, for
+/// validating what comes off the wire. RowFrame is past it on purpose: it
+/// transforms the whole value, never one section.
 inline constexpr uint8_t kTransformIdCount = 8;
 
 /// How a transform relates an original row to where its value ended up, which
@@ -178,6 +185,9 @@ struct TransformContext {
   /// Bit width of the section being transformed, which sets the width of any
   /// codebook entry.
   int width{0};
+  /// Column row of the first value, for transforms whose inverse depends on
+  /// where a row sits rather than only on its value.
+  uint64_t firstRow{0};
   /// Dense run ids for the key section, one per row, where the encoding
   /// holding that section already had them. Empty otherwise, and a transform
   /// that wants them must then derive them from keySection itself.
@@ -339,6 +349,13 @@ class SectionTransform {
   /// Whether this transform needs a key section. Selection uses this to know
   /// whether it must hold a section back unpermuted.
   virtual bool needsKeySection() const {
+    return false;
+  }
+
+  /// Whether this transform applies to whole values before the column is
+  /// split, with TransformContext::width the column's type width, rather than
+  /// to one section. The encoder admits such a transform only there.
+  virtual bool transformsWholeValue() const {
     return false;
   }
 

@@ -19,8 +19,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <random>
+#include <span>
+#include <vector>
 
+#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 
 using namespace facebook::nimble;
@@ -349,6 +353,67 @@ TEST(SectionTransformTest, unknownTransformIdThrows) {
 TEST(SectionTransformTest, removedBurrowsWheelerIdsThrow) {
   EXPECT_THROW(transformForRaw(5), NimbleUserError);
   EXPECT_THROW(transformForRaw(6), NimbleUserError);
+}
+
+// The row frame is a whole-value transform, so its id must never be accepted
+// from a section's transform byte, where there is no row to add the line at.
+TEST(SectionTransformTest, rowFrameIdIsRejectedAsASectionTransform) {
+  EXPECT_THROW(
+      transformForRaw(static_cast<uint8_t>(TransformId::RowFrame)),
+      NimbleUserError);
+  const auto* transform = transformFor(TransformId::RowFrame);
+  EXPECT_TRUE(transform->transformsWholeValue());
+  EXPECT_EQ(transform->positionMapping(), PositionMapping::InPlace);
+  EXPECT_TRUE(transform->supportsPointAccess());
+}
+
+// The transform must fit exactly the frame the encoder has always fitted, or
+// streams would change bytes, and must invert from any first row, since a
+// reader adds the line back starting wherever its range starts.
+TEST(SectionTransformTest, rowFrameRoundTripsFromAnyFirstRow) {
+  constexpr size_t kCount = 40'000;
+  std::mt19937_64 rng(11);
+  for (const int width : {32, 64}) {
+    SCOPED_TRACE(width);
+    const uint64_t mask =
+        width == 64 ? ~uint64_t{0} : (uint64_t{1} << width) - 1;
+    std::vector<uint64_t> original(kCount);
+    for (size_t row = 0; row < kCount; ++row) {
+      original[row] = (row * 3 + rng() % 7) & mask;
+    }
+    const auto expected = width == 32
+        ? detail::subintsplit::fitSubIntSplitRowFrame(std::span<const uint32_t>(
+              std::vector<uint32_t>(original.begin(), original.end())))
+        : detail::subintsplit::fitSubIntSplitRowFrame(
+              std::span<const uint64_t>(original));
+    ASSERT_TRUE(expected.active());
+
+    const auto* transform = transformFor(TransformId::RowFrame);
+    std::vector<uint64_t> values = original;
+    TransformState state;
+    transform->apply(values, TransformContext{.width = width}, state);
+    ASSERT_EQ(state.codebook.size(), 2u);
+    EXPECT_EQ(state.codebook[0], expected.slope);
+    EXPECT_EQ(state.codebook[1], expected.base);
+    EXPECT_LT(*std::max_element(values.begin(), values.end()), 16u);
+
+    constexpr uint64_t kFirstRow = 12'345;
+    std::vector<uint64_t> tail(values.begin() + kFirstRow, values.end());
+    transform->invert(
+        tail, TransformContext{.width = width, .firstRow = kFirstRow}, state);
+    EXPECT_TRUE(std::equal(tail.begin(), tail.end(), original.begin() + kFirstRow));
+  }
+}
+
+// A column that follows no line is left untouched and records nothing.
+TEST(SectionTransformTest, rowFrameLeavesUnfittedColumnsAlone) {
+  const auto original = makeSection(40'000, 64, Shape::Uniform, 5);
+  std::vector<uint64_t> values = original;
+  TransformState state;
+  transformFor(TransformId::RowFrame)
+      ->apply(values, TransformContext{.width = 64}, state);
+  EXPECT_TRUE(state.codebook.empty());
+  EXPECT_EQ(values, original);
 }
 
 // Only the relabellings carry a codebook; the rest must not

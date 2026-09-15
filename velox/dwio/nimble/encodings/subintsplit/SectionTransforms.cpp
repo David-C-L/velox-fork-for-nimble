@@ -26,6 +26,7 @@
 #include "folly/container/F14Map.h"
 
 #include "velox/dwio/nimble/common/RadixSort.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
 
 namespace facebook::nimble::subintsplit {
 
@@ -589,7 +590,102 @@ class BitPlaneTransform : public SectionTransform {
   }
 };
 
+// The row frame as a transform. A column whose values climb by a steady step
+// per row, such as pre/post-order ids, spends its high bits on that climb;
+// subtracting the line leaves residuals whose sections are narrow. Every row
+// stays addressable, since the inverse is one multiply-add by the row index,
+// which is what admits it alongside the other in-place transforms.
+//
+// apply() fits the line when the state carries none and leaves the values
+// untouched when nothing fits, so an empty codebook means not applied. The
+// fit is the one SubIntSplitRowFrame.h has always run, so streams keep their
+// bytes and their header.
+class RowFrameTransform : public SectionTransform {
+ public:
+  TransformId id() const override {
+    return TransformId::RowFrame;
+  }
+
+  void apply(
+      std::span<uint64_t> values,
+      const TransformContext& context,
+      TransformState& state) const override {
+    checkWidth(context.width);
+    if (state.codebook.empty()) {
+      const auto frame =
+          context.width == 32 ? fitNarrowed(values) : fitWide(values);
+      if (!frame.active()) {
+        return;
+      }
+      state.codebook = {frame.slope, frame.base};
+    }
+    addLine(values, context, state, /*sign=*/~uint64_t{0});
+  }
+
+  void invert(
+      std::span<uint64_t> values,
+      const TransformContext& context,
+      const TransformState& state) const override {
+    checkWidth(context.width);
+    if (!state.codebook.empty()) {
+      addLine(values, context, state, /*sign=*/1);
+    }
+  }
+
+  PositionMapping positionMapping() const override {
+    return PositionMapping::InPlace;
+  }
+
+  bool supportsPointAccess() const override {
+    return true;
+  }
+
+  bool transformsWholeValue() const override {
+    return true;
+  }
+
+ private:
+  static void checkWidth(int width) {
+    NIMBLE_CHECK(
+        width == 32 || width == 64,
+        fmt::format("Row frame needs a 32- or 64-bit column, got {}", width));
+  }
+
+  static detail::SubIntSplitRowFrame fitWide(std::span<const uint64_t> values) {
+    return detail::subintsplit::fitSubIntSplitRowFrame(values);
+  }
+
+  static detail::SubIntSplitRowFrame fitNarrowed(
+      std::span<const uint64_t> values) {
+    const std::vector<uint32_t> narrowed(values.begin(), values.end());
+    return detail::subintsplit::fitSubIntSplitRowFrame(
+        std::span<const uint32_t>(narrowed));
+  }
+
+  // Adds sign * (slope * row + base) to every value, modulo the width. sign
+  // is 1 or all ones, so subtraction is the same loop.
+  static void addLine(
+      std::span<uint64_t> values,
+      const TransformContext& context,
+      const TransformState& state,
+      uint64_t sign) {
+    NIMBLE_CHECK_EQ(
+        state.codebook.size(), size_t{2}, "Row frame stores slope, base.");
+    const uint64_t mask = context.width >= 64
+        ? ~uint64_t{0}
+        : (uint64_t{1} << context.width) - 1;
+    const uint64_t slope = state.codebook[0] * sign;
+    uint64_t predicted =
+        (state.codebook[0] * context.firstRow + state.codebook[1]) * sign;
+    for (auto& value : values) {
+      value = (value + predicted) & mask;
+      predicted += slope;
+    }
+  }
+};
+
 const KeyDerivedTransform kKeyDerived;
+const RowFrameTransform kRowFrame;
 const RelabelTransform kRelabelFrequency{TransformId::RelabelFrequency};
 const RelabelTransform kRelabelDense{TransformId::RelabelDense};
 const RelabelTransform kRelabelGray{TransformId::RelabelGray};
@@ -643,6 +739,8 @@ std::string toString(TransformId id) {
       return "RelabelGray";
     case TransformId::BitPlane:
       return "BitPlane";
+    case TransformId::RowFrame:
+      return "RowFrame";
   }
   return "Unknown";
 }
@@ -670,6 +768,8 @@ const SectionTransform* transformFor(TransformId id) {
       return &kRelabelGray;
     case TransformId::BitPlane:
       return &kBitPlane;
+    case TransformId::RowFrame:
+      return &kRowFrame;
   }
   NIMBLE_UNREACHABLE(
       fmt::format(

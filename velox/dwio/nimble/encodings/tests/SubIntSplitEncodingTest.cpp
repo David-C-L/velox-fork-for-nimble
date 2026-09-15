@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <folly/String.h>
 #include <gtest/gtest.h>
 
 #include "velox/common/memory/Memory.h"
@@ -655,6 +656,31 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTrips32Bit) {
       values,
       buffer);
   expectBitwiseEqual(values, decodeAll<uint32_t>(encoded, *pool));
+}
+
+// Streams written before the row frame became a transform must still decode,
+// and the transform must write them unchanged, so one written at dac77caca is
+// kept verbatim.
+TEST(SubIntSplitEncodingTests, rowFrameStreamWrittenBeforeTransformLayerDecodes) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  std::vector<uint32_t> values(20'000);
+  for (uint32_t row = 0; row < values.size(); ++row) {
+    values[row] = row * 2 + 7 + (row % 1'000 == 0 ? 2 : 0);
+  }
+  constexpr std::string_view kWrittenAtDac77caca =
+      "1006204e00000202fe0200000000000000000000000000000000035800000004"
+      "1f0a0000000a02204e000042000000060b204e00000003061500000000000000"
+      "000f0000f401f4017701fa409cc05db036401f9411c4095f05ee4296c1da3075"
+      "803e342194114709e20400000000000000070000000902140000000907090620"
+      "4e000000000000";
+  const std::string written{encodeWithNonRecursiveSubIntSplit(values, buffer)};
+  ASSERT_TRUE(parseRowFrame(written).active());
+  EXPECT_EQ(folly::hexlify(written), kWrittenAtDac77caca);
+
+  std::string golden;
+  ASSERT_TRUE(folly::unhexlify(kWrittenAtDac77caca, golden));
+  expectBitwiseEqual(values, decodeAll<uint32_t>(golden, *pool));
 }
 
 // Columns that do not follow a line must not be charged a planner pass, and
