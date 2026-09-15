@@ -553,9 +553,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     if (!blockedSection_ && transformInfo_.anyTransform()) {
       if (permutedSection_) {
         if (length < kMinSpanLength) {
-          for (uint32_t i = 0; i < length; ++i) {
-            output[i] = readOneRow(offset + i);
-          }
+          readPermutedProbes(offset, length, output);
           return;
         }
         if (length * kSpanAdvantageNumerator <
@@ -904,13 +902,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   static constexpr uint32_t kSpanAdvantageDenominator = 1;
 
   // Below this many rows, the radix sort's own fixed cost -- four passes,
-  // each clearing a 256-entry count table -- has too little to amortise
-  // over and a plain probe per row wins instead. Measured to lie between 11
-  // rows (span path slightly slower than the gather it replaced) and 111
-  // rows (already a clear win); this picks a round number inside that gap
-  // rather than the measured boundary itself, which nobody has narrowed
-  // further yet.
-  static constexpr uint32_t kMinSpanLength = 64;
+  // each clearing a 256-entry count table -- has too little to amortise and
+  // readPermutedProbes() wins instead. Measured on the range driver at
+  // 524,288 rows over lengths 4 to 256 for SIS/key_derived+view and
+  // SIS/auto+view: the span path is faster from 24 rows on osm_h3_r9,
+  // osm_s2_l30, snowflake and xmark_prepost_full (from 16 on three of them),
+  // while publicbi_npi prefers probes at every length up to 256. 24 minimises
+  // the summed log slowdown against the faster path over lengths 16 to 48.
+  static constexpr uint32_t kMinSpanLength = 24;
 
   // Decodes every section in order across the whole column, undoes the
   // transforms over that span, and keeps the requested rows.
@@ -1090,6 +1089,78 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // rather than one per row that survives interleaving. Each block's values
   // come back in source order, not request order, so they are scattered into
   // `scratch` at their recorded row rather than appended.
+  // Reads a range too short for readPermutedSpan()'s sort to pay. Sections
+  // left in place are still read as one run each, and only permuted sections
+  // pay a probe per row, through a position map fetched once for the range.
+  // readOneRow() instead probes every section of every row and fetches the
+  // map and dispatches on each section's mapping per row.
+  // Kept out of line so the untransformed read path it branches from stays
+  // as small as it was.
+  FOLLY_NOINLINE void readPermutedProbes(
+      uint32_t offset,
+      uint32_t length,
+      physicalType* output) const {
+    // A run read does not undo a section's own transform, so a stream that
+    // also transforms a section in place keeps the per-row probe.
+    for (const auto& section : sections_) {
+      if (section.transform != nullptr &&
+          section.transform->positionMapping() !=
+              subintsplit::PositionMapping::Permuted) {
+        for (uint32_t i = 0; i < length; ++i) {
+          output[i] = readOneRow(offset + i);
+        }
+        return;
+      }
+    }
+    const auto& positions = positionMap();
+    const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
+    if (seedWithConstant) {
+      std::fill(output, output + length, constantBits_);
+    }
+    thread_local velox::raw_vector<uint8_t> scratch;
+    scratch.resize(static_cast<size_t>(length) * sizeof(physicalType));
+    thread_local velox::raw_vector<uint64_t> probed;
+    probed.resize(length);
+    for (size_t s = 0; s < sections_.size(); ++s) {
+      const auto& section = sections_[s];
+      const bool isFirst = !seedWithConstant && s == 0;
+      const bool permuted = section.transform != nullptr &&
+          section.transform->positionMapping() ==
+              subintsplit::PositionMapping::Permuted;
+      if (!permuted) {
+        switch (section.storageBytes) {
+          case 1:
+            readSectionChunk<uint8_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          case 2:
+            readSectionChunk<uint16_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          case 4:
+            readSectionChunk<uint32_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+          default:
+            readSectionChunk<uint64_t>(
+                section, offset, length, output, isFirst, scratch.data());
+            break;
+        }
+        continue;
+      }
+      for (uint32_t i = 0; i < length; ++i) {
+        probed[i] = section.valueAt(*section.view, positions[offset + i]);
+      }
+      if (isFirst) {
+        detail::accumulateSubIntSplitSection<physicalType, uint64_t, true>(
+            probed.data(), output, length, section.mask, section.bitStart);
+      } else {
+        detail::accumulateSubIntSplitSection<physicalType, uint64_t, false>(
+            probed.data(), output, length, section.mask, section.bitStart);
+      }
+    }
+  }
+
   template <typename SectionT>
   static void readPermutedSpanSection(
       const Section& section,
