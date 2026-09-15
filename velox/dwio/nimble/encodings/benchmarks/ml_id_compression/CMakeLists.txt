@@ -111,6 +111,12 @@ nimble_add_ml_id_benchmark(
   MlIdSectionDecodeRateBenchmark.cpp
 )
 
+# MlIdAdmissionBenchmark: precision and recall of the SubIntSplit admission
+# heuristic against the bytes splitting actually saves.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_admission_benchmark MlIdAdmissionBenchmark.cpp
+)
+
 # MlIdDecodeRangeBenchmark: contiguous-range decode across (start, length).
 nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_range_benchmark MlIdDecodeRangeBenchmark.cpp OPENZL
