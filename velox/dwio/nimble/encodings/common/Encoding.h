@@ -397,6 +397,19 @@ class Encoding {
     /// planning time.
     bool subIntSplitHybridPlanner{false};
 
+    /// How top-level selection admits SubIntSplit, as a
+    /// detail::subintsplit::SubIntSplitAdmission value. 0 (the default) keeps
+    /// SubIntSplitEncoding::estimateSize competing with the other candidates.
+    /// 1 selects SubIntSplit exactly when the bit-flip profile's gradient gate
+    /// admits the stream and drops it otherwise; 2 also requires the
+    /// active-bit entropy guard (see SubIntSplitTopLevelPolicy.h).
+    uint8_t subIntSplitAdmission{0};
+
+    /// Consecutive pairs the admission profile is computed over, taken at a
+    /// fixed stride across the stream. 0 uses the statistics' own profile
+    /// over every pair. Only read when subIntSplitAdmission is not 0.
+    uint32_t subIntSplitAdmissionProfilePairs{0};
+
     /// Whether SubIntSplit may subtract a fitted slope * row + base from every
     /// value before planning its sections (see SubIntSplitRowFrame.h). It is
     /// fitted only where nearly every 1'024-row stride of the column's low bits

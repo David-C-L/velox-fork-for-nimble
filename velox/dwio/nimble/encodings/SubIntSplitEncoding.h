@@ -199,7 +199,10 @@ class SubIntSplitEncoding
         static_cast<uint64_t>(sizeof(physicalType)) * 8u;
     const uint64_t rangeBits =
         velox::bits::bitsRequired(statistics.max() - statistics.min());
-    if (rangeBits > (kTypeWidthBits * 3) / 4) {
+    // Under a bit-flip admission the profile has already decided; the range
+    // rule would only turn an admitted wide stream into Trivial.
+    if (options.subIntSplitAdmission == 0 &&
+        rangeBits > (kTypeWidthBits * 3) / 4) {
       return std::nullopt;
     }
     const uint64_t fbwEstimate =

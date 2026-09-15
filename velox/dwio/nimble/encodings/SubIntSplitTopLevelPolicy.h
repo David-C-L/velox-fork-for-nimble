@@ -17,17 +17,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/selection/BitFlipProfile.h"
 
 // Standalone, cheap top-level policies for predicting whether a stream is
 // likely to benefit from SubIntSplit, built on Statistics<T>::bitFlipProfile()
-// (see BitFlipProfile.h). These are evidence-gathering components only: they
-// are not wired into EncodingSizeEstimation.h or any production selection
-// path. See SubIntSplitEstimator.h for how they're used to gate a real cost
-// estimate, and benchmarks/ml_id_compression/MlIdSelectionPolicyBenchmark.cpp
-// for how their predictions are compared against ground truth.
+// (see BitFlipProfile.h). The gradient gate, optionally with the active-bit
+// entropy guard, is what ManualEncodingSelectionPolicy::select() admits
+// SubIntSplit by when Encoding::Options::subIntSplitAdmission asks for it;
+// the default admission is still SubIntSplitEncoding::estimateSize. See
+// benchmarks/ml_id_compression/MlIdAdmissionBenchmark.cpp for how the modes
+// compare against ground truth, and SubIntSplitEstimator.h for how they're used
+// to gate a real cost estimate, and
+// benchmarks/ml_id_compression/MlIdSelectionPolicyBenchmark.cpp for how their
+// predictions are compared against ground truth.
 
 namespace facebook::nimble::detail::subintsplit {
 
@@ -58,7 +63,48 @@ struct TopLevelPolicyConfig {
   // stddev without any of them being a meaningful spike; this floor rejects
   // that case.
   double minGradientMagnitude{0.005};
+
+  // The entropy guard rejects a stream whose non-constant bits flip, on
+  // average, nearly as unpredictably as random bits: mean binary entropy of
+  // flipProbability over the bits that ever flip above this. Such a stream
+  // has nothing left for a split to exploit once its constant bits are
+  // dropped, which FixedBitWidth already does. 0.8 is the entropy of a bit
+  // flipping one pair in four. On 39 ID and PublicBI columns it sat between
+  // the largest positive (0.77) and the smallest rejected negative (0.82).
+  // Varying bits come from the whole stream (BitFlipProfile::varyingBits),
+  // so a sampled profile does not drop slow fields and inflate the mean.
+  double maxActiveFlipEntropy{0.8};
 };
+
+/// How top-level selection decides whether SubIntSplit is tried.
+enum class SubIntSplitAdmission : uint8_t {
+  /// SubIntSplitEncoding::estimateSize competes with the other candidates on
+  /// its read-factor-weighted size.
+  kEstimate = 0,
+  /// bitFlipGradientGate() alone admits SubIntSplit, which is then selected.
+  kBitFlip = 1,
+  /// bitFlipGradientGate() and the active-bit entropy guard must both admit.
+  kBitFlipEntropy = 2,
+};
+
+/// Returns the mean binary entropy, in bits, of the flip probabilities of
+/// the bit positions in `profile.varyingBits`; 0 when there are none.
+inline double activeBitFlipEntropy(const BitFlipProfile& profile) {
+  double entropySum{0.0};
+  int numActiveBits{0};
+  for (int b = 0; b < profile.numBits; ++b) {
+    if (((profile.varyingBits >> b) & 1) == 0) {
+      continue;
+    }
+    ++numActiveBits;
+    const double probability = profile.flipProbability[b];
+    if (probability > 0.0 && probability < 1.0) {
+      entropySum -= probability * std::log2(probability) +
+          (1.0 - probability) * std::log2(1.0 - probability);
+    }
+  }
+  return numActiveBits == 0 ? 0.0 : entropySum / numActiveBits;
+}
 
 // Predicts whether `profile` indicates a stream heterogeneous enough to be
 // worth costing SubIntSplit against its rivals.
@@ -131,6 +177,24 @@ inline bool bitFlipGradientGate(
   const double maxGradient = *std::max_element(
       profile.gradient.begin(), profile.gradient.begin() + profile.numBits);
   return maxGradient >= config.minGradientMagnitude;
+}
+
+/// Returns whether `admission` admits SubIntSplit for a stream with
+/// `profile`. kEstimate is not a profile decision and always returns true.
+inline bool bitFlipAdmits(
+    const BitFlipProfile& profile,
+    SubIntSplitAdmission admission,
+    const TopLevelPolicyConfig& config) {
+  switch (admission) {
+    case SubIntSplitAdmission::kEstimate:
+      return true;
+    case SubIntSplitAdmission::kBitFlip:
+      return bitFlipGradientGate(profile, config);
+    case SubIntSplitAdmission::kBitFlipEntropy:
+      return bitFlipGradientGate(profile, config) &&
+          activeBitFlipEntropy(profile) <= config.maxActiveFlipEntropy;
+  }
+  return false;
 }
 
 } // namespace facebook::nimble::detail::subintsplit

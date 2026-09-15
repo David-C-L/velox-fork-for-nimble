@@ -486,10 +486,51 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       }
     }
 
+    // A bit-flip admission decides SubIntSplit from the profile alone: an
+    // admitted stream is left with SubIntSplit as its only candidate, and a
+    // rejected one loses it. The default admission leaves the list alone.
+    bool subIntSplitAdmitted{false};
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+    if constexpr (
+        isIntegralType<T>() &&
+        (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
+      const auto admission =
+          static_cast<detail::subintsplit::SubIntSplitAdmission>(
+              options.subIntSplitAdmission);
+      const auto subIntSplit = std::find_if(
+          candidateEncodingReadFactors.begin(),
+          candidateEncodingReadFactors.end(),
+          [](const auto& entry) {
+            return entry.first == EncodingType::SubIntSplit;
+          });
+      if (admission != detail::subintsplit::SubIntSplitAdmission::kEstimate &&
+          subIntSplit != candidateEncodingReadFactors.end()) {
+        const bool admitted = options.subIntSplitAdmissionProfilePairs == 0
+            ? detail::subintsplit::bitFlipAdmits(
+                  statistics.bitFlipProfile(),
+                  admission,
+                  detail::subintsplit::TopLevelPolicyConfig{})
+            : detail::subintsplit::bitFlipAdmits(
+                  computeBitFlipProfile(
+                      values, options.subIntSplitAdmissionProfilePairs),
+                  admission,
+                  detail::subintsplit::TopLevelPolicyConfig{});
+        if (admitted) {
+          const auto entry = *subIntSplit;
+          candidateEncodingReadFactors.assign(1, entry);
+          subIntSplitAdmitted = true;
+        } else {
+          candidateEncodingReadFactors.erase(subIntSplit);
+        }
+      }
+    }
+#endif
+
     // Not while decode is priced: the screen compares sizes, and would drop a
     // candidate that loses on size and wins once its decode is counted.
-    if (!options.subIntSplitSectionSelection ||
-        options.subIntSplitDecodeWeight == 0.0) {
+    if (!subIntSplitAdmitted &&
+        (!options.subIntSplitSectionSelection ||
+         options.subIntSplitDecodeWeight == 0.0)) {
       screenCandidatesBySample<T>(
           values, candidateEncodingReadFactors, options);
     }

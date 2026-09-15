@@ -25,6 +25,8 @@
 
 #include "velox/dwio/nimble/encodings/SubIntSplitEstimator.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
+#include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
+#include "velox/dwio/nimble/encodings/selection/Statistics.h"
 
 using namespace facebook;
 using namespace facebook::nimble;
@@ -58,7 +60,169 @@ std::vector<uint64_t> makeConcatenatedFieldsStream(size_t n) {
   return values;
 }
 
+// Snowflake-shaped packed fields: a slowly increasing timestamp in bits
+// [30, 63], a machine id in bits [20, 21] that changes every 500 rows, and a
+// random 12-bit sequence in bits [0, 11].
+std::vector<uint64_t> makePackedFieldsStream(size_t n) {
+  std::mt19937_64 rng(kSeed);
+  constexpr uint64_t kMachineIds[] = {1, 3, 0, 2};
+  std::vector<uint64_t> values(n);
+  for (size_t i = 0; i < n; ++i) {
+    values[i] = ((uint64_t{1'700'000} + i / 64) << 30) |
+        (kMachineIds[(i / 500) % 4] << 20) | (rng() & 0xFFF);
+  }
+  return values;
+}
+
+// The per-bit shift-and-mask count the lane-counted profile has to match.
+std::vector<uint64_t> countFlipsBitByBit(
+    const std::vector<uint64_t>& values,
+    size_t stride) {
+  std::vector<uint64_t> counts(64, 0);
+  for (size_t i = 0; i + 1 < values.size(); i += stride) {
+    const uint64_t flipped = values[i] ^ values[i + 1];
+    for (int b = 0; b < 64; ++b) {
+      counts[b] += (flipped >> b) & 1;
+    }
+  }
+  return counts;
+}
+
+bool admits(const std::vector<uint64_t>& values, SubIntSplitAdmission mode) {
+  return bitFlipAdmits(
+      computeBitFlipProfile<uint64_t>(std::span<const uint64_t>(values)),
+      mode,
+      TopLevelPolicyConfig{});
+}
+
 } // namespace
+
+TEST(SubIntSplitTopLevelPolicyTest, profileMatchesBitByBitCount) {
+  // 1'000 values span several 255-pair count drains and a partial one.
+  auto values = makePackedFieldsStream(1'000);
+  values[500] = ~uint64_t{0};
+  const auto profile =
+      computeBitFlipProfile<uint64_t>(std::span<const uint64_t>(values));
+  const auto counts = countFlipsBitByBit(values, 1);
+  uint64_t varyingBits{0};
+  for (int b = 0; b < 64; ++b) {
+    EXPECT_EQ(profile.flipProbability[b], counts[b] / 999.0) << "bit: " << b;
+    varyingBits |= uint64_t{counts[b] > 0} << b;
+  }
+  EXPECT_EQ(profile.varyingBits, varyingBits);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, sampledProfileUsesStridedPairs) {
+  const auto values = makePackedFieldsStream(10'001);
+  const std::span<const uint64_t> span(values);
+  // A cap at or above the pair count is the full profile.
+  const auto full = computeBitFlipProfile<uint64_t>(span);
+  const auto capped = computeBitFlipProfile<uint64_t>(span, 10'000);
+  EXPECT_EQ(full.flipProbability, capped.flipProbability);
+
+  // 10'000 pairs capped at 1'024 take every 10th pair, 1'000 of them.
+  const auto sampled = computeBitFlipProfile<uint64_t>(span, 1'024);
+  const auto counts = countFlipsBitByBit(values, 10);
+  for (int b = 0; b < 64; ++b) {
+    EXPECT_EQ(sampled.flipProbability[b], counts[b] / 1'000.0) << "bit: " << b;
+  }
+  // Varying bits still come from every value.
+  EXPECT_EQ(sampled.varyingBits, full.varyingBits);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, activeBitFlipEntropy) {
+  BitFlipProfile profile;
+  profile.numBits = 64;
+  EXPECT_EQ(activeBitFlipEntropy(profile), 0.0);
+
+  // Bits that always flip carry no entropy but still count as varying.
+  profile.flipProbability[0] = 1.0;
+  profile.flipProbability[1] = 0.5;
+  profile.varyingBits = 0b11;
+  EXPECT_DOUBLE_EQ(activeBitFlipEntropy(profile), 0.5);
+
+  profile.flipProbability[2] = 0.25;
+  profile.varyingBits = 0b111;
+  EXPECT_NEAR(activeBitFlipEntropy(profile), (1.0 + 0.811'278) / 3, 1e-6);
+
+  // A varying bit a sample never saw flip counts, at zero entropy.
+  profile.varyingBits = 0b1111;
+  EXPECT_NEAR(activeBitFlipEntropy(profile), (1.0 + 0.811'278) / 4, 1e-6);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, admissionRejectsConstantStream) {
+  const std::vector<uint64_t> values(10'000, 42);
+  EXPECT_FALSE(admits(values, SubIntSplitAdmission::kBitFlip));
+  EXPECT_FALSE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
+  EXPECT_FALSE(admits({42}, SubIntSplitAdmission::kBitFlip));
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, entropyGuardRejectsRandomStreams) {
+  // At 10'000 rows sampling noise is enough for the gradient gate to fire on
+  // a random stream; the entropy guard sees every bit flipping at 0.5.
+  const auto random = makeUniformRandomStream(10'000);
+  EXPECT_GT(
+      activeBitFlipEntropy(
+          computeBitFlipProfile<uint64_t>(std::span<const uint64_t>(random))),
+      0.99);
+  EXPECT_FALSE(admits(random, SubIntSplitAdmission::kBitFlipEntropy));
+  // One random field with constant bits around it: splitting has nothing to
+  // gain over dropping the constant bits.
+  const auto field = makeConcatenatedFieldsStream(10'000);
+  EXPECT_TRUE(admits(field, SubIntSplitAdmission::kBitFlip));
+  EXPECT_FALSE(admits(field, SubIntSplitAdmission::kBitFlipEntropy));
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, admissionAcceptsPackedFields) {
+  const auto values = makePackedFieldsStream(10'000);
+  EXPECT_TRUE(admits(values, SubIntSplitAdmission::kBitFlip));
+  EXPECT_TRUE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, admissionAcceptsMonotoneCounter) {
+  // A dense counter halves its flip rate per bit, a sharp gradient at bit 1
+  // and low active entropy (about 0.22), so both modes admit it. Neither
+  // guard can tell it from a split-friendly column; this pins that.
+  std::vector<uint64_t> values(10'000);
+  for (size_t i = 0; i < values.size(); ++i) {
+    values[i] = i;
+  }
+  EXPECT_TRUE(admits(values, SubIntSplitAdmission::kBitFlip));
+  EXPECT_TRUE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, selectionFollowsAdmissionMode) {
+  const auto packed = makePackedFieldsStream(10'000);
+  const auto random = makeUniformRandomStream(10'000);
+  auto select = [](const std::vector<uint64_t>& values, uint8_t mode) {
+    const std::span<const uint64_t> span(values);
+    const auto statistics = Statistics<uint64_t>::create(span);
+    ManualEncodingSelectionPolicy<uint64_t> policy{
+        ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+        CompressionOptions{},
+        std::nullopt};
+    Encoding::Options options;
+    options.subIntSplitAdmission = mode;
+    return policy.select(span, statistics, options).encodingType;
+  };
+  EXPECT_EQ(select(packed, 2), EncodingType::SubIntSplit);
+  EXPECT_NE(select(random, 2), EncodingType::SubIntSplit);
+  // A sampled profile admits it too. At 1'024 pairs (every 10th pair) the
+  // timestamp and machine bits rarely flip in a sampled pair; they still
+  // count as varying, so the random sequence bits do not dominate the mean.
+  const std::span<const uint64_t> span(packed);
+  const auto statistics = Statistics<uint64_t>::create(span);
+  ManualEncodingSelectionPolicy<uint64_t> policy{
+      ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+      CompressionOptions{},
+      std::nullopt};
+  Encoding::Options options;
+  options.subIntSplitAdmission = 2;
+  options.subIntSplitAdmissionProfilePairs = 1'024;
+  EXPECT_EQ(
+      policy.select(span, statistics, options).encodingType,
+      EncodingType::SubIntSplit);
+}
 
 TEST(SubIntSplitTopLevelPolicyTest, varianceGateRejectsUniformRandom) {
   const auto values = makeUniformRandomStream(10'000);

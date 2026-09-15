@@ -16,7 +16,9 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -38,20 +40,29 @@ inline constexpr int kMaxBitWidth = 64;
 /// `flipProbability` across `numBits` positions; `gradient[i]` is
 /// |flipProbability[i] - flipProbability[i - 1]| (gradient[0] == 0). Only
 /// the first `numBits` entries of each array are meaningful; the remainder
-/// are zero-filled.
+/// are zero-filled. `varyingBits` has bit i set when bit i is not the same in
+/// every value of the stream, whatever pairs the probabilities were taken
+/// from, so a bit that flips too rarely to show up in a sample still counts as
+/// varying.
 struct BitFlipProfile {
   std::array<double, kMaxBitWidth> flipProbability{};
   double variance{0.0};
   std::array<double, kMaxBitWidth> gradient{};
   int numBits{0};
+  uint64_t varyingBits{0};
 };
 
-/// Computes the bit-flip profile of `values` by XORing each consecutive pair
-/// and accumulating a per-bit set-count via shift-and-mask, so the whole pass
-/// is O(n * numBits), not O(n * numBits^2). Returns a zero profile when
+/// Computes the bit-flip profile of `values` over at most `maxPairs`
+/// consecutive pairs, or over every pair when `maxPairs` is 0. A capped
+/// profile takes pairs (i, i + 1) at a fixed stride across the whole stream,
+/// so adjacency, which is what a flip measures, is kept while the counting
+/// cost falls to O(maxPairs * flipped bits). `varyingBits` always covers every
+/// value, which costs one OR and one AND per value. Returns a zero profile when
 /// `values` has fewer than two elements.
 template <typename T>
-BitFlipProfile computeBitFlipProfile(std::span<const T> values) {
+BitFlipProfile computeBitFlipProfile(
+    std::span<const T> values,
+    size_t maxPairs) {
   using UnsignedT = std::make_unsigned_t<T>;
   constexpr int kBits = std::numeric_limits<UnsignedT>::digits;
   static_assert(kBits <= kMaxBitWidth);
@@ -62,14 +73,31 @@ BitFlipProfile computeBitFlipProfile(std::span<const T> values) {
     return profile;
   }
 
+  UnsignedT anyValueBits{0};
+  UnsignedT everyValueBits = static_cast<UnsignedT>(~UnsignedT{0});
+  for (const T value : values) {
+    anyValueBits |= static_cast<UnsignedT>(value);
+    everyValueBits &= static_cast<UnsignedT>(value);
+  }
+  profile.varyingBits = static_cast<uint64_t>(
+      static_cast<UnsignedT>(anyValueBits & ~everyValueBits));
+
+  const size_t totalPairs = values.size() - 1;
+  const size_t stride = (maxPairs == 0 || maxPairs >= totalPairs)
+      ? 1
+      : (totalPairs + maxPairs - 1) / maxPairs;
+  // Only set bits are visited: ID-like streams flip a minority of their bits
+  // per pair, and this measured faster than shifting out all numBits.
   std::array<uint64_t, kMaxBitWidth> flipCounts{};
-  const size_t pairCount = values.size() - 1;
-  for (size_t i = 0; i + 1 < values.size(); ++i) {
-    const UnsignedT xorVal = static_cast<UnsignedT>(values[i]) ^
+  size_t pairCount = 0;
+  for (size_t i = 0; i < totalPairs; i += stride) {
+    UnsignedT flipped = static_cast<UnsignedT>(values[i]) ^
         static_cast<UnsignedT>(values[i + 1]);
-    for (int b = 0; b < kBits; ++b) {
-      flipCounts[b] += (xorVal >> b) & UnsignedT{1};
+    while (flipped != 0) {
+      ++flipCounts[std::countr_zero(flipped)];
+      flipped &= flipped - 1;
     }
+    ++pairCount;
   }
 
   double sum = 0.0;
@@ -93,6 +121,12 @@ BitFlipProfile computeBitFlipProfile(std::span<const T> values) {
   }
 
   return profile;
+}
+
+/// Computes the bit-flip profile of `values` over every consecutive pair.
+template <typename T>
+BitFlipProfile computeBitFlipProfile(std::span<const T> values) {
+  return computeBitFlipProfile(values, /*maxPairs=*/0);
 }
 
 } // namespace facebook::nimble
