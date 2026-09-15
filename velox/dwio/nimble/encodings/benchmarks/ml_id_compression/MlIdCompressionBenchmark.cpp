@@ -128,6 +128,11 @@ int runBenchmark() {
           std::cout << "  --- " << enc.name << " node estimates ---\n"
                     << estimates;
         }
+        auto choices = target->describeSectionChoices();
+        if (!choices.empty()) {
+          std::cout << "  --- " << enc.name << " section choices ---\n"
+                    << choices;
+        }
       }
 
       const size_t payloadBytes = target->payloadSize();

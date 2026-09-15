@@ -270,6 +270,12 @@ struct NimbleBenchTargetBase {
   virtual std::string describeNodeEstimates() {
     return {};
   }
+
+  /// For a SubIntSplit stream, what each section and the whole value were
+  /// quoted by section selection and by the split planner. Empty otherwise.
+  virtual std::string describeSectionChoices() {
+    return {};
+  }
 };
 
 template <typename EncodingT>
@@ -324,6 +330,17 @@ struct NimbleBenchTargetImpl
             reinterpret_cast<const char*>(payload.data()), payload.size()),
         *benchmarks::benchmarkPool(),
         Encoding::Options{});
+  }
+
+  std::string describeSectionChoices() override {
+    const auto payload = target.payloadBytes();
+    if (payload.empty()) {
+      return {};
+    }
+    return describeSubIntSplitSectionChoices(
+        std::string_view(
+            reinterpret_cast<const char*>(payload.data()), payload.size()),
+        *benchmarks::benchmarkPool());
   }
 };
 

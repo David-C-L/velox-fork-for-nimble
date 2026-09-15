@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 #include <span>
 #include <string>
@@ -28,6 +30,8 @@
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
+#include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
 #include "velox/dwio/nimble/tools/EncodingUtilities.h"
@@ -296,6 +300,296 @@ inline std::string describeEncodingNodeEstimates(
         return true;
       });
 
+  return out;
+}
+
+namespace detail {
+
+// One priced alternative for a stream: an encoding and what it was quoted.
+struct PricedEncoding {
+  EncodingType encoding;
+  double bytes;
+  // What selection compares, bytes times the effective read factor. Equal to
+  // bytes for the planner's models, which weigh no factor.
+  double cost;
+};
+
+// Selection's quotes for `values` under `sectionOptions`, cheapest cost first,
+// over the candidates a SubIntSplit section is offered.
+template <typename T>
+std::vector<PricedEncoding> sectionSelectionQuotes(
+    std::span<const T> values,
+    const Encoding::Options& sectionOptions) {
+  const auto statistics = Statistics<T>::create(values);
+  const auto fixedBitWidthBytes =
+      ::facebook::nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+          EncodingType::FixedBitWidth, values, statistics, sectionOptions);
+  std::vector<PricedEncoding> quotes;
+  for (const auto& [encoding, readFactor] : nestedEncodingReadFactors(
+           ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+           EncodingType::SubIntSplit)) {
+    const auto estimate =
+        ::facebook::nimble::detail::EncodingSizeEstimation<T>::estimateSize(
+            encoding, values, statistics, sectionOptions);
+    if (!estimate.has_value()) {
+      continue;
+    }
+    const float factor = effectiveReadFactor(
+        encoding, readFactor, estimate.value(), fixedBitWidthBytes);
+    quotes.push_back(
+        {encoding,
+         static_cast<double>(estimate.value()),
+         static_cast<double>(estimate.value() * factor)});
+  }
+  std::stable_sort(quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
+    return a.cost < b.cost;
+  });
+  return quotes;
+}
+
+// The split planner's model quotes for `values`, a `bitWidth`-bit range,
+// cheapest first, from the sample the writer would draw and scaled to the
+// stream, under the production planner's inventory.
+inline std::vector<PricedEncoding> plannerModelQuotes(
+    std::span<const uint64_t> values,
+    int bitWidth) {
+  namespace sis = ::facebook::nimble::detail::subintsplit;
+  std::vector<uint64_t> sample;
+  sis::sampleIntoU64<uint64_t>(values, sample, sis::defaultSamplerConfig());
+  if (sample.empty()) {
+    return {};
+  }
+  sis::MetricCollector collector;
+  const auto metrics =
+      collector.compute(sample, sis::allCostModelRequiredFlags());
+  const double scale =
+      static_cast<double>(values.size()) / static_cast<double>(sample.size());
+  std::vector<PricedEncoding> quotes;
+  for (const auto encoding :
+       {EncodingType::Trivial,
+        EncodingType::FixedBitWidth,
+        EncodingType::Constant,
+        EncodingType::MainlyConstant,
+        EncodingType::RLE,
+        EncodingType::Varint,
+        EncodingType::Dictionary,
+        EncodingType::SimdForBitpack,
+        EncodingType::PFOR,
+        EncodingType::BlockBitPacking,
+        EncodingType::Delta,
+        EncodingType::FOR,
+        EncodingType::FrequencyPartition}) {
+    const auto cost = sis::bestSegmentCost(
+        metrics,
+        sample.size(),
+        values.size(),
+        bitWidth,
+        sample,
+        sis::AllowedEncodings{encoding},
+        /*allowHuffman=*/false,
+        /*allowDeltaBlock=*/false,
+        sis::DecodeCostWeighting{});
+    if (std::isfinite(cost.sizeBits)) {
+      const double bytes = cost.sizeBits * scale / 8.0;
+      quotes.push_back({encoding, bytes, bytes});
+    }
+  }
+  std::stable_sort(quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
+    return a.cost < b.cost;
+  });
+  return quotes;
+}
+
+inline std::string formatQuote(const std::vector<PricedEncoding>& quotes, size_t rank) {
+  if (rank >= quotes.size()) {
+    return "\t";
+  }
+  return folly::to<std::string>(
+      toString(quotes[rank].encoding),
+      "\t",
+      static_cast<uint64_t>(quotes[rank].bytes));
+}
+
+inline std::string formatQuotes(const std::vector<PricedEncoding>& quotes) {
+  std::string out;
+  for (const auto& quote : quotes) {
+    out += folly::to<std::string>(
+        out.empty() ? "" : ";",
+        toString(quote.encoding),
+        "=",
+        static_cast<uint64_t>(quote.bytes),
+        "/",
+        static_cast<uint64_t>(quote.cost));
+  }
+  return out;
+}
+
+// Decodes every value of one SubIntSplit section, widened to 64 bits.
+inline std::vector<uint64_t> decodeSectionValues(
+    const ::facebook::nimble::detail::SubIntSplitSection& section,
+    velox::memory::MemoryPool& pool,
+    const Encoding::Options& sectionOptions) {
+  auto encoding = EncodingFactory().create(
+      pool,
+      section.stream,
+      [](uint32_t) -> void* { return nullptr; },
+      sectionOptions);
+  const uint32_t rows = encoding->rowCount();
+  std::vector<uint64_t> values(rows);
+  const auto widen = [&]<typename S>() {
+    std::vector<S> narrow(rows);
+    encoding->materialize(rows, narrow.data());
+    std::copy(narrow.begin(), narrow.end(), values.begin());
+  };
+  switch (section.storageBytes) {
+    case 1:
+      widen.template operator()<uint8_t>();
+      break;
+    case 2:
+      widen.template operator()<uint16_t>();
+      break;
+    case 4:
+      widen.template operator()<uint32_t>();
+      break;
+    default:
+      widen.template operator()<uint64_t>();
+      break;
+  }
+  return values;
+}
+
+// Selection's quotes for section values held at `storageBytes`.
+inline std::vector<PricedEncoding> sectionSelectionQuotesAt(
+    const std::vector<uint64_t>& values,
+    uint8_t storageBytes,
+    const Encoding::Options& sectionOptions) {
+  const auto narrowed = [&]<typename S>() {
+    std::vector<S> narrow(values.begin(), values.end());
+    return sectionSelectionQuotes<S>(std::span<const S>(narrow), sectionOptions);
+  };
+  switch (storageBytes) {
+    case 1:
+      return narrowed.template operator()<uint8_t>();
+    case 2:
+      return narrowed.template operator()<uint16_t>();
+    case 4:
+      return narrowed.template operator()<uint32_t>();
+    default:
+      return narrowed.template operator()<uint64_t>();
+  }
+}
+
+} // namespace detail
+
+/// Why a SubIntSplit stream's plan looks the way it does, one line per
+/// section and one for the whole value, empty when `stream` is not SubIntSplit.
+///
+/// For each section: its bits, transform and encoding, the bytes it took, the
+/// two cheapest candidates as section selection costs them (estimate times
+/// effective read factor, the comparison that chose the encoding), and the two
+/// cheapest of the split planner's models for the same bits (the prices that
+/// placed the boundaries). `all` lists every selection quote as
+/// encoding=estimate/cost. The `whole` line prices the value as one section,
+/// which is the alternative every split was chosen over; it is omitted when a
+/// transform reorders rows, since the stored sections no longer reassemble the
+/// values. Quotes are recomputed from the stored values under default options,
+/// so a stream written with a decode weight or a transform search may have
+/// been chosen on other terms.
+inline std::string describeSubIntSplitSectionChoices(
+    std::string_view stream,
+    velox::memory::MemoryPool& pool) {
+  namespace nimbleDetail = ::facebook::nimble::detail;
+  auto root = EncodingFactory().create(
+      pool, stream, [](uint32_t) -> void* { return nullptr; }, Encoding::Options{});
+  if (root == nullptr ||
+      (root->encodingType() != EncodingType::SubIntSplit &&
+       root->encodingType() != EncodingType::SubIntSplitReordered)) {
+    return {};
+  }
+  const uint32_t rows = root->rowCount();
+  const int valueBits = root->dataType() == DataType::Int32 ||
+          root->dataType() == DataType::Uint32 ||
+          root->dataType() == DataType::Float
+      ? 32
+      : 64;
+  nimbleDetail::SubIntSplitTransformInfo transformInfo;
+  nimbleDetail::SubIntSplitRowFrame rowFrame;
+  const auto sections = nimbleDetail::parseSubIntSplitSections(
+      stream, root->dataOffset(), &transformInfo, &rowFrame);
+  const Encoding::Options sectionOptions =
+      nimbleDetail::subintsplit::sectionEncodingOptions(Encoding::Options{});
+
+  std::string out = folly::to<std::string>(
+      "#frameSlope=",
+      rowFrame.slope,
+      " frameBase=",
+      rowFrame.base,
+      " keySection=",
+      transformInfo.anyTransform() ? static_cast<int>(transformInfo.keySection)
+                                   : -1,
+      "\n#section\tbitStart\tbitEnd\ttransform\tencoding\tactual"
+      "\tselPick\tselPickEstimate\tselRunnerUp\tselRunnerUpEstimate"
+      "\tplannerPick\tplannerPickBytes\tplannerRunnerUp\tplannerRunnerUpBytes"
+      "\tall\n");
+  std::vector<uint64_t> wholeValues(rows, 0);
+  for (size_t s = 0; s < sections.size(); ++s) {
+    const auto& section = sections[s];
+    const auto values = detail::decodeSectionValues(section, pool, sectionOptions);
+    const uint8_t transformId = transformInfo.anyTransform()
+        ? transformInfo.transformIds[s]
+        : uint8_t{0};
+    for (uint32_t row = 0; row < rows && row < values.size(); ++row) {
+      wholeValues[row] |= values[row] << section.bitStart;
+    }
+    const auto selection = detail::sectionSelectionQuotesAt(
+        values, section.storageBytes, sectionOptions);
+    const auto planner = detail::plannerModelQuotes(
+        values, section.bitEnd - section.bitStart + 1);
+    auto sectionEncoding = EncodingFactory().create(
+        pool, section.stream, [](uint32_t) -> void* { return nullptr; }, sectionOptions);
+    out += folly::to<std::string>(
+        s,
+        "\t",
+        section.bitStart,
+        "\t",
+        section.bitEnd,
+        "\t",
+        static_cast<int>(transformId),
+        "\t",
+        toString(sectionEncoding->encodingType()),
+        "\t",
+        section.stream.size(),
+        "\t",
+        detail::formatQuote(selection, 0),
+        "\t",
+        detail::formatQuote(selection, 1),
+        "\t",
+        detail::formatQuote(planner, 0),
+        "\t",
+        detail::formatQuote(planner, 1),
+        "\t",
+        detail::formatQuotes(selection),
+        "\n");
+  }
+  if (!transformInfo.anyTransform()) {
+    const auto selection = detail::sectionSelectionQuotesAt(
+        wholeValues, static_cast<uint8_t>(valueBits / 8), sectionOptions);
+    const auto planner = detail::plannerModelQuotes(wholeValues, valueBits);
+    out += folly::to<std::string>(
+        "whole\t0\t",
+        valueBits - 1,
+        "\t0\t\t\t",
+        detail::formatQuote(selection, 0),
+        "\t",
+        detail::formatQuote(selection, 1),
+        "\t",
+        detail::formatQuote(planner, 0),
+        "\t",
+        detail::formatQuote(planner, 1),
+        "\t",
+        detail::formatQuotes(selection),
+        "\n");
+  }
   return out;
 }
 
