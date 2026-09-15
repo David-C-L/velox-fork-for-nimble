@@ -1643,26 +1643,39 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   // caller who already knows which transform the column wants. Priced against
   // SIS/realNested, which is the same encoder with the search switched off.
   {
-    const std::vector<std::pair<const char*, bool>> arms{
-        {"SIS/auto", false},
-        {"SIS/auto+view", true},
+    // SIS/hybrid_auto and its view take their split boundaries from the
+    // hybrid planner and then run the same per-section transform search, so
+    // against SIS/hybrid they differ only by the search and against SIS/auto
+    // only by the plan.
+    struct AutoArm {
+      const char* name;
+      bool withView;
+      bool hybrid;
     };
-    for (const auto& [name, withView] : arms) {
+    const std::vector<AutoArm> arms{
+        {"SIS/auto", false, false},
+        {"SIS/auto+view", true, false},
+        {"SIS/hybrid_auto", false, true},
+        {"SIS/hybrid_auto+view", true, true},
+    };
+    for (const auto& [name, withView, hybrid] : arms) {
       EncoderEntry<T> entry;
       entry.name = name;
       entry.family = "SubIntSplit";
-      entry.variant = withView ? "real_nested_view" : "real_nested";
+      entry.variant = hybrid ? (withView ? "hybrid_view" : "hybrid")
+                             : (withView ? "real_nested_view" : "real_nested");
       entry.inventory = "full";
       entry.transform = "auto";
       entry.isSequential = false;
       entry.fastSkip = withView;
       entry.randomAccess = withView;
-      entry.factory = [withView](
+      entry.factory = [withView, hybrid](
                           const Vector<T>& data,
                           const Encoding::Options& opts) {
         Encoding::Options o = opts;
         o.subIntSplitAutoTransform = true;
         o.subIntSplitKeySection = 0xFF;
+        o.subIntSplitHybridPlanner = hybrid;
         if (withView) {
           auto impl = std::make_unique<
               NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
