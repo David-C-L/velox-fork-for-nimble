@@ -1640,7 +1640,14 @@ SubIntSplitEncoding<T>::estimatorSamplerConfig() {
   // estimate costs; halving the block keeps the same number of distinct
   // stretches of the stream in a smaller sample, which is what the run-length
   // and frame-residual models in the cost grid read.
-  return detail::subintsplit::SamplerConfig{.maxSamples = 256, .blockSize = 32};
+  //
+  // Halving it again does not pay. At 256 values in blocks of 32 the estimate
+  // took 5.74 ms rather than 7.20 ms on a 524'288-row uint64 column -- a fifth
+  // less, not half, because fitting the row frame and drawing the sample are
+  // passes over the whole column and the DP is not all of the cost -- while
+  // the median estimate/actual ratio over the 38 columns a split wins on rose
+  // from 1.34 to 1.71 and selection lost one of them.
+  return detail::subintsplit::SamplerConfig{.maxSamples = 512, .blockSize = 64};
 }
 
 template <typename T>
