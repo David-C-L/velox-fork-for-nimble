@@ -314,6 +314,13 @@ inline std::string cacheArmIdentity(
   // Admission decides whether nested streams may pick SubIntSplit, so it can
   // move the bytes of any arm.
   id += "|adm" + std::to_string(static_cast<int>(options.subIntSplitAdmission));
+  // Whether an admitted stream still has to win on size changes which encoding
+  // is written wherever the gate and the size comparison disagree. Only the
+  // forcing case is in the id, so entries cached before this option existed
+  // stay addressable.
+  if (options.subIntSplitAdmissionForces) {
+    id += "|admf";
+  }
   id += "|v" + std::to_string(options.useVarintRowCount ? 1 : 0);
   // deltaZigzagAnchorStride is deliberately absent: it does not exist on this
   // branch, and an option that no encoding here reads cannot change the bytes.

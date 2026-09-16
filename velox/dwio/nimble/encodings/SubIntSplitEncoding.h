@@ -223,8 +223,10 @@ class SubIntSplitEncoding
         static_cast<uint64_t>(sizeof(physicalType)) * 8u;
     const uint64_t rangeBits =
         velox::bits::bitsRequired(statistics.max() - statistics.min());
-    // Under a bit-flip admission the profile has already decided; the range
-    // rule would only turn an admitted wide stream into Trivial.
+    // Under a bit-flip admission the profile has already decided the stream is
+    // worth costing, and the range rule would veto it before its estimate is
+    // compared. It is exactly the wide streams -- a random low half of a
+    // UUIDv7, say -- that the profile is there to rescue.
     if (options.subIntSplitAdmission == 0 &&
         rangeBits > (kTypeWidthBits * 3) / 4) {
       return std::nullopt;

@@ -501,10 +501,13 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
           candidateEncodingReadFactors.end());
     }
 
-    // A bit-flip admission decides SubIntSplit from the profile alone: an
-    // admitted stream is left with SubIntSplit as its only candidate, and a
-    // rejected one loses it. The default admission leaves the list alone.
-    bool subIntSplitAdmitted{false};
+    // A bit-flip admission decides from the profile alone whether SubIntSplit
+    // is worth costing: a rejected stream loses the candidate, and an admitted
+    // one keeps it and then has to win the ordinary size comparison like any
+    // other candidate. Options::subIntSplitAdmissionForces restores the
+    // earlier behaviour, where an admitted stream was left with SubIntSplit as
+    // its only candidate. The default admission leaves the list alone.
+    bool subIntSplitForced{false};
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
     if constexpr (
         isIntegralType<T>() &&
@@ -530,12 +533,12 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
                       values, options.subIntSplitAdmissionProfilePairs),
                   admission,
                   detail::subintsplit::TopLevelPolicyConfig{});
-        if (admitted) {
+        if (!admitted) {
+          candidateEncodingReadFactors.erase(subIntSplit);
+        } else if (options.subIntSplitAdmissionForces) {
           const auto entry = *subIntSplit;
           candidateEncodingReadFactors.assign(1, entry);
-          subIntSplitAdmitted = true;
-        } else {
-          candidateEncodingReadFactors.erase(subIntSplit);
+          subIntSplitForced = true;
         }
       }
     }
@@ -543,7 +546,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
 
     // Not while decode is priced: the screen compares sizes, and would drop a
     // candidate that loses on size and wins once its decode is counted.
-    if (!subIntSplitAdmitted &&
+    if (!subIntSplitForced &&
         (!options.subIntSplitSectionSelection ||
          options.subIntSplitDecodeWeight == 0.0)) {
       screenCandidatesBySample<T>(

@@ -400,10 +400,20 @@ class Encoding {
     /// How top-level selection admits SubIntSplit, as a
     /// detail::subintsplit::SubIntSplitAdmission value. 0 (the default) keeps
     /// SubIntSplitEncoding::estimateSize competing with the other candidates.
-    /// 1 selects SubIntSplit exactly when the bit-flip profile's gradient gate
-    /// admits the stream and drops it otherwise; 2 also requires the
-    /// active-bit entropy guard (see SubIntSplitTopLevelPolicy.h).
+    /// 1 offers SubIntSplit as a candidate exactly when the bit-flip profile's
+    /// gradient gate admits the stream and withholds it otherwise; 2 also
+    /// requires the active-bit entropy guard (see SubIntSplitTopLevelPolicy.h).
+    /// Under 1 and 2 an admitted stream still has to win the ordinary size
+    /// comparison, unless subIntSplitAdmissionForces says otherwise.
     uint8_t subIntSplitAdmission{0};
+
+    /// Whether a bit-flip admission decides on its own, rather than deciding
+    /// only which candidates compete. True makes an admitted stream
+    /// SubIntSplit without a size comparison, which is what the admission
+    /// modes did before they were turned into a candidacy gate; it is kept for
+    /// the ablation that separates the gate's predictions from what selection
+    /// does with them. Read only when subIntSplitAdmission is not 0.
+    bool subIntSplitAdmissionForces{false};
 
     /// Consecutive pairs the admission profile is computed over, taken at a
     /// fixed stride across the stream. 0 uses the statistics' own profile

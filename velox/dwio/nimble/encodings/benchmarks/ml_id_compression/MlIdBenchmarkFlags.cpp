@@ -120,6 +120,13 @@ DEFINE_int32(
     "Encoding::Options::subIntSplitAdmission: how selection decides whether "
     "SubIntSplit competes. 0 the size estimate, 1 the bit-flip profile's "
     "gradient guard, 2 the gradient guard plus the entropy guard.");
+DEFINE_bool(
+    mlidc_sis_admission_forces,
+    false,
+    "Encoding::Options::subIntSplitAdmissionForces: whether a bit-flip "
+    "admission selects SubIntSplit outright instead of only letting it "
+    "compete on size. Reproduces the pre-candidacy behaviour for the "
+    "ablation. Inert at --mlidc_sis_admission=0.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,

@@ -229,6 +229,7 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
       static_cast<uint8_t>(FLAGS_mlidc_sis_decode_read_path);
   options.subIntSplitMaxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
   options.subIntSplitAdmission = static_cast<uint8_t>(FLAGS_mlidc_sis_admission);
+  options.subIntSplitAdmissionForces = FLAGS_mlidc_sis_admission_forces;
   // Which arm is being built is known here and nowhere below it, so the encode
   // cache reads it from here rather than every encode signature growing an
   // argument it would only pass through.

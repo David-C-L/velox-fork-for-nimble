@@ -88,6 +88,40 @@ std::vector<uint64_t> countFlipsBitByBit(
   return counts;
 }
 
+// The same two sharp bit-flip boundaries as makeConcatenatedFieldsStream, but
+// only 16 distinct values, so a dictionary stores four bits per value where a
+// split of a 14-bit range cannot get below ten. A stream the gate admits and
+// the size comparison should still turn down.
+std::vector<uint64_t> makeLowCardinalityFieldsStream(size_t n) {
+  std::mt19937_64 rng(kSeed);
+  std::uniform_int_distribution<uint64_t> midField(0, 15);
+  std::vector<uint64_t> values(n);
+  for (auto& v : values) {
+    v = midField(rng) << 10;
+  }
+  return values;
+}
+
+// What top-level selection picks for `values` under `mode`, with the
+// candidates and read factors the writer uses by default.
+EncodingType selectedUnder(
+    const std::vector<uint64_t>& values,
+    SubIntSplitAdmission mode,
+    bool forces) {
+  const std::span<const uint64_t> span(values);
+  Encoding::Options options;
+  options.subIntSplitAdmission = static_cast<uint8_t>(mode);
+  options.subIntSplitAdmissionForces = forces;
+  ManualEncodingSelectionPolicy<uint64_t> policy{
+      ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+      CompressionOptions{},
+      std::nullopt,
+  };
+  return policy
+      .select(span, Statistics<uint64_t>::create(span), options)
+      .encodingType;
+}
+
 bool admits(const std::vector<uint64_t>& values, SubIntSplitAdmission mode) {
   return bitFlipAdmits(
       computeBitFlipProfile<uint64_t>(std::span<const uint64_t>(values)),
@@ -315,6 +349,50 @@ TEST(SubIntSplitTopLevelPolicyTest, gradientGateRejectsFlatProfileNoiseSpikes) {
 
   const TopLevelPolicyConfig config;
   EXPECT_FALSE(bitFlipGradientGate(profile, config));
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, admittedStreamStillHasToWinOnSize) {
+  const auto values = makeLowCardinalityFieldsStream(50'000);
+  // The premise: both gates admit, so whatever selection does next is the
+  // size comparison and not the admission.
+  ASSERT_TRUE(admits(values, SubIntSplitAdmission::kBitFlip));
+  ASSERT_TRUE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
+
+  EXPECT_NE(
+      selectedUnder(values, SubIntSplitAdmission::kBitFlip, /*forces=*/false),
+      EncodingType::SubIntSplit);
+  EXPECT_NE(
+      selectedUnder(
+          values, SubIntSplitAdmission::kBitFlipEntropy, /*forces=*/false),
+      EncodingType::SubIntSplit);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, forcingSelectsAnAdmittedStreamOutright) {
+  // The ablation switch: the same admitted stream as above, which the size
+  // comparison turns down, is SubIntSplit once the admission decides alone.
+  const auto values = makeLowCardinalityFieldsStream(50'000);
+
+  EXPECT_EQ(
+      selectedUnder(values, SubIntSplitAdmission::kBitFlip, /*forces=*/true),
+      EncodingType::SubIntSplit);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, rejectedStreamIsNeverSubIntSplit) {
+  const auto values = makeUniformRandomStream(200'000);
+  ASSERT_FALSE(admits(values, SubIntSplitAdmission::kBitFlip));
+  ASSERT_FALSE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
+
+  for (const auto mode :
+       {SubIntSplitAdmission::kBitFlip, SubIntSplitAdmission::kBitFlipEntropy}) {
+    // Forcing cannot resurrect a rejected stream either: a rejected stream
+    // loses the candidate before the two paths part.
+    EXPECT_NE(
+        selectedUnder(values, mode, /*forces=*/false),
+        EncodingType::SubIntSplit);
+    EXPECT_NE(
+        selectedUnder(values, mode, /*forces=*/true),
+        EncodingType::SubIntSplit);
+  }
 }
 
 TEST(SubIntSplitTopLevelPolicyTest, estimatorGateSkipsUniformRandom) {

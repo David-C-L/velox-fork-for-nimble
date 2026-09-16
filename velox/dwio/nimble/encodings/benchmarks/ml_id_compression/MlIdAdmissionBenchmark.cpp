@@ -35,7 +35,9 @@
 //   admission_confusion.py <out>/*.csv [--decision policy|estimate|<mode>]
 //
 // Each column also gets one row_kind=admission row per bit-flip admission
-// mode (bitflip, bitflip_entropy) and profile pair cap in
+// mode (bitflip and bitflip_entropy, which gate candidacy and leave the size
+// comparison to pick, plus bitflip_forced and bitflip_entropy_forced, which
+// select an admitted stream outright) and profile pair cap in
 // --admission_profile_pairs: the gate's decision, what computing the profile
 // and gating costs (decision_ns), and what select() costs and picks with that
 // Encoding::Options::subIntSplitAdmission (select_ns, policy_encoding).
@@ -232,13 +234,18 @@ int runBenchmark() {
     const nimble::detail::subintsplit::TopLevelPolicyConfig admissionConfig;
     struct AdmissionModeName {
       SubIntSplitAdmission mode;
+      // Whether the mode decides outright or only decides candidacy; the
+      // forcing rows are the ablation the candidacy rows are read against.
+      bool forces;
       std::string_view name;
     };
     constexpr AdmissionModeName kAdmissionModes[] = {
-        {SubIntSplitAdmission::kBitFlip, "bitflip"},
-        {SubIntSplitAdmission::kBitFlipEntropy, "bitflip_entropy"},
+        {SubIntSplitAdmission::kBitFlip, false, "bitflip"},
+        {SubIntSplitAdmission::kBitFlipEntropy, false, "bitflip_entropy"},
+        {SubIntSplitAdmission::kBitFlip, true, "bitflip_forced"},
+        {SubIntSplitAdmission::kBitFlipEntropy, true, "bitflip_entropy_forced"},
     };
-    for (const auto& [mode, modeName] : kAdmissionModes) {
+    for (const auto& [mode, forces, modeName] : kAdmissionModes) {
       for (const uint32_t pairCap : profilePairCaps) {
         std::vector<int64_t> decisionNanos;
         std::vector<int64_t> selectNanos;
@@ -247,6 +254,7 @@ int runBenchmark() {
         EncodingType modeSelected = EncodingType::Trivial;
         Encoding::Options options;
         options.subIntSplitAdmission = static_cast<uint8_t>(mode);
+        options.subIntSplitAdmissionForces = forces;
         options.subIntSplitAdmissionProfilePairs = pairCap;
         for (int repeat = 0; repeat < repeats; ++repeat) {
           auto start = Clock::now();

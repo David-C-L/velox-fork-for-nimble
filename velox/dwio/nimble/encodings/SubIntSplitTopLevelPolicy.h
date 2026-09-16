@@ -76,14 +76,18 @@ struct TopLevelPolicyConfig {
   double maxActiveFlipEntropy{0.8};
 };
 
-/// How top-level selection decides whether SubIntSplit is tried.
+/// How top-level selection decides whether SubIntSplit is tried. Under the
+/// bit-flip modes an admitted stream is offered SubIntSplit as a candidate and
+/// still has to win the ordinary size comparison; only
+/// Encoding::Options::subIntSplitAdmissionForces lets the gate decide alone.
 enum class SubIntSplitAdmission : uint8_t {
   /// SubIntSplitEncoding::estimateSize competes with the other candidates on
   /// its read-factor-weighted size.
   kEstimate = 0,
-  /// bitFlipGradientGate() alone admits SubIntSplit, which is then selected.
+  /// bitFlipGradientGate() alone decides whether SubIntSplit is a candidate.
   kBitFlip = 1,
-  /// bitFlipGradientGate() and the active-bit entropy guard must both admit.
+  /// bitFlipGradientGate() and the active-bit entropy guard must both admit
+  /// for SubIntSplit to be a candidate.
   kBitFlipEntropy = 2,
 };
 
