@@ -1640,7 +1640,7 @@ SubIntSplitEncoding<T>::estimatorSamplerConfig() {
   // estimate costs; halving the block keeps the same number of distinct
   // stretches of the stream in a smaller sample, which is what the run-length
   // and frame-residual models in the cost grid read.
-  return detail::subintsplit::SamplerConfig{.maxSamples = 512, .blockSize = 64};
+  return detail::subintsplit::SamplerConfig{.maxSamples = 256, .blockSize = 32};
 }
 
 template <typename T>
