@@ -800,34 +800,43 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
     const uint64_t rowCount = this->rowCount_;
-    // A permuted stream prices the list as a whole rather than range by
-    // range, because the span read now takes the whole list: its cost is the
-    // sort and the blocks the sorted request turns out to have, neither of
-    // which cares where the range boundaries fell. So the only question left
-    // is the same one a single range asks -- too few rows for the sort to
-    // pay, few enough for spans to beat a whole-column decode, or neither.
+    // A permuted stream still prices range by range to decide whether to
+    // decode the column, and only then reads the ranges it keeps as one
+    // span.
+    //
+    // Pricing the list as a whole instead -- charging the span path's two
+    // decoded rows per requested row, which is what a single range is
+    // charged -- reads the cost of a scattered request wrongly and was
+    // measured doing so: a gather of 173,015 rows in ranges of two, a third
+    // of the column, priced under a whole-column decode and lost 3x to one.
+    // The reason is that a row of a long range shares its block with its
+    // neighbours and a row of a two-row range does not, so the same row
+    // count costs the span path far more when it arrives scattered. The
+    // per-range price already separates those two cases, by charging a range
+    // too short to sort at the probe rate.
+    uint64_t totalRows = 0;
     if (permutedSection_) {
-      uint64_t totalRows = 0;
       for (const auto& [offset, rangeLength] : ranges) {
         totalRows += rangeLength;
       }
-      if (totalRows * kSpanAdvantageNumerator <
-          rowCount * kSpanAdvantageDenominator) {
-        if (totalRows < kMinSpanLength) {
-          readResidualRangesSeparately(ranges, output);
-        } else {
-          readPermutedSpanRanges(
-              ranges, static_cast<uint32_t>(totalRows), output);
-        }
-        return;
-      }
-      readWholeColumnRanges(ranges, output);
-      return;
     }
     uint64_t piecewiseCost = 0;
     for (const auto& [offset, rangeLength] : ranges) {
       const uint64_t length = rangeLength;
-      if (length * kGatherAdvantage < rowCount) {
+      if (permutedSection_) {
+        if (length < kMinSpanLength) {
+          piecewiseCost += length * kProbeCostInDecodedRows;
+        } else if (
+            length * kSpanAdvantageNumerator <
+            rowCount * kSpanAdvantageDenominator) {
+          // readPermutedSpan() levels with a whole-column decode at half the
+          // column, which makes one of its rows cost about two decoded ones.
+          piecewiseCost +=
+              length * kSpanAdvantageNumerator / kSpanAdvantageDenominator;
+        } else {
+          piecewiseCost += rowCount;
+        }
+      } else if (length * kGatherAdvantage < rowCount) {
         piecewiseCost += length * kProbeCostInDecodedRows;
       } else {
         piecewiseCost += rowCount;
@@ -837,6 +846,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
     }
     if (piecewiseCost < rowCount) {
+      // Worth reading piecewise, and a permuted stream reads the whole list
+      // as one span rather than one range at a time: the sort, the grouping
+      // and the scratch are fixed per call, and a run's occurrences are as
+      // likely to be split across two ranges of a request as to sit inside
+      // one. Below kMinSpanLength rows in total the sort still has nothing
+      // to amortise over, so the list falls back to probes per range.
+      if (permutedSection_ && totalRows >= kMinSpanLength) {
+        readPermutedSpanRanges(ranges, static_cast<uint32_t>(totalRows), output);
+        return;
+      }
       readResidualRangesSeparately(ranges, output);
       return;
     }
