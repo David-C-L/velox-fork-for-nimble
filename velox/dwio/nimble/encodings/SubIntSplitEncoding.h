@@ -1663,8 +1663,9 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   }
 
   std::vector<uint64_t> samples;
-  detail::subintsplit::sampleIntoU64<physicalType>(
-      values, samples, estimatorSamplerConfig());
+  std::vector<size_t> sampleRows;
+  detail::subintsplit::sampleIntoU64WithRows<physicalType>(
+      values, samples, &sampleRows, estimatorSamplerConfig());
   if (samples.empty()) {
     return fixedBitWidthEstimate;
   }
@@ -1674,20 +1675,58 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // disk, and selection is comparing bytes here.
   auto selectorConfig = plannerSelectorConfig(options);
   selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{};
-  const auto plan = detail::subintsplit::selectSplitsRestricted(
-      samples,
-      kBits,
-      rowCount,
-      options.subIntSplitAllowedEncodings,
-      selectorConfig);
-  if (!std::isfinite(plan.totalSizeBits) || plan.segments.empty()) {
-    return fixedBitWidthEstimate;
+  const auto planBytes = [&](const std::vector<uint64_t>& planSamples)
+      -> std::optional<uint64_t> {
+    const auto plan = detail::subintsplit::selectSplitsRestricted(
+        planSamples,
+        kBits,
+        rowCount,
+        options.subIntSplitAllowedEncodings,
+        selectorConfig);
+    if (!std::isfinite(plan.totalSizeBits) || plan.segments.empty()) {
+      return std::nullopt;
+    }
+    return static_cast<uint64_t>(std::ceil(plan.totalSizeBits / 8.0)) +
+        kOuterOverheadBytes + plan.segments.size() * kPerSectionOverheadBytes;
+  };
+
+  uint64_t estimated = fixedBitWidthEstimate;
+  if (const auto valueBytes = planBytes(samples)) {
+    estimated = std::min(estimated, *valueBytes);
   }
 
-  const uint64_t planBytes =
-      static_cast<uint64_t>(std::ceil(plan.totalSizeBits / 8.0)) +
-      kOuterOverheadBytes + plan.segments.size() * kPerSectionOverheadBytes;
-  return std::min(planBytes, fixedBitWidthEstimate);
+  // The encoder fits a row frame and plans over the residuals as well as over
+  // the values, keeping whichever costs less. Estimating only the values put a
+  // monotone counter -- a sorted spatial id, a sequence number -- hundreds of
+  // times above what the encoder writes for it, because block-stratified
+  // sampling breaks the column's monotonicity and the models see the jumps
+  // between blocks rather than the line through them. The frame is fitted over
+  // the whole column, as the encoder fits it, and then subtracted from the
+  // sample alone, which is all the DP reads.
+  if (options.subIntSplitRowFrame) {
+    auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
+        values);
+    if (!frame.active()) {
+      frame = detail::subintsplit::fitSubIntSplitStepFrame<physicalType>(
+          values);
+    }
+    if (frame.active()) {
+      constexpr uint64_t kWidthMask =
+          kBits >= 64 ? ~uint64_t{0} : (uint64_t{2} << (kBits - 1)) - 1;
+      std::vector<uint64_t> residualSamples(samples.size());
+      for (size_t i = 0; i < samples.size(); ++i) {
+        residualSamples[i] =
+            (samples[i] - (frame.slope * sampleRows[i] + frame.base)) &
+            kWidthMask;
+      }
+      if (const auto residualBytes = planBytes(residualSamples)) {
+        estimated = std::min(
+            estimated,
+            *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
+      }
+    }
+  }
+  return estimated;
 }
 
 template <typename T>

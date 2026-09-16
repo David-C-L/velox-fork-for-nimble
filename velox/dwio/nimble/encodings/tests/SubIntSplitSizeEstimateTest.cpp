@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -183,6 +184,8 @@ class SubIntSplitSizeEstimateTest : public ::testing::Test {
     const double actual = static_cast<double>(actualSubIntSplitBytes(values));
     ASSERT_GT(actual, 0.0) << name;
     const double ratio = estimated / actual;
+    std::cerr << name << ": estimate " << estimated << " actual " << actual
+              << " ratio " << ratio << "\n";
     EXPECT_GE(ratio, 1.0 / factor) << name << " estimate/actual " << ratio;
     EXPECT_LE(ratio, factor) << name << " estimate/actual " << ratio;
   }
