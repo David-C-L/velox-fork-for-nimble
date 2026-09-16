@@ -88,16 +88,15 @@ std::vector<uint64_t> countFlipsBitByBit(
   return counts;
 }
 
-// The same two sharp bit-flip boundaries as makeConcatenatedFieldsStream, but
-// only 16 distinct values, so a dictionary stores four bits per value where a
-// split of a 14-bit range cannot get below ten. A stream the gate admits and
-// the size comparison should still turn down.
+// A sharp bit-flip boundary at bit 10, from a field that steps through 16
+// values in runs of eight; bits [0, 9] and [14, 63] never flip. Both gates
+// admit it -- the gradient spike is 0.125 and the varying bits carry 0.30 bits
+// of flip entropy -- and a run-length or dictionary encoding still stores it
+// in a fraction of what a split of its 14-bit range could.
 std::vector<uint64_t> makeLowCardinalityFieldsStream(size_t n) {
-  std::mt19937_64 rng(kSeed);
-  std::uniform_int_distribution<uint64_t> midField(0, 15);
   std::vector<uint64_t> values(n);
-  for (auto& v : values) {
-    v = midField(rng) << 10;
+  for (size_t i = 0; i < n; ++i) {
+    values[i] = ((i / 8) % 16) << 10;
   }
   return values;
 }
