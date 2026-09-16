@@ -293,8 +293,11 @@ struct EncodingSizeEstimation {
         if constexpr (
             isNumericType<physicalType>() &&
             (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
+          // No values to plan a split over, so the estimate is the
+          // FixedBitWidth bound the encoder's whole-value floor guarantees.
+          // The values overload below is what selection reaches.
           return SubIntSplitEncoding<T>::estimateSize(
-              entryCount, statistics, options);
+              entryCount, {}, statistics, options);
         } else {
           return std::nullopt;
         }
@@ -377,6 +380,20 @@ struct EncodingSizeEstimation {
         // conservative there.
         if constexpr (isIntegralType<physicalType>()) {
           return ForEncoding<physicalType>::estimateSize(values, options);
+        } else {
+          return std::nullopt;
+        }
+      }
+      case EncodingType::SubIntSplit: {
+        // Planned over the values, for the same reason FOR is: where the bit
+        // fields of a value sit, and how each behaves down the stream, is not
+        // in any summary of the values. The statistics-only overload falls
+        // back to the FixedBitWidth bound.
+        if constexpr (
+            isNumericType<physicalType>() &&
+            (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
+          return SubIntSplitEncoding<T>::estimateSize(
+              values.size(), values, statistics, options);
         } else {
           return std::nullopt;
         }

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -207,39 +208,16 @@ class SubIntSplitEncoding
       const Encoding::Options& options = {});
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Statistics-only size estimate for general encoding selection, where
-  /// only `Statistics<physicalType>` -- not the raw values -- is available.
-  /// Approximates the split-section layout as a single FixedBitWidth-packed
-  /// stream over the full value range, discounted by 10% for the bit
-  /// savings sectioning typically achieves, plus a fixed per-section header
-  /// overhead (assumes the default 4-section split). Returns nullopt when
-  /// the value range is too wide for sectioning to be worthwhile, so
-  /// encoding selection skips it instead of picking a poor split.
+  /// Estimates what a split would store `values` in, by planning one over a
+  /// sample of them: the same split DP the encoder runs, over a smaller
+  /// sample and priced on size alone. The answer is floored at
+  /// FixedBitWidth's estimate, which is exact and which the encoder's
+  /// whole-value floor guarantees a split never writes more than.
   static std::optional<uint64_t> estimateSize(
       uint64_t rowCount,
+      std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,
-      const Encoding::Options& options) {
-    constexpr uint64_t kTypeWidthBits =
-        static_cast<uint64_t>(sizeof(physicalType)) * 8u;
-    const uint64_t rangeBits =
-        velox::bits::bitsRequired(statistics.max() - statistics.min());
-    // Under a bit-flip admission the profile has already decided the stream is
-    // worth costing, and the range rule would veto it before its estimate is
-    // compared. It is exactly the wide streams -- a random low half of a
-    // UUIDv7, say -- that the profile is there to rescue.
-    if (options.subIntSplitAdmission == 0 &&
-        rangeBits > (kTypeWidthBits * 3) / 4) {
-      return std::nullopt;
-    }
-    const uint64_t fbwEstimate =
-        FixedBitWidthEncoding<physicalType>::estimateSize(
-            rowCount, statistics, options);
-    // Outer prefix(6) + compressionType(2) + up to 4 sections' worth of
-    // per-section prefix(6) + relative offset(8) overhead.
-    constexpr uint64_t kOverheadBytes = 6u + 2u + 4u * 6u + 4u * 8u;
-    return static_cast<uint64_t>(static_cast<double>(fbwEstimate) * 0.90) +
-        kOverheadBytes;
-  }
+      const Encoding::Options& options);
 #endif
 
   std::string debugString(int offset) const final;
@@ -272,6 +250,17 @@ class SubIntSplitEncoding
   // The configuration the split planner runs under for `options`.
   static detail::subintsplit::SelectorConfig plannerSelectorConfig(
       const Encoding::Options& options);
+
+  // The sample estimateSize plans over. Smaller than the encoder's, because
+  // the estimate only has to rank a split against the other candidates, not
+  // choose the boundaries the encoder will use, and the DP is linear in the
+  // sample: see estimateSize for what the difference costs and buys.
+  static detail::subintsplit::SamplerConfig estimatorSamplerConfig();
+
+  // Bytes a split's header costs beyond its sections: the outer prefix and
+  // compression type, plus a prefix and a relative offset per section.
+  static constexpr uint64_t kOuterOverheadBytes{6u + 2u};
+  static constexpr uint64_t kPerSectionOverheadBytes{6u + 8u};
 
   // Samples `values` and costs the split grid over the sample.
   static PlanningSample costPlanningSample(
@@ -1641,6 +1630,64 @@ SubIntSplitEncoding<T>::plannerSelectorConfig(const Encoding::Options& options) 
       .readPath = static_cast<detail::subintsplit::DecodeReadPath>(
           options.subIntSplitDecodeReadPath)};
   return selectorConfig;
+}
+
+template <typename T>
+detail::subintsplit::SamplerConfig
+SubIntSplitEncoding<T>::estimatorSamplerConfig() {
+  // A quarter of the encoder's sample, in blocks half as long. The DP is
+  // O(kBits^2 * sampleSize), so this is the term that decides what the
+  // estimate costs; halving the block keeps the same number of distinct
+  // stretches of the stream in a smaller sample, which is what the run-length
+  // and frame-residual models in the cost grid read.
+  return detail::subintsplit::SamplerConfig{.maxSamples = 512, .blockSize = 64};
+}
+
+template <typename T>
+std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
+    uint64_t rowCount,
+    std::span<const physicalType> values,
+    const Statistics<physicalType>& statistics,
+    const Encoding::Options& options) {
+  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+  // Exact, and an upper bound on what a split writes: the encoder's
+  // WholeValueFloor stores the values as one FixedBitWidth section rather than
+  // let a plan come in above it. Every path below therefore falls back to it
+  // rather than to nullopt, so that a stream a plan cannot be costed for is
+  // still costed as the split that would be written for it.
+  const uint64_t fixedBitWidthEstimate =
+      FixedBitWidthEncoding<physicalType>::estimateSize(
+          rowCount, statistics, options);
+  if (values.empty()) {
+    return fixedBitWidthEstimate;
+  }
+
+  std::vector<uint64_t> samples;
+  detail::subintsplit::sampleIntoU64<physicalType>(
+      values, samples, estimatorSamplerConfig());
+  if (samples.empty()) {
+    return fixedBitWidthEstimate;
+  }
+
+  // Priced on size alone. The planner's objective carries a per-boundary
+  // penalty and, when a caller asks for it, a decode term; neither is bytes on
+  // disk, and selection is comparing bytes here.
+  auto selectorConfig = plannerSelectorConfig(options);
+  selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{};
+  const auto plan = detail::subintsplit::selectSplitsRestricted(
+      samples,
+      kBits,
+      rowCount,
+      options.subIntSplitAllowedEncodings,
+      selectorConfig);
+  if (!std::isfinite(plan.totalSizeBits) || plan.segments.empty()) {
+    return fixedBitWidthEstimate;
+  }
+
+  const uint64_t planBytes =
+      static_cast<uint64_t>(std::ceil(plan.totalSizeBits / 8.0)) +
+      kOuterOverheadBytes + plan.segments.size() * kPerSectionOverheadBytes;
+  return std::min(planBytes, fixedBitWidthEstimate);
 }
 
 template <typename T>

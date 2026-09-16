@@ -146,6 +146,8 @@ int runBenchmark() {
       "payload_bytes",
       "encode_ns",
       "estimate_admits",
+      "sis_estimate_bytes",
+      "policy_estimate_bytes",
       "policy_selects_sis",
       "policy_encoding",
       "statistics_ns",
@@ -184,7 +186,8 @@ int runBenchmark() {
     std::vector<int64_t> statisticsNanos;
     std::vector<int64_t> heuristicNanos;
     std::vector<int64_t> estimateNanos;
-    bool estimateAdmits = false;
+    std::optional<uint64_t> sisEstimate;
+    std::optional<uint64_t> policyEstimate;
     EncodingType selected = EncodingType::Trivial;
     for (int repeat = 0; repeat < repeats; ++repeat) {
       auto start = Clock::now();
@@ -195,15 +198,17 @@ int runBenchmark() {
           ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
           CompressionOptions{},
           std::nullopt};
-      selected =
-          policy.select(values, statistics, Encoding::Options{}).encodingType;
+      const auto selection =
+          policy.select(values, statistics, Encoding::Options{});
       heuristicNanos.push_back(elapsedNanos(start));
+      selected = selection.encodingType;
+      policyEstimate = selection.estimatedSize;
       start = Clock::now();
-      estimateAdmits = SubIntSplitEncoding<Elem>::estimateSize(
-                           values.size(), statistics, Encoding::Options{})
-                           .has_value();
+      sisEstimate = SubIntSplitEncoding<Elem>::estimateSize(
+          values.size(), values, statistics, Encoding::Options{});
       estimateNanos.push_back(elapsedNanos(start));
     }
+    const bool estimateAdmits = sisEstimate.has_value();
 
     csv.beginRow();
     csv.set("driver", std::string(kDriver));
@@ -212,6 +217,15 @@ int runBenchmark() {
     csv.set("N", static_cast<int64_t>(numRows));
     csv.set("row_kind", "heuristic");
     csv.set("estimate_admits", int64_t{estimateAdmits ? 1 : 0});
+    // -1 where the candidate was withheld or the winner carried no estimate, so
+    // "no estimate" is not read back as zero bytes.
+    csv.set(
+        "sis_estimate_bytes",
+        sisEstimate.has_value() ? static_cast<int64_t>(*sisEstimate) : -1);
+    csv.set(
+        "policy_estimate_bytes",
+        policyEstimate.has_value() ? static_cast<int64_t>(*policyEstimate)
+                                   : -1);
     csv.set(
         "policy_selects_sis",
         int64_t{selected == EncodingType::SubIntSplit ? 1 : 0});
