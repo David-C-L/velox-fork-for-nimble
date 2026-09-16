@@ -472,11 +472,13 @@ class FrequencyPartitionEncoding
           break;
         }
         case FreqPartIndexType::TierTagArray: {
+          // The header only. The tag stream is nested-encoded and its size
+          // depends on how the rows are distributed across the tiers, which is
+          // exactly what a caller holding no counts does not know: a column
+          // whose rows nearly all land in one tier codes its tags in close to
+          // nothing. Charging the flat packing here would quote above what
+          // such a column writes and stop being a bound.
           payloadSize += 8;
-          payloadSize += static_cast<uint64_t>(std::llround(
-              static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
-                  rowCount, /*minValue=*/0, tiersCreated, options)) *
-              kFrequencyPartitionNestedIndexDiscount));
           break;
         }
         case FreqPartIndexType::NoIndex:
