@@ -16,11 +16,13 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <unordered_set>
 #include <vector>
 
@@ -585,11 +587,23 @@ inline double deltaCostBits(
 }
 
 // FOR (Frame of Reference): fixed-size frames, each bit-packed against a
-// local minimum (reference). The local bit width is estimated from the
-// average step size scaled to the frame size -- a random-walk heuristic
-// where the local range over a frame of `kForFrameSize` steps grows roughly
-// with avgAbsDelta -- capped by the segment's overall range.
-// Required: MinMax, DeltaStats
+// local minimum (reference).
+//
+// CHANGES SELECTION. The local bit width used to come from a random-walk
+// heuristic -- the local range over a frame of `kForFrameSize` steps taken to
+// grow with the average absolute step, capped by the segment's range. That is
+// an assumption about how the values are arranged, and a segment that does not
+// meet it is mispriced in whichever direction it misses by: on a UUIDv7's low
+// half, two constant bits over sixty-two random ones, the heuristic quoted the
+// section 59.21 bits a value for a stream FOR writes at 64.85.
+//
+// Nothing is assumed now. The scan windows the segment at FOR's own frame size
+// and reports what each window spans, so the packed payload is priced at the
+// widths the encoder will really pack to and the two metadata streams at the
+// extremes those windows reached. See SegmentMetrics::frameBitWidthSum. A
+// segment shorter than one frame carries no windows, and FOR stores it as the
+// single frame the segment's own range sizes.
+// Required: MinMax (which fills the frame metrics), DeltaStats
 inline double
 forCostBits(const SegmentMetrics& m, size_t numValues, int bitWidth) noexcept {
   if (numValues == 0) {
@@ -599,46 +613,37 @@ forCostBits(const SegmentMetrics& m, size_t numValues, int bitWidth) noexcept {
   const uint32_t numFrames =
       static_cast<uint32_t>((numValues + kForFrameSize - 1) / kForFrameSize);
 
-  const double avgAbsDelta = numValues > 1
-      ? static_cast<double>(m.sumAbsDelta) / static_cast<double>(numValues - 1)
-      : 0.0;
-  const double localRange = std::min(
-      static_cast<double>(m.range),
-      avgAbsDelta * static_cast<double>(kForFrameSize) / 2.0);
-  const uint8_t localBits = localRange < 1.0
-      ? uint8_t{0}
-      : static_cast<uint8_t>(std::bit_width(static_cast<uint64_t>(localRange)));
+  const double meanFrameBits = m.frameCount > 0
+      ? static_cast<double>(m.frameBitWidthSum) /
+          static_cast<double>(m.frameCount)
+      : static_cast<double>(std::bit_width(m.range));
+  const uint8_t frameBitWidthSpread =
+      m.frameCount > 0 ? m.maxFrameBitWidth - m.minFrameBitWidth : uint8_t{0};
+  const uint64_t referenceRange =
+      m.frameCount > 0 ? m.frameReferenceRange : m.range;
 
   // prefix(6) + compressionType(1) + frameSize(4) + numFrames(4) +
   // enableBitOffsets(1)
   constexpr double kOuterHeaderBits = (6.0 + 1.0 + 4.0 + 4.0 + 1.0) * 8.0;
   // Per-frame metadata streams (bitWidths, references, bitOffsets), each a
-  // nested encoding with its own ~7-byte header.
+  // nested encoding with its own ~7-byte header. The bit widths and the
+  // references are bit-packed to the spread the windows measured rather than
+  // to the width their element type would take.
   constexpr double kNestedHeaderBits = 7.0 * 8.0;
-  const double bitWidthsBits =
-      kNestedHeaderBits + static_cast<double>(numFrames) * 8.0;
+  const double bitWidthsBits = kNestedHeaderBits +
+      static_cast<double>(numFrames) *
+          static_cast<double>(std::bit_width(frameBitWidthSpread));
   const double referencesBits = kNestedHeaderBits +
       static_cast<double>(numFrames) *
-          static_cast<double>(storageWidthBits(bitWidth));
+          std::min<double>(
+              storageWidthBits(bitWidth), std::bit_width(referenceRange));
   const double bitOffsetsBits =
       kNestedHeaderBits + static_cast<double>(numFrames) * 64.0;
-  const double packedBits = static_cast<double>(numValues) * localBits;
+  const double packedBits = static_cast<double>(numValues) * meanFrameBits;
 
   return kOuterHeaderBits + bitWidthsBits + referencesBits + bitOffsetsBits +
       packedBits;
 }
-
-// Multiplier applied to the undiscounted TierTagArray index estimate below to
-// approximate the size after nested encoding selection (which, empirically,
-// usually picks Huffman over the tag stream's skewed tier distribution). 1.0
-// disables the discount, pricing the raw packed width -- the safer default,
-// since an optimistic estimate over-selects FrequencyPartition while a
-// pessimistic one merely under-selects it. Kept as a named constant so the
-// discount can be measured independently of the base fix; must be kept in
-// sync with FrequencyPartitionEncoding.h's matching
-// kFrequencyPartitionNestedIndexDiscount -- the two estimators price the same
-// wire format on different paths.
-constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
 
 // Bits needed to distinguish `x` outcomes, minimum 1. Selection-time twin of
 // FrequencyPartitionEncoding's private, encode-time ceilLog2WithMinOne: kept
@@ -707,16 +712,26 @@ inline double frequencyPartitionCostBits(
   // frequencyPartitionIndex to TierTagArray for every section (see
   // SubIntSplitEncoding.h), so that -- not PerTierBitmaps -- is the index a
   // FrequencyPartition candidate here would actually pay for. Priced as an
-  // 8-byte header (tagBits + padding + tagStreamByteCount) plus the
-  // undiscounted packed width of one tagBits-wide tag per row, mirroring
-  // FrequencyPartitionEncoding::estimateSize's TierTagArray case; see
-  // kFrequencyPartitionNestedIndexDiscount above for the nested-selection
-  // discount this omits by default.
+  // 8-byte header (tagBits + padding + tagStreamByteCount) plus the tag stream
+  // itself, through the same estimator
+  // FrequencyPartitionEncoding::estimateSize prices it with, so the two paths
+  // cannot drift. The tag counts are the tier coverages this model already
+  // reads: the tiers here are the top-2 and the next six, which is where the
+  // key costs above put them too.
   const uint32_t numTiers = frequencyPartitionNumTiers(m.uniqueCount);
-  const uint8_t tagBits = ceilLog2WithMinOne(numTiers + 1);
+  const std::array<uint64_t, 3> tagRowCounts{
+      static_cast<uint64_t>(tier0Coverage * n),
+      static_cast<uint64_t>(tier1Coverage * n),
+      static_cast<uint64_t>(fallbackCoverage * n)};
   const double indexHeaderBits = 8.0 * 8.0;
   const double indexBits = indexHeaderBits +
-      static_cast<double>(tagBits) * n * kFrequencyPartitionNestedIndexDiscount;
+      8.0 *
+          static_cast<double>(
+              FrequencyPartitionEncoding<uint64_t>::tierTagStreamSize(
+                  static_cast<uint64_t>(numValues),
+                  tagRowCounts,
+                  numTiers,
+                  Encoding::Options{}));
 
   // One dictionary + one key stream per active tier, each a nested
   // sub-encoding with a ~7-byte header.
