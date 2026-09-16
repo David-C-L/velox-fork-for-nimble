@@ -35,7 +35,6 @@
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
-#include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
@@ -111,6 +110,17 @@ class FrequencyPartitionEncoding
 
   static constexpr uint8_t kFormatVersion = 1;
 
+  // Multiplier applied to the undiscounted TierTagArray tag-stream estimate
+  // in estimateSize() to approximate the size after nested encoding
+  // selection (which, empirically, usually picks Huffman over the tag
+  // stream's skewed tier distribution). 1.0 disables the discount, pricing
+  // the raw packed width -- the safer default, since an optimistic estimate
+  // over-selects FrequencyPartition while a pessimistic one merely
+  // under-selects it. Kept as a named constant so the discount can be
+  // measured independently of the base fix; see
+  // SubIntSplitCostModels.h's matching kFrequencyPartitionNestedIndexDiscount,
+  // which must be updated together with this one.
+  static constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
   static constexpr uint32_t kRankSampleStride = 256;
   // Upper bound on tiers: one per entry of the key-bit table
   // {1, 2, 4, 8, 16, 32}, which is what encode() fills.
@@ -156,43 +166,6 @@ class FrequencyPartitionEncoding
       const Encoding::Options& options = {});
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Bytes the TierTagArray index's tag stream is expected to occupy over
-  /// `rowCount` rows, given how many rows each tag covers: one entry of
-  /// `tagRowCounts` per tier encode() creates, then the fallback's.
-  ///
-  /// Priced by the estimators nested selection applies to that stream rather
-  /// than by the flat tagBits packing alone, the same way the dictionary and
-  /// key streams are priced. A tag is the tier its row landed in, so the tag
-  /// distribution is the tier distribution, which is skewed by construction --
-  /// tiers exist because some values are far more frequent than others -- and a
-  /// flat width spends ceilLog2(tiers + 1) bits on every row without being able
-  /// to use that skew. Those counts fix the Huffman code lengths exactly, so
-  /// the skewed candidate can be priced without holding the stream. The flat
-  /// packing stays a candidate, so this never quotes above it.
-  static uint64_t tierTagStreamSize(
-      uint64_t rowCount,
-      std::span<const uint64_t> tagRowCounts,
-      uint32_t tiersCreated,
-      const Encoding::Options& options) {
-    const uint64_t packedSize = FixedBitWidthEncoding<uint32_t>::estimateSize(
-        rowCount,
-        /*minValue=*/0,
-        /*maxValue=*/tiersCreated, // tag values span 0..numTiers
-        options);
-    std::vector<uint32_t> frequencies;
-    frequencies.reserve(tagRowCounts.size());
-    for (const uint64_t tagRows : tagRowCounts) {
-      if (tagRows > 0) {
-        frequencies.push_back(static_cast<uint32_t>(tagRows));
-      }
-    }
-    const auto huffmanSize = HuffmanEncoding<uint32_t>::
-        estimateSizeFromFrequencies(rowCount, frequencies, options);
-    return huffmanSize.has_value() ? std::min(packedSize, huffmanSize.value())
-                                   : packedSize;
-  }
-
-
   /// Size estimate for encoding selection, priced from the frequency
   /// distribution the encoder will actually partition.
   ///
@@ -293,10 +266,6 @@ class FrequencyPartitionEncoding
     uint64_t rowsInTiers = 0;
     uint32_t tiersCreated = 0;
     uint32_t nonEmptyTiers = 0;
-    // Rows per tier, then the fallback's, which is what the tag stream stores
-    // one of per row. See tierTagStreamSize.
-    std::vector<uint64_t> tagRowCounts;
-    tagRowCounts.reserve(kMaxTiers + 1);
 
     for (const uint32_t keyBits : kKeyBitOptions) {
       if (keyBits > kMaxKeyBits || assigned >= ranked) {
@@ -321,7 +290,6 @@ class FrequencyPartitionEncoding
       }
       assigned += dictEntries;
       rowsInTiers += tierRows;
-      tagRowCounts.push_back(tierRows);
       if (tierRows == 0) {
         continue;
       }
@@ -344,7 +312,6 @@ class FrequencyPartitionEncoding
     // Values that never reached a tier keep their full width.
     const uint64_t fallbackRows =
         rowCount > rowsInTiers ? rowCount - rowsInTiers : 0;
-    tagRowCounts.push_back(fallbackRows);
     if (fallbackRows > 0) {
       const uint64_t unencodedSize = std::min(
           TrivialEncoding<physicalType>::estimateSize(fallbackRows),
@@ -380,11 +347,23 @@ class FrequencyPartitionEncoding
         }
         case FreqPartIndexType::TierTagArray: {
           // tagBits(1) + padding(3) + tagStreamByteCount(4) header, then the
-          // tag stream, priced by what nested selection does with it. See
-          // tierTagStreamSize.
+          // tag stream. The stream goes through nested selection at encode
+          // time (FrequencyPartitionEncoding::encode), so its real size is
+          // usually smaller than this: this prices the undiscounted
+          // FixedBitWidth packing of one tagBits-wide tag per row, the same
+          // way the dictionary/key streams above are priced against
+          // TrivialEncoding/FixedBitWidthEncoding::estimateSize.
+          // kFrequencyPartitionNestedIndexDiscount (1.0 = no discount, i.e.
+          // this pessimistic estimate) is where a nested-selection discount
+          // would be applied if one is adopted later.
           payloadSize += 8;
-          payloadSize +=
-              tierTagStreamSize(rowCount, tagRowCounts, tiersCreated, options);
+          payloadSize += static_cast<uint64_t>(std::llround(
+              static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
+                  rowCount,
+                  /*minValue=*/0,
+                  /*maxValue=*/tiersCreated, // tag values span 0..numTiers
+                  options)) *
+              kFrequencyPartitionNestedIndexDiscount));
           break;
         }
         case FreqPartIndexType::EliasFano: {
@@ -472,13 +451,11 @@ class FrequencyPartitionEncoding
           break;
         }
         case FreqPartIndexType::TierTagArray: {
-          // The header only. The tag stream is nested-encoded and its size
-          // depends on how the rows are distributed across the tiers, which is
-          // exactly what a caller holding no counts does not know: a column
-          // whose rows nearly all land in one tier codes its tags in close to
-          // nothing. Charging the flat packing here would quote above what
-          // such a column writes and stop being a bound.
           payloadSize += 8;
+          payloadSize += static_cast<uint64_t>(std::llround(
+              static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
+                  rowCount, /*minValue=*/0, tiersCreated, options)) *
+              kFrequencyPartitionNestedIndexDiscount));
           break;
         }
         case FreqPartIndexType::NoIndex:

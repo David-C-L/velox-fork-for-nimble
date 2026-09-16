@@ -95,22 +95,6 @@ struct SegmentMetrics {
   // required bit width whenever the delta distribution is right-skewed.
   uint64_t maxDelta{0};
 
-  // The frames FOR bit-packs against, measured rather than inferred. A frame's
-  // local range is a property of the values in position and follows from no
-  // summary of them: small steps and a wide local span are compatible, and so
-  // are large steps and a narrow one. So the scan windows the segment at FOR's
-  // own frame size and reports what each window actually spans.
-  //
-  // frameBitWidthSum is the sum over windows of the bits a window's span needs,
-  // so the packed payload is frameBitWidthSum/frameCount bits a row; the
-  // extremes size the per-frame bit-width stream, and frameReferenceRange the
-  // per-frame reference stream. Zero frames means the metric was not requested.
-  uint64_t frameBitWidthSum{0};
-  uint32_t frameCount{0};
-  uint8_t minFrameBitWidth{0};
-  uint8_t maxFrameBitWidth{0};
-  uint64_t frameReferenceRange{0};
-
   // How many distinct values were seen exactly once, and exactly twice, over
   // the rows that were actually counted (the whole segment, or the prefix
   // scanned before the unique cap stopped the counting).
@@ -350,54 +334,7 @@ class MetricCollector {
     out.sumAbsDelta = sumAbsDelta;
     out.monotonicCount = monotonic;
     out.maxDelta = maxDelta;
-    fillFrameRanges(values, out);
     return out;
-  }
-
-  // The frame size ForEncoding packs against, and the block size the planner's
-  // sampler draws in, so a window here is one real frame's worth of adjacent
-  // rows rather than a stride across the column.
-  static constexpr size_t kFrameWindow = 128;
-
-  // Windows `values` at FOR's frame size and records what each window spans.
-  // See SegmentMetrics::frameBitWidthSum. Left untouched for a segment shorter
-  // than a frame, where FOR stores one frame and forCostBits has the segment's
-  // own range to price it with.
-  static void fillFrameRanges(
-      const std::vector<uint64_t>& values,
-      SegmentMetrics& out) noexcept {
-    const size_t count = values.size();
-    if (count < kFrameWindow) {
-      return;
-    }
-    uint64_t bitWidthSum = 0;
-    uint32_t frames = 0;
-    uint8_t smallestBitWidth = std::numeric_limits<uint8_t>::max();
-    uint8_t largestBitWidth = 0;
-    uint64_t smallestReference = std::numeric_limits<uint64_t>::max();
-    uint64_t largestReference = 0;
-    for (size_t start = 0; start < count; start += kFrameWindow) {
-      const size_t end = std::min(start + kFrameWindow, count);
-      uint64_t frameMin = values[start];
-      uint64_t frameMax = values[start];
-      for (size_t i = start + 1; i < end; ++i) {
-        frameMin = std::min(frameMin, values[i]);
-        frameMax = std::max(frameMax, values[i]);
-      }
-      const auto bitWidth =
-          static_cast<uint8_t>(std::bit_width(frameMax - frameMin));
-      bitWidthSum += bitWidth;
-      ++frames;
-      smallestBitWidth = std::min(smallestBitWidth, bitWidth);
-      largestBitWidth = std::max(largestBitWidth, bitWidth);
-      smallestReference = std::min(smallestReference, frameMin);
-      largestReference = std::max(largestReference, frameMin);
-    }
-    out.frameBitWidthSum = bitWidthSum;
-    out.frameCount = frames;
-    out.minFrameBitWidth = smallestBitWidth;
-    out.maxFrameBitWidth = largestBitWidth;
-    out.frameReferenceRange = largestReference - smallestReference;
   }
 
   // Cumulative coverage of the top 1, 2, 4 and 8 values, from the eight
@@ -478,7 +415,6 @@ class MetricCollector {
     out.sumAbsDelta = sumAbsDelta;
     out.monotonicCount = monotonic;
     out.maxDelta = maxDelta;
-    fillFrameRanges(values, out);
 
     // The histogram gets its own pass, scalar, in the same form the general
     // path uses. It is deliberately not in the loop above, and fusing it back
@@ -647,7 +583,6 @@ class MetricCollector {
 
     if (doMin) {
       out.range = out.max - out.min;
-      fillFrameRanges(values, out);
     }
     if (doRun) {
       out.avgRunLength =

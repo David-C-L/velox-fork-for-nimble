@@ -111,19 +111,6 @@ class HuffmanEncoding final
       const Statistics<physicalType>& statistics,
       const Encoding::Options& options = {});
 
-  /// Bytes a Huffman encoding of `rowCount` rows whose symbols occur with
-  /// `frequencies` occupies, or nullopt when the alphabet is too small, too
-  /// large, or would need a code deeper than kMaxCodeBits.
-  ///
-  /// For a caller that knows the distribution without holding the stream --
-  /// FrequencyPartitionEncoding prices its tag stream this way, since a tag is
-  /// the tier its row landed in and the tier row counts are already known
-  /// there. Sorts `frequencies` in place.
-  static std::optional<uint64_t> estimateSizeFromFrequencies(
-      uint64_t rowCount,
-      std::vector<uint32_t>& frequencies,
-      const Encoding::Options& options = {});
-
  private:
   // Temporary encoder tree. Child fields index nodes_; leaves have no children
   // and internal nodes have no symbol.
@@ -476,30 +463,18 @@ std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
   // Huffman by default any more, for reasons in
   // Encoding::Options::subIntSplitAllowHuffman. So what this now moves is the
   // other callers of this estimator, which is where being right is the point.
-  return estimateSizeFromFrequencies(values.size(), frequencies, options);
-}
-
-template <typename T>
-std::optional<uint64_t> HuffmanEncoding<T>::estimateSizeFromFrequencies(
-    uint64_t rowCount,
-    std::vector<uint32_t>& frequencies,
-    const Encoding::Options& options) {
-  if (rowCount < 2 || frequencies.size() < 2 ||
-      frequencies.size() > kMaxSymbols) {
-    return std::nullopt;
-  }
-  const uint64_t symbolCount = frequencies.size();
   const auto encodedBits = codeBits(frequencies);
   if (!encodedBits.has_value()) {
     return std::nullopt;
   }
 
   const uint64_t checkpoints =
-      velox::bits::divRoundUp(rowCount, kCheckpointStride);
+      velox::bits::divRoundUp(values.size(), kCheckpointStride);
   const uint64_t bitstreamBytes = (encodedBits.value() + 7) / 8 + 4;
-  return EncodingPrefix::serializedSize(rowCount, options.useVarintRowCount) +
-      varint::varintSize(symbolCount) + 1 +
-      symbolCount * sizeof(physicalType) + symbolCount +
+  return EncodingPrefix::serializedSize(
+             values.size(), options.useVarintRowCount) +
+      varint::varintSize(uniqueCounts->size()) + 1 +
+      uniqueCounts->size() * sizeof(physicalType) + uniqueCounts->size() +
       varint::varintSize(checkpoints) + checkpoints * 2 +
       varint::varintSize(bitstreamBytes) + bitstreamBytes;
 }
