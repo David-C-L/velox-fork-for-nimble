@@ -28,8 +28,9 @@
 
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Buffer.h"
-#include "velox/dwio/nimble/encodings/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
+#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
+#include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
 
