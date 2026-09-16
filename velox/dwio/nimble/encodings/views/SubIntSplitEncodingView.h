@@ -915,6 +915,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // 2/1 is set from where spans and the fallback were measured level: at
   // B = rowCount_/2 on NPI's 524288 rows, spans read 7.31 ms against the
   // fallback's 7.05, and past that point spans lose by a growing margin.
+  //
+  // Re-measured at 4/1 -- a whole-column decode from a quarter of the column
+  // rather than a half -- on the same five columns. It is neutral below the
+  // boundary it moves (0.95 to 1.02 at B = 64 to 32,768) and splits at
+  // B = 131,072, the length it changes: 1.53 on publicbi_npi and 1.28 on
+  // osm_s2_l30, 0.84 on snowflake and 0.83 on bing_quadkey, median 1.01. A
+  // ratio that helps one column as much as it costs another is not a better
+  // ratio, so this stays at 2/1.
   static constexpr uint32_t kSpanAdvantageNumerator = 2;
   static constexpr uint32_t kSpanAdvantageDenominator = 1;
 
@@ -926,6 +934,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // osm_s2_l30, snowflake and xmark_prepost_full (from 16 on three of them),
   // while publicbi_npi prefers probes at every length up to 256. 24 minimises
   // the summed log slowdown against the faster path over lengths 16 to 48.
+  //
+  // Re-measured once the span path handed its blocks down as one range list,
+  // by building a variant with this at 2^30 -- probes at every length -- and
+  // running the range driver at B = 8 to 131,072 on the five 524,288-row
+  // columns whose plan has a permuted section. Probes are level at B = 8
+  // (0.96 to 1.01 of the span path, which is the same code either way) and
+  // lose everywhere above it: 0.94 at worst and 0.20 at best for B = 64,
+  // 0.12 to 0.75 by B = 131,072. publicbi_npi is still the closest call at
+  // B = 64, at 0.93, which is the column the original note said prefers
+  // probes; nothing here argues for moving the boundary.
   static constexpr uint32_t kMinSpanLength = 24;
 
   // Decodes every section in order across the whole column, undoes the
