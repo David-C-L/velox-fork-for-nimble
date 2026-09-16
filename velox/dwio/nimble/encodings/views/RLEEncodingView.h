@@ -16,6 +16,8 @@
 #pragma once
 
 #include <algorithm>
+#include <span>
+#include <utility>
 
 #include <folly/CPortability.h>
 
@@ -127,6 +129,90 @@ class RLEEncodingView final : public TypedEncodingView<T> {
       offset += count;
       ++it;
     }
+  }
+
+  // Answers a whole range list from one forward walk of the run ends.
+  //
+  // Read one range at a time -- which is what the default does -- each range
+  // pays a binary search over every run end in the section. A section grouped
+  // by a key has one run per distinct key, so that search is over hundreds of
+  // thousands of entries and misses cache on nearly every step, and it is the
+  // whole cost of a read whose ranges are a row or two each. That is exactly
+  // the list SubIntSplitEncodingView's permuted span read hands down: it sorts
+  // its source indices before reading, so the ranges arrive ascending and each
+  // one starts close to where the last ended.
+  //
+  // Ascending is not promised by the interface, only produced by the caller
+  // that matters, so it is tested rather than assumed: a range that starts
+  // before the previous one ended restarts the walk with the binary search it
+  // would have paid anyway.
+  void readPhysicalRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const final {
+    const uint32_t* const first = runEnds_.data();
+    const uint32_t* const last = first + runEnds_.size();
+    const uint32_t* run = first;
+    // One past the highest row the cursor is known to be correct for.
+    uint64_t walked = 0;
+    for (const auto& [offset, length] : ranges) {
+      if (length == 0) {
+        continue;
+      }
+      // Long enough to amortise its own search, and readPhysical() has a
+      // vectorised run fill this walk does not; the cursor stays where it
+      // was, which is still behind this range and so still correct for the
+      // next one.
+      if (length >= kMinBulkRunValueLength) {
+        readPhysical(offset, length, output);
+        walked = static_cast<uint64_t>(offset) + length;
+        output += length;
+        continue;
+      }
+      this->checkReadRange(offset, length);
+      run = offset >= walked ? advanceToRun(run, last, offset)
+                             : std::upper_bound(first, last, offset);
+      NIMBLE_CHECK(run != last);
+      uint32_t produced = 0;
+      uint32_t row = offset;
+      while (produced < length) {
+        const auto runIndex = static_cast<uint32_t>(run - first);
+        const uint32_t count = std::min(length - produced, *run - row);
+        physicalType value;
+        values_->readAt(runIndex, &value);
+        std::fill(output + produced, output + produced + count, value);
+        produced += count;
+        row += count;
+        if (row == *run) {
+          ++run;
+        }
+      }
+      // Either the loop stopped inside a run, leaving *run > row, or it
+      // exhausted one and stepped to the next, whose end is above row as
+      // well. Both make the cursor correct for any later range starting at
+      // `row` or beyond.
+      walked = row;
+      output += length;
+    }
+  }
+
+  // First run end above `row`, searched forward from `run` in O(log gap)
+  // rather than O(log runCount): a range list that steps a little way at a
+  // time never touches the far end of the table, which is what keeps this off
+  // the cache misses a fresh binary search pays on every call.
+  static const uint32_t*
+  advanceToRun(const uint32_t* run, const uint32_t* last, uint32_t row) {
+    if (run == last || *run > row) {
+      return run;
+    }
+    size_t step = 1;
+    const uint32_t* below = run;
+    const uint32_t* above = below + 1;
+    while (above < last && *above <= row) {
+      below = above;
+      step *= 2;
+      above = static_cast<size_t>(last - below) > step ? below + step : last;
+    }
+    return std::upper_bound(below + 1, above, row);
   }
 
   // Kept out of line deliberately. Inlining it into readPhysical() cost an

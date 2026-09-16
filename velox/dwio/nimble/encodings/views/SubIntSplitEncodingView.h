@@ -800,6 +800,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
     const uint64_t rowCount = this->rowCount_;
+    // A permuted stream still prices range by range to decide whether to
+    // decode the column, and only then reads the ranges it keeps as one
+    // span.
+    //
+    // Pricing the list as a whole instead -- charging the span path's two
+    // decoded rows per requested row, which is what a single range is
+    // charged -- reads the cost of a scattered request wrongly and was
+    // measured doing so: a gather of 173,015 rows in ranges of two, a third
+    // of the column, priced under a whole-column decode and lost 3x to one.
+    // The reason is that a row of a long range shares its block with its
+    // neighbours and a row of a two-row range does not, so the same row
+    // count costs the span path far more when it arrives scattered. The
+    // per-range price already separates those two cases, by charging a range
+    // too short to sort at the probe rate.
+    uint64_t totalRows = 0;
+    if (permutedSection_) {
+      for (const auto& [offset, rangeLength] : ranges) {
+        totalRows += rangeLength;
+      }
+    }
     uint64_t piecewiseCost = 0;
     for (const auto& [offset, rangeLength] : ranges) {
       const uint64_t length = rangeLength;
@@ -826,10 +846,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
     }
     if (piecewiseCost < rowCount) {
+      // Worth reading piecewise, and a permuted stream reads the whole list
+      // as one span rather than one range at a time: the sort, the grouping
+      // and the scratch are fixed per call, and a run's occurrences are as
+      // likely to be split across two ranges of a request as to sit inside
+      // one. Below kMinSpanLength rows in total the sort still has nothing
+      // to amortise over, so the list falls back to probes per range.
+      if (permutedSection_ && totalRows >= kMinSpanLength) {
+        readPermutedSpanRanges(ranges, static_cast<uint32_t>(totalRows), output);
+        return;
+      }
       readResidualRangesSeparately(ranges, output);
       return;
     }
+    readWholeColumnRanges(ranges, output);
+  }
 
+  // Decodes the column once and keeps the rows the list asked for.
+  void readWholeColumnRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      physicalType* output) const {
     // Fully overwritten by readPhysicalBlock() below before being read.
     thread_local velox::raw_vector<physicalType> whole;
     whole.resize(this->rowCount_);
@@ -898,6 +934,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // 2/1 is set from where spans and the fallback were measured level: at
   // B = rowCount_/2 on NPI's 524288 rows, spans read 7.31 ms against the
   // fallback's 7.05, and past that point spans lose by a growing margin.
+  //
+  // Re-measured at 4/1 -- a whole-column decode from a quarter of the column
+  // rather than a half -- on the same five columns. It is neutral below the
+  // boundary it moves (0.95 to 1.02 at B = 64 to 32,768) and splits at
+  // B = 131,072, the length it changes: 1.53 on publicbi_npi and 1.28 on
+  // osm_s2_l30, 0.84 on snowflake and 0.83 on bing_quadkey, median 1.01. A
+  // ratio that helps one column as much as it costs another is not a better
+  // ratio, so this stays at 2/1.
   static constexpr uint32_t kSpanAdvantageNumerator = 2;
   static constexpr uint32_t kSpanAdvantageDenominator = 1;
 
@@ -909,6 +953,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // osm_s2_l30, snowflake and xmark_prepost_full (from 16 on three of them),
   // while publicbi_npi prefers probes at every length up to 256. 24 minimises
   // the summed log slowdown against the faster path over lengths 16 to 48.
+  //
+  // Re-measured once the span path handed its blocks down as one range list,
+  // by building a variant with this at 2^30 -- probes at every length -- and
+  // running the range driver at B = 8 to 131,072 on the five 524,288-row
+  // columns whose plan has a permuted section. Probes are level at B = 8
+  // (0.96 to 1.01 of the span path, which is the same code either way) and
+  // lose everywhere above it: 0.94 at worst and 0.20 at best for B = 64,
+  // 0.12 to 0.75 by B = 131,072. publicbi_npi is still the closest call at
+  // B = 64, at 0.93, which is the column the original note said prefers
+  // probes; nothing here argues for moving the boundary.
   static constexpr uint32_t kMinSpanLength = 24;
 
   // Decodes every section in order across the whole column, undoes the
@@ -967,14 +1021,22 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // per pass: O(length) work, and a fixed, tiny table to clear regardless of
   // length or rowCount_. A comparison sort was the third-largest cost the
   // span path measured on it.
+  //
+  // Only the digits a source index can carry are swept. A source index is a
+  // row of this stream, so 524,288 rows need 19 bits and therefore three
+  // passes, not four; each pass skipped is a 256-entry table cleared and
+  // prefix-summed, which is fixed work a short range has too few rows to
+  // amortise. An odd pass count leaves the result in the scratch buffer, so
+  // it is copied back -- length words, against the pass it saved.
   static void radixSortBySource(
       velox::raw_vector<SourceRow>& order,
-      uint32_t length) {
+      uint32_t length,
+      uint32_t maxSource) {
     thread_local velox::raw_vector<SourceRow> radixScratch;
     radixScratch.resize(length);
     SourceRow* src = order.data();
     SourceRow* dst = radixScratch.data();
-    for (int shift = 0; shift < 32; shift += 8) {
+    for (int shift = 0; shift < 32 && (maxSource >> shift) != 0; shift += 8) {
       uint32_t count[257] = {};
       for (uint32_t i = 0; i < length; ++i) {
         ++count[((src[i].source >> shift) & 0xFF) + 1];
@@ -988,16 +1050,35 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
       std::swap(src, dst);
     }
-    // Four passes -- an even number -- leave the fully sorted result back in
-    // `src`, which by construction is order.data() again at this point.
+    if (src != order.data()) {
+      std::copy_n(src, length, order.data());
+    }
   }
 
   void readPermutedSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
+    const std::pair<uint32_t, uint32_t> one{offset, length};
+    readPermutedSpanRanges({&one, 1}, length, output);
+  }
+
+  // The span read, over a whole range list rather than one range.
+  //
+  // Everything the span path pays before it touches a section -- the sort, the
+  // grouping, the scratch -- is fixed per call, not per row, and a run's
+  // occurrences are just as likely to be shared between two ranges of one
+  // request as to sit inside one of them. Sorting the whole request at once
+  // therefore pays the fixed cost once and finds the longer blocks, where
+  // reading each range on its own pays it per range and re-splits every block
+  // a range boundary happens to fall in. `totalRows` is the sum of the
+  // lengths, which the caller has already computed to make this choice.
+  void readPermutedSpanRanges(
+      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      uint32_t totalRows,
+      physicalType* output) const {
     const auto& positions = positionMap();
     const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
     if (seedWithConstant) {
-      std::fill(output, output + length, constantBits_);
+      std::fill(output, output + totalRows, constantBits_);
     }
 
     // A run's occurrences within [offset, offset+length) are exactly a block
@@ -1020,18 +1101,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // here is overwritten by the loop directly below, so that fill was pure
     // loss on any call whose length exceeds the largest one seen so far.
     thread_local velox::raw_vector<SourceRow> order;
-    order.resize(length);
-    for (uint32_t i = 0; i < length; ++i) {
-      order[i] = {positions[offset + i], i};
+    order.resize(totalRows);
+    uint32_t at = 0;
+    for (const auto& [rangeOffset, rangeLength] : ranges) {
+      for (uint32_t i = 0; i < rangeLength; ++i, ++at) {
+        order[at] = {positions[rangeOffset + i], at};
+      }
     }
-    radixSortBySource(order, length);
+    radixSortBySource(order, totalRows, this->rowCount_ - 1);
 
     // Sized to the whole range rather than chunked: this path already pays
     // for a heap scratch buffer for its permuted sections, so a plain
     // section gains nothing here from the stack-sized chunking the bulk path
     // uses for cache residency.
     thread_local velox::raw_vector<uint8_t> scratch;
-    scratch.resize(static_cast<size_t>(length) * sizeof(physicalType));
+    scratch.resize(static_cast<size_t>(totalRows) * sizeof(physicalType));
 
     for (size_t s = 0; s < sections_.size(); ++s) {
       const auto& section = sections_[s];
@@ -1041,43 +1125,68 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
               subintsplit::PositionMapping::Permuted;
       if (!permuted) {
         // Untransformed or declined: values sit in original row order
-        // already, so this is exactly readSectionChunk's job.
-        switch (section.storageBytes) {
-          case 1:
-            readSectionChunk<uint8_t>(
-                section, offset, length, output, isFirst, scratch.data());
-            break;
-          case 2:
-            readSectionChunk<uint16_t>(
-                section, offset, length, output, isFirst, scratch.data());
-            break;
-          case 4:
-            readSectionChunk<uint32_t>(
-                section, offset, length, output, isFirst, scratch.data());
-            break;
-          default:
-            readSectionChunk<uint64_t>(
-                section, offset, length, output, isFirst, scratch.data());
-            break;
+        // already, so this is exactly readSectionChunk's job, one range at a
+        // time.
+        physicalType* rangeOutput = output;
+        for (const auto& [rangeOffset, rangeLength] : ranges) {
+          switch (section.storageBytes) {
+            case 1:
+              readSectionChunk<uint8_t>(
+                  section,
+                  rangeOffset,
+                  rangeLength,
+                  rangeOutput,
+                  isFirst,
+                  scratch.data());
+              break;
+            case 2:
+              readSectionChunk<uint16_t>(
+                  section,
+                  rangeOffset,
+                  rangeLength,
+                  rangeOutput,
+                  isFirst,
+                  scratch.data());
+              break;
+            case 4:
+              readSectionChunk<uint32_t>(
+                  section,
+                  rangeOffset,
+                  rangeLength,
+                  rangeOutput,
+                  isFirst,
+                  scratch.data());
+              break;
+            default:
+              readSectionChunk<uint64_t>(
+                  section,
+                  rangeOffset,
+                  rangeLength,
+                  rangeOutput,
+                  isFirst,
+                  scratch.data());
+              break;
+          }
+          rangeOutput += rangeLength;
         }
         continue;
       }
       switch (section.storageBytes) {
         case 1:
           readPermutedSpanSection<uint8_t>(
-              section, length, order, output, isFirst, scratch);
+              section, totalRows, order, output, isFirst, scratch);
           break;
         case 2:
           readPermutedSpanSection<uint16_t>(
-              section, length, order, output, isFirst, scratch);
+              section, totalRows, order, output, isFirst, scratch);
           break;
         case 4:
           readPermutedSpanSection<uint32_t>(
-              section, length, order, output, isFirst, scratch);
+              section, totalRows, order, output, isFirst, scratch);
           break;
         default:
           readPermutedSpanSection<uint64_t>(
-              section, length, order, output, isFirst, scratch);
+              section, totalRows, order, output, isFirst, scratch);
           break;
       }
     }
@@ -1170,11 +1279,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       bool isFirst,
       velox::raw_vector<uint8_t>& scratch) {
     auto* gathered = reinterpret_cast<SectionT*>(scratch.data());
-    // Same zero-fill hazard as `order` above, paid once per block rather
-    // than once per call: at k=1024 runs this resizes up to 1024 times per
-    // readPermutedSpan call, so a std::vector here was the dominant share of
-    // the span path's per-element cost above bulk decode's.
-    thread_local velox::raw_vector<SectionT> block;
+    // The blocks are handed to the section as one ascending range list rather
+    // than read one at a time. Sorting by source has already made the list
+    // ascending, and that is what an encoding whose random access is a search
+    // needs to be told: an RLE section grouped by a key has one run per
+    // distinct key, so reading a block on its own costs a binary search over
+    // every run end in the section, and on a high-cardinality column nearly
+    // every block is one row. Given the list, the section walks its runs once
+    // for all of them. It also spares the per-block dispatch and the resize
+    // that used to run once per block.
+    //
+    // std::vector rather than raw_vector because raw_vector rejects
+    // std::pair: libstdc++ 11 does not call it trivially copyable even when
+    // both members are. clear() and push_back keep the capacity without the
+    // value-initialisation resize() would do, which is the cost that
+    // mattered here.
+    thread_local std::vector<std::pair<uint32_t, uint32_t>> blocks;
+    blocks.clear();
     uint32_t j = 0;
     while (j < length) {
       uint32_t blockEnd = j + 1;
@@ -1182,13 +1303,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
              order[blockEnd].source == order[blockEnd - 1].source + 1) {
         ++blockEnd;
       }
-      const uint32_t blockLength = blockEnd - j;
-      block.resize(blockLength);
-      section.view->read(order[j].source, blockLength, block.data());
-      for (uint32_t k = 0; k < blockLength; ++k) {
-        gathered[order[j + k].row] = block[k];
-      }
+      blocks.emplace_back(order[j].source, blockEnd - j);
       j = blockEnd;
+    }
+    // Same zero-fill hazard as `order` above: resized once per call now, to
+    // the whole request, and every element is written by the read below.
+    thread_local velox::raw_vector<SectionT> block;
+    block.resize(length);
+    section.view->readRanges(blocks, block.data());
+    for (uint32_t k = 0; k < length; ++k) {
+      gathered[order[k].row] = block[k];
     }
     if (isFirst) {
       detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(

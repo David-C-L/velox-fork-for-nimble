@@ -60,6 +60,51 @@ TEST_F(RLEEncodingViewTest, chunkedReadsStartAndEndMidRun) {
   expectRangeRead(*view, values, /*offset=*/12'345, /*length=*/513);
 }
 
+// The range-list read walks the run ends with a cursor when the list ascends
+// and falls back to a search when it does not, so the two have to agree with
+// each other and with a plain read. The shapes here are the ones
+// SubIntSplitEncodingView's permuted span read produces: hundreds of ranges of
+// a row or two, ascending, over a section whose runs are a handful of rows.
+TEST_F(RLEEncodingViewTest, rangeListReadsWalkAndReset) {
+  constexpr uint32_t kRows{40'000};
+  std::mt19937 rng{0x11bb};
+  std::uniform_int_distribution<uint32_t> runLength{1, 6};
+  std::uniform_int_distribution<int32_t> runValue{-50, 50};
+  nimble::Vector<int32_t> values{pool_.get()};
+  values.reserve(kRows);
+  while (values.size() < kRows) {
+    const int32_t value = runValue(rng);
+    for (uint32_t i = runLength(rng); i > 0 && values.size() < kRows; --i) {
+      values.push_back(value);
+    }
+  }
+  const auto serialized =
+      nimble::test::Encoder<nimble::RLEEncoding<int32_t>>::encode(
+          *buffer_, values);
+  auto view = nimble::createEncodingView(serialized, pool_.get(), {});
+  ASSERT_NE(view, nullptr);
+  const std::span<const int32_t> rows{values.data(), values.size()};
+
+  std::vector<std::pair<uint32_t, uint32_t>> scattered;
+  std::uniform_int_distribution<uint32_t> gap{1, 200};
+  for (uint32_t at = 0; at + 2 < kRows;) {
+    scattered.emplace_back(at, at % 3 == 0 ? 2 : 1);
+    at += 2 + gap(rng);
+  }
+  ASSERT_GT(scattered.size(), 100);
+  nimble::test::expectRangeListRead(*view, rows, scattered);
+
+  // Ascending, but one range is long enough to take the vectorised bulk read,
+  // which leaves the cursor behind the rows it produced.
+  nimble::test::expectRangeListRead(
+      *view, rows, {{7, 3}, {64, 1}, {1'000, 2'048}, {30'000, 4}});
+
+  // Descending and overlapping: every range but the first has to restart the
+  // walk rather than trust the cursor.
+  nimble::test::expectRangeListRead(
+      *view, rows, {{30'000, 8}, {12, 4}, {29'999, 8}, {12, 4}, {0, 1}});
+}
+
 TEST_F(RLEEncodingViewTest, concurrent) {
   const auto positions = randomizedPositions(/*seed=*/11);
 
