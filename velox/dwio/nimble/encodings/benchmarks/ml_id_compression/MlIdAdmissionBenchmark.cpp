@@ -147,6 +147,7 @@ int runBenchmark() {
       "encode_ns",
       "estimate_admits",
       "sis_estimate_bytes",
+      "legacy_estimate_bytes",
       "policy_estimate_bytes",
       "policy_selects_sis",
       "policy_encoding",
@@ -210,6 +211,31 @@ int runBenchmark() {
     }
     const bool estimateAdmits = sisEstimate.has_value();
 
+    // What the rule the sampled plan replaced would have said: 0.90 times
+    // FixedBitWidth's estimate over the whole value range, plus a header for
+    // four sections, withheld once that range passed three quarters of the
+    // type width. Recomputed here rather than kept in the encoding, so that
+    // the change has something to be scored against on these columns.
+    std::optional<uint64_t> legacyEstimate;
+    {
+      const auto statistics = Statistics<physicalType>::create(values);
+      constexpr uint64_t kTypeWidthBits = sizeof(physicalType) * 8u;
+      const uint64_t rangeBits =
+          velox::bits::bitsRequired(statistics.max() - statistics.min());
+      if (rangeBits <= (kTypeWidthBits * 3) / 4) {
+        constexpr uint64_t kLegacyOverheadBytes = 6u + 2u + 4u * 6u + 4u * 8u;
+        legacyEstimate = static_cast<uint64_t>(
+                             0.90 *
+                             static_cast<double>(
+                                 FixedBitWidthEncoding<physicalType>::
+                                     estimateSize(
+                                         values.size(),
+                                         statistics,
+                                         Encoding::Options{}))) +
+            kLegacyOverheadBytes;
+      }
+    }
+
     csv.beginRow();
     csv.set("driver", std::string(kDriver));
     csv.set("dtype", elemTypeName<Elem>());
@@ -222,6 +248,10 @@ int runBenchmark() {
     csv.set(
         "sis_estimate_bytes",
         sisEstimate.has_value() ? static_cast<int64_t>(*sisEstimate) : -1);
+    csv.set(
+        "legacy_estimate_bytes",
+        legacyEstimate.has_value() ? static_cast<int64_t>(*legacyEstimate)
+                                   : -1);
     csv.set(
         "policy_estimate_bytes",
         policyEstimate.has_value() ? static_cast<int64_t>(*policyEstimate)
