@@ -68,12 +68,22 @@ struct TopLevelPolicyConfig {
   // average, nearly as unpredictably as random bits: mean binary entropy of
   // flipProbability over the bits that ever flip above this. Such a stream
   // has nothing left for a split to exploit once its constant bits are
-  // dropped, which FixedBitWidth already does. 0.8 is the entropy of a bit
-  // flipping one pair in four. On 39 ID and PublicBI columns it sat between
-  // the largest positive (0.77) and the smallest rejected negative (0.82).
-  // Varying bits come from the whole stream (BitFlipProfile::varyingBits),
-  // so a sampled profile does not drop slow fields and inflate the mean.
-  double maxActiveFlipEntropy{0.8};
+  // dropped, which FixedBitWidth already does. Varying bits come from the
+  // whole stream (BitFlipProfile::varyingBits), so a sampled profile does not
+  // drop slow fields and inflate the mean.
+  //
+  // 0.8 was read off 39 columns before the ground truth counted pure
+  // baselines, and on the 42 columns since it rejects six streams a split
+  // does win on -- an NPI, two Corporations id columns, an IPv4 id, a
+  // quadkey and a species id -- for recall 0.82 against the gradient guard's
+  // 0.97. Leaving one dataset family out picks 0.99 or 1.0 in every fold, so
+  // 0.99 is the highest value the data supports: it holds precision at 1.00
+  // for recall 0.95, where the gradient guard alone trades one false
+  // positive for one more true positive. Now that admission decides
+  // candidacy rather than the encoding, that false positive costs a size
+  // estimate and nothing else, so kBitFlip is the better of the two modes and
+  // this guard exists for the ablation that shows why.
+  double maxActiveFlipEntropy{0.99};
 };
 
 /// How top-level selection decides whether SubIntSplit is tried. Under the
