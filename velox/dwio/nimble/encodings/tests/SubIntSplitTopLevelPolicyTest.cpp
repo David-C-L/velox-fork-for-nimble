@@ -17,6 +17,7 @@
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -161,6 +162,50 @@ TEST(SubIntSplitTopLevelPolicyTest, sampledProfileUsesStridedPairs) {
   }
   // Varying bits still come from every value.
   EXPECT_EQ(sampled.varyingBits, full.varyingBits);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, flipCountsMatchScalarReference) {
+  // Word patterns the bit-sliced counter has to carry through: all bits set
+  // (every counter overflows on the same word), one bit set, none set, and
+  // random. 1'000 words drive several sixteen-word carries and leave a partial
+  // vector at the end.
+  auto words = makeUniformRandomStream(1'000);
+  words[0] = ~uint64_t{0};
+  words[1] = 0;
+  words[2] = uint64_t{1} << 63;
+  for (size_t i = 100; i < 140; ++i) {
+    words[i] = ~uint64_t{0};
+  }
+  for (size_t size : {size_t{0}, size_t{1}, size_t{3}, size_t{17}, size_t{999},
+                      size_t{1'000}}) {
+    const std::span<const uint64_t> span(words.data(), size);
+    std::array<uint64_t, kMaxBitWidth> vectorised{};
+    std::array<uint64_t, kMaxBitWidth> reference{};
+    ::facebook::nimble::detail::accumulateFlipCounts(span, vectorised);
+    ::facebook::nimble::detail::accumulateFlipCountsScalar(span, reference);
+    EXPECT_EQ(vectorised, reference) << "size: " << size;
+  }
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, gradientGateProfileSkipsVaryingBits) {
+  const auto values = makePackedFieldsStream(10'001);
+  const std::span<const uint64_t> span(values);
+  const auto withVaryingBits = computeBitFlipProfile<uint64_t>(span, 1'024);
+  const auto gateProfile =
+      bitFlipAdmissionProfile(span, SubIntSplitAdmission::kBitFlip, 1'024);
+  // The gradient gate reads the probabilities, not the varying bits, so
+  // skipping the whole-stream pass leaves its decision alone.
+  EXPECT_EQ(gateProfile.flipProbability, withVaryingBits.flipProbability);
+  EXPECT_EQ(gateProfile.gradient, withVaryingBits.gradient);
+  EXPECT_EQ(gateProfile.varyingBits, 0);
+  EXPECT_EQ(
+      bitFlipGradientGate(gateProfile, TopLevelPolicyConfig{}),
+      bitFlipGradientGate(withVaryingBits, TopLevelPolicyConfig{}));
+
+  // The entropy guard does read them, so its profile keeps the pass.
+  const auto entropyProfile = bitFlipAdmissionProfile(
+      span, SubIntSplitAdmission::kBitFlipEntropy, 1'024);
+  EXPECT_EQ(entropyProfile.varyingBits, withVaryingBits.varyingBits);
 }
 
 TEST(SubIntSplitTopLevelPolicyTest, activeBitFlipEntropy) {
