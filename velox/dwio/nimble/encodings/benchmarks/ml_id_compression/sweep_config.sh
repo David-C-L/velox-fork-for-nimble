@@ -85,9 +85,12 @@ FPE/fpe_noindex,FPE/fpe_pertier,FPE/fpe_elias"
 # --- gather ladders ---------------------------------------------------------
 # Dense at the bottom: the run-length axis spans 60.45x at selectivity 0.05 and
 # 1.01x at 1.0, so small gathers carry the nuance and large ones coalesce.
-GATHER_SELECTIVITY="0.001,0.01,0.05,0.10,0.33,0.66,1.0"
+#
+# Both are overridable so a launcher can ask for a different shape grid without
+# forking this file; unset, they are exactly the values earlier sweeps used.
+GATHER_SELECTIVITY="${GATHER_SELECTIVITY:-0.001,0.01,0.05,0.10,0.33,0.66,1.0}"
 # Judgement, not measured -- the pull only contains run lengths 1 and 131072.
-GATHER_RUN_LENGTHS="1,111,12417,131072"
+GATHER_RUN_LENGTHS="${GATHER_RUN_LENGTHS:-1,111,12417,131072}"
 
 # --- range ladder -----------------------------------------------------------
 # The two halves of this list behave differently on purpose.
