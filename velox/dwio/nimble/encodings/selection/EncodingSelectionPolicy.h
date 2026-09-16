@@ -529,8 +529,10 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
                   admission,
                   detail::subintsplit::TopLevelPolicyConfig{})
             : detail::subintsplit::bitFlipAdmits(
-                  computeBitFlipProfile(
-                      values, options.subIntSplitAdmissionProfilePairs),
+                  detail::subintsplit::bitFlipAdmissionProfile(
+                      values,
+                      admission,
+                      options.subIntSplitAdmissionProfilePairs),
                   admission,
                   detail::subintsplit::TopLevelPolicyConfig{});
         if (!admitted) {

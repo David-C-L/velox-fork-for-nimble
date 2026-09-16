@@ -416,9 +416,15 @@ class Encoding {
     bool subIntSplitAdmissionForces{false};
 
     /// Consecutive pairs the admission profile is computed over, taken at a
-    /// fixed stride across the stream. 0 uses the statistics' own profile
-    /// over every pair. Only read when subIntSplitAdmission is not 0.
-    uint32_t subIntSplitAdmissionProfilePairs{0};
+    /// fixed stride across the stream. 0 uses the statistics' own profile over
+    /// every pair. Only read when subIntSplitAdmission is not 0.
+    ///
+    /// The default samples, because the gate is meant to be cheap enough to
+    /// run before anything expensive and a whole-stream profile is not: on a
+    /// 524'288-row uint64 column it costs 9.97 ms against 228 us at this cap,
+    /// and over the 42 evaluation columns the two profiles admit exactly the
+    /// same streams.
+    uint32_t subIntSplitAdmissionProfilePairs{1'024};
 
     /// Whether selection may choose SubIntSplit for a nested stream: an RLE's
     /// run values, a Dictionary's alphabet, a FrequencyPartition tier. True
