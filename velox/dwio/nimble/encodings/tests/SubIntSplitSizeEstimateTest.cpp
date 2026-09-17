@@ -257,6 +257,7 @@ TEST_F(SubIntSplitSizeEstimateTest, splitIsNotPricedUnderSubstreamCompression) {
 }
 
 TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
+  // The screen is off by default, so every case below asks for it.
   // Over every pair. Uniform random is the case where the cap matters: a
   // 1'024-pair profile of it clears the gradient floor on sampling noise, so
   // the screen declines there and the split DP runs. The columns the screen
@@ -264,6 +265,7 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
   // calculation -- have no gradient boundary at all, and no sample size
   // changes that.
   Encoding::Options options;
+  options.subIntSplitEstimateBitFlipScreen = true;
   options.subIntSplitAdmissionProfilePairs = 0;
   // 300'000 rows, not kNumRows: a whole-stream flip probability taken from
   // 65'535 pairs still carries 0.002 of standard error, which puts the
@@ -279,8 +281,12 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
       *randomBound,
       FixedBitWidthEncoding<uint64_t>::estimateSize(
           random.size(), randomStatistics, options));
-  // A bound is only useful if it is one: the estimate may not come in under it.
-  EXPECT_GE(
+  // The bound is the gate's prediction, not a proof, and this stream is where
+  // that shows: the split DP prices a uniform-random column about 2% below
+  // FixedBitWidth, by taking the bits that never vary out into a constant
+  // section, so taking the bound gives up a win that small. It is why the
+  // screen is off by default.
+  EXPECT_LT(
       *SubIntSplitEncoding<uint64_t>::estimateSize(
           random.size(), randomSpan, randomStatistics, options),
       *randomBound);
@@ -298,6 +304,7 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
   // The sampled default declines on this stream, which is the screen's limit
   // and not a bug: it costs a split DP that the estimate then prices out.
   Encoding::Options sampled;
+  sampled.subIntSplitEstimateBitFlipScreen = true;
   EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
                    randomSpan, randomStatistics, sampled)
                    .has_value());

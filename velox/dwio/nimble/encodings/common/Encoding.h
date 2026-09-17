@@ -484,10 +484,23 @@ class Encoding {
 
     /// Whether selection may rule SubIntSplit out from the bit-flip gradient
     /// gate rather than by planning a split (see
-    /// SubIntSplitEncoding::estimateSizeLowerBound). Off makes every candidacy
-    /// decision pay the sampled split DP, which is the ablation that says what
-    /// the screen saves.
-    bool subIntSplitEstimateBitFlipScreen{true};
+    /// SubIntSplitEncoding::estimateSizeLowerBound).
+    ///
+    /// Off, because measuring it says it does not pay. Over the 60-column
+    /// corpus the screen fires on five columns and saves 36.8 ms of the
+    /// 1.16 s selection spends on them -- 3% -- because the corpus is 49
+    /// positives to 11 negatives and the columns a split does win on still
+    /// pay the DP. It costs one of those positives, a Corporations funding
+    /// column the gate rejects. And the bound it supplies is a prediction
+    /// rather than a proof: on a 300'000-row uniform-random column the gate
+    /// rejects, the split DP still prices a split 2% below FixedBitWidth, so
+    /// taking the bound can withhold a candidate that would have won by that
+    /// much, which is more than EncodingSelectionPolicy's candidateCannotWin
+    /// screen promises its callers.
+    ///
+    /// On for a writer that expects mostly negatives, where skipping a 7.2 ms
+    /// DP per column is what the gate is for.
+    bool subIntSplitEstimateBitFlipScreen{false};
 
     /// How many of the split DP's cheapest plans the hybrid planner re-prices,
     /// and separately how many bit-flip-restricted plans. Only read when
