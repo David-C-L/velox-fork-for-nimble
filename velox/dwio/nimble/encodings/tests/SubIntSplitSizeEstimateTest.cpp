@@ -265,7 +265,11 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
   // changes that.
   Encoding::Options options;
   options.subIntSplitAdmissionProfilePairs = 0;
-  const auto random = makeUniformRandomStream(kNumRows);
+  // 300'000 rows, not kNumRows: a whole-stream flip probability taken from
+  // 65'535 pairs still carries 0.002 of standard error, which puts the
+  // largest of 63 adjacent differences at the gate's 0.005 floor, and this
+  // test is about the bound rather than about that boundary.
+  const auto random = makeUniformRandomStream(300'000);
   const std::span<const uint64_t> randomSpan(random);
   const auto randomStatistics = Statistics<uint64_t>::create(randomSpan);
   const auto randomBound = SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
