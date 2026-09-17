@@ -127,6 +127,23 @@ DEFINE_bool(
     "admission selects SubIntSplit outright instead of only letting it "
     "compete on size. Reproduces the pre-candidacy behaviour for the "
     "ablation. Inert at --mlidc_sis_admission=0.");
+DEFINE_bool(
+    mlidc_sis_row_frame,
+    true,
+    "Encoding::Options::subIntSplitRowFrame: whether SubIntSplit may subtract "
+    "a fitted line or step from every value before planning its sections.");
+DEFINE_bool(
+    mlidc_sis_estimate_compression_guard,
+    true,
+    "Encoding::Options::subIntSplitEstimateCompressionGuard: whether the size "
+    "estimate withholds the row frame's credit when the streams will be "
+    "handed to a substream compressor.");
+DEFINE_bool(
+    mlidc_sis_estimate_bitflip_screen,
+    true,
+    "Encoding::Options::subIntSplitEstimateBitFlipScreen: whether selection "
+    "may rule SubIntSplit out from the bit-flip gradient gate rather than by "
+    "planning a split.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,
