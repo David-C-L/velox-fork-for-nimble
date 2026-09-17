@@ -450,6 +450,34 @@ class Encoding {
     /// fit a frame, so their streams are unchanged.
     bool subIntSplitRowFrame{true};
 
+    /// Whether the streams this selection writes are handed to a substream
+    /// compressor once they are encoded. Set by the selection policy from the
+    /// CompressionOptions it was built with, so that a size estimate can tell
+    /// the two worlds apart; a caller does not set it.
+    bool substreamCompression{false};
+
+    /// Whether SubIntSplit's estimate withholds the row frame's credit when
+    /// substreamCompression says the stream will be compressed afterwards.
+    ///
+    /// A frame-fittable stream is a near-linear one, and a near-linear stream
+    /// is exactly what a general-purpose substream compressor already handles:
+    /// under OpenZL the unsplit stream of XMark's prepost ids compresses to
+    /// 2.41 bits per value, while the split the estimate prefers for it, which
+    /// stores 92% fewer uncompressed bytes, compresses to 3.82. Crediting a
+    /// frame the compressor would have earned anyway is what made four nested
+    /// SubIntSplit cells regress by 9% to 59% under OpenZL while the same
+    /// cells improved by 30% to 92% uncompressed. Off, the estimate prices the
+    /// frame in both worlds; on, it prices it only where nothing downstream
+    /// will.
+    bool subIntSplitEstimateCompressionGuard{true};
+
+    /// Whether selection may rule SubIntSplit out from the bit-flip gradient
+    /// gate rather than by planning a split (see
+    /// SubIntSplitEncoding::estimateSizeLowerBound). Off makes every candidacy
+    /// decision pay the sampled split DP, which is the ablation that says what
+    /// the screen saves.
+    bool subIntSplitEstimateBitFlipScreen{true};
+
     /// How many of the split DP's cheapest plans the hybrid planner re-prices,
     /// and separately how many bit-flip-restricted plans. Only read when
     /// subIntSplitHybridPlanner is set.

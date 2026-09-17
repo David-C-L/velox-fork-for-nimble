@@ -564,6 +564,15 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       };
     }
 
+    // What an estimate is priced against. A size estimate counts bytes on
+    // disk, and where this policy hands its streams to a substream compressor
+    // the bytes on disk are compressed ones; the flag is how an estimate that
+    // prices the two worlds differently is told which it is in. Copied rather
+    // than mutated because the caller's options are shared with the encode.
+    Encoding::Options estimationOptions = options;
+    estimationOptions.substreamCompression = compressionOptions_.has_value() &&
+        compressionOptions_->compressionType != CompressionType::Uncompressed;
+
     // FixedBitWidth's size, when it is a candidate, so that Trivial's read
     // factor can be withheld where taking it would cost compression. See
     // trivialKeepsItsDiscount below for why this is needed and what it costs
@@ -576,7 +585,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
               return entry.first == EncodingType::FixedBitWidth;
             })) {
       fixedBitWidthSize = detail::EncodingSizeEstimation<T>::estimateSize(
-          EncodingType::FixedBitWidth, values, statistics, options);
+          EncodingType::FixedBitWidth, values, statistics, estimationOptions);
     }
 
     // How much a section's decode counts against its size here, and for
@@ -610,12 +619,17 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       const auto encodingType = entry.first;
       if (decodeWeight == 0.0 &&
           candidateCannotWin<T>(
-              encodingType, entry.second, minCost, values, statistics, options)) {
+              encodingType,
+              entry.second,
+              minCost,
+              values,
+              statistics,
+              estimationOptions)) {
         continue;
       }
       const auto estimatedSize =
           detail::EncodingSizeEstimation<T>::estimateSize(
-              encodingType, values, statistics, options);
+              encodingType, values, statistics, estimationOptions);
       if (!estimatedSize.has_value()) {
         NIMBLE_SELECTION_LOG(encodingType << " encoding is incompatible.");
         continue;

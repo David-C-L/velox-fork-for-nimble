@@ -101,6 +101,18 @@ struct EncodingSizeEstimation {
         isBoolType<physicalType>()) {
       return std::nullopt;
     } else {
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+      // Bounded from the bit-flip profile rather than from a distinct count,
+      // so it is answered before the preamble below.
+      if (encodingType == EncodingType::SubIntSplit) {
+        if constexpr (sizeof(physicalType) == 4 || sizeof(physicalType) == 8) {
+          return SubIntSplitEncoding<T>::estimateSizeLowerBound(
+              values, statistics, options);
+        } else {
+          return std::nullopt;
+        }
+      }
+#endif
       if (encodingType != EncodingType::MainlyConstant &&
           encodingType != EncodingType::Dictionary
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS

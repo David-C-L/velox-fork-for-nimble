@@ -224,6 +224,83 @@ TEST_F(SubIntSplitSizeEstimateTest, counterEstimateIsLooseUpward) {
   expectRatioWithin(makeCounterStream(kNumRows), 1.0, 50.0, "counter");
 }
 
+TEST_F(SubIntSplitSizeEstimateTest, rowFrameIsWithheldUnderSubstreamCompression) {
+  // A counter is what the row frame exists for: subtracting the fitted line
+  // leaves residuals a split stores in a handful of bits per value. It is also
+  // what a substream compressor handles on its own, so the estimate must not
+  // count the frame twice.
+  const auto values = makeCounterStream(kNumRows);
+  const std::span<const uint64_t> span(values);
+  const auto statistics = Statistics<uint64_t>::create(span);
+
+  Encoding::Options uncompressed;
+  const auto framed = SubIntSplitEncoding<uint64_t>::estimateSize(
+      values.size(), span, statistics, uncompressed);
+  ASSERT_TRUE(framed.has_value());
+
+  Encoding::Options compressed;
+  compressed.substreamCompression = true;
+  const auto guarded = SubIntSplitEncoding<uint64_t>::estimateSize(
+      values.size(), span, statistics, compressed);
+  ASSERT_TRUE(guarded.has_value());
+  EXPECT_GT(*guarded, *framed);
+
+  // The guard withholds the frame and nothing else: with the frame off in both
+  // worlds the two estimates agree.
+  Encoding::Options unframed;
+  unframed.subIntSplitRowFrame = false;
+  const auto withoutFrame = SubIntSplitEncoding<uint64_t>::estimateSize(
+      values.size(), span, statistics, unframed);
+  EXPECT_EQ(guarded, withoutFrame);
+
+  // And turning the guard off restores the uncompressed answer.
+  compressed.subIntSplitEstimateCompressionGuard = false;
+  EXPECT_EQ(
+      SubIntSplitEncoding<uint64_t>::estimateSize(
+          values.size(), span, statistics, compressed),
+      framed);
+}
+
+TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
+  const Encoding::Options options;
+
+  // Uniform random has no field boundary for the gradient gate to find, so the
+  // bound says a split cannot come in below FixedBitWidth and the caller may
+  // skip the split DP.
+  const auto random = makeUniformRandomStream(kNumRows);
+  const std::span<const uint64_t> randomSpan(random);
+  const auto randomStatistics = Statistics<uint64_t>::create(randomSpan);
+  const auto randomBound = SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+      randomSpan, randomStatistics, options);
+  ASSERT_TRUE(randomBound.has_value());
+  EXPECT_EQ(
+      *randomBound,
+      FixedBitWidthEncoding<uint64_t>::estimateSize(
+          random.size(), randomStatistics, options));
+  // A bound is only useful if it is one: the estimate may not come in under it.
+  EXPECT_GE(
+      *SubIntSplitEncoding<uint64_t>::estimateSize(
+          random.size(), randomSpan, randomStatistics, options),
+      *randomBound);
+
+  // A composite key has one, so the bound declines to answer and the estimate
+  // is what decides.
+  const auto composite = makeCompositeKeyStream(kNumRows);
+  const std::span<const uint64_t> compositeSpan(composite);
+  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+                   compositeSpan,
+                   Statistics<uint64_t>::create(compositeSpan),
+                   options)
+                   .has_value());
+
+  // Off, the screen never rules anything out.
+  Encoding::Options noScreen;
+  noScreen.subIntSplitEstimateBitFlipScreen = false;
+  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+                   randomSpan, randomStatistics, noScreen)
+                   .has_value());
+}
+
 TEST_F(SubIntSplitSizeEstimateTest, estimateNeverExceedsFixedBitWidth) {
   // The encoder's whole-value floor stores the values as one FixedBitWidth
   // section rather than let a plan come in above it, so an estimate above

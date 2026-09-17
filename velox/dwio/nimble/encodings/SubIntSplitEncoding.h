@@ -218,6 +218,23 @@ class SubIntSplitEncoding
       std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,
       const Encoding::Options& options);
+
+  /// Bounds estimateSize() from below without planning a split, for a caller
+  /// that only needs to know whether one can win. Returns FixedBitWidth's
+  /// estimate, which is exact and which estimateSize() floors its answer at,
+  /// when the bit-flip gradient gate finds no heterogeneity in `values` to
+  /// split on; nullopt, meaning no bound, otherwise.
+  ///
+  /// The bound is the gate's prediction, not a proof: it holds exactly where
+  /// the gate is right that a rejected stream has nothing for a split to
+  /// exploit. On the 42 evaluation columns the gate rejects three streams a
+  /// split does not win on and one, a Corporations funding column, that it
+  /// does; taking the bound therefore costs that column its SubIntSplit and
+  /// saves the split DP on the other three.
+  static std::optional<uint64_t> estimateSizeLowerBound(
+      std::span<const physicalType> values,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options);
 #endif
 
   std::string debugString(int offset) const final;
@@ -1710,7 +1727,14 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // between blocks rather than the line through them. The frame is fitted over
   // the whole column, as the encoder fits it, and then subtracted from the
   // sample alone, which is all the DP reads.
-  if (options.subIntSplitRowFrame) {
+  //
+  // Not under a substream compressor, unless the caller turns the guard off:
+  // see Encoding::Options::subIntSplitEstimateCompressionGuard for why a frame
+  // the compressor would have earned anyway is not the split's to count.
+  const bool creditRowFrame = options.subIntSplitRowFrame &&
+      !(options.substreamCompression &&
+        options.subIntSplitEstimateCompressionGuard);
+  if (creditRowFrame) {
     auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
         values);
     if (!frame.active()) {
@@ -1734,6 +1758,29 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
     }
   }
   return estimated;
+}
+
+template <typename T>
+std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSizeLowerBound(
+    std::span<const physicalType> values,
+    const Statistics<physicalType>& statistics,
+    const Encoding::Options& options) {
+  if (!options.subIntSplitEstimateBitFlipScreen || values.size() < 2) {
+    return std::nullopt;
+  }
+  // The gradient gate only, whatever admission mode the caller runs: the
+  // entropy guard's whole-stream varying-bit pass costs more than the bound
+  // saves on the columns it would change.
+  const auto profile = detail::subintsplit::bitFlipAdmissionProfile(
+      values,
+      detail::subintsplit::SubIntSplitAdmission::kBitFlip,
+      options.subIntSplitAdmissionProfilePairs);
+  if (detail::subintsplit::bitFlipGradientGate(
+          profile, detail::subintsplit::TopLevelPolicyConfig{})) {
+    return std::nullopt;
+  }
+  return FixedBitWidthEncoding<physicalType>::estimateSize(
+      values.size(), statistics, options);
 }
 
 template <typename T>
