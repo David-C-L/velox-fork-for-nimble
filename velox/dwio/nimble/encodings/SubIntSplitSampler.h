@@ -54,21 +54,40 @@ inline SamplerConfig defaultSamplerConfig() noexcept {
 //
 // Writes directly into `out` (which is resized); no heap allocation occurs if
 // `out` already has sufficient capacity.
+// Draws the same sample as sampleIntoU64 and, when `rows` is not null, records
+// the row each sample came from alongside it. Anything positional evaluated
+// over the sample -- a row frame's prediction for a row, say -- needs those
+// rows, and the alternative is materialising the whole stream to get at them.
 template <typename physicalType>
-void sampleIntoU64(
+void sampleIntoU64WithRows(
     std::span<const physicalType> values,
     std::vector<uint64_t>& out,
+    std::vector<size_t>* rows,
     const SamplerConfig& cfg = defaultSamplerConfig()) {
   static_assert(sizeof(physicalType) <= 8);
 
   const size_t n = values.size();
   out.clear();
+  if (rows != nullptr) {
+    rows->clear();
+  }
   if (n == 0) {
     return;
   }
 
   const size_t target = std::min(cfg.maxSamples > 0 ? cfg.maxSamples : n, n);
   out.reserve(target);
+  if (rows != nullptr) {
+    rows->reserve(target);
+  }
+  const auto take = [&](size_t i) {
+    uint64_t bits = 0;
+    __builtin_memcpy(&bits, &values[i], sizeof(physicalType));
+    out.push_back(bits);
+    if (rows != nullptr) {
+      rows->push_back(i);
+    }
+  };
 
   if (cfg.blockSize > 0) {
     // Block-stratified: evenly-spaced contiguous windows.
@@ -78,20 +97,24 @@ void sampleIntoU64(
       const size_t start = b * blockStride;
       const size_t end = std::min(start + cfg.blockSize, n);
       for (size_t i = start; i < end && out.size() < target; ++i) {
-        uint64_t bits = 0;
-        __builtin_memcpy(&bits, &values[i], sizeof(physicalType));
-        out.push_back(bits);
+        take(i);
       }
     }
   } else {
     // Uniform stride sampling.
     const size_t stride = std::max<size_t>(1, n / target);
     for (size_t i = 0; i < n; i += stride) {
-      uint64_t bits = 0;
-      __builtin_memcpy(&bits, &values[i], sizeof(physicalType));
-      out.push_back(bits);
+      take(i);
     }
   }
+}
+
+template <typename physicalType>
+void sampleIntoU64(
+    std::span<const physicalType> values,
+    std::vector<uint64_t>& out,
+    const SamplerConfig& cfg = defaultSamplerConfig()) {
+  sampleIntoU64WithRows<physicalType>(values, out, nullptr, cfg);
 }
 
 } // namespace facebook::nimble::detail::subintsplit

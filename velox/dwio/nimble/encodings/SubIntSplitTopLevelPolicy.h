@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/selection/BitFlipProfile.h"
@@ -63,6 +64,7 @@ struct TopLevelPolicyConfig {
   // stddev without any of them being a meaningful spike; this floor rejects
   // that case.
   double minGradientMagnitude{0.005};
+
 
   // The entropy guard rejects a stream whose non-constant bits flip, on
   // average, nearly as unpredictably as random bits: mean binary entropy of
@@ -191,6 +193,27 @@ inline bool bitFlipGradientGate(
   const double maxGradient = *std::max_element(
       profile.gradient.begin(), profile.gradient.begin() + profile.numBits);
   return maxGradient >= config.minGradientMagnitude;
+}
+
+/// Returns which bit-flip work `admission` needs done over the whole stream.
+/// Only the entropy guard reads BitFlipProfile::varyingBits, and filling it
+/// reads every value; the gradient gate reads the sampled pairs alone, so
+/// admitting by it costs a fixed number of pairs whatever the column's length.
+inline BitFlipVaryingBits bitFlipVaryingBitsFor(SubIntSplitAdmission admission) {
+  return admission == SubIntSplitAdmission::kBitFlipEntropy
+      ? BitFlipVaryingBits::kWholeStream
+      : BitFlipVaryingBits::kSkip;
+}
+
+/// Returns the profile `admission` decides from, taken over at most `maxPairs`
+/// adjacent pairs of `values` (every pair when `maxPairs` is 0).
+template <typename T>
+BitFlipProfile bitFlipAdmissionProfile(
+    std::span<const T> values,
+    SubIntSplitAdmission admission,
+    size_t maxPairs) {
+  return computeBitFlipProfile<T>(
+      values, maxPairs, bitFlipVaryingBitsFor(admission));
 }
 
 /// Returns whether `admission` admits SubIntSplit for a stream with

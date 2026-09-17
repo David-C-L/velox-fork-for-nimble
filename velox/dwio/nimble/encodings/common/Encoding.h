@@ -416,9 +416,15 @@ class Encoding {
     bool subIntSplitAdmissionForces{false};
 
     /// Consecutive pairs the admission profile is computed over, taken at a
-    /// fixed stride across the stream. 0 uses the statistics' own profile
-    /// over every pair. Only read when subIntSplitAdmission is not 0.
-    uint32_t subIntSplitAdmissionProfilePairs{0};
+    /// fixed stride across the stream. 0 uses the statistics' own profile over
+    /// every pair. Only read when subIntSplitAdmission is not 0.
+    ///
+    /// The default samples, because the gate is meant to be cheap enough to
+    /// run before anything expensive and a whole-stream profile is not: on a
+    /// 524'288-row uint64 column it costs 9.97 ms against 228 us at this cap,
+    /// and over the 42 evaluation columns the two profiles admit exactly the
+    /// same streams.
+    uint32_t subIntSplitAdmissionProfilePairs{1'024};
 
     /// Whether selection may choose SubIntSplit for a nested stream: an RLE's
     /// run values, a Dictionary's alphabet, a FrequencyPartition tier. True
@@ -443,6 +449,58 @@ class Encoding {
     /// from 9.35 to 5.14 bits per value; none of the other five paper columns
     /// fit a frame, so their streams are unchanged.
     bool subIntSplitRowFrame{true};
+
+    /// Whether the streams this selection writes are handed to a substream
+    /// compressor once they are encoded. Set by the selection policy from the
+    /// CompressionOptions it was built with, so that a size estimate can tell
+    /// the two worlds apart; a caller does not set it.
+    bool substreamCompression{false};
+
+    /// Whether SubIntSplit's estimate declines to price a split at all when
+    /// substreamCompression says the stream will be compressed afterwards,
+    /// answering FixedBitWidth's bound instead so the split loses.
+    ///
+    /// The estimate ranks candidates on uncompressed bytes, and under a
+    /// compressor those are not the bytes on disk. The two rankings disagree
+    /// most where a split's uncompressed win is largest, because a large
+    /// uncompressed win means redundancy a general-purpose compressor also
+    /// finds: on XMark's nested prepost stream the split stores 92% fewer
+    /// uncompressed bytes than its rival and 59% more OpenZL-compressed ones,
+    /// and Snowflake's nested streams lose 9% to 12% the same way. Over the
+    /// nine sweep columns' nested cells the unguarded estimate is 20.5%
+    /// smaller uncompressed and 2.6% smaller under OpenZL, but the OpenZL
+    /// figure is eight cells worse against five better.
+    ///
+    /// This is a stop-gap for a defect in what the estimate prices, not a
+    /// claim that a split never pays under a compressor: it gives up the five
+    /// cells that do win, worth that 2.6%. Pricing compressed bytes -- by
+    /// compressing a bounded sample of the values with the configured codec
+    /// and scaling the rivals' estimates by the ratio, which the measurements
+    /// above say would keep those five -- is what removes the need for it.
+    ///
+    /// Uncompressed selection never reads this: substreamCompression is false
+    /// there.
+    bool subIntSplitEstimateCompressionGuard{true};
+
+    /// Whether selection may rule SubIntSplit out from the bit-flip gradient
+    /// gate rather than by planning a split (see
+    /// SubIntSplitEncoding::estimateSizeLowerBound).
+    ///
+    /// Off, because measuring it says it does not pay. Over the 60-column
+    /// corpus the screen fires on five columns and saves 36.8 ms of the
+    /// 1.16 s selection spends on them -- 3% -- because the corpus is 49
+    /// positives to 11 negatives and the columns a split does win on still
+    /// pay the DP. It costs one of those positives, a Corporations funding
+    /// column the gate rejects. And the bound it supplies is a prediction
+    /// rather than a proof: on a 300'000-row uniform-random column the gate
+    /// rejects, the split DP still prices a split 2% below FixedBitWidth, so
+    /// taking the bound can withhold a candidate that would have won by that
+    /// much, which is more than EncodingSelectionPolicy's candidateCannotWin
+    /// screen promises its callers.
+    ///
+    /// On for a writer that expects mostly negatives, where skipping a 7.2 ms
+    /// DP per column is what the gate is for.
+    bool subIntSplitEstimateBitFlipScreen{false};
 
     /// How many of the split DP's cheapest plans the hybrid planner re-prices,
     /// and separately how many bit-flip-restricted plans. Only read when

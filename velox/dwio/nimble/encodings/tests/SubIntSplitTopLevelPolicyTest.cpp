@@ -17,6 +17,7 @@
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -106,11 +107,13 @@ std::vector<uint64_t> makeLowCardinalityFieldsStream(size_t n) {
 EncodingType selectedUnder(
     const std::vector<uint64_t>& values,
     SubIntSplitAdmission mode,
-    bool forces) {
+    bool forces,
+    uint32_t profilePairs) {
   const std::span<const uint64_t> span(values);
   Encoding::Options options;
   options.subIntSplitAdmission = static_cast<uint8_t>(mode);
   options.subIntSplitAdmissionForces = forces;
+  options.subIntSplitAdmissionProfilePairs = profilePairs;
   ManualEncodingSelectionPolicy<uint64_t> policy{
       ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
       CompressionOptions{},
@@ -161,6 +164,50 @@ TEST(SubIntSplitTopLevelPolicyTest, sampledProfileUsesStridedPairs) {
   }
   // Varying bits still come from every value.
   EXPECT_EQ(sampled.varyingBits, full.varyingBits);
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, flipCountsMatchScalarReference) {
+  // Word patterns the bit-sliced counter has to carry through: all bits set
+  // (every counter overflows on the same word), one bit set, none set, and
+  // random. 1'000 words drive several sixteen-word carries and leave a partial
+  // vector at the end.
+  auto words = makeUniformRandomStream(1'000);
+  words[0] = ~uint64_t{0};
+  words[1] = 0;
+  words[2] = uint64_t{1} << 63;
+  for (size_t i = 100; i < 140; ++i) {
+    words[i] = ~uint64_t{0};
+  }
+  for (size_t size : {size_t{0}, size_t{1}, size_t{3}, size_t{17}, size_t{999},
+                      size_t{1'000}}) {
+    const std::span<const uint64_t> span(words.data(), size);
+    std::array<uint64_t, kMaxBitWidth> vectorised{};
+    std::array<uint64_t, kMaxBitWidth> reference{};
+    ::facebook::nimble::detail::accumulateFlipCounts(span, vectorised);
+    ::facebook::nimble::detail::accumulateFlipCountsScalar(span, reference);
+    EXPECT_EQ(vectorised, reference) << "size: " << size;
+  }
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, gradientGateProfileSkipsVaryingBits) {
+  const auto values = makePackedFieldsStream(10'001);
+  const std::span<const uint64_t> span(values);
+  const auto withVaryingBits = computeBitFlipProfile<uint64_t>(span, 1'024);
+  const auto gateProfile =
+      bitFlipAdmissionProfile(span, SubIntSplitAdmission::kBitFlip, 1'024);
+  // The gradient gate reads the probabilities, not the varying bits, so
+  // skipping the whole-stream pass leaves its decision alone.
+  EXPECT_EQ(gateProfile.flipProbability, withVaryingBits.flipProbability);
+  EXPECT_EQ(gateProfile.gradient, withVaryingBits.gradient);
+  EXPECT_EQ(gateProfile.varyingBits, 0);
+  EXPECT_EQ(
+      bitFlipGradientGate(gateProfile, TopLevelPolicyConfig{}),
+      bitFlipGradientGate(withVaryingBits, TopLevelPolicyConfig{}));
+
+  // The entropy guard does read them, so its profile keeps the pass.
+  const auto entropyProfile = bitFlipAdmissionProfile(
+      span, SubIntSplitAdmission::kBitFlipEntropy, 1'024);
+  EXPECT_EQ(entropyProfile.varyingBits, withVaryingBits.varyingBits);
 }
 
 TEST(SubIntSplitTopLevelPolicyTest, activeBitFlipEntropy) {
@@ -358,11 +405,14 @@ TEST(SubIntSplitTopLevelPolicyTest, admittedStreamStillHasToWinOnSize) {
   ASSERT_TRUE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
 
   EXPECT_NE(
-      selectedUnder(values, SubIntSplitAdmission::kBitFlip, /*forces=*/false),
+      selectedUnder(
+          values, SubIntSplitAdmission::kBitFlip, /*forces=*/false,
+          /*profilePairs=*/0),
       EncodingType::SubIntSplit);
   EXPECT_NE(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlipEntropy, /*forces=*/false),
+          values, SubIntSplitAdmission::kBitFlipEntropy, /*forces=*/false,
+          /*profilePairs=*/0),
       EncodingType::SubIntSplit);
 }
 
@@ -372,7 +422,9 @@ TEST(SubIntSplitTopLevelPolicyTest, forcingSelectsAnAdmittedStreamOutright) {
   const auto values = makeLowCardinalityFieldsStream(50'000);
 
   EXPECT_EQ(
-      selectedUnder(values, SubIntSplitAdmission::kBitFlip, /*forces=*/true),
+      selectedUnder(
+          values, SubIntSplitAdmission::kBitFlip, /*forces=*/true,
+          /*profilePairs=*/0),
       EncodingType::SubIntSplit);
 }
 
@@ -386,12 +438,45 @@ TEST(SubIntSplitTopLevelPolicyTest, rejectedStreamIsNeverSubIntSplit) {
     // Forcing cannot resurrect a rejected stream either: a rejected stream
     // loses the candidate before the two paths part.
     EXPECT_NE(
-        selectedUnder(values, mode, /*forces=*/false),
+        selectedUnder(values, mode, /*forces=*/false, /*profilePairs=*/0),
         EncodingType::SubIntSplit);
     EXPECT_NE(
-        selectedUnder(values, mode, /*forces=*/true),
+        selectedUnder(values, mode, /*forces=*/true, /*profilePairs=*/0),
         EncodingType::SubIntSplit);
   }
+}
+
+TEST(SubIntSplitTopLevelPolicyTest, sampledGateAdmitsWhatWholeStreamRejects) {
+  // What sampling the profile costs, stated rather than hidden. A flip
+  // probability taken from 1'024 pairs has a standard error of 0.016, so the
+  // largest of 63 adjacent differences is around 0.06 on noise alone, well
+  // above the gate's 0.005 floor. Raising the floor to that noise was measured
+  // on 60 columns and rejected: it removed no false positive the gate makes on
+  // real data -- those have gradients above 0.12, and are streams with real
+  // field structure a split still does not pay for -- and cost four true
+  // positives whose own boundaries are below it.
+  const auto values = makeUniformRandomStream(200'000);
+  const std::span<const uint64_t> span(values);
+  EXPECT_FALSE(bitFlipGradientGate(
+      computeBitFlipProfile<uint64_t>(span), TopLevelPolicyConfig{}));
+  EXPECT_TRUE(bitFlipGradientGate(
+      bitFlipAdmissionProfile(span, SubIntSplitAdmission::kBitFlip, 1'024),
+      TopLevelPolicyConfig{}));
+
+  // Which is why the gate is a candidacy screen and not the decision: with
+  // the estimate still pricing the candidate the sampled gate's admission
+  // changes nothing, and only letting the gate decide alone turns it into a
+  // split nobody wanted.
+  EXPECT_NE(
+      selectedUnder(
+          values, SubIntSplitAdmission::kBitFlip, /*forces=*/false,
+          /*profilePairs=*/1'024),
+      EncodingType::SubIntSplit);
+  EXPECT_EQ(
+      selectedUnder(
+          values, SubIntSplitAdmission::kBitFlip, /*forces=*/true,
+          /*profilePairs=*/1'024),
+      EncodingType::SubIntSplit);
 }
 
 TEST(SubIntSplitTopLevelPolicyTest, estimatorGateSkipsUniformRandom) {

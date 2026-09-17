@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -207,39 +208,33 @@ class SubIntSplitEncoding
       const Encoding::Options& options = {});
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Statistics-only size estimate for general encoding selection, where
-  /// only `Statistics<physicalType>` -- not the raw values -- is available.
-  /// Approximates the split-section layout as a single FixedBitWidth-packed
-  /// stream over the full value range, discounted by 10% for the bit
-  /// savings sectioning typically achieves, plus a fixed per-section header
-  /// overhead (assumes the default 4-section split). Returns nullopt when
-  /// the value range is too wide for sectioning to be worthwhile, so
-  /// encoding selection skips it instead of picking a poor split.
+  /// Estimates what a split would store `values` in, by planning one over a
+  /// sample of them: the same split DP the encoder runs, over a smaller
+  /// sample and priced on size alone. The answer is floored at
+  /// FixedBitWidth's estimate, which is exact and which the encoder's
+  /// whole-value floor guarantees a split never writes more than.
   static std::optional<uint64_t> estimateSize(
       uint64_t rowCount,
+      std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,
-      const Encoding::Options& options) {
-    constexpr uint64_t kTypeWidthBits =
-        static_cast<uint64_t>(sizeof(physicalType)) * 8u;
-    const uint64_t rangeBits =
-        velox::bits::bitsRequired(statistics.max() - statistics.min());
-    // Under a bit-flip admission the profile has already decided the stream is
-    // worth costing, and the range rule would veto it before its estimate is
-    // compared. It is exactly the wide streams -- a random low half of a
-    // UUIDv7, say -- that the profile is there to rescue.
-    if (options.subIntSplitAdmission == 0 &&
-        rangeBits > (kTypeWidthBits * 3) / 4) {
-      return std::nullopt;
-    }
-    const uint64_t fbwEstimate =
-        FixedBitWidthEncoding<physicalType>::estimateSize(
-            rowCount, statistics, options);
-    // Outer prefix(6) + compressionType(2) + up to 4 sections' worth of
-    // per-section prefix(6) + relative offset(8) overhead.
-    constexpr uint64_t kOverheadBytes = 6u + 2u + 4u * 6u + 4u * 8u;
-    return static_cast<uint64_t>(static_cast<double>(fbwEstimate) * 0.90) +
-        kOverheadBytes;
-  }
+      const Encoding::Options& options);
+
+  /// Bounds estimateSize() from below without planning a split, for a caller
+  /// that only needs to know whether one can win. Returns FixedBitWidth's
+  /// estimate, which is exact and which estimateSize() floors its answer at,
+  /// when the bit-flip gradient gate finds no heterogeneity in `values` to
+  /// split on; nullopt, meaning no bound, otherwise.
+  ///
+  /// The bound is the gate's prediction, not a proof: it holds exactly where
+  /// the gate is right that a rejected stream has nothing for a split to
+  /// exploit. On the 42 evaluation columns the gate rejects three streams a
+  /// split does not win on and one, a Corporations funding column, that it
+  /// does; taking the bound therefore costs that column its SubIntSplit and
+  /// saves the split DP on the other three.
+  static std::optional<uint64_t> estimateSizeLowerBound(
+      std::span<const physicalType> values,
+      const Statistics<physicalType>& statistics,
+      const Encoding::Options& options);
 #endif
 
   std::string debugString(int offset) const final;
@@ -272,6 +267,17 @@ class SubIntSplitEncoding
   // The configuration the split planner runs under for `options`.
   static detail::subintsplit::SelectorConfig plannerSelectorConfig(
       const Encoding::Options& options);
+
+  // The sample estimateSize plans over. Smaller than the encoder's, because
+  // the estimate only has to rank a split against the other candidates, not
+  // choose the boundaries the encoder will use, and the DP is linear in the
+  // sample: see estimateSize for what the difference costs and buys.
+  static detail::subintsplit::SamplerConfig estimatorSamplerConfig();
+
+  // Bytes a split's header costs beyond its sections: the outer prefix and
+  // compression type, plus a prefix and a relative offset per section.
+  static constexpr uint64_t kOuterOverheadBytes{6u + 2u};
+  static constexpr uint64_t kPerSectionOverheadBytes{6u + 8u};
 
   // Samples `values` and costs the split grid over the sample.
   static PlanningSample costPlanningSample(
@@ -1641,6 +1647,142 @@ SubIntSplitEncoding<T>::plannerSelectorConfig(const Encoding::Options& options) 
       .readPath = static_cast<detail::subintsplit::DecodeReadPath>(
           options.subIntSplitDecodeReadPath)};
   return selectorConfig;
+}
+
+template <typename T>
+detail::subintsplit::SamplerConfig
+SubIntSplitEncoding<T>::estimatorSamplerConfig() {
+  // A quarter of the encoder's sample, in blocks half as long. The DP is
+  // O(kBits^2 * sampleSize), so this is the term that decides what the
+  // estimate costs; halving the block keeps the same number of distinct
+  // stretches of the stream in a smaller sample, which is what the run-length
+  // and frame-residual models in the cost grid read.
+  //
+  // Halving it again does not pay. At 256 values in blocks of 32 the estimate
+  // took 5.74 ms rather than 7.20 ms on a 524'288-row uint64 column -- a fifth
+  // less, not half, because fitting the row frame and drawing the sample are
+  // passes over the whole column and the DP is not all of the cost -- while
+  // the median estimate/actual ratio over the 38 columns a split wins on rose
+  // from 1.34 to 1.71 and selection lost one of them.
+  return detail::subintsplit::SamplerConfig{.maxSamples = 512, .blockSize = 64};
+}
+
+template <typename T>
+std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
+    uint64_t rowCount,
+    std::span<const physicalType> values,
+    const Statistics<physicalType>& statistics,
+    const Encoding::Options& options) {
+  constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
+  // Exact, and an upper bound on what a split writes: the encoder's
+  // WholeValueFloor stores the values as one FixedBitWidth section rather than
+  // let a plan come in above it. Every path below therefore falls back to it
+  // rather than to nullopt, so that a stream a plan cannot be costed for is
+  // still costed as the split that would be written for it.
+  const uint64_t fixedBitWidthEstimate =
+      FixedBitWidthEncoding<physicalType>::estimateSize(
+          rowCount, statistics, options);
+  if (values.empty()) {
+    return fixedBitWidthEstimate;
+  }
+
+  // A split is ranked here on uncompressed bytes, and where a substream
+  // compressor follows the encode those are not the bytes on disk. Priced at
+  // the FixedBitWidth bound a split loses the comparison, which is what
+  // Encoding::Options::subIntSplitEstimateCompressionGuard asks for and why.
+  if (options.substreamCompression &&
+      options.subIntSplitEstimateCompressionGuard) {
+    return fixedBitWidthEstimate;
+  }
+
+  std::vector<uint64_t> samples;
+  std::vector<size_t> sampleRows;
+  detail::subintsplit::sampleIntoU64WithRows<physicalType>(
+      values, samples, &sampleRows, estimatorSamplerConfig());
+  if (samples.empty()) {
+    return fixedBitWidthEstimate;
+  }
+
+  // Priced on size alone. The planner's objective carries a per-boundary
+  // penalty and, when a caller asks for it, a decode term; neither is bytes on
+  // disk, and selection is comparing bytes here.
+  auto selectorConfig = plannerSelectorConfig(options);
+  selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{};
+  const auto planBytes = [&](const std::vector<uint64_t>& planSamples)
+      -> std::optional<uint64_t> {
+    const auto plan = detail::subintsplit::selectSplitsRestricted(
+        planSamples,
+        kBits,
+        rowCount,
+        options.subIntSplitAllowedEncodings,
+        selectorConfig);
+    if (!std::isfinite(plan.totalSizeBits) || plan.segments.empty()) {
+      return std::nullopt;
+    }
+    return static_cast<uint64_t>(std::ceil(plan.totalSizeBits / 8.0)) +
+        kOuterOverheadBytes + plan.segments.size() * kPerSectionOverheadBytes;
+  };
+
+  uint64_t estimated = fixedBitWidthEstimate;
+  if (const auto valueBytes = planBytes(samples)) {
+    estimated = std::min(estimated, *valueBytes);
+  }
+
+  // The encoder fits a row frame and plans over the residuals as well as over
+  // the values, keeping whichever costs less. Estimating only the values put a
+  // monotone counter -- a sorted spatial id, a sequence number -- hundreds of
+  // times above what the encoder writes for it, because block-stratified
+  // sampling breaks the column's monotonicity and the models see the jumps
+  // between blocks rather than the line through them. The frame is fitted over
+  // the whole column, as the encoder fits it, and then subtracted from the
+  // sample alone, which is all the DP reads.
+  if (options.subIntSplitRowFrame) {
+    auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
+        values);
+    if (!frame.active()) {
+      frame = detail::subintsplit::fitSubIntSplitStepFrame<physicalType>(
+          values);
+    }
+    if (frame.active()) {
+      constexpr uint64_t kWidthMask =
+          kBits >= 64 ? ~uint64_t{0} : (uint64_t{2} << (kBits - 1)) - 1;
+      std::vector<uint64_t> residualSamples(samples.size());
+      for (size_t i = 0; i < samples.size(); ++i) {
+        residualSamples[i] =
+            (samples[i] - (frame.slope * sampleRows[i] + frame.base)) &
+            kWidthMask;
+      }
+      if (const auto residualBytes = planBytes(residualSamples)) {
+        estimated = std::min(
+            estimated,
+            *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
+      }
+    }
+  }
+  return estimated;
+}
+
+template <typename T>
+std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSizeLowerBound(
+    std::span<const physicalType> values,
+    const Statistics<physicalType>& statistics,
+    const Encoding::Options& options) {
+  if (!options.subIntSplitEstimateBitFlipScreen || values.size() < 2) {
+    return std::nullopt;
+  }
+  // The gradient gate only, whatever admission mode the caller runs: the
+  // entropy guard's whole-stream varying-bit pass costs more than the bound
+  // saves on the columns it would change.
+  const auto profile = detail::subintsplit::bitFlipAdmissionProfile(
+      values,
+      detail::subintsplit::SubIntSplitAdmission::kBitFlip,
+      options.subIntSplitAdmissionProfilePairs);
+  if (detail::subintsplit::bitFlipGradientGate(
+          profile, detail::subintsplit::TopLevelPolicyConfig{})) {
+    return std::nullopt;
+  }
+  return FixedBitWidthEncoding<physicalType>::estimateSize(
+      values.size(), statistics, options);
 }
 
 template <typename T>
