@@ -456,19 +456,20 @@ class Encoding {
     /// the two worlds apart; a caller does not set it.
     bool substreamCompression{false};
 
-    /// Whether SubIntSplit's estimate withholds the row frame's credit when
-    /// substreamCompression says the stream will be compressed afterwards.
+    /// Whether SubIntSplit's estimate withholds the row frame's credit, when
+    /// substreamCompression says the stream will be compressed afterwards,
+    /// from a split the values alone do not already win.
     ///
-    /// A frame-fittable stream is a near-linear one, and a near-linear stream
-    /// is exactly what a general-purpose substream compressor already handles:
-    /// under OpenZL the unsplit stream of XMark's prepost ids compresses to
-    /// 2.41 bits per value, while the split the estimate prefers for it, which
-    /// stores 92% fewer uncompressed bytes, compresses to 3.82. Crediting a
-    /// frame the compressor would have earned anyway is what made four nested
-    /// SubIntSplit cells regress by 9% to 59% under OpenZL while the same
-    /// cells improved by 30% to 92% uncompressed. Off, the estimate prices the
-    /// frame in both worlds; on, it prices it only where nothing downstream
-    /// will.
+    /// A win that rests on the frame is a win over a linear trend, and a
+    /// substream compressor removes a linear trend for itself and usually
+    /// better: on XMark's prepost ids the unsplit nested stream compresses to
+    /// 2.41 bits per value under OpenZL while the frame-fitted split, which
+    /// stores 92% fewer uncompressed bytes, compresses to only 3.82. Crediting
+    /// such a frame is what made four nested SubIntSplit cells regress by 9%
+    /// to 59% under OpenZL while the same cells improved by 30% to 92%
+    /// uncompressed. Where the values already beat FixedBitWidth without a
+    /// frame the stream has bit-field structure a compressor does not undo,
+    /// and the frame's further improvement is credited as before.
     bool subIntSplitEstimateCompressionGuard{true};
 
     /// Whether selection may rule SubIntSplit out from the bit-flip gradient

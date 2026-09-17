@@ -1715,8 +1715,15 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   };
 
   uint64_t estimated = fixedBitWidthEstimate;
+  // Whether the values alone, with no frame subtracted, already put a split
+  // below FixedBitWidth. That is what says the stream has bit-field structure
+  // rather than a trend, and it is what the compression guard below turns on.
+  bool valuesAloneWin = false;
   if (const auto valueBytes = planBytes(samples)) {
-    estimated = std::min(estimated, *valueBytes);
+    if (*valueBytes < estimated) {
+      estimated = *valueBytes;
+      valuesAloneWin = true;
+    }
   }
 
   // The encoder fits a row frame and plans over the residuals as well as over
@@ -1728,13 +1735,13 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // the whole column, as the encoder fits it, and then subtracted from the
   // sample alone, which is all the DP reads.
   //
-  // Not under a substream compressor, unless the caller turns the guard off:
-  // see Encoding::Options::subIntSplitEstimateCompressionGuard for why a frame
-  // the compressor would have earned anyway is not the split's to count.
-  const bool creditRowFrame = options.subIntSplitRowFrame &&
-      !(options.substreamCompression &&
-        options.subIntSplitEstimateCompressionGuard);
-  if (creditRowFrame) {
+  // Under a substream compressor the frame may only improve a split the values
+  // already won: see Encoding::Options::subIntSplitEstimateCompressionGuard
+  // for why a win that rests on the frame alone is the compressor's win.
+  const bool creditRowFrame = valuesAloneWin ||
+      !options.substreamCompression ||
+      !options.subIntSplitEstimateCompressionGuard;
+  if (options.subIntSplitRowFrame) {
     auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
         values);
     if (!frame.active()) {
@@ -1751,9 +1758,11 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
             kWidthMask;
       }
       if (const auto residualBytes = planBytes(residualSamples)) {
-        estimated = std::min(
-            estimated,
-            *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
+        if (creditRowFrame) {
+          estimated = std::min(
+              estimated,
+              *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
+        }
       }
     }
   }
