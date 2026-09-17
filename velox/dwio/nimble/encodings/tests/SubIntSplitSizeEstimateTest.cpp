@@ -262,11 +262,14 @@ TEST_F(SubIntSplitSizeEstimateTest, rowFrameIsWithheldUnderSubstreamCompression)
 }
 
 TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
-  const Encoding::Options options;
-
-  // Uniform random has no field boundary for the gradient gate to find, so the
-  // bound says a split cannot come in below FixedBitWidth and the caller may
-  // skip the split DP.
+  // Over every pair. Uniform random is the case where the cap matters: a
+  // 1'024-pair profile of it clears the gradient floor on sampling noise, so
+  // the screen declines there and the split DP runs. The columns the screen
+  // does rule out at the cap -- record counters, a constant-heavy
+  // calculation -- have no gradient boundary at all, and no sample size
+  // changes that.
+  Encoding::Options options;
+  options.subIntSplitAdmissionProfilePairs = 0;
   const auto random = makeUniformRandomStream(kNumRows);
   const std::span<const uint64_t> randomSpan(random);
   const auto randomStatistics = Statistics<uint64_t>::create(randomSpan);
@@ -293,9 +296,17 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
                    options)
                    .has_value());
 
+  // The sampled default declines on this stream, which is the screen's limit
+  // and not a bug: it costs a split DP that the estimate then prices out.
+  Encoding::Options sampled;
+  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+                   randomSpan, randomStatistics, sampled)
+                   .has_value());
+
   // Off, the screen never rules anything out.
   Encoding::Options noScreen;
   noScreen.subIntSplitEstimateBitFlipScreen = false;
+  noScreen.subIntSplitAdmissionProfilePairs = 0;
   EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
                    randomSpan, randomStatistics, noScreen)
                    .has_value());
