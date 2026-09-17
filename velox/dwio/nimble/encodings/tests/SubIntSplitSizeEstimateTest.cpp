@@ -224,41 +224,36 @@ TEST_F(SubIntSplitSizeEstimateTest, counterEstimateIsLooseUpward) {
   expectRatioWithin(makeCounterStream(kNumRows), 1.0, 50.0, "counter");
 }
 
-TEST_F(SubIntSplitSizeEstimateTest, rowFrameIsWithheldUnderSubstreamCompression) {
-  // A counter is what the row frame exists for: subtracting the fitted line
-  // leaves residuals a split stores in a handful of bits per value. It is also
-  // what a substream compressor handles on its own, so the estimate must not
-  // count the frame twice.
+TEST_F(SubIntSplitSizeEstimateTest, splitIsNotPricedUnderSubstreamCompression) {
+  // A counter is a stream the estimate does price a split for, through the
+  // row frame, and a substream compressor is what makes that pricing wrong:
+  // the estimate counts uncompressed bytes and the compressor changes which
+  // candidate is smallest.
   const auto values = makeCounterStream(kNumRows);
   const std::span<const uint64_t> span(values);
   const auto statistics = Statistics<uint64_t>::create(span);
 
   Encoding::Options uncompressed;
-  const auto framed = SubIntSplitEncoding<uint64_t>::estimateSize(
+  const auto priced = SubIntSplitEncoding<uint64_t>::estimateSize(
       values.size(), span, statistics, uncompressed);
-  ASSERT_TRUE(framed.has_value());
+  ASSERT_TRUE(priced.has_value());
+  const auto fixedBitWidth = FixedBitWidthEncoding<uint64_t>::estimateSize(
+      values.size(), statistics, uncompressed);
+  ASSERT_LT(*priced, fixedBitWidth);
 
   Encoding::Options compressed;
   compressed.substreamCompression = true;
-  const auto guarded = SubIntSplitEncoding<uint64_t>::estimateSize(
-      values.size(), span, statistics, compressed);
-  ASSERT_TRUE(guarded.has_value());
-  EXPECT_GT(*guarded, *framed);
+  EXPECT_EQ(
+      SubIntSplitEncoding<uint64_t>::estimateSize(
+          values.size(), span, statistics, compressed),
+      fixedBitWidth);
 
-  // The guard withholds the frame and nothing else: with the frame off in both
-  // worlds the two estimates agree.
-  Encoding::Options unframed;
-  unframed.subIntSplitRowFrame = false;
-  const auto withoutFrame = SubIntSplitEncoding<uint64_t>::estimateSize(
-      values.size(), span, statistics, unframed);
-  EXPECT_EQ(guarded, withoutFrame);
-
-  // And turning the guard off restores the uncompressed answer.
+  // The guard off, the estimate prices the split in both worlds alike.
   compressed.subIntSplitEstimateCompressionGuard = false;
   EXPECT_EQ(
       SubIntSplitEncoding<uint64_t>::estimateSize(
           values.size(), span, statistics, compressed),
-      framed);
+      priced);
 }
 
 TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {

@@ -456,20 +456,30 @@ class Encoding {
     /// the two worlds apart; a caller does not set it.
     bool substreamCompression{false};
 
-    /// Whether SubIntSplit's estimate withholds the row frame's credit, when
+    /// Whether SubIntSplit's estimate declines to price a split at all when
     /// substreamCompression says the stream will be compressed afterwards,
-    /// from a split the values alone do not already win.
+    /// answering FixedBitWidth's bound instead so the split loses.
     ///
-    /// A win that rests on the frame is a win over a linear trend, and a
-    /// substream compressor removes a linear trend for itself and usually
-    /// better: on XMark's prepost ids the unsplit nested stream compresses to
-    /// 2.41 bits per value under OpenZL while the frame-fitted split, which
-    /// stores 92% fewer uncompressed bytes, compresses to only 3.82. Crediting
-    /// such a frame is what made four nested SubIntSplit cells regress by 9%
-    /// to 59% under OpenZL while the same cells improved by 30% to 92%
-    /// uncompressed. Where the values already beat FixedBitWidth without a
-    /// frame the stream has bit-field structure a compressor does not undo,
-    /// and the frame's further improvement is credited as before.
+    /// The estimate ranks candidates on uncompressed bytes, and under a
+    /// compressor those are not the bytes on disk. The two rankings disagree
+    /// most where a split's uncompressed win is largest, because a large
+    /// uncompressed win means redundancy a general-purpose compressor also
+    /// finds: on XMark's nested prepost stream the split stores 92% fewer
+    /// uncompressed bytes than its rival and 59% more OpenZL-compressed ones,
+    /// and Snowflake's nested streams lose 9% to 12% the same way. Over the
+    /// nine sweep columns' nested cells the unguarded estimate is 20.5%
+    /// smaller uncompressed and 2.6% smaller under OpenZL, but the OpenZL
+    /// figure is eight cells worse against five better.
+    ///
+    /// This is a stop-gap for a defect in what the estimate prices, not a
+    /// claim that a split never pays under a compressor: it gives up the five
+    /// cells that do win, worth that 2.6%. Pricing compressed bytes -- by
+    /// compressing a bounded sample of the values with the configured codec
+    /// and scaling the rivals' estimates by the ratio, which the measurements
+    /// above say would keep those five -- is what removes the need for it.
+    ///
+    /// Uncompressed selection never reads this: substreamCompression is false
+    /// there.
     bool subIntSplitEstimateCompressionGuard{true};
 
     /// Whether selection may rule SubIntSplit out from the bit-flip gradient

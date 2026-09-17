@@ -1686,6 +1686,15 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
     return fixedBitWidthEstimate;
   }
 
+  // A split is ranked here on uncompressed bytes, and where a substream
+  // compressor follows the encode those are not the bytes on disk. Priced at
+  // the FixedBitWidth bound a split loses the comparison, which is what
+  // Encoding::Options::subIntSplitEstimateCompressionGuard asks for and why.
+  if (options.substreamCompression &&
+      options.subIntSplitEstimateCompressionGuard) {
+    return fixedBitWidthEstimate;
+  }
+
   std::vector<uint64_t> samples;
   std::vector<size_t> sampleRows;
   detail::subintsplit::sampleIntoU64WithRows<physicalType>(
@@ -1715,15 +1724,8 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   };
 
   uint64_t estimated = fixedBitWidthEstimate;
-  // Whether the values alone, with no frame subtracted, already put a split
-  // below FixedBitWidth. That is what says the stream has bit-field structure
-  // rather than a trend, and it is what the compression guard below turns on.
-  bool valuesAloneWin = false;
   if (const auto valueBytes = planBytes(samples)) {
-    if (*valueBytes < estimated) {
-      estimated = *valueBytes;
-      valuesAloneWin = true;
-    }
+    estimated = std::min(estimated, *valueBytes);
   }
 
   // The encoder fits a row frame and plans over the residuals as well as over
@@ -1734,13 +1736,6 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // between blocks rather than the line through them. The frame is fitted over
   // the whole column, as the encoder fits it, and then subtracted from the
   // sample alone, which is all the DP reads.
-  //
-  // Under a substream compressor the frame may only improve a split the values
-  // already won: see Encoding::Options::subIntSplitEstimateCompressionGuard
-  // for why a win that rests on the frame alone is the compressor's win.
-  const bool creditRowFrame = valuesAloneWin ||
-      !options.substreamCompression ||
-      !options.subIntSplitEstimateCompressionGuard;
   if (options.subIntSplitRowFrame) {
     auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
         values);
@@ -1758,11 +1753,9 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
             kWidthMask;
       }
       if (const auto residualBytes = planBytes(residualSamples)) {
-        if (creditRowFrame) {
-          estimated = std::min(
-              estimated,
-              *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
-        }
+        estimated = std::min(
+            estimated,
+            *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
       }
     }
   }
