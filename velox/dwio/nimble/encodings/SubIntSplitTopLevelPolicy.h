@@ -65,6 +65,22 @@ struct TopLevelPolicyConfig {
   // that case.
   double minGradientMagnitude{0.005};
 
+  // How many standard errors of sampling noise the largest gradient has to
+  // clear, on top of the absolute floor above.
+  //
+  // A flip probability taken from P pairs has a standard error of at most
+  // 0.5 / sqrt(P), so the difference of two adjacent ones has at most
+  // 0.5 * sqrt(2 / P): 0.022 at the 1'024-pair admission cap against 0.001
+  // over a whole 524'288-row column. The absolute floor was read off
+  // whole-stream profiles, where it sits well above that noise, and a sampled
+  // profile of a uniform-random stream clears it on noise alone -- 200'000
+  // random uint64 values are rejected by the whole-stream gate and admitted by
+  // the 1'024-pair gate without this term. Scaling the floor with the sample
+  // keeps one gate rather than one per cap: at 524'288 pairs the noise term is
+  // 0.002 and the absolute floor still binds, so whole-stream decisions are
+  // exactly the ones the floor alone made.
+  double gradientNoiseSigmas{2.0};
+
   // The entropy guard rejects a stream whose non-constant bits flip, on
   // average, nearly as unpredictably as random bits: mean binary entropy of
   // flipProbability over the bits that ever flip above this. Such a stream
@@ -119,6 +135,21 @@ inline double activeBitFlipEntropy(const BitFlipProfile& profile) {
     }
   }
   return numActiveBits == 0 ? 0.0 : entropySum / numActiveBits;
+}
+
+/// Returns how large the largest gradient in `profile` has to be for the
+/// gradient gate to read it as a field boundary rather than as noise: the
+/// absolute floor, or the sampling-noise term when the profile came from few
+/// enough pairs for that to be larger.
+inline double bitFlipGradientFloor(
+    const BitFlipProfile& profile,
+    const TopLevelPolicyConfig& config) {
+  if (profile.numPairs == 0) {
+    return config.minGradientMagnitude;
+  }
+  const double noiseFloor = config.gradientNoiseSigmas * 0.5 *
+      std::sqrt(2.0 / static_cast<double>(profile.numPairs));
+  return std::max(config.minGradientMagnitude, noiseFloor);
 }
 
 // Predicts whether `profile` indicates a stream heterogeneous enough to be
@@ -191,7 +222,7 @@ inline bool bitFlipGradientGate(
   }
   const double maxGradient = *std::max_element(
       profile.gradient.begin(), profile.gradient.begin() + profile.numBits);
-  return maxGradient >= config.minGradientMagnitude;
+  return maxGradient >= bitFlipGradientFloor(profile, config);
 }
 
 /// Returns which bit-flip work `admission` needs done over the whole stream.

@@ -44,7 +44,9 @@ inline constexpr int kMaxBitWidth = 64;
 /// `flipProbability` across `numBits` positions; `gradient[i]` is
 /// |flipProbability[i] - flipProbability[i - 1]| (gradient[0] == 0). Only
 /// the first `numBits` entries of each array are meaningful; the remainder
-/// are zero-filled. `varyingBits` has bit i set when bit i is not the same in
+/// are zero-filled. `numPairs` is how many pairs the probabilities were taken
+/// from, which is what says how much of a small gradient is sampling noise.
+/// `varyingBits` has bit i set when bit i is not the same in
 /// every value of the stream, whatever pairs the probabilities were taken
 /// from, so a bit that flips too rarely to show up in a sample still counts as
 /// varying; it is zero when the caller asked for it to be skipped.
@@ -54,6 +56,7 @@ struct BitFlipProfile {
   std::array<double, kMaxBitWidth> gradient{};
   int numBits{0};
   uint64_t varyingBits{0};
+  size_t numPairs{0};
 };
 
 /// Whether `BitFlipProfile::varyingBits` is worth what it costs to fill.
@@ -256,6 +259,7 @@ BitFlipProfile computeBitFlipProfile(
     }
   }
   detail::accumulateFlipCounts({flipWords.data(), chunkSize}, flipCounts);
+  profile.numPairs = pairCount;
 
   double sum = 0.0;
   for (int b = 0; b < kBits; ++b) {
