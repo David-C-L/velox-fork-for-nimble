@@ -226,7 +226,10 @@ std::unique_ptr<SubIntSplitEncoding<T>> makeReorderedSubIntSplitEncoding(
   Encoding::Options options;
   options.subIntSplitTransform =
       static_cast<uint8_t>(subintsplit::TransformId::KeyDerived);
-  options.subIntSplitKeySection = 0xFF;
+  // Forcing the transform requires the key section to be named: the encoder
+  // refuses to search for one when it is told to apply the transform whatever
+  // it costs.
+  options.subIntSplitKeySection = 0;
   options.subIntSplitForceApply = true;
   auto encoded =
       SubIntSplitEncoding<T>::encode(selection, span, buffer, options);
