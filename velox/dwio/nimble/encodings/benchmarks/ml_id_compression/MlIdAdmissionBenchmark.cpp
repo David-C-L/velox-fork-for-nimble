@@ -169,6 +169,16 @@ int runBenchmark() {
       : FLAGS_mlidc_output_csv;
   CsvResultWriter csv(csvPath, csvColumns);
 
+  // The compressor the ground-truth encoder rows below are written under, so
+  // that a size estimate which prices compressed bytes differently is asked
+  // about the same world the arms are measured in. Uncompressed by default,
+  // which is what --mlidc_substream_compression defaults to; the writer's own
+  // default is a compressor, and passing that here would have selection price
+  // for compressed bytes against arms encoded without one.
+  CompressionOptions policyCompressionOptions;
+  policyCompressionOptions.compressionType =
+      parseCompressionType(FLAGS_mlidc_substream_compression);
+
   const int repeats = std::max(FLAGS_admission_repeats, 1);
   std::vector<uint32_t> profilePairCaps;
   {
@@ -199,7 +209,7 @@ int runBenchmark() {
       start = Clock::now();
       ManualEncodingSelectionPolicy<Elem> policy{
           ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
-          CompressionOptions{},
+          policyCompressionOptions,
           std::nullopt};
       const auto selection =
           policy.select(values, statistics, Encoding::Options{});
@@ -328,7 +338,7 @@ int runBenchmark() {
           ManualEncodingSelectionPolicy<Elem> policy{
               ManualEncodingSelectionPolicyFactory::
                   defaultEncodingReadFactors(),
-              CompressionOptions{},
+              policyCompressionOptions,
               std::nullopt};
           modeSelected =
               policy.select(values, statistics, options).encodingType;
@@ -369,10 +379,7 @@ int runBenchmark() {
             *std::max_element(
                 profile.gradient.begin(),
                 profile.gradient.begin() + profile.numBits));
-        csv.set(
-            "gradient_floor",
-            nimble::detail::subintsplit::bitFlipGradientFloor(
-                profile, admissionConfig));
+        csv.set("gradient_floor", admissionConfig.minGradientMagnitude);
         csv.set("skipped", int64_t{0});
         csv.endRow();
       }
