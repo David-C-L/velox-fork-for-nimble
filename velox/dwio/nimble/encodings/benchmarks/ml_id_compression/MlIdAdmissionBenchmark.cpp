@@ -160,6 +160,8 @@ int runBenchmark() {
       "select_ns",
       "active_flip_entropy",
       "gradient_boundaries",
+      "max_gradient",
+      "gradient_floor",
       "bit_by_bit_profile_ns",
       "skipped"};
   const std::string csvPath = FLAGS_mlidc_output_csv.empty()
@@ -276,20 +278,32 @@ int runBenchmark() {
 
     using nimble::detail::subintsplit::SubIntSplitAdmission;
     const nimble::detail::subintsplit::TopLevelPolicyConfig admissionConfig;
-    struct AdmissionModeName {
+    // The designs a column's admission can be decided by, each named for what
+    // decides it: the size estimate alone, the estimate with the gradient gate
+    // screening the split DP out, the gate deciding candidacy with the
+    // estimate pricing what it admits, and the gate deciding outright.
+    struct AdmissionArm {
+      std::string_view name;
       SubIntSplitAdmission mode;
       // Whether the mode decides outright or only decides candidacy; the
       // forcing rows are the ablation the candidacy rows are read against.
       bool forces;
-      std::string_view name;
+      // Whether estimateSizeLowerBound() may rule a split out from the gate
+      // before the split DP is planned.
+      bool bitFlipScreen;
     };
-    constexpr AdmissionModeName kAdmissionModes[] = {
-        {SubIntSplitAdmission::kBitFlip, false, "bitflip"},
-        {SubIntSplitAdmission::kBitFlipEntropy, false, "bitflip_entropy"},
-        {SubIntSplitAdmission::kBitFlip, true, "bitflip_forced"},
-        {SubIntSplitAdmission::kBitFlipEntropy, true, "bitflip_entropy_forced"},
+    constexpr AdmissionArm kAdmissionArms[] = {
+        {"estimate", SubIntSplitAdmission::kEstimate, false, false},
+        {"estimate_screened", SubIntSplitAdmission::kEstimate, false, true},
+        {"bitflip", SubIntSplitAdmission::kBitFlip, false, false},
+        {"bitflip_entropy", SubIntSplitAdmission::kBitFlipEntropy, false, false},
+        {"bitflip_forced", SubIntSplitAdmission::kBitFlip, true, false},
+        {"bitflip_entropy_forced",
+         SubIntSplitAdmission::kBitFlipEntropy,
+         true,
+         false},
     };
-    for (const auto& [mode, forces, modeName] : kAdmissionModes) {
+    for (const auto& [modeName, mode, forces, bitFlipScreen] : kAdmissionArms) {
       for (const uint32_t pairCap : profilePairCaps) {
         std::vector<int64_t> decisionNanos;
         std::vector<int64_t> selectNanos;
@@ -300,9 +314,11 @@ int runBenchmark() {
         options.subIntSplitAdmission = static_cast<uint8_t>(mode);
         options.subIntSplitAdmissionForces = forces;
         options.subIntSplitAdmissionProfilePairs = pairCap;
+        options.subIntSplitEstimateBitFlipScreen = bitFlipScreen;
         for (int repeat = 0; repeat < repeats; ++repeat) {
           auto start = Clock::now();
-          profile = computeBitFlipProfile(values, pairCap);
+          profile = nimble::detail::subintsplit::bitFlipAdmissionProfile(
+              values, mode, pairCap);
           admitted = nimble::detail::subintsplit::bitFlipAdmits(
               profile, mode, admissionConfig);
           decisionNanos.push_back(elapsedNanos(start));
@@ -329,7 +345,14 @@ int runBenchmark() {
         csv.set("row_kind", "admission");
         csv.set("admission_mode", std::string(modeName));
         csv.set("profile_pairs", static_cast<int64_t>(pairCap));
-        csv.set("decision", int64_t{admitted ? 1 : 0});
+        // Under kEstimate nothing is admitted by profile, so the arm's
+        // prediction is what selection did with the estimate.
+        csv.set(
+            "decision",
+            int64_t{
+                mode == SubIntSplitAdmission::kEstimate
+                    ? (modeSelected == EncodingType::SubIntSplit ? 1 : 0)
+                    : (admitted ? 1 : 0)});
         csv.set(
             "policy_selects_sis",
             int64_t{modeSelected == EncodingType::SubIntSplit ? 1 : 0});
@@ -341,6 +364,15 @@ int runBenchmark() {
             nimble::detail::subintsplit::activeBitFlipEntropy(profile));
         csv.set(
             "gradient_boundaries", static_cast<int64_t>(boundaries.size()) - 2);
+        csv.set(
+            "max_gradient",
+            *std::max_element(
+                profile.gradient.begin(),
+                profile.gradient.begin() + profile.numBits));
+        csv.set(
+            "gradient_floor",
+            nimble::detail::subintsplit::bitFlipGradientFloor(
+                profile, admissionConfig));
         csv.set("skipped", int64_t{0});
         csv.endRow();
       }
