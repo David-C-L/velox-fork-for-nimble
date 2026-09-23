@@ -41,6 +41,7 @@ target_link_libraries(nimble_ml_id_benchmark_common PUBLIC gflags)
 velox_add_test_headers(
   nimble_ml_id_benchmark_common
   AblationPolicy.h
+  AccessStructure.h
   Axes.h
   BlockCodecTarget.h
   CachePolicy.h
@@ -138,6 +139,13 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_gather_benchmark MlIdDecodeGatherBenchmark.cpp OPENZL
 )
 
+# MlIdAmortisationBenchmark: sweeps how many operations a one-time view or
+# materialisation build is amortised over, per access pattern, so the
+# break-even against the cursor path is derivable rather than argued.
+nimble_add_ml_id_benchmark(
+  nimble_ml_id_amortisation_benchmark MlIdAmortisationBenchmark.cpp OPENZL
+)
+
 # MlIdCostModelOracleBenchmark: validates SubIntSplit's DP cost model against an
 # oracle that actually encodes each candidate bit range.
 nimble_add_ml_id_benchmark(
@@ -164,14 +172,16 @@ nimble_add_ml_id_benchmark(
 # MlIdSmokeBenchmark: encode + decode correctness check (no timing). Sweeps
 # every supported element type, so it is also the compile-coverage gate.
 nimble_add_ml_id_benchmark(
-  nimble_ml_id_smoke_benchmark MlIdSmokeBenchmark.cpp)
+  nimble_ml_id_smoke_benchmark MlIdSmokeBenchmark.cpp
+)
 
 # MlIdSelectionPolicyBenchmark: measures whether the bit-flip-probability
 # top-level policies would correctly predict "SubIntSplit wins" against real
 # candidate encodings -- evidence-gathering only, does not touch production
 # selection.
 nimble_add_ml_id_benchmark(
-  nimble_ml_id_selection_policy_benchmark MlIdSelectionPolicyBenchmark.cpp)
+  nimble_ml_id_selection_policy_benchmark MlIdSelectionPolicyBenchmark.cpp
+)
 
 # Correctness tests for the block-codec arms. The benchmark drivers report
 # numbers rather than assert them, so the block indexing -- which decides both

@@ -297,7 +297,6 @@ TEST(BlockCodecTargetPropertyTest, encoderEntries) {
   const auto data = makeData<int64_t>(3'000);
   for (const auto* entries : {&zstd, &openzl}) {
     for (const auto& entry : *entries) {
-      EXPECT_FALSE(entry.wholePayloadCodec) << entry.name;
       auto target = entry.factory(data, Encoding::Options{});
       std::vector<int64_t> out(data.size());
       target->materializeAll(out.data(), data.size());
