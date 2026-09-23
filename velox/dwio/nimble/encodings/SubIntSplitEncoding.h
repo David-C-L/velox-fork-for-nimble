@@ -45,11 +45,11 @@
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitPlanRefiner.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
@@ -660,7 +660,6 @@ template <typename T>
 void SubIntSplitEncoding<T>::materializeResiduals(
     uint32_t rowCount,
     physicalType* output) {
-
   // Lazily size the scratch buffer on the first call. The scratch must hold one
   // chunk's worth of section values at the widest possible storage type.
   constexpr uint32_t kScratchBytes =
@@ -1524,25 +1523,24 @@ std::string_view SubIntSplitEncoding<T>::encode(
         std::string(detail::subintsplit::kRowFrameConfigKey));
     const bool captured = frameConfig.has_value() &&
         *frameConfig == detail::subintsplit::kRowFramePresent;
-    return captured
-        ? encodeResiduals(
-              selection,
-              residuals,
-              buffer,
-              options,
-              rowFrame,
-              nullptr,
-              nullptr,
-              {})
-        : encodeResiduals(
-              selection,
-              values,
-              buffer,
-              options,
-              detail::SubIntSplitRowFrame{},
-              nullptr,
-              nullptr,
-              {});
+    return captured ? encodeResiduals(
+                          selection,
+                          residuals,
+                          buffer,
+                          options,
+                          rowFrame,
+                          nullptr,
+                          nullptr,
+                          {})
+                    : encodeResiduals(
+                          selection,
+                          values,
+                          buffer,
+                          options,
+                          detail::SubIntSplitRowFrame{},
+                          nullptr,
+                          nullptr,
+                          {});
   }
 
   // A step frame produces runs of whole values, which the planner's run
@@ -1580,7 +1578,14 @@ std::string_view SubIntSplitEncoding<T>::encode(
     if (!decisive) {
       Buffer scratch{buffer.getMemoryPool()};
       const auto framed = encodeResiduals(
-          selection, residuals, scratch, options, rowFrame, nullptr, nullptr, {});
+          selection,
+          residuals,
+          scratch,
+          options,
+          rowFrame,
+          nullptr,
+          nullptr,
+          {});
       const auto unframed = encodeResiduals(
           selection,
           values,
@@ -1659,7 +1664,8 @@ std::string_view SubIntSplitEncoding<T>::encode(
 
 template <typename T>
 detail::subintsplit::SelectorConfig
-SubIntSplitEncoding<T>::plannerSelectorConfig(const Encoding::Options& options) {
+SubIntSplitEncoding<T>::plannerSelectorConfig(
+    const Encoding::Options& options) {
   // Huffman and DeltaBlock are both withdrawn by default, for the same
   // reason: each was priced into where these boundaries fall while being
   // unselectable for the sections they produce, so their cost models steered
@@ -1748,8 +1754,8 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // disk, and selection is comparing bytes here.
   auto selectorConfig = plannerSelectorConfig(options);
   selectorConfig.decodeWeighting = detail::subintsplit::DecodeCostWeighting{};
-  const auto planBytes = [&](const std::vector<uint64_t>& planSamples)
-      -> std::optional<uint64_t> {
+  const auto planBytes =
+      [&](const std::vector<uint64_t>& planSamples) -> std::optional<uint64_t> {
     const auto plan = detail::subintsplit::selectSplitsRestricted(
         planSamples,
         kBits,
@@ -1777,11 +1783,11 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // the whole column, as the encoder fits it, and then subtracted from the
   // sample alone, which is all the DP reads.
   if (options.subIntSplitRowFrame) {
-    auto frame = detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(
-        values);
+    auto frame =
+        detail::subintsplit::fitSubIntSplitRowFrame<physicalType>(values);
     if (!frame.active()) {
-      frame = detail::subintsplit::fitSubIntSplitStepFrame<physicalType>(
-          values);
+      frame =
+          detail::subintsplit::fitSubIntSplitStepFrame<physicalType>(values);
     }
     if (frame.active()) {
       constexpr uint64_t kWidthMask =
@@ -1794,8 +1800,7 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
       }
       if (const auto residualBytes = planBytes(residualSamples)) {
         estimated = std::min(
-            estimated,
-            *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
+            estimated, *residualBytes + detail::kSubIntSplitRowFrameHeaderSize);
       }
     }
   }
@@ -1984,8 +1989,8 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
             options.subIntSplitAllowedEncodings,
             sizeOnlyConfig);
         // Compared on estimated size alone, not on totalCost: bytes are what is
-        // being bounded, and totalCost is the objective that has just been shown
-        // not to bound them.
+        // being bounded, and totalCost is the objective that has just been
+        // shown not to bound them.
         const double allowedSizeBits = sizeOnly.totalSizeBits *
             (1.0 + options.subIntSplitMaxSizeRegression);
         if (selectorResult.totalSizeBits > allowedSizeBits) {
@@ -2192,12 +2197,11 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     }
     return encoded;
   };
-  const auto encodeSectionFrom = [&](uint8_t s,
-                                     uint8_t storageBytes,
-                                     const auto& sectionValueAt) {
-    return encodeSectionInto(
-        s, storageBytes, sectionValueAt, sectionBuffer, sectionOptions);
-  };
+  const auto encodeSectionFrom =
+      [&](uint8_t s, uint8_t storageBytes, const auto& sectionValueAt) {
+        return encodeSectionInto(
+            s, storageBytes, sectionValueAt, sectionBuffer, sectionOptions);
+      };
   const auto encodeSection = [&](uint8_t s,
                                  uint8_t storageBytes,
                                  const std::vector<uint64_t>& sectionU64) {
@@ -2499,9 +2503,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       attempt.info.keySection = candidateKey;
       const auto& keySegment = segments[candidateKey];
       keyGroups = groupsEnoughToKey(
-          keyValues,
-          keySegment.bitEnd - keySegment.bitStart + 1,
-          &keyDistinct);
+          keyValues, keySegment.bitEnd - keySegment.bitStart + 1, &keyDistinct);
     }
 
     // Priced per candidate key rather than once for the column: two keys over
@@ -2744,7 +2746,8 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   // stores the column worse than the smallest attempt by more than the caller
   // allowed, the smallest attempt is what gets written.
   if (smallestAttempt.has_value() && best.has_value()) {
-    const double allowedBytes = static_cast<double>(smallestAttempt->totalBytes) *
+    const double allowedBytes =
+        static_cast<double>(smallestAttempt->totalBytes) *
         (1.0 + options.subIntSplitMaxSizeRegression);
     if (static_cast<double>(best->totalBytes) > allowedBytes) {
       best = std::move(smallestAttempt);
@@ -2807,9 +2810,8 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     // section, and have to beat whatever the values' floor already reached.
     const uint64_t framedHeader =
         singleSectionHeader + detail::kSubIntSplitRowFrameHeaderSize;
-    const uint64_t framedBytesToBeat = floor.has_value()
-        ? floor->size() + singleSectionHeader
-        : bytesToBeat;
+    const uint64_t framedBytesToBeat =
+        floor.has_value() ? floor->size() + singleSectionHeader : bytesToBeat;
     if (!replayed && stepFrame != nullptr && framedBytesToBeat > framedHeader) {
       WholeValueFloor framedValuesFloor{
           selection,
@@ -3125,8 +3127,9 @@ std::string SubIntSplitEncoding<T>::debugString(int offset) const {
     if (s < transformInfo_.transformIds.size() &&
         transformInfo_.transformIds[s] != 0) {
       result += " transform=" +
-          subintsplit::toString(static_cast<subintsplit::TransformId>(
-              transformInfo_.transformIds[s]));
+          subintsplit::toString(
+                    static_cast<subintsplit::TransformId>(
+                        transformInfo_.transformIds[s]));
     }
     result += "\n";
     result += sec.encoding->debugString(offset + 4);

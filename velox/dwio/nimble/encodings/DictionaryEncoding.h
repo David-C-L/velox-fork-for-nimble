@@ -132,8 +132,7 @@ class DictionaryEncoding
     //   indices: one dictionary index per row, estimated as FixedBitWidth.
     const auto& uniqueCounts = statistics.uniqueCounts().value();
     const uint64_t uniqueCount = uniqueCounts.size();
-    if constexpr (
-        !isStringType<physicalType>() && !isFloatingPointType<T>()) {
+    if constexpr (!isStringType<physicalType>() && !isFloatingPointType<T>()) {
       return estimateIntegralSize(
           rowCount, uniqueCount, statistics.min(), statistics.max(), options);
     }

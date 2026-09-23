@@ -208,10 +208,12 @@ TEST_F(TransformedEncodingTest, announcesTheTypeThatMatchesWhatItChose) {
     const auto type = static_cast<EncodingType>(encoded[0]);
     if (info.anyTransform()) {
       EXPECT_EQ(type, EncodingType::SubIntSplitReordered)
-          << toString(id) << " was applied but the stream reads as untransformed";
+          << toString(id)
+          << " was applied but the stream reads as untransformed";
     } else {
       EXPECT_EQ(type, EncodingType::SubIntSplit)
-          << toString(id) << " was declined but the stream reads as transformed";
+          << toString(id)
+          << " was declined but the stream reads as transformed";
       EXPECT_EQ(std::string(encoded), std::string(plain))
           << toString(id) << " declined but did not leave the bytes alone";
     }
@@ -233,8 +235,8 @@ TEST_F(TransformedEncodingTest, neverTransformsTheKeySection) {
         buffer, values, CompressionType::Uncompressed, options);
 
     detail::SubIntSplitTransformInfo info;
-    const auto sections = detail::parseSubIntSplitSections(
-        encoded, Encoding::kPrefixSize, &info);
+    const auto sections =
+        detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_FALSE(sections.empty());
     if (info.anyTransform()) {
       ASSERT_EQ(info.keySection, keySection);
@@ -458,8 +460,8 @@ TEST_F(TransformedEncodingTest, keySearchReturnsOneOfTheAttemptsItPriced) {
       searchBuffer, values, CompressionType::Uncompressed, searchOptions);
 
   detail::SubIntSplitTransformInfo info;
-  const auto sections = detail::parseSubIntSplitSections(
-      searched, Encoding::kPrefixSize, &info);
+  const auto sections =
+      detail::parseSubIntSplitSections(searched, Encoding::kPrefixSize, &info);
   ASSERT_GT(sections.size(), 1u) << "a key search needs more than one section";
 
   auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
@@ -594,8 +596,12 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
   // throws rather than declining if the column does not actually split into
   // at least two sections.
   Buffer probeBuffer{*pool_};
-  const auto probeEncoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      probeBuffer, values, CompressionType::Uncompressed, Encoding::Options{});
+  const auto probeEncoded =
+      test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+          probeBuffer,
+          values,
+          CompressionType::Uncompressed,
+          Encoding::Options{});
   detail::SubIntSplitTransformInfo probeInfo;
   const auto probeSections = detail::parseSubIntSplitSections(
       probeEncoded, Encoding::kPrefixSize, &probeInfo);
@@ -639,7 +645,9 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
 // shares with every other family, without a narrow-width test for any of
 // them. This closes that gap: same narrow-section shape as
 // permutesNarrowSectionsToo, one non-KeyDerived transform per section.
-TEST_F(TransformedEncodingTest, narrowSectionsRoundTripForInPlaceAndGatheredTransforms) {
+TEST_F(
+    TransformedEncodingTest,
+    narrowSectionsRoundTripForInPlaceAndGatheredTransforms) {
   Vector<uint64_t> values{pool_.get()};
   values.resize(20000);
   std::mt19937_64 rng(53);
@@ -694,7 +702,6 @@ TEST_F(TransformedEncodingTest, narrowSectionsRoundTripForInPlaceAndGatheredTran
   }
 }
 
-
 // PositionCache and BlockCache (SubIntSplitEncodingView.h) are thread_local,
 // keyed only on the raw `this` pointer, with nothing to invalidate them.
 // Every other test here builds exactly one view, so address reuse -- a
@@ -702,7 +709,9 @@ TEST_F(TransformedEncodingTest, narrowSectionsRoundTripForInPlaceAndGatheredTran
 // been exercised. Placement-new forces that reuse deterministically, the way
 // a stack slot in a loop or an allocator size class could produce it in
 // production without any help.
-TEST_F(TransformedEncodingTest, positionCacheDoesNotLeakAcrossViewsAtTheSameAddress) {
+TEST_F(
+    TransformedEncodingTest,
+    positionCacheDoesNotLeakAcrossViewsAtTheSameAddress) {
   using ViewType = SubIntSplitEncodingView<uint64_t>;
 
   // packedIdentifiers with keySection=1 is the shape every passing transform
@@ -728,8 +737,12 @@ TEST_F(TransformedEncodingTest, positionCacheDoesNotLeakAcrossViewsAtTheSameAddr
   // depend on subIntSplitTransform or subIntSplitKeySection, so probing with
   // default options finds the same boundaries the real encode below will.
   Buffer probeBufferA{*pool_};
-  const auto probeEncodedA = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      probeBufferA, valuesA, CompressionType::Uncompressed, Encoding::Options{});
+  const auto probeEncodedA =
+      test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+          probeBufferA,
+          valuesA,
+          CompressionType::Uncompressed,
+          Encoding::Options{});
   detail::SubIntSplitTransformInfo probeInfoA;
   const auto sectionsA = detail::parseSubIntSplitSections(
       probeEncodedA, Encoding::kPrefixSize, &probeInfoA);
@@ -753,8 +766,12 @@ TEST_F(TransformedEncodingTest, positionCacheDoesNotLeakAcrossViewsAtTheSameAddr
   optionsB.subIntSplitTransform = static_cast<uint8_t>(TransformId::KeyDerived);
 
   Buffer probeBufferB{*pool_};
-  const auto probeEncodedB = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-      probeBufferB, valuesB, CompressionType::Uncompressed, Encoding::Options{});
+  const auto probeEncodedB =
+      test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+          probeBufferB,
+          valuesB,
+          CompressionType::Uncompressed,
+          Encoding::Options{});
   detail::SubIntSplitTransformInfo probeInfoB;
   const auto sectionsB = detail::parseSubIntSplitSections(
       probeEncodedB, Encoding::kPrefixSize, &probeInfoB);

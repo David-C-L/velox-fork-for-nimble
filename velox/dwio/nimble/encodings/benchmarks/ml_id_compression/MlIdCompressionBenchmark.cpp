@@ -117,8 +117,7 @@ int runBenchmark() {
         // one the way a positional parse of the form above has twice.
         auto nodes = target->describeTree();
         if (!nodes.empty()) {
-          std::cout << "  --- " << enc.name << " encoding nodes ---\n"
-                    << nodes;
+          std::cout << "  --- " << enc.name << " encoding nodes ---\n" << nodes;
         }
         // Each node's cost against what its selection was quoted. Kept
         // separate from the tree above because it decodes every node to

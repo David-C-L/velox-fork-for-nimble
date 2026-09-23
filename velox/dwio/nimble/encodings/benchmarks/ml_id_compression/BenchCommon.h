@@ -152,9 +152,8 @@ class NimbleBenchTarget {
     // the cache off, and hashing the column was charged to every Nimble arm's
     // encode time and to no other target's.
     const bool caching = !cacheDir().empty();
-    const auto armId = caching
-        ? cacheArmIdentity(options, realNestedSelection)
-        : std::string{};
+    const auto armId = caching ? cacheArmIdentity(options, realNestedSelection)
+                               : std::string{};
     const auto key = caching
         ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
         : std::string{};
@@ -2152,7 +2151,8 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         "RLE", "Dictionary", "MainlyConstant", "FPE/fpe_pertier"};
     const auto withNestedStreams = [](EncoderEntry<T> entry, bool allowed) {
       entry.factory = [factory = std::move(entry.factory), allowed](
-                          const Vector<T>& data, const Encoding::Options& opts) {
+                          const Vector<T>& data,
+                          const Encoding::Options& opts) {
         Encoding::Options o = opts;
         o.subIntSplitInNestedStreams = allowed;
         return factory(data, o);

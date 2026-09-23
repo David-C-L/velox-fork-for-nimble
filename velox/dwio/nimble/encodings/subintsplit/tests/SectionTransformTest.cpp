@@ -93,12 +93,15 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
           size_t{1024},
           static_cast<size_t>(subintsplit::kTransformBlockSize) + 37}) {
       for (int width : {1, 3, 5, 7, 8, 13, 16, 32, 40, 63, 64}) {
-        for (auto shape : {Shape::Uniform, Shape::LowCardinality,
-                           Shape::Monotone, Shape::Constant}) {
+        for (auto shape :
+             {Shape::Uniform,
+              Shape::LowCardinality,
+              Shape::Monotone,
+              Shape::Constant}) {
           const auto original =
               makeSection(count, width, shape, count * 31 + width);
-          const auto key = makeSection(
-              count, 6, Shape::LowCardinality, count + 11);
+          const auto key =
+              makeSection(count, 6, Shape::LowCardinality, count + 11);
 
           std::vector<uint64_t> values = original;
           TransformContext context{.keySection = key, .width = width};
@@ -194,7 +197,9 @@ TEST(SectionTransformTest, keyDerivedRoundTripsWithManyDistinctKeys) {
 // already hands back dense run ids, as a dictionary-backed key section would.
 // Ids follow the dictionary's sorted numbering rather than first-appearance
 // order, so this also checks that the merge does not assume the two coincide.
-TEST(SectionTransformTest, keyDerivedRoundTripsWithManyDistinctKeysGivenRunIds) {
+TEST(
+    SectionTransformTest,
+    keyDerivedRoundTripsWithManyDistinctKeysGivenRunIds) {
   constexpr size_t kCount = 20'000;
   constexpr size_t kDistinctKeys = 5'000;
   std::mt19937_64 rng(7);
@@ -382,8 +387,9 @@ TEST(SectionTransformTest, rowFrameRoundTripsFromAnyFirstRow) {
       original[row] = (row * 3 + rng() % 7) & mask;
     }
     const auto expected = width == 32
-        ? detail::subintsplit::fitSubIntSplitRowFrame(std::span<const uint32_t>(
-              std::vector<uint32_t>(original.begin(), original.end())))
+        ? detail::subintsplit::fitSubIntSplitRowFrame(
+              std::span<const uint32_t>(
+                  std::vector<uint32_t>(original.begin(), original.end())))
         : detail::subintsplit::fitSubIntSplitRowFrame(
               std::span<const uint64_t>(original));
     ASSERT_TRUE(expected.active());
@@ -401,7 +407,8 @@ TEST(SectionTransformTest, rowFrameRoundTripsFromAnyFirstRow) {
     std::vector<uint64_t> tail(values.begin() + kFirstRow, values.end());
     transform->invert(
         tail, TransformContext{.width = width, .firstRow = kFirstRow}, state);
-    EXPECT_TRUE(std::equal(tail.begin(), tail.end(), original.begin() + kFirstRow));
+    EXPECT_TRUE(
+        std::equal(tail.begin(), tail.end(), original.begin() + kFirstRow));
   }
 }
 

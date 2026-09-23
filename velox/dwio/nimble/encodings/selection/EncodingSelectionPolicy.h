@@ -17,23 +17,23 @@
 
 #include <glog/logging.h>
 #include <algorithm>
-#include <limits>
-#include <span>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/dwio/nimble/common/Constants.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 
 namespace facebook::nimble {
@@ -304,12 +304,12 @@ inline float effectiveReadFactor(
 }
 
 /// Whether `encodingType` is certain to cost at least `minCost` under
-/// selection's size-only comparison, from a lower bound on its estimate, so that
-/// selection may skip estimating it. Skipping changes nothing selection returns:
-/// a candidate wins only by costing strictly less than every earlier one, and a
-/// cost is the estimate times the read factor, both of which the bound's cost
-/// cannot exceed. Trivial is never skipped, since its read factor depends on its
-/// estimate.
+/// selection's size-only comparison, from a lower bound on its estimate, so
+/// that selection may skip estimating it. Skipping changes nothing selection
+/// returns: a candidate wins only by costing strictly less than every earlier
+/// one, and a cost is the estimate times the read factor, both of which the
+/// bound's cost cannot exceed. Trivial is never skipped, since its read factor
+/// depends on its estimate.
 template <typename T>
 bool candidateCannotWin(
     EncodingType encodingType,
@@ -395,7 +395,8 @@ void screenNumericCandidatesBySample(
       sampleCosts.emplace_back();
       continue;
     }
-    const double cost = static_cast<double>(estimatedSize.value()) *
+    const double cost =
+        static_cast<double>(estimatedSize.value()) *
         effectiveReadFactor(
             encodingType, readFactor, estimatedSize.value(), fixedBitWidthSize);
     sampleCosts.emplace_back(cost);
@@ -777,7 +778,9 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         ? nestedEncodingReadFactorsOverride_.value()
         : candidateEncodingReadFactors_;
     auto nestedEncodingReadFactors = nimble::nestedEncodingReadFactors(
-        sourceEncodingReadFactors, parentEncodingType, nestedEncodingIdentifier);
+        sourceEncodingReadFactors,
+        parentEncodingType,
+        nestedEncodingIdentifier);
     UNIQUE_PTR_FACTORY(
         nestedDataType,
         ManualEncodingSelectionPolicy,

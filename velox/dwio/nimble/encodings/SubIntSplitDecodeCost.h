@@ -69,8 +69,9 @@ enum class DecodeAccessPattern : uint8_t {
 /// construction away; one that opens it for every scan pays it every time, and
 /// for some sections construction is nearly all of the cost: building a
 /// FrequencyPartition section resolves its tiers at about 25 ns per row on
-/// either reader, against 3 ns per row to decode it once built. Pricing one form
-/// and measuring the other makes a correct model look wrong, so both are named.
+/// either reader, against 3 ns per row to decode it once built. Pricing one
+/// form and measuring the other makes a correct model look wrong, so both are
+/// named.
 enum class DecodeReadPath : uint8_t {
   /// SubIntSplitEncoding::materialize, construction amortised.
   Cursor = 0,
@@ -121,7 +122,8 @@ struct DecodeRate {
   DecodeCostConfidence confidence{DecodeCostConfidence::Unfitted};
   // Nanoseconds per row of constructing the section's decoder, charged only on
   // the read paths that pay for opening a stream. Measured medians from
-  // bench_section_decode_rate; zero where construction does not scale with rows.
+  // bench_section_decode_rate; zero where construction does not scale with
+  // rows.
   double openNanosPerRow{0.0};
 };
 
@@ -429,10 +431,10 @@ inline DecodeRate cursorDecodeRate(
 /// with kViewAssemblyNanosPerRowPerSection per section, construction plus read
 /// reproduces whole-view reads of 280 untransformed plans at r = 0.998.
 ///
-/// Point is nanoseconds per probe through readAt plus kViewProbeNanosPerSection,
-/// the median per-section gap between whole-view probes and their live
-/// sections' standalone probes over the same plans (r = 0.996). Unlike the
-/// cursor point rates these are absolute, not a ranking.
+/// Point is nanoseconds per probe through readAt plus
+/// kViewProbeNanosPerSection, the median per-section gap between whole-view
+/// probes and their live sections' standalone probes over the same plans (r =
+/// 0.996). Unlike the cursor point rates these are absolute, not a ranking.
 ///
 /// Untransformed Constant sections cost nothing: the view folds them into a
 /// single OR before reading anything. Entries are medians where cost did not
@@ -441,8 +443,8 @@ inline DecodeRate cursorDecodeRate(
 inline DecodeRate viewDecodeRate(
     EncodingType encodingType,
     DecodeAccessPattern pattern) noexcept {
-  // {read ns/row, ns per encoded byte per row, confidence, open ns/row}, medians
-  // over distinct sections unless a fit is noted.
+  // {read ns/row, ns per encoded byte per row, confidence, open ns/row},
+  // medians over distinct sections unless a fit is noted.
   const auto bulk = [&]() -> DecodeRate {
     switch (encodingType) {
       // Folded out of the view before anything is read.
@@ -487,9 +489,10 @@ inline DecodeRate viewDecodeRate(
   const auto point = [&]() -> DecodeRate {
     constexpr double kViewProbeNanosPerSection = 31.0;
     const auto measured = [](double nanos) -> DecodeRate {
-      return {nanos + kViewProbeNanosPerSection,
-              0.0,
-              DecodeCostConfidence::Measured};
+      return {
+          nanos + kViewProbeNanosPerSection,
+          0.0,
+          DecodeCostConfidence::Measured};
     };
     switch (encodingType) {
       case EncodingType::Constant:
@@ -516,9 +519,10 @@ inline DecodeRate viewDecodeRate(
       case EncodingType::Dictionary:
         return measured(58.5);
       case EncodingType::MainlyConstant:
-        return {29.1 + kViewProbeNanosPerSection,
-                0.0,
-                DecodeCostConfidence::Inferred};
+        return {
+            29.1 + kViewProbeNanosPerSection,
+            0.0,
+            DecodeCostConfidence::Inferred};
       default: {
         DecodeRate rate =
             cursorDecodeRate(encodingType, DecodeAccessPattern::Point);
@@ -636,7 +640,7 @@ inline double combineSectionDecodeNanos(
           pattern == DecodeAccessPattern::Gather
       ? kProbeNanosPerSection
       : (readsThroughView(readPath) ? kViewAssemblyNanosPerRowPerSection
-                                          : kAssemblyNanosPerRowPerSection);
+                                    : kAssemblyNanosPerRowPerSection);
   return total +
       perSectionOverhead * static_cast<double>(perSectionNanosPerRow.size());
 }

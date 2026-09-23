@@ -320,9 +320,10 @@ TEST_F(HuffmanEncodingTest, estimateAcceptsCodeTreeAtLimit) {
 
   const std::span<const uint32_t> input{values.data(), values.size()};
   EXPECT_NO_THROW(encode(values));
-  EXPECT_TRUE(HuffmanEncoding<uint32_t>::estimateSize(
-                  input, Statistics<uint32_t>::create(input))
-                  .has_value());
+  EXPECT_TRUE(
+      HuffmanEncoding<uint32_t>::estimateSize(
+          input, Statistics<uint32_t>::create(input))
+          .has_value());
 }
 
 TEST_F(HuffmanEncodingTest, estimateAcceptsBalancedMaximumAlphabet) {
@@ -330,9 +331,10 @@ TEST_F(HuffmanEncodingTest, estimateAcceptsBalancedMaximumAlphabet) {
   // depth log2(4096) = 12, the deepest tree the table can still hold.
   std::vector<uint32_t> values(HuffmanEncoding<uint32_t>::kMaxSymbols);
   std::iota(values.begin(), values.end(), 0);
-  EXPECT_TRUE(HuffmanEncoding<uint32_t>::estimateSize(
-                  values, Statistics<uint32_t>::create(values))
-                  .has_value());
+  EXPECT_TRUE(
+      HuffmanEncoding<uint32_t>::estimateSize(
+          values, Statistics<uint32_t>::create(values))
+          .has_value());
 }
 
 TEST_F(HuffmanEncodingTest, estimateRejectsCodeTreePastLimit) {

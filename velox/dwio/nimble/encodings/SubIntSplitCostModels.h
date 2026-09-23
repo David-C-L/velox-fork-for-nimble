@@ -787,13 +787,8 @@ inline SegmentCost bestSegmentCost(
     if (!std::isfinite(sizeBits)) {
       return;
     }
-    const double decodeNanos =
-        decodeNanosPerRow(
-            type,
-            weighting.accessPattern,
-            weighting.readPath,
-            sizeBits,
-            numValues);
+    const double decodeNanos = decodeNanosPerRow(
+        type, weighting.accessPattern, weighting.readPath, sizeBits, numValues);
     const double weighted =
         sizeBits + decodeCostBits(decodeNanos, numValues, weighting.weight);
     if (weighted < best.weightedBits) {

@@ -407,9 +407,11 @@ TYPED_TEST(StatisticsIntegerTests, distinctLowerBound) {
 
   std::vector<ValueType> narrow;
   for (int i = 0; i < 1'000; ++i) {
-    narrow.push_back(static_cast<ValueType>(
-        static_cast<UnsignedType>(std::numeric_limits<ValueType>::lowest()) +
-        static_cast<UnsignedType>(i % 97)));
+    narrow.push_back(
+        static_cast<ValueType>(
+            static_cast<UnsignedType>(
+                std::numeric_limits<ValueType>::lowest()) +
+            static_cast<UnsignedType>(i % 97)));
   }
   const auto narrowStatistics = T::create({narrow});
   EXPECT_EQ(97, narrowStatistics.distinctLowerBound());

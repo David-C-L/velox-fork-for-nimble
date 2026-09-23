@@ -32,10 +32,9 @@ namespace {
 std::vector<uint32_t> stableSortedOrder(const std::vector<uint64_t>& keys) {
   std::vector<uint32_t> order(keys.size());
   std::iota(order.begin(), order.end(), 0u);
-  std::stable_sort(
-      order.begin(), order.end(), [&keys](uint32_t a, uint32_t b) {
-        return keys[a] < keys[b];
-      });
+  std::stable_sort(order.begin(), order.end(), [&keys](uint32_t a, uint32_t b) {
+    return keys[a] < keys[b];
+  });
   return order;
 }
 

@@ -78,10 +78,15 @@ add_executable(
 if(NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
   target_sources(
     nimble_encodings_tests
-    PRIVATE SubIntSplitEncodingTest.cpp SubIntSplitCostModelsTest.cpp
-            SubIntSplitEncodingViewTest.cpp SubIntSplitTopLevelPolicyTest.cpp
-            SubIntSplitSelectorTest.cpp SubIntSplitSizeEstimateTest.cpp
-            EncodingSizeEstimationTest.cpp EstimatorAccuracyTest.cpp
+    PRIVATE
+      SubIntSplitEncodingTest.cpp
+      SubIntSplitCostModelsTest.cpp
+      SubIntSplitEncodingViewTest.cpp
+      SubIntSplitTopLevelPolicyTest.cpp
+      SubIntSplitSelectorTest.cpp
+      SubIntSplitSizeEstimateTest.cpp
+      EncodingSizeEstimationTest.cpp
+      EstimatorAccuracyTest.cpp
   )
 endif()
 

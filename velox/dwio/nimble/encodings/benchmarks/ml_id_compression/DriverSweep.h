@@ -262,7 +262,8 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   options.subIntSplitDecodeReadPath =
       static_cast<uint8_t>(FLAGS_mlidc_sis_decode_read_path);
   options.subIntSplitMaxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
-  options.subIntSplitAdmission = static_cast<uint8_t>(FLAGS_mlidc_sis_admission);
+  options.subIntSplitAdmission =
+      static_cast<uint8_t>(FLAGS_mlidc_sis_admission);
   options.subIntSplitAdmissionForces = FLAGS_mlidc_sis_admission_forces;
   options.subIntSplitRowFrame = FLAGS_mlidc_sis_row_frame;
   options.subIntSplitEstimateCompressionGuard =

@@ -18,10 +18,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <random>
 #include <span>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -148,7 +148,10 @@ class SubIntSplitSizeEstimateTest : public ::testing::Test {
   uint64_t estimate(const std::vector<uint64_t>& values) {
     const std::span<const uint64_t> span(values);
     const auto estimated = SubIntSplitEncoding<uint64_t>::estimateSize(
-        span.size(), span, Statistics<uint64_t>::create(span), Encoding::Options{});
+        span.size(),
+        span,
+        Statistics<uint64_t>::create(span),
+        Encoding::Options{});
     EXPECT_TRUE(estimated.has_value());
     return estimated.value_or(0);
   }
@@ -198,7 +201,8 @@ class SubIntSplitSizeEstimateTest : public ::testing::Test {
 // split stores is a material share of the column either way, so a wrong answer
 // changes which encoding selection picks. Measured 1.11 and 0.96.
 TEST_F(SubIntSplitSizeEstimateTest, compositeKeyEstimateTracksWhatIsWritten) {
-  expectRatioWithin(makeCompositeKeyStream(kNumRows), 1.25, 1.25, "composite key");
+  expectRatioWithin(
+      makeCompositeKeyStream(kNumRows), 1.25, 1.25, "composite key");
 }
 
 TEST_F(SubIntSplitSizeEstimateTest, uniformRandomEstimateTracksWhatIsWritten) {
@@ -274,8 +278,9 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
   const auto random = makeUniformRandomStream(300'000);
   const std::span<const uint64_t> randomSpan(random);
   const auto randomStatistics = Statistics<uint64_t>::create(randomSpan);
-  const auto randomBound = SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
-      randomSpan, randomStatistics, options);
+  const auto randomBound =
+      SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+          randomSpan, randomStatistics, options);
   ASSERT_TRUE(randomBound.has_value());
   EXPECT_EQ(
       *randomBound,
@@ -295,27 +300,28 @@ TEST_F(SubIntSplitSizeEstimateTest, lowerBoundRulesOutStreamsWithoutFields) {
   // is what decides.
   const auto composite = makeCompositeKeyStream(kNumRows);
   const std::span<const uint64_t> compositeSpan(composite);
-  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
-                   compositeSpan,
-                   Statistics<uint64_t>::create(compositeSpan),
-                   options)
-                   .has_value());
+  EXPECT_FALSE(
+      SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+          compositeSpan, Statistics<uint64_t>::create(compositeSpan), options)
+          .has_value());
 
   // The sampled default declines on this stream, which is the screen's limit
   // and not a bug: it costs a split DP that the estimate then prices out.
   Encoding::Options sampled;
   sampled.subIntSplitEstimateBitFlipScreen = true;
-  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
-                   randomSpan, randomStatistics, sampled)
-                   .has_value());
+  EXPECT_FALSE(
+      SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+          randomSpan, randomStatistics, sampled)
+          .has_value());
 
   // Off, the screen never rules anything out.
   Encoding::Options noScreen;
   noScreen.subIntSplitEstimateBitFlipScreen = false;
   noScreen.subIntSplitAdmissionProfilePairs = 0;
-  EXPECT_FALSE(SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
-                   randomSpan, randomStatistics, noScreen)
-                   .has_value());
+  EXPECT_FALSE(
+      SubIntSplitEncoding<uint64_t>::estimateSizeLowerBound(
+          randomSpan, randomStatistics, noScreen)
+          .has_value());
 }
 
 TEST_F(SubIntSplitSizeEstimateTest, estimateNeverExceedsFixedBitWidth) {
@@ -369,10 +375,10 @@ TEST_F(SubIntSplitSizeEstimateTest, selectionAvoidsSubIntSplitWhereItIsNot) {
   // Uniform random has no bit structure to split on, and constant-heavy is
   // stored far better whole. Neither should reach a split now that the range
   // rule no longer withholds the candidate.
-  EXPECT_NE(selected(makeUniformRandomStream(kNumRows)),
-            EncodingType::SubIntSplit);
-  EXPECT_NE(selected(makeConstantHeavyStream(kNumRows)),
-            EncodingType::SubIntSplit);
+  EXPECT_NE(
+      selected(makeUniformRandomStream(kNumRows)), EncodingType::SubIntSplit);
+  EXPECT_NE(
+      selected(makeConstantHeavyStream(kNumRows)), EncodingType::SubIntSplit);
 }
 
 } // namespace

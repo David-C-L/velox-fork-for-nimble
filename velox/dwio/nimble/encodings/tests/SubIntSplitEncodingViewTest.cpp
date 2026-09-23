@@ -178,8 +178,11 @@ TEST_F(SubIntSplitEncodingViewTest, readsThroughRowFrame) {
     for (const auto compressionType :
          {nimble::CompressionType::Uncompressed,
           nimble::CompressionType::Zstd}) {
-      SCOPED_TRACE(fmt::format(
-          "autoTransform={} compression={}", autoTransform, compressionType));
+      SCOPED_TRACE(
+          fmt::format(
+              "autoTransform={} compression={}",
+              autoTransform,
+              compressionType));
       nimble::Encoding::Options options;
       options.subIntSplitAutoTransform = autoTransform;
       auto serialized =

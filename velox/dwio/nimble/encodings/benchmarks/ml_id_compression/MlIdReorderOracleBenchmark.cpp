@@ -46,11 +46,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <functional>
 #include <numeric>
 #include <random>
 #include <span>
@@ -214,7 +214,8 @@ std::vector<EncodingType> inventoryEncodings(Inventory inventory) {
       EncodingType::RLE,
       EncodingType::Varint,
   };
-  if (inventory == Inventory::PlusDelta || inventory == Inventory::PlusEntropy) {
+  if (inventory == Inventory::PlusDelta ||
+      inventory == Inventory::PlusEntropy) {
     types.push_back(EncodingType::Delta);
   }
   if (inventory == Inventory::PlusEntropy) {
@@ -467,7 +468,8 @@ SectionOutcome applyCandidate(
     if (candidate.family == "A") {
       permutation = candidate.stride > 0
           ? rx::stridePermutation(numRows, candidate.stride)
-          : rx::transposePermutation(numRows, candidate.rows, candidate.columns);
+          : rx::transposePermutation(
+                numRows, candidate.rows, candidate.columns);
     } else if (candidate.family == "B") {
       if (key.size() != section.size()) {
         return outcome;
@@ -476,7 +478,8 @@ SectionOutcome applyCandidate(
     } else if (candidate.family == "C") {
       permutation = rx::sortPermutation(section);
     } else {
-      permutation = rx::groupSortPermutation(section, candidate.groupSize, groupOrder);
+      permutation =
+          rx::groupSortPermutation(section, candidate.groupSize, groupOrder);
     }
 
     outcome.transformed = rx::applyPermutation(section, permutation);
@@ -488,7 +491,8 @@ SectionOutcome applyCandidate(
       } else {
         stored = rx::invertPermutation(permutation);
       }
-      const size_t bytes = storedIndexBytes(stored, inventory, indexCompression);
+      const size_t bytes =
+          storedIndexBytes(stored, inventory, indexCompression);
       if (bytes == kEncodeFailed) {
         return outcome;
       }
@@ -619,7 +623,8 @@ SectionOutcome applyCandidate(
             (rx::inverseBitPlaneTranspose(outcome.transformed, width) ==
              section);
         timeInverse([&]() {
-          auto scratch = rx::inverseBitPlaneTranspose(outcome.transformed, width);
+          auto scratch =
+              rx::inverseBitPlaneTranspose(outcome.transformed, width);
           inverseSink = inverseSink + (scratch.empty() ? 0 : scratch.front());
         });
       }
@@ -632,7 +637,8 @@ SectionOutcome applyCandidate(
     }
 
     uint32_t primaryIndex = 0;
-    const auto burrowsWheeler = rx::burrowsWheelerTransform(section, primaryIndex);
+    const auto burrowsWheeler =
+        rx::burrowsWheelerTransform(section, primaryIndex);
     // Restoration is the primary index alone: one offset per block.
     int indexWidth = 1;
     while (indexWidth < 32 && (numRows >> indexWidth) != 0) {
@@ -832,8 +838,8 @@ std::vector<uint32_t> buildArmPermutation(
       const size_t slot = pick(rng);
       const int run = live[slot];
       const size_t index = static_cast<size_t>(run) * perRun + cursor[run];
-      const size_t runEnd = std::min(
-          static_cast<size_t>(run + 1) * perRun, count);
+      const size_t runEnd =
+          std::min(static_cast<size_t>(run + 1) * perRun, count);
       order[out++] = sorted[index];
       if (++cursor[run] + static_cast<size_t>(run) * perRun >= runEnd) {
         live.erase(live.begin() + static_cast<int64_t>(slot));
@@ -851,15 +857,14 @@ std::vector<uint32_t> buildArmPermutation(
     // needs and what every earlier arm denied it.
     std::vector<uint32_t> byKey(count);
     std::iota(byKey.begin(), byKey.end(), 0u);
-    std::stable_sort(
-        byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {
-          const uint64_t ka = sectionKey(a);
-          const uint64_t kb = sectionKey(b);
-          if (ka != kb) {
-            return ka < kb;
-          }
-          return ownValues[a] < ownValues[b];
-        });
+    std::stable_sort(byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {
+      const uint64_t ka = sectionKey(a);
+      const uint64_t kb = sectionKey(b);
+      if (ka != kb) {
+        return ka < kb;
+      }
+      return ownValues[a] < ownValues[b];
+    });
     std::vector<std::vector<uint32_t>> partitions;
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t row = byKey[i];
@@ -931,8 +936,8 @@ std::vector<Candidate> buildCandidates(
       candidate.stride = stride;
       candidates.push_back(candidate);
     }
-    for (const auto& shape :
-         std::vector<std::pair<uint32_t, uint32_t>>{{32, 32}, {16, 64}, {64, 16}}) {
+    for (const auto& shape : std::vector<std::pair<uint32_t, uint32_t>>{
+             {32, 32}, {16, 64}, {64, 16}}) {
       Candidate candidate;
       candidate.family = "A";
       candidate.name = "A_transpose";
@@ -1083,8 +1088,7 @@ double rangeCost(
       width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
   std::vector<uint64_t> values(blockRows);
   for (uint32_t i = 0; i < blockRows; ++i) {
-    values[i] =
-        (static_cast<uint64_t>(physical[begin + i]) >> bitStart) & mask;
+    values[i] = (static_cast<uint64_t>(physical[begin + i]) >> bitStart) & mask;
   }
 
   size_t restorationBits = 0;
@@ -1134,8 +1138,8 @@ std::vector<SearchTransform> buildSearchTransforms(
        },
        [](const std::vector<uint64_t>& values, int width) {
          size_t bits = 10; // primary index
-         bits += rx::sortedAlphabetOf(values).size() *
-             static_cast<size_t>(width);
+         bits +=
+             rx::sortedAlphabetOf(values).size() * static_cast<size_t>(width);
          return bits;
        }});
 
@@ -1276,8 +1280,7 @@ int runBenchmark() {
     const auto numSections = static_cast<int>(segments.size());
     const auto candidates = buildCandidates(families, numSections);
 
-    std::cout << "== " << dataset.name << " : " << numSections
-              << " sections:";
+    std::cout << "== " << dataset.name << " : " << numSections << " sections:";
     for (const auto& segment : segments) {
       std::cout << " [" << segment.bitStart << ".." << segment.bitEnd << "]";
     }
@@ -1286,8 +1289,8 @@ int runBenchmark() {
     // Values in shipped order, used to define the arms.
     std::vector<uint64_t> ownValues(data.size());
     for (size_t i = 0; i < data.size(); ++i) {
-      ownValues[i] = static_cast<uint64_t>(
-          reinterpret_cast<const Phys*>(data.data())[i]);
+      ownValues[i] =
+          static_cast<uint64_t>(reinterpret_cast<const Phys*>(data.data())[i]);
     }
 
     std::vector<uint64_t> siblingValues;
@@ -1324,13 +1327,7 @@ int runBenchmark() {
 
       bool armOk = true;
       const auto armOrder = buildArmPermutation(
-          arm,
-          data.size(),
-          seed,
-          sectionKey,
-          ownValues,
-          siblingValues,
-          armOk);
+          arm, data.size(), seed, sectionKey, ownValues, siblingValues, armOk);
       if (!armOk) {
         std::cerr << "  [SKIP] unusable order arm: " << armToken << "\n";
         continue;
@@ -1354,12 +1351,10 @@ int runBenchmark() {
         std::vector<uint64_t> armSamples;
         sampleIntoU64(physical, armSamples, defaultSamplerConfig());
         if (!armSamples.empty()) {
-          armSegments = selectSplits(
-                            armSamples,
-                            kBits,
-                            ordered.size(),
-                            defaultSelectorConfig())
-                            .segments;
+          armSegments =
+              selectSplits(
+                  armSamples, kBits, ordered.size(), defaultSelectorConfig())
+                  .segments;
         }
       }
       const auto armNumSections = static_cast<int>(armSegments.size());
@@ -1395,7 +1390,8 @@ int runBenchmark() {
           // values while the sorted arm's front blocks carry the smallest.
           // Striding makes every arm cover the same rows, which is what makes
           // one arm's baseline comparable to another's.
-          const size_t blockStride = std::max<size_t>(1, totalBlocks / blockLimit);
+          const size_t blockStride =
+              std::max<size_t>(1, totalBlocks / blockLimit);
           for (size_t block = 0; block < blockLimit; ++block) {
             const size_t begin = block * blockStride * blockRows;
 
@@ -1404,15 +1400,14 @@ int runBenchmark() {
             std::vector<std::vector<uint64_t>> sections(armNumSections);
             std::vector<int> widths(armNumSections);
             for (int s = 0; s < armNumSections; ++s) {
-              const int width = armSegments[s].bitEnd - armSegments[s].bitStart + 1;
+              const int width =
+                  armSegments[s].bitEnd - armSegments[s].bitStart + 1;
               widths[s] = width;
-              const uint64_t mask = width >= 64
-                  ? ~uint64_t{0}
-                  : ((uint64_t{1} << width) - 1);
+              const uint64_t mask =
+                  width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
               sections[s].resize(blockRows);
               for (uint32_t i = 0; i < blockRows; ++i) {
-                const auto value =
-                    static_cast<uint64_t>(physical[begin + i]);
+                const auto value = static_cast<uint64_t>(physical[begin + i]);
                 sections[s][i] = (value >> armSegments[s].bitStart) & mask;
               }
             }
@@ -1509,7 +1504,8 @@ int runBenchmark() {
                 csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
-                csv.set("block_index", static_cast<int64_t>(block * blockStride));
+                csv.set(
+                    "block_index", static_cast<int64_t>(block * blockStride));
                 csv.set("num_sections", static_cast<int64_t>(armNumSections));
                 csv.set("family", candidate.family);
                 csv.set("transform", candidate.name);
@@ -1522,12 +1518,10 @@ int runBenchmark() {
                     "bit_start", static_cast<int64_t>(armSegments[s].bitStart));
                 csv.set("bit_end", static_cast<int64_t>(armSegments[s].bitEnd));
                 csv.set("section_width", static_cast<int64_t>(widths[s]));
-                csv.set(
-                    "encoding_baseline", encodingName(baselineEncoding[s]));
+                csv.set("encoding_baseline", encodingName(baselineEncoding[s]));
                 csv.set(
                     "encoding_transformed", encodingName(transformedEncoding));
-                csv.set(
-                    "baseline_bits", static_cast<int64_t>(baselineBits[s]));
+                csv.set("baseline_bits", static_cast<int64_t>(baselineBits[s]));
                 csv.set("transformed_bits", static_cast<int64_t>(bytes * 8));
                 csv.set(
                     "restoration_bits",
@@ -1562,9 +1556,7 @@ int runBenchmark() {
                   "restoration", rx::restorationName(candidate.restoration));
               csv.set("scope", "BLOCK_OPTIN");
               csv.set("section_index", static_cast<int64_t>(-1));
-              csv.set(
-                  "baseline_bits",
-                  static_cast<int64_t>(blockBaselineBits));
+              csv.set("baseline_bits", static_cast<int64_t>(blockBaselineBits));
               csv.set("net_bits", optInBits);
               csv.set("net_bits_per_elem", optInBits / blockRows);
               csv.set("skipped", static_cast<int64_t>(0));
@@ -1578,7 +1570,8 @@ int runBenchmark() {
                 csv.set("order_arm", armToken);
                 csv.set("inventory", inventoryName(inventory));
                 csv.set("block_rows", static_cast<int64_t>(blockRows));
-                csv.set("block_index", static_cast<int64_t>(block * blockStride));
+                csv.set(
+                    "block_index", static_cast<int64_t>(block * blockStride));
                 csv.set("family", candidate.family);
                 csv.set("transform", candidate.name);
                 csv.set("param", candidate.param);
@@ -1689,7 +1682,8 @@ int runBenchmark() {
               // One split for all blocks, chosen against real bytes. This is
               // the ceiling a better cost model could reach.
               const double globalPerElem =
-                  splitDp(summedCost[name], kBits, splitPenalty * searchBlocks) /
+                  splitDp(
+                      summedCost[name], kBits, splitPenalty * searchBlocks) /
                   denominator;
 
               csv.beginRow();
@@ -1744,8 +1738,8 @@ int runBenchmark() {
             if (optIn <= 0.0) {
               break;
             }
-            std::cout << "      " << std::setw(12) << armCandidates[c].name << " "
-                      << std::setw(18) << armCandidates[c].param
+            std::cout << "      " << std::setw(12) << armCandidates[c].name
+                      << " " << std::setw(18) << armCandidates[c].param
                       << "  opt-in=" << std::showpos << std::setprecision(2)
                       << optIn << "  forced=" << forced << std::noshowpos
                       << " b/e\n";
@@ -1756,7 +1750,8 @@ int runBenchmark() {
   }
 
   if (roundTripFailures > 0) {
-    std::cerr << "\n" << roundTripFailures
+    std::cerr << "\n"
+              << roundTripFailures
               << " round-trip failures; results are not trustworthy.\n";
     return 1;
   }

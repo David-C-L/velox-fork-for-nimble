@@ -162,13 +162,13 @@
 #include "velox/dwio/nimble/encodings/PFOREncoding.h"
 #include "velox/dwio/nimble/encodings/RLEEncoding.h"
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
+#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
@@ -377,8 +377,7 @@ size_t oracleEncodeBytes(
     const facebook::nimble::Encoding::Options& options) {
   switch (type) {
     case EncodingType::Trivial:
-      return tryEncode<TrivialEncoding<Storage>, Storage>(
-          sectionData, options);
+      return tryEncode<TrivialEncoding<Storage>, Storage>(sectionData, options);
     case EncodingType::FixedBitWidth:
       return tryEncode<FixedBitWidthEncoding<Storage>, Storage>(
           sectionData, options);
@@ -420,8 +419,7 @@ size_t oracleEncodeBytes(
       return tryEncode<FrequencyPartitionEncoding<Storage>, Storage>(
           sectionData, options);
     case EncodingType::Huffman:
-      return tryEncode<HuffmanEncoding<Storage>, Storage>(
-          sectionData, options);
+      return tryEncode<HuffmanEncoding<Storage>, Storage>(sectionData, options);
     case EncodingType::DeltaBlock:
       return tryEncode<DeltaBlockEncoding<Storage>, Storage>(
           sectionData, options);
@@ -731,15 +729,13 @@ std::optional<size_t> encodeColumn(
   try {
     auto& pool = benchmarks::benchmarkPool();
     Buffer buffer{*pool};
-    const auto encoded =
-        encodeWithCompression<SubIntSplitEncoding<Elem>, Elem>(
-            buffer,
-            column,
-            parseCompressionType(FLAGS_mlidc_substream_compression),
-            columnOptions,
-            /*realNestedSelection=*/true,
-            segments.empty() ? EncodingLayout::Config{}
-                             : planConfigFor(segments));
+    const auto encoded = encodeWithCompression<SubIntSplitEncoding<Elem>, Elem>(
+        buffer,
+        column,
+        parseCompressionType(FLAGS_mlidc_substream_compression),
+        columnOptions,
+        /*realNestedSelection=*/true,
+        segments.empty() ? EncodingLayout::Config{} : planConfigFor(segments));
     return encoded.size();
   } catch (...) {
     return std::nullopt;
@@ -1046,8 +1042,7 @@ int runBenchmark() {
     }
     if (preserveBytes.has_value()) {
       csv.set(
-          "writer_preserve_bytes",
-          static_cast<int64_t>(preserveBytes.value()));
+          "writer_preserve_bytes", static_cast<int64_t>(preserveBytes.value()));
     }
     csv.set("writer_reproduced", writerReproduced ? int64_t{1} : int64_t{0});
     csv.set("skipped", writerReproduced ? int64_t{0} : int64_t{1});
@@ -1125,8 +1120,8 @@ int runBenchmark() {
           ? sampleBlocks - 1
           : 0;
 
-      std::cout << "  -- sample_size=" << sampleSize
-                << " seams=" << sampleSeams << "\n";
+      std::cout << "  -- sample_size=" << sampleSize << " seams=" << sampleSeams
+                << "\n";
 
       // -----------------------------------------------------------------
       // Build oracle grid + cost model grid over [l..r], 0 <= l <= r < kBits.
@@ -1296,8 +1291,7 @@ int runBenchmark() {
           oc.results.resize(candidates.size());
           withNarrowedSection(
               width, sectionU64, *pool, [&](const auto& sectionData) {
-                using Storage =
-                    std::decay_t<decltype(sectionData.data()[0])>;
+                using Storage = std::decay_t<decltype(sectionData.data()[0])>;
                 const auto values = std::span<const Storage>(
                     sectionData.data(), sectionData.size());
                 const auto timed = [&estimatorCostingNanos](auto&& fn) {
@@ -1322,11 +1316,12 @@ int runBenchmark() {
                     encodingAvailableAtWidth(
                         EncodingType::FixedBitWidth, storageBytes)
                     ? timed([&] {
-                        return facebook::nimble::detail::EncodingSizeEstimation<
-                            Storage>::estimateSize(EncodingType::FixedBitWidth,
-                                                   values,
-                                                   statistics,
-                                                   sectionOptions);
+                        return facebook::nimble::detail::
+                            EncodingSizeEstimation<Storage>::estimateSize(
+                                EncodingType::FixedBitWidth,
+                                values,
+                                statistics,
+                                sectionOptions);
                       })
                     : std::optional<uint64_t>{};
                 double bestSelectionCost =
@@ -1363,11 +1358,12 @@ int runBenchmark() {
                     continue;
                   }
                   const auto estimate = timed([&] {
-                    return facebook::nimble::detail::EncodingSizeEstimation<
-                        Storage>::estimateSize(candidates[ci].type,
-                                               values,
-                                               statistics,
-                                               sectionOptions);
+                    return facebook::nimble::detail::
+                        EncodingSizeEstimation<Storage>::estimateSize(
+                            candidates[ci].type,
+                            values,
+                            statistics,
+                            sectionOptions);
                   });
                   if (!estimate.has_value()) {
                     continue;
@@ -1504,8 +1500,7 @@ int runBenchmark() {
             // sampling windows, which are artefacts. Comparing the two across
             // the sweep is the measurement of how much the sampler inflates it.
             csv.set("max_delta", static_cast<int64_t>(metrics.maxDelta));
-            csv.set(
-                "sample_seam_count", static_cast<int64_t>(sampleSeams));
+            csv.set("sample_seam_count", static_cast<int64_t>(sampleSeams));
             csv.set("has_cost_model", hasCostModel ? int64_t{1} : int64_t{0});
             if (hasCostModel) {
               csv.set("est_bits", mc.estBits[ci]);
@@ -1627,8 +1622,8 @@ int runBenchmark() {
       // Four plans are scored, not two. The model's DP is run twice: once with
       // fullCount == sampleSize, which is what this driver used to do, and once
       // at the column's real row count, which is what production does. The two
-      // are not the same plan. A cell's fixed per-section header is charged once
-      // per segment whatever the row count, so at sample scale it weighs
+      // are not the same plan. A cell's fixed per-section header is charged
+      // once per segment whatever the row count, so at sample scale it weighs
       // fullCount/sampleSize times more against the per-value terms than it
       // really does -- and the number of segments is exactly what that tradeoff
       // decides. Reporting only the sample-scale plan measured a configuration
@@ -1645,8 +1640,8 @@ int runBenchmark() {
 
       const SelectorResult autoSampleScale = selectSplitsRestricted(
           samples, kBits, sampleSize, allowed, selectorCfg);
-      const SelectorResult autoFullScale = selectSplitsRestricted(
-          samples, kBits, n, allowed, selectorCfg);
+      const SelectorResult autoFullScale =
+          selectSplitsRestricted(samples, kBits, n, allowed, selectorCfg);
       const OracleDpResult oracleSampleScale =
           oracleDp(oracleGrid, kBits, /*costScale=*/1.0, splitPenaltyBytes);
       const OracleDpResult oracleFullScale =
@@ -1674,7 +1669,8 @@ int runBenchmark() {
           OracleObjective::kSelectionEstimate);
       std::cout << "  costing_time: cost_models="
                 << static_cast<double>(costModelNanos) / 1e6
-                << " ms, estimators=" << static_cast<double>(estimatorCostingNanos) / 1e6
+                << " ms, estimators="
+                << static_cast<double>(estimatorCostingNanos) / 1e6
                 << " ms over " << kBits * (kBits + 1) / 2 << " ranges\n";
 
       // Scores one plan: its measured bytes on the sample, its regret against
@@ -1754,8 +1750,7 @@ int runBenchmark() {
             }
             const auto estimated = cell.results[ci].estimateBytes;
             if (estimated != std::numeric_limits<size_t>::max()) {
-              csv.set(
-                  "selection_est_bytes", static_cast<int64_t>(estimated));
+              csv.set("selection_est_bytes", static_cast<int64_t>(estimated));
               if (estimated > 0 &&
                   cell.selectionBytes != std::numeric_limits<size_t>::max()) {
                 csv.set(
@@ -1807,8 +1802,7 @@ int runBenchmark() {
         // Compare model against oracle on full_column_bytes, which is
         // like-for-like; do not read the difference between these two columns
         // as regret.
-        csv.set(
-            "oracle_cell_sum_bytes", static_cast<int64_t>(cellBestSum));
+        csv.set("oracle_cell_sum_bytes", static_cast<int64_t>(cellBestSum));
         csv.set(
             "plan_unresolved_segments",
             static_cast<int64_t>(unresolvedSegments));
@@ -1857,10 +1851,11 @@ int runBenchmark() {
         }
         std::cout << "\n";
         if (unresolvedSegments > 0) {
-          std::cout << "  [WARN] " << planType << " sample_bytes excludes "
-                    << unresolvedSegments
-                    << " segment(s) whose encoding could not be measured; it is "
-                       "not comparable with the other plans\n";
+          std::cout
+              << "  [WARN] " << planType << " sample_bytes excludes "
+              << unresolvedSegments
+              << " segment(s) whose encoding could not be measured; it is "
+                 "not comparable with the other plans\n";
         }
       };
 
@@ -1920,7 +1915,8 @@ int runBenchmark() {
           isCut[0] = true;
           isCut[kBits] = true;
           for (const int boundary : bitFlipGradientBoundaries(
-                   profileStatistics.bitFlipProfile(), TopLevelPolicyConfig{})) {
+                   profileStatistics.bitFlipProfile(),
+                   TopLevelPolicyConfig{})) {
             if (boundary > 0 && boundary < kBits) {
               isCut[boundary] = true;
             }
@@ -1952,8 +1948,8 @@ int runBenchmark() {
             n, static_cast<size_t>(FLAGS_hybrid_rescore_samples));
         std::vector<uint64_t> rescoreSamples;
         sampleIntoU64(physical, rescoreSamples, rescoreCfg);
-        const double rescoreScale = static_cast<double>(n) /
-            static_cast<double>(rescoreSamples.size());
+        const double rescoreScale =
+            static_cast<double>(n) / static_cast<double>(rescoreSamples.size());
 
         // Selection's estimate, in bytes, for the candidate it would pick on
         // one range of the larger sample, with the encoding it names. Cached,
@@ -1980,12 +1976,12 @@ int runBenchmark() {
                 const auto values = std::span<const Storage>(
                     sectionData.data(), sectionData.size());
                 const auto statistics = Statistics<Storage>::create(values);
-                const auto fixedBitWidthEstimate =
-                    facebook::nimble::detail::EncodingSizeEstimation<
-                        Storage>::estimateSize(EncodingType::FixedBitWidth,
-                                               values,
-                                               statistics,
-                                               sectionOptions);
+                const auto fixedBitWidthEstimate = facebook::nimble::detail::
+                    EncodingSizeEstimation<Storage>::estimateSize(
+                        EncodingType::FixedBitWidth,
+                        values,
+                        statistics,
+                        sectionOptions);
                 double bestSelectionCost =
                     std::numeric_limits<double>::infinity();
                 for (const auto& candidate : candidates) {
@@ -1997,12 +1993,9 @@ int runBenchmark() {
                   if (!readFactor.has_value()) {
                     continue;
                   }
-                  const auto estimate =
-                      facebook::nimble::detail::EncodingSizeEstimation<
-                          Storage>::estimateSize(candidate.type,
-                                                 values,
-                                                 statistics,
-                                                 sectionOptions);
+                  const auto estimate = facebook::nimble::detail::
+                      EncodingSizeEstimation<Storage>::estimateSize(
+                          candidate.type, values, statistics, sectionOptions);
                   if (!estimate.has_value()) {
                     continue;
                   }
@@ -2110,8 +2103,7 @@ int runBenchmark() {
               }
               RangePlan split = refined;
               split[i].second = cut;
-              split.insert(
-                  split.begin() + i + 1, {cut + 1, refined[i].second});
+              split.insert(split.begin() + i + 1, {cut + 1, refined[i].second});
               neighbours.push_back(std::move(split));
             }
           }
@@ -2148,7 +2140,8 @@ int runBenchmark() {
       csv.set("seed", static_cast<int64_t>(seed));
       csv.set("sample_size", static_cast<int64_t>(sampleSize));
       csv.set(
-          "min_segment_width", static_cast<int64_t>(selectorCfg.minSegmentWidth));
+          "min_segment_width",
+          static_cast<int64_t>(selectorCfg.minSegmentWidth));
       csv.set("plan_type", "summary");
       csv.set("sample_seam_count", static_cast<int64_t>(sampleSeams));
       // The oracle is optimal over contiguous bit ranges of at least

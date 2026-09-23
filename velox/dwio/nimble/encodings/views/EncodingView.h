@@ -18,11 +18,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 #include <memory>
 #include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Exceptions.h"

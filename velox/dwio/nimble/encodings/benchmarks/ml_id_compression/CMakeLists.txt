@@ -47,11 +47,14 @@ velox_add_test_headers(
   CachePolicy.h
   DriverSweep.h
   ElemType.h
+  EncodeCache.h
   EncodingNodeEstimates.h
   GatherTraceGen.h
+  InputOrder.h
   MeasureLoop.h
   OpenZLBenchTarget.h
   PointTraceGen.h
+  ReorderTransforms.h
   ResultWriter.h
   SelectiveTraceGen.h
   SubstreamCompression.h

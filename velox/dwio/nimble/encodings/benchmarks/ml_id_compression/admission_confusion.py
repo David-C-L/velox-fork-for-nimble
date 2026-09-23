@@ -38,8 +38,11 @@ def main():
     parser.add_argument("csvs", nargs="+")
     parser.add_argument("--sis_arms", default="SIS/realNested,SIS/hybrid")
     parser.add_argument("--margin", type=float, default=0.01)
-    parser.add_argument("--decision", choices=["policy", "estimate", "bitflip", "bitflip_entropy"],
-                        default="policy")
+    parser.add_argument(
+        "--decision",
+        choices=["policy", "estimate", "bitflip", "bitflip_entropy"],
+        default="policy",
+    )
     parser.add_argument("--profile_pairs", default="0")
     args = parser.parse_args()
     sisArms = args.sis_arms.split(",")
@@ -57,14 +60,18 @@ def main():
                 if row["row_kind"] == "heuristic":
                     heuristic[dataset] = row
                 elif row["row_kind"] == "admission":
-                    admission[(dataset, row["admission_mode"], row["profile_pairs"])] = row
+                    admission[
+                        (dataset, row["admission_mode"], row["profile_pairs"])
+                    ] = row
                 elif row["row_kind"] == "encoder":
                     arms[dataset][row["encoding"]] = int(row["payload_bytes"])
                     encodeNanos[dataset][row["encoding"]] = int(row["encode_ns"])
 
     cells = defaultdict(list)
-    print("dataset,predicted,actual,sis_arm,sis_bytes,best_other,other_bytes,"
-          "heuristic_ns,sis_encode_ns")
+    print(
+        "dataset,predicted,actual,sis_arm,sis_bytes,best_other,other_bytes,"
+        "heuristic_ns,sis_encode_ns"
+    )
     for dataset in sorted(heuristic):
         present = [arm for arm in sisArms if arm in arms[dataset]]
         others = {
@@ -79,7 +86,9 @@ def main():
         otherArm = min(others, key=others.get)
         actual = arms[dataset][sisArm] < (1.0 - args.margin) * others[otherArm]
         if args.decision in ("policy", "estimate"):
-            key = "policy_selects_sis" if args.decision == "policy" else "estimate_admits"
+            key = (
+                "policy_selects_sis" if args.decision == "policy" else "estimate_admits"
+            )
             predicted = heuristic[dataset][key] == "1"
             decisionNanos = heuristic[dataset]["heuristic_ns"]
         else:
@@ -87,18 +96,34 @@ def main():
             predicted = row["decision"] == "1"
             decisionNanos = row["decision_ns"]
         cells[(predicted, actual)].append(dataset)
-        print(f"{dataset},{int(predicted)},{int(actual)},{sisArm},"
-              f"{arms[dataset][sisArm]},{otherArm},{others[otherArm]},"
-              f"{decisionNanos},{encodeNanos[dataset][sisArm]}")
+        print(
+            f"{dataset},{int(predicted)},{int(actual)},{sisArm},"
+            f"{arms[dataset][sisArm]},{otherArm},{others[otherArm]},"
+            f"{decisionNanos},{encodeNanos[dataset][sisArm]}"
+        )
 
     truePositive = len(cells[(True, True)])
     falsePositive = len(cells[(True, False)])
     falseNegative = len(cells[(False, True)])
-    precision = truePositive / (truePositive + falsePositive) if truePositive + falsePositive else float("nan")
-    recall = truePositive / (truePositive + falseNegative) if truePositive + falseNegative else float("nan")
-    for (predicted, actual), label in [((True, True), "TP"), ((True, False), "FP"),
-                                       ((False, True), "FN"), ((False, False), "TN")]:
-        print(f"{label} {len(cells[(predicted, actual)])}: {' '.join(cells[(predicted, actual)])}")
+    precision = (
+        truePositive / (truePositive + falsePositive)
+        if truePositive + falsePositive
+        else float("nan")
+    )
+    recall = (
+        truePositive / (truePositive + falseNegative)
+        if truePositive + falseNegative
+        else float("nan")
+    )
+    for (predicted, actual), label in [
+        ((True, True), "TP"),
+        ((True, False), "FP"),
+        ((False, True), "FN"),
+        ((False, False), "TN"),
+    ]:
+        print(
+            f"{label} {len(cells[(predicted, actual)])}: {' '.join(cells[(predicted, actual)])}"
+        )
     print(f"precision {precision:.3f} recall {recall:.3f}")
 
 

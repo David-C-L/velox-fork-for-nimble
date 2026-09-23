@@ -671,9 +671,8 @@ class RowFrameTransform : public SectionTransform {
       uint64_t sign) {
     NIMBLE_CHECK_EQ(
         state.codebook.size(), size_t{2}, "Row frame stores slope, base.");
-    const uint64_t mask = context.width >= 64
-        ? ~uint64_t{0}
-        : (uint64_t{1} << context.width) - 1;
+    const uint64_t mask =
+        context.width >= 64 ? ~uint64_t{0} : (uint64_t{1} << context.width) - 1;
     const uint64_t slope = state.codebook[0] * sign;
     uint64_t predicted =
         (state.codebook[0] * context.firstRow + state.codebook[1]) * sign;

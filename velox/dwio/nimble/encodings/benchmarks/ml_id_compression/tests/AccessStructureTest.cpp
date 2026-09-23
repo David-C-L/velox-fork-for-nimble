@@ -157,8 +157,7 @@ TEST(MaterializingTargetTest, residentBytesGrowsByADecodedColumn) {
 
   int64_t value{};
   target.materializeRange(11, 1, &value);
-  EXPECT_GE(
-      target.residentBytes(), innerBytes + kRows * sizeof(int64_t));
+  EXPECT_GE(target.residentBytes(), innerBytes + kRows * sizeof(int64_t));
 
   // A second read adds nothing: the column is already held.
   const size_t afterFirst = target.residentBytes();

@@ -65,7 +65,6 @@ struct TopLevelPolicyConfig {
   // that case.
   double minGradientMagnitude{0.005};
 
-
   // The entropy guard rejects a stream whose non-constant bits flip, on
   // average, nearly as unpredictably as random bits: mean binary entropy of
   // flipProbability over the bits that ever flip above this. Such a stream
@@ -199,7 +198,8 @@ inline bool bitFlipGradientGate(
 /// Only the entropy guard reads BitFlipProfile::varyingBits, and filling it
 /// reads every value; the gradient gate reads the sampled pairs alone, so
 /// admitting by it costs a fixed number of pairs whatever the column's length.
-inline BitFlipVaryingBits bitFlipVaryingBitsFor(SubIntSplitAdmission admission) {
+inline BitFlipVaryingBits bitFlipVaryingBitsFor(
+    SubIntSplitAdmission admission) {
   return admission == SubIntSplitAdmission::kBitFlipEntropy
       ? BitFlipVaryingBits::kWholeStream
       : BitFlipVaryingBits::kSkip;

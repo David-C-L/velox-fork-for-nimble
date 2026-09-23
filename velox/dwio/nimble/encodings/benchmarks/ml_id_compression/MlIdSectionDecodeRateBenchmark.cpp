@@ -140,14 +140,15 @@ SectionTiming timeSection(
   // freshly opened stream.
   std::unique_ptr<EncodingView> view;
   timing.viewCreateNanos = minNanos(FLAGS_rate_iters, [&] {
-    view = facebook::nimble::detail::makeSectionView<SectionT>(stream, &pool, options);
+    view = facebook::nimble::detail::makeSectionView<SectionT>(
+        stream, &pool, options);
   });
   timing.materializedFallback =
-      dynamic_cast<facebook::nimble::detail::MaterializedEncodingView<SectionT>*>(view.get()) !=
-      nullptr;
-  timing.viewBulkNanos = minNanos(FLAGS_rate_iters, [&] {
-    view->read(0, rows, sink.data());
-  });
+      dynamic_cast<
+          facebook::nimble::detail::MaterializedEncodingView<SectionT>*>(
+          view.get()) != nullptr;
+  timing.viewBulkNanos =
+      minNanos(FLAGS_rate_iters, [&] { view->read(0, rows, sink.data()); });
   // How SubIntSplitEncodingView's chunked kernel actually reads a section: one
   // read() per kViewChunkSize rows, in order. A view whose read() has to find
   // its position on every call pays that once per chunk, which a single
@@ -156,7 +157,9 @@ SectionTiming timeSection(
   timing.viewChunkedBulkNanos = minNanos(FLAGS_rate_iters, [&] {
     for (uint32_t offset = 0; offset < rows; offset += kViewChunkSize) {
       view->read(
-          offset, std::min(kViewChunkSize, rows - offset), sink.data() + offset);
+          offset,
+          std::min(kViewChunkSize, rows - offset),
+          sink.data() + offset);
     }
   });
   timing.viewPointNanos = minNanos(FLAGS_rate_iters, [&] {
@@ -289,8 +292,9 @@ int runBenchmark() {
           }
         });
         std::cout << "  " << enc.name << ": " << sections.size()
-                  << " sections, " << stream.size() << " B, cursor_bulk="
-                  << cursorBulk << " ns, view_create=" << viewCreate
+                  << " sections, " << stream.size()
+                  << " B, cursor_bulk=" << cursorBulk
+                  << " ns, view_create=" << viewCreate
                   << " ns, view_bulk=" << viewBulk
                   << " ns, view_point=" << viewPoint << " ns/" << probes.size()
                   << " probes\n";
@@ -301,7 +305,9 @@ int runBenchmark() {
         csv.set("arm", enc.name);
         csv.set("N", static_cast<int64_t>(n));
         csv.set("decode_weight", FLAGS_mlidc_sis_decode_weight);
-        csv.set("read_path", static_cast<int64_t>(FLAGS_mlidc_sis_decode_read_path));
+        csv.set(
+            "read_path",
+            static_cast<int64_t>(FLAGS_mlidc_sis_decode_read_path));
         csv.set("withdrawn", FLAGS_mlidc_sis_withdraw_nested_encodings);
         csv.set("section_index", int64_t{-1});
         csv.set("num_sections", static_cast<int64_t>(sections.size()));
@@ -328,7 +334,8 @@ int runBenchmark() {
         SectionTiming timing;
         switch (meta.storageBytes) {
           case 1:
-            timing = timeSection<uint8_t>(meta.stream, n, probes, pool, options);
+            timing =
+                timeSection<uint8_t>(meta.stream, n, probes, pool, options);
             break;
           case 2:
             timing =
@@ -361,14 +368,17 @@ int runBenchmark() {
         csv.set("arm", enc.name);
         csv.set("N", static_cast<int64_t>(n));
         csv.set("decode_weight", FLAGS_mlidc_sis_decode_weight);
-        csv.set("read_path", static_cast<int64_t>(FLAGS_mlidc_sis_decode_read_path));
+        csv.set(
+            "read_path",
+            static_cast<int64_t>(FLAGS_mlidc_sis_decode_read_path));
         csv.set("withdrawn", FLAGS_mlidc_sis_withdraw_nested_encodings);
         csv.set("section_index", static_cast<int64_t>(s));
         csv.set("num_sections", static_cast<int64_t>(sections.size()));
         csv.set("bit_start", static_cast<int64_t>(meta.bitStart));
         csv.set("bit_end", static_cast<int64_t>(meta.bitEnd));
         csv.set(
-            "width_bits", static_cast<int64_t>(meta.bitEnd - meta.bitStart + 1));
+            "width_bits",
+            static_cast<int64_t>(meta.bitEnd - meta.bitStart + 1));
         csv.set("storage_bytes", static_cast<int64_t>(meta.storageBytes));
         csv.set("encoding_type", toString(sectionType));
         csv.set("encoded_bytes", static_cast<int64_t>(meta.stream.size()));
@@ -376,7 +386,8 @@ int runBenchmark() {
         csv.set(
             "materialized_fallback",
             timing.materializedFallback ? int64_t{1} : int64_t{0});
-        csv.set("cursor_create_ns", static_cast<int64_t>(timing.cursorCreateNanos));
+        csv.set(
+            "cursor_create_ns", static_cast<int64_t>(timing.cursorCreateNanos));
         csv.set("cursor_bulk_ns", static_cast<int64_t>(timing.cursorBulkNanos));
         csv.set("view_create_ns", static_cast<int64_t>(timing.viewCreateNanos));
         csv.set("view_bulk_ns", static_cast<int64_t>(timing.viewBulkNanos));

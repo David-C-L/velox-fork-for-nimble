@@ -116,10 +116,11 @@ inline constexpr double kRowFrameMinAgreement = 0.9;
 /// again at a second stride to rule out aliasing. Low bits rather than the
 /// whole word, because a packed ID usually keeps a field above its counters
 /// that moves independently of the row, like a tree depth, and that field
-/// decides the whole word's growth while carrying none of the line. The widest agreeing width, because every counter below it adds its
-/// own term to the slope. Sorted columns with uneven gaps, hashes and
-/// timestamps all fail the agreement test at every width, which keeps the
-/// planner pass this costs off the columns that could not use it.
+/// decides the whole word's growth while carrying none of the line. The widest
+/// agreeing width, because every counter below it adds its own term to the
+/// slope. Sorted columns with uneven gaps, hashes and timestamps all fail the
+/// agreement test at every width, which keeps the planner pass this costs off
+/// the columns that could not use it.
 ///
 /// The base is the most negative residual of those low bits, so that the
 /// fields below `width` stay non-negative and do not borrow from the fields
@@ -179,8 +180,7 @@ SubIntSplitRowFrame fitSubIntSplitRowFrame(
         : -((-median + strideLength / 2) / strideLength);
     if (slope == 0 ||
         agreement(width, slope, kRowFrameStride) < kRowFrameMinAgreement ||
-        agreement(width, slope, kRowFrameCheckStride) <
-            kRowFrameMinAgreement) {
+        agreement(width, slope, kRowFrameCheckStride) < kRowFrameMinAgreement) {
       continue;
     }
 

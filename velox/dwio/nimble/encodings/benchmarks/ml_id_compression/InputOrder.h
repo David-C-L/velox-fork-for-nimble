@@ -148,15 +148,14 @@ inline std::vector<uint32_t> buildInputOrder(
     // which is what the key-derived family needs and what mergeirr denies it.
     std::vector<uint32_t> byKey(count);
     std::iota(byKey.begin(), byKey.end(), 0u);
-    std::stable_sort(
-        byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {
-          const uint64_t left = keyOf(a);
-          const uint64_t right = keyOf(b);
-          if (left != right) {
-            return left < right;
-          }
-          return values[a] < values[b];
-        });
+    std::stable_sort(byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {
+      const uint64_t left = keyOf(a);
+      const uint64_t right = keyOf(b);
+      if (left != right) {
+        return left < right;
+      }
+      return values[a] < values[b];
+    });
 
     std::vector<std::vector<uint32_t>> partitions;
     for (uint32_t i = 0; i < count; ++i) {

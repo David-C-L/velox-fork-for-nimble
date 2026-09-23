@@ -150,8 +150,8 @@ inline void accumulateFlipCounts(
     const __m256i carryFromEights = _mm256_and_si256(eights, carryFromFours);
     eights = _mm256_xor_si256(eights, carryFromFours);
     if (!_mm256_testz_si256(carryFromEights, carryFromEights)) {
-      _mm256_store_si256(reinterpret_cast<__m256i*>(lanes.data()),
-                         carryFromEights);
+      _mm256_store_si256(
+          reinterpret_cast<__m256i*>(lanes.data()), carryFromEights);
       for (const uint64_t lane : lanes) {
         spillPlane(lane, 16, counts);
       }
@@ -248,10 +248,9 @@ BitFlipProfile computeBitFlipProfile(
   size_t pairCount = 0;
   size_t chunkSize = 0;
   for (size_t i = 0; i < totalPairs; i += stride) {
-    flipWords[chunkSize++] = static_cast<uint64_t>(
-        static_cast<UnsignedT>(
-            static_cast<UnsignedT>(values[i]) ^
-            static_cast<UnsignedT>(values[i + 1])));
+    flipWords[chunkSize++] = static_cast<uint64_t>(static_cast<UnsignedT>(
+        static_cast<UnsignedT>(values[i]) ^
+        static_cast<UnsignedT>(values[i + 1])));
     ++pairCount;
     if (chunkSize == kChunkWords) {
       detail::accumulateFlipCounts({flipWords.data(), chunkSize}, flipCounts);

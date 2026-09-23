@@ -31,11 +31,11 @@
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/common/Vector.h"
+#include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
+#include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
-#include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
-#include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
@@ -152,7 +152,8 @@ class FrequencyPartitionEncoding
     size_t total = tierRankSamples_.size() * sizeof(uint32_t);
     total += cursorPos_.size() * sizeof(uint32_t);
     total += cursorRank_.size() * sizeof(uint32_t);
-    total += (cursorValid_.size() + 7) / 8; // std::vector<bool> packs 1 bit each.
+    total +=
+        (cursorValid_.size() + 7) / 8; // std::vector<bool> packs 1 bit each.
     for (const auto& tier : tiers_) {
       total += tier.resolvedValues.size() * sizeof(T);
     }
@@ -712,10 +713,7 @@ class FrequencyPartitionEncoding
   // would read past the end of tagArray_. tagBits <= 8 is required (same
   // precondition as unpackTagAt); it always holds here since tagBits is
   // ceilLog2(numTiers + 1) and numTiers <= kMaxTiers.
-  uint32_t countEqualTag(
-      uint32_t begin,
-      uint32_t end,
-      uint8_t target) const {
+  uint32_t countEqualTag(uint32_t begin, uint32_t end, uint8_t target) const {
     if (begin >= end) {
       return 0;
     }
@@ -1155,8 +1153,7 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
             if (i % kRankSampleStride == 0) {
               const uint32_t si = i / kRankSampleStride;
               for (uint32_t t = 0; t < numBuckets; ++t) {
-                tierRankSamples_[t * numRankSamplesPerBucket_ + si] =
-                    counts[t];
+                tierRankSamples_[t * numRankSamplesPerBucket_ + si] = counts[t];
               }
             }
             const uint8_t tag = unpackTagAt(tagArray_.data(), i, tagBits_);
@@ -1168,8 +1165,7 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
           const uint32_t lastSi =
               (totalRowCount_ + kRankSampleStride - 1) / kRankSampleStride;
           for (uint32_t t = 0; t < numBuckets; ++t) {
-            tierRankSamples_[t * numRankSamplesPerBucket_ + lastSi] =
-                counts[t];
+            tierRankSamples_[t * numRankSamplesPerBucket_ + lastSi] = counts[t];
           }
 
           // Set tierCount from the scan.

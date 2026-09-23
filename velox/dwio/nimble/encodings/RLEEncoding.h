@@ -635,9 +635,10 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
   /// The writer hands run lengths to nested selection, which on real data
   /// picks MainlyConstant or FrequencyPartition for them. This header cannot
   /// price those (MainlyConstantEncoding.h includes it), so the overload above
-  /// falls back to one FixedBitWidth over [minRepeat, maxRepeat], where a single
-  /// long run sets the width charged to every length. Callers that can see the
-  /// nested encodings, such as EncodingSizeEstimation, pass the better price.
+  /// falls back to one FixedBitWidth over [minRepeat, maxRepeat], where a
+  /// single long run sets the width charged to every length. Callers that can
+  /// see the nested encodings, such as EncodingSizeEstimation, pass the better
+  /// price.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,

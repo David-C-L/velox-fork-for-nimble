@@ -26,9 +26,9 @@
 #include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
-#include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/views/EncodingView.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
 
@@ -155,8 +155,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         // of bounds and PositionCache segfaults, so both are keyed the same
         // way now rather than one being assumed safe because it looked
         // different.
-        viewId_{
-            nextViewId_.fetch_add(1, std::memory_order_relaxed)} {
+        viewId_{nextViewId_.fetch_add(1, std::memory_order_relaxed)} {
     NIMBLE_CHECK(
         this->encodingType_ == EncodingType::SubIntSplit ||
             this->encodingType_ == EncodingType::SubIntSplitReordered,
@@ -350,8 +349,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       switch (mapping) {
         case subintsplit::PositionMapping::Permuted:
           // One offset, taken from the map built off the key section.
-          sectionValue =
-              section.valueAt(*section.view, (*positions)[index]);
+          sectionValue = section.valueAt(*section.view, (*positions)[index]);
           break;
         case subintsplit::PositionMapping::Gathered: {
           // Several offsets, which only the transform knows; it asks for the
@@ -506,10 +504,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  void readResidualRange(
-      uint32_t offset,
-      uint32_t length,
-      physicalType* output) const {
+  void readResidualRange(uint32_t offset, uint32_t length, physicalType* output)
+      const {
     if (length == 0) {
       return;
     }
@@ -853,7 +849,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       // one. Below kMinSpanLength rows in total the sort still has nothing
       // to amortise over, so the list falls back to probes per range.
       if (permutedSection_ && totalRows >= kMinSpanLength) {
-        readPermutedSpanRanges(ranges, static_cast<uint32_t>(totalRows), output);
+        readPermutedSpanRanges(
+            ranges, static_cast<uint32_t>(totalRows), output);
         return;
       }
       readResidualRangesSeparately(ranges, output);
@@ -1444,8 +1441,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // L3 round trip for data that is read once, immediately, by the next
     // instruction. readPhysical has always sized its scratch to a chunk and
     // kept it in L1; this path did not.
-    scratch.resize(
-        static_cast<size_t>(kViewChunkSize) * sizeof(physicalType));
+    scratch.resize(static_cast<size_t>(kViewChunkSize) * sizeof(physicalType));
     // A widened read is per block, so this one is sized per block.
     widenScratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
     // A section is widened to 64 bits only where something will read it that
@@ -1483,8 +1479,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       if (section.transform != nullptr) {
         return true;
       }
-      return rewritesValues &&
-          section.wireIndex == transformInfo_.keySection;
+      return rewritesValues && section.wireIndex == transformInfo_.keySection;
     };
     for (size_t i = 0; i < sections_.size(); ++i) {
       const auto& section = sections_[i];
@@ -1629,44 +1624,44 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
               std::min(kViewChunkSize, blockCount - chunk);
           const uint32_t chunkStart = blockStart + chunk;
           physicalType* chunkOutput = output + chunk;
-        switch (section.storageBytes) {
-          case 1:
-            readSectionChunk<uint8_t>(
-                section,
-                chunkStart,
-                chunkCount,
-                chunkOutput,
-                sectionSeeds,
-                scratch.data());
-            break;
-          case 2:
-            readSectionChunk<uint16_t>(
-                section,
-                chunkStart,
-                chunkCount,
-                chunkOutput,
-                sectionSeeds,
-                scratch.data());
-            break;
-          case 4:
-            readSectionChunk<uint32_t>(
-                section,
-                chunkStart,
-                chunkCount,
-                chunkOutput,
-                sectionSeeds,
-                scratch.data());
-            break;
-          default:
-            readSectionChunk<uint64_t>(
-                section,
-                chunkStart,
-                chunkCount,
-                chunkOutput,
-                sectionSeeds,
-                scratch.data());
-            break;
-        }
+          switch (section.storageBytes) {
+            case 1:
+              readSectionChunk<uint8_t>(
+                  section,
+                  chunkStart,
+                  chunkCount,
+                  chunkOutput,
+                  sectionSeeds,
+                  scratch.data());
+              break;
+            case 2:
+              readSectionChunk<uint16_t>(
+                  section,
+                  chunkStart,
+                  chunkCount,
+                  chunkOutput,
+                  sectionSeeds,
+                  scratch.data());
+              break;
+            case 4:
+              readSectionChunk<uint32_t>(
+                  section,
+                  chunkStart,
+                  chunkCount,
+                  chunkOutput,
+                  sectionSeeds,
+                  scratch.data());
+              break;
+            default:
+              readSectionChunk<uint64_t>(
+                  section,
+                  chunkStart,
+                  chunkCount,
+                  chunkOutput,
+                  sectionSeeds,
+                  scratch.data());
+              break;
+          }
         }
         continue;
       }

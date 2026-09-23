@@ -309,8 +309,8 @@ TEST_F(EncodingSizeEstimationTest, mainlyConstantOverPricedForDenseData) {
 // and a frequency skew that fills several FrequencyPartition tiers.
 TEST_F(EncodingSizeEstimationTest, sizeLowerBoundNeverExceedsEstimate) {
   std::mt19937_64 rng(2'026);
-  const auto check = [&]<typename T>(const std::vector<T>& data,
-                                     const std::string& name) {
+  const auto check = [&]<typename T>(
+                         const std::vector<T>& data, const std::string& name) {
     using Est = detail::EncodingSizeEstimation<T>;
     using Physical = typename TypeTraits<T>::physicalType;
     const std::span<const Physical> values{
@@ -345,7 +345,8 @@ TEST_F(EncodingSizeEstimationTest, sizeLowerBoundNeverExceedsEstimate) {
     }
     check(unique, "near-unique" + suffix);
 
-    for (const uint64_t common : {uint64_t{0}, uint64_t{1} << 40, ~uint64_t{0}}) {
+    for (const uint64_t common :
+         {uint64_t{0}, uint64_t{1} << 40, ~uint64_t{0}}) {
       std::vector<uint64_t> dominant(rows, common);
       for (size_t i = 0; i < rows; i += 3) {
         dominant[i] = rng() >> 1;

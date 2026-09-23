@@ -159,10 +159,10 @@ struct EncodingSizeEstimation {
  private:
   // MainlyConstantEncodingBase::estimateSize for numbers, with the common value
   // unknown. With D distinct values the common one occurs at most
-  // rowCount - (D - 1) times, so at least D - 1 rows are uncommon; and whichever
-  // value is common, the others span at least the smaller of max - (second
-  // smallest) and (second largest) - min. Both prices grow with those two
-  // quantities, so priced at them they bound the estimate from below.
+  // rowCount - (D - 1) times, so at least D - 1 rows are uncommon; and
+  // whichever value is common, the others span at least the smaller of max -
+  // (second smallest) and (second largest) - min. Both prices grow with those
+  // two quantities, so priced at them they bound the estimate from below.
   static std::optional<uint64_t> mainlyConstantSizeLowerBound(
       std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,

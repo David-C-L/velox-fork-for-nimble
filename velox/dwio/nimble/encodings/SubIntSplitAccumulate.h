@@ -167,8 +167,8 @@ inline std::vector<SubIntSplitSection> parseSubIntSplitSections(
   // before.
   const uint8_t flags = encoding::read<uint8_t>(pos);
   NIMBLE_CHECK_FILE(
-      (flags & ~(kSubIntSplitSectionTransformFlag | kSubIntSplitRowFrameFlag)) ==
-          0,
+      (flags &
+       ~(kSubIntSplitSectionTransformFlag | kSubIntSplitRowFrameFlag)) == 0,
       fmt::format("Unsupported SubIntSplit header flags: {}", flags));
 
   SubIntSplitRowFrame parsedFrame;

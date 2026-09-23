@@ -188,8 +188,8 @@ class BitRangeCounter {
   void reset(int bitStart) {
     const size_t numSamples = samples_.size();
     if (bitStart_ >= 0 && bitStart == bitStart_ + 1) {
-      const auto firstOne = std::partition_point(
-          keys_.begin(), keys_.end(), [](uint64_t key) {
+      const auto firstOne =
+          std::partition_point(keys_.begin(), keys_.end(), [](uint64_t key) {
             return (key >> 63) == 0;
           });
       for (auto& key : keys_) {
@@ -197,11 +197,7 @@ class BitRangeCounter {
       }
       mergeBuffer_.resize(numSamples);
       std::merge(
-          keys_.begin(),
-          firstOne,
-          firstOne,
-          keys_.end(),
-          mergeBuffer_.begin());
+          keys_.begin(), firstOne, firstOne, keys_.end(), mergeBuffer_.begin());
       keys_.swap(mergeBuffer_);
     } else {
       keys_.resize(numSamples);
@@ -580,7 +576,8 @@ inline SelectorResult selectSplitsImpl(
   }
   const int sz = std::min(kBits, 64);
   return selectSplitsOverGrid(
-      buildSegmentCostGrid(samples, sz, fullCount, std::forward<CostFn>(costFn)),
+      buildSegmentCostGrid(
+          samples, sz, fullCount, std::forward<CostFn>(costFn)),
       sz,
       cfg);
 }

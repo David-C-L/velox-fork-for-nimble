@@ -102,7 +102,8 @@ nimble::EncodingType predictSelected(
     if (!size.has_value()) {
       continue;
     }
-    const float cost = static_cast<float>(size.value()) *
+    const float cost =
+        static_cast<float>(size.value()) *
         nimble::effectiveReadFactor(
             encodingType, factor, size.value(), fixedBitWidthSize);
     if (cost < minCost) {
@@ -653,8 +654,7 @@ TYPED_TEST(EncodingSelectionNumericTests, selectMainlyConst) {
     // select() keeps the first candidate on a tie and Trivial precedes
     // FixedBitWidth in the list, so equal costs go to Trivial.
     const bool expectTrivial = !fixedBitWidthSize.has_value() ||
-        trivialCost <=
-            static_cast<float>(fixedBitWidthSize.value()) *
+        trivialCost <= static_cast<float>(fixedBitWidthSize.value()) *
                 rootReadFactor(nimble::EncodingType::FixedBitWidth);
 
     // MainlyConstant re-encodes a floating point exception stream logically, so

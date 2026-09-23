@@ -117,8 +117,8 @@ class RangePricer {
         : 0.0;
     const auto decodePattern = static_cast<DecodeAccessPattern>(
         sectionOptions_.subIntSplitDecodeAccessPattern);
-    const auto decodeReadPath = static_cast<DecodeReadPath>(
-        sectionOptions_.subIntSplitDecodeReadPath);
+    const auto decodeReadPath =
+        static_cast<DecodeReadPath>(sectionOptions_.subIntSplitDecodeReadPath);
 
     double minCost = std::numeric_limits<double>::max();
     std::optional<uint64_t> selectedSize;
@@ -379,8 +379,7 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
   const PlanPrice total = search.price(chosen, weight);
   result.weightedBits = total.weightedBits;
   result.sizeBits = total.sizeBits;
-  const double scale =
-      static_cast<double>(values.size()) /
+  const double scale = static_cast<double>(values.size()) /
       static_cast<double>(pricer.sampleRows());
   for (const auto& [bitStart, bitEnd] : chosen) {
     const RangePrice& range = pricer.price(bitStart, bitEnd);
@@ -396,8 +395,7 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
         range.sizeBits,
         pricer.sampleRows());
     segment.cost = segment.sizeCostBits +
-        decodeCostBits(
-            segment.decodeNanosPerRow, pricer.sampleRows(), weight) *
+        decodeCostBits(segment.decodeNanosPerRow, pricer.sampleRows(), weight) *
             scale;
     result.segments.push_back(segment);
   }

@@ -119,8 +119,7 @@ EncodingType selectedUnder(
       CompressionOptions{},
       std::nullopt,
   };
-  return policy
-      .select(span, Statistics<uint64_t>::create(span), options)
+  return policy.select(span, Statistics<uint64_t>::create(span), options)
       .encodingType;
 }
 
@@ -178,8 +177,13 @@ TEST(SubIntSplitTopLevelPolicyTest, flipCountsMatchScalarReference) {
   for (size_t i = 100; i < 140; ++i) {
     words[i] = ~uint64_t{0};
   }
-  for (size_t size : {size_t{0}, size_t{1}, size_t{3}, size_t{17}, size_t{999},
-                      size_t{1'000}}) {
+  for (size_t size :
+       {size_t{0},
+        size_t{1},
+        size_t{3},
+        size_t{17},
+        size_t{999},
+        size_t{1'000}}) {
     const std::span<const uint64_t> span(words.data(), size);
     std::array<uint64_t, kMaxBitWidth> vectorised{};
     std::array<uint64_t, kMaxBitWidth> reference{};
@@ -406,12 +410,16 @@ TEST(SubIntSplitTopLevelPolicyTest, admittedStreamStillHasToWinOnSize) {
 
   EXPECT_NE(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlip, /*forces=*/false,
+          values,
+          SubIntSplitAdmission::kBitFlip,
+          /*forces=*/false,
           /*profilePairs=*/0),
       EncodingType::SubIntSplit);
   EXPECT_NE(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlipEntropy, /*forces=*/false,
+          values,
+          SubIntSplitAdmission::kBitFlipEntropy,
+          /*forces=*/false,
           /*profilePairs=*/0),
       EncodingType::SubIntSplit);
 }
@@ -423,7 +431,9 @@ TEST(SubIntSplitTopLevelPolicyTest, forcingSelectsAnAdmittedStreamOutright) {
 
   EXPECT_EQ(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlip, /*forces=*/true,
+          values,
+          SubIntSplitAdmission::kBitFlip,
+          /*forces=*/true,
           /*profilePairs=*/0),
       EncodingType::SubIntSplit);
 }
@@ -434,7 +444,8 @@ TEST(SubIntSplitTopLevelPolicyTest, rejectedStreamIsNeverSubIntSplit) {
   ASSERT_FALSE(admits(values, SubIntSplitAdmission::kBitFlipEntropy));
 
   for (const auto mode :
-       {SubIntSplitAdmission::kBitFlip, SubIntSplitAdmission::kBitFlipEntropy}) {
+       {SubIntSplitAdmission::kBitFlip,
+        SubIntSplitAdmission::kBitFlipEntropy}) {
     // Forcing cannot resurrect a rejected stream either: a rejected stream
     // loses the candidate before the two paths part.
     EXPECT_NE(
@@ -469,12 +480,16 @@ TEST(SubIntSplitTopLevelPolicyTest, sampledGateAdmitsWhatWholeStreamRejects) {
   // split nobody wanted.
   EXPECT_NE(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlip, /*forces=*/false,
+          values,
+          SubIntSplitAdmission::kBitFlip,
+          /*forces=*/false,
           /*profilePairs=*/1'024),
       EncodingType::SubIntSplit);
   EXPECT_EQ(
       selectedUnder(
-          values, SubIntSplitAdmission::kBitFlip, /*forces=*/true,
+          values,
+          SubIntSplitAdmission::kBitFlip,
+          /*forces=*/true,
           /*profilePairs=*/1'024),
       EncodingType::SubIntSplit);
 }

@@ -191,9 +191,9 @@ TEST_F(EstimatorAccuracyTest, forModelOnHighEntropyStream) {
   const auto values = randomHighEntropyValues();
   const double estimate =
       plannerModelBytes(detail::subintsplit::forCostBits, values);
-  const double actual = static_cast<double>(encodedBytes(EncodingType::FOR, values));
-  expectRatioWithin(
-      "forModelHighEntropy", estimate, actual, 0.82, 1.05);
+  const double actual =
+      static_cast<double>(encodedBytes(EncodingType::FOR, values));
+  expectRatioWithin("forModelHighEntropy", estimate, actual, 0.82, 1.05);
 }
 
 // The same model on the arrangement FOR exists for, where it quotes 0.74x.
@@ -204,9 +204,9 @@ TEST_F(EstimatorAccuracyTest, forModelOnLocallyClusteredStream) {
   const auto values = locallyClusteredValues();
   const double estimate =
       plannerModelBytes(detail::subintsplit::forCostBits, values);
-  const double actual = static_cast<double>(encodedBytes(EncodingType::FOR, values));
-  expectRatioWithin(
-      "forModelClustered", estimate, actual, 0.65, 1.20);
+  const double actual =
+      static_cast<double>(encodedBytes(EncodingType::FOR, values));
+  expectRatioWithin("forModelClustered", estimate, actual, 0.65, 1.20);
 }
 
 // FOR's own values-based estimator walks the same frames the encoder does and
@@ -214,11 +214,12 @@ TEST_F(EstimatorAccuracyTest, forModelOnLocallyClusteredStream) {
 // to them, so it is exact up to those, and measures 1.00x.
 TEST_F(EstimatorAccuracyTest, forEstimatorOnHighEntropyStream) {
   const auto values = randomHighEntropyValues();
-  const double estimate = static_cast<double>(
-      ForEncoding<uint64_t>::estimateSize({values.data(), values.size()}, options()));
-  const double actual = static_cast<double>(encodedBytes(EncodingType::FOR, values));
-  expectRatioWithin(
-      "forEstimatorHighEntropy", estimate, actual, 0.97, 1.04);
+  const double estimate =
+      static_cast<double>(ForEncoding<uint64_t>::estimateSize(
+          {values.data(), values.size()}, options()));
+  const double actual =
+      static_cast<double>(encodedBytes(EncodingType::FOR, values));
+  expectRatioWithin("forEstimatorHighEntropy", estimate, actual, 0.97, 1.04);
 }
 
 // FrequencyPartition's estimate runs above what it writes -- 1.30x here, and
@@ -265,12 +266,12 @@ TEST_F(EstimatorAccuracyTest, deltaEstimatorOnLocallyClusteredStream) {
   const auto values = locallyClusteredValues();
   const auto statistics = Statistics<uint64_t>::create(
       std::span<const uint64_t>{values.data(), values.size()});
-  const double estimate = static_cast<double>(
-      DeltaEncoding<uint64_t>::estimateSize(values.size(), statistics, options()));
+  const double estimate =
+      static_cast<double>(DeltaEncoding<uint64_t>::estimateSize(
+          values.size(), statistics, options()));
   const double actual =
       static_cast<double>(encodedBytes(EncodingType::Delta, values));
-  expectRatioWithin(
-      "deltaEstimatorClustered", estimate, actual, 0.95, 1.10);
+  expectRatioWithin("deltaEstimatorClustered", estimate, actual, 0.95, 1.10);
 }
 
 } // namespace

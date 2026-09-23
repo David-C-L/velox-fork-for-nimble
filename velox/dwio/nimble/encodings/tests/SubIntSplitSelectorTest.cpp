@@ -287,8 +287,7 @@ TEST(SubIntSplitSelectorTest, KBestSplitsStartsWithTheDpPlanAndRisesInCost) {
   const auto samples = decodeCostSamples();
   const auto cfg = defaultSelectorConfig();
   const AllowedEncodings all;
-  const auto dp =
-      selectSplitsRestricted(samples, 32, samples.size(), all, cfg);
+  const auto dp = selectSplitsRestricted(samples, 32, samples.size(), all, cfg);
   const auto grid = buildSegmentCostGrid(
       samples, 32, samples.size(), restrictedSegmentCostFn(all, cfg));
   const auto plans = kBestSplits(grid, 32, cfg, 4);
@@ -297,7 +296,8 @@ TEST(SubIntSplitSelectorTest, KBestSplitsStartsWithTheDpPlanAndRisesInCost) {
   double previousCost = -std::numeric_limits<double>::infinity();
   for (size_t rank = 0; rank < plans.size(); ++rank) {
     SCOPED_TRACE(rank);
-    double cost = cfg.splitPenalty * static_cast<double>(plans[rank].size() - 1);
+    double cost =
+        cfg.splitPenalty * static_cast<double>(plans[rank].size() - 1);
     int nextBit = 0;
     for (const auto& segment : plans[rank]) {
       EXPECT_EQ(segment.bitStart, nextBit);
@@ -392,17 +392,29 @@ TEST(SubIntSplitSelectorTest, DecodeWeightTradesSizeForDecode) {
 // able to reach different plans.
 TEST(SubIntSplitSelectorTest, PointAndBulkRankEncodingsDifferently) {
   EXPECT_GT(
-      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Point, DecodeReadPath::Cursor)
+      decodeRate(
+          EncodingType::FrequencyPartition,
+          DecodeAccessPattern::Point,
+          DecodeReadPath::Cursor)
           .baseNanosPerRow,
-      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Point, DecodeReadPath::Cursor)
+      decodeRate(
+          EncodingType::FixedBitWidth,
+          DecodeAccessPattern::Point,
+          DecodeReadPath::Cursor)
               .baseNanosPerRow *
           10.0);
   // On bulk the same pair is within a factor of two, which is why bulk alone
   // never declined it.
   EXPECT_LT(
-      decodeRate(EncodingType::FrequencyPartition, DecodeAccessPattern::Bulk, DecodeReadPath::Cursor)
+      decodeRate(
+          EncodingType::FrequencyPartition,
+          DecodeAccessPattern::Bulk,
+          DecodeReadPath::Cursor)
           .baseNanosPerRow,
-      decodeRate(EncodingType::FixedBitWidth, DecodeAccessPattern::Bulk, DecodeReadPath::Cursor)
+      decodeRate(
+          EncodingType::FixedBitWidth,
+          DecodeAccessPattern::Bulk,
+          DecodeReadPath::Cursor)
               .baseNanosPerRow *
           2.0);
 }
@@ -498,8 +510,10 @@ TEST(SubIntSplitSelectorTest, ViewPathPricesSectionsForTheViewItBuilds) {
   // The cursor pays FrequencyPartition's construction too, but only when
   // opening is charged; amortised pricing is unchanged.
   EXPECT_GT(
-      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::CursorWithOpen),
-      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::Cursor) + 20.0);
+      bulkRate(
+          EncodingType::FrequencyPartition, DecodeReadPath::CursorWithOpen),
+      bulkRate(EncodingType::FrequencyPartition, DecodeReadPath::Cursor) +
+          20.0);
   // A probe's cost does not carry the open.
   EXPECT_DOUBLE_EQ(
       decodeRate(

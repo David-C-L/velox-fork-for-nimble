@@ -157,10 +157,8 @@ SortedType<T> populateRangeUniqueCounts(
 // over the offsets from min touches memory sequentially and needs only as many
 // passes as the range has bits.
 template <typename T>
-SortedType<T> populateSortedUniqueCounts(
-    std::span<const T> values,
-    T minValue,
-    T maxValue) {
+SortedType<T>
+populateSortedUniqueCounts(std::span<const T> values, T minValue, T maxValue) {
   using UnsignedT = std::make_unsigned_t<T>;
   const UnsignedT base = static_cast<UnsignedT>(minValue);
   std::vector<UnsignedT> offsets(values.size());
@@ -398,16 +396,16 @@ void Statistics<T, InputType>::populateUniques() const {
       // would count every row into a map grown by rehashing as it fills. The
       // split planner's refiner prices thousands of 16,384-row slices of wide
       // bit ranges this way, most of them near-unique, and the rehashing was
-      // about a sixth of what pricing them cost. The sort is bounded by the row count
-      // whatever the cardinality. Every reader of the counts is independent of
-      // their order: MainlyConstant breaks count ties by value, Huffman sorts
-      // the frequencies, and the rest read sizes or sums.
+      // about a sixth of what pricing them cost. The sort is bounded by the row
+      // count whatever the cardinality. Every reader of the counts is
+      // independent of their order: MainlyConstant breaks count ties by value,
+      // Huffman sorts the frequencies, and the rest read sizes or sums.
       uniqueCounts_.emplace(
           std::in_place,
           populateSortedUniqueCounts<T>(data_, minValue, maxValue));
     } else if (
-        auto hashCounts = populateBoundedHashUniqueCounts<T>(
-            data_, kMaxHashDistinctCount)) {
+        auto hashCounts =
+            populateBoundedHashUniqueCounts<T>(data_, kMaxHashDistinctCount)) {
       uniqueCounts_.emplace(std::in_place, std::move(hashCounts.value()));
     } else {
       uniqueCounts_.emplace(
@@ -467,8 +465,8 @@ void Statistics<T, InputType>::populateBucketCounts() const {
     const auto threshold = static_cast<UnsignedT>(UnsignedT{1} << (7 * bucket));
     uint64_t count{0};
     for (size_t i = 0; i < data_.size(); ++i) {
-      const auto offset = static_cast<UnsignedT>(
-          static_cast<UnsignedT>(data_[i]) - base);
+      const auto offset =
+          static_cast<UnsignedT>(static_cast<UnsignedT>(data_[i]) - base);
       count += offset >= threshold;
     }
     reaching[bucket] = count;
@@ -527,8 +525,7 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
     }
     stats.sumAbsoluteDelta += blockSum;
     stats.nonDecreasingCount += blockNonDecreasing;
-    stats.maxIncrease =
-        std::max<uint64_t>(stats.maxIncrease, blockMaxIncrease);
+    stats.maxIncrease = std::max<uint64_t>(stats.maxIncrease, blockMaxIncrease);
   }
   adjacentPairStats_ = stats;
 }
@@ -546,8 +543,8 @@ void Statistics<T, InputType>::populateDistinctLowerBound() const {
   const int bits = std::min<int>(
       kDistinctBoundBits,
       static_cast<int>(std::bit_width(
-          static_cast<uint64_t>(static_cast<UnsignedT>(
-              static_cast<UnsignedT>(max()) - base)))));
+          static_cast<uint64_t>(
+              static_cast<UnsignedT>(static_cast<UnsignedT>(max()) - base)))));
   const uint64_t mask = (uint64_t{1} << bits) - 1;
   std::vector<uint64_t> seen(((uint64_t{1} << bits) + 63) / 64, 0);
   for (const auto value : data_) {

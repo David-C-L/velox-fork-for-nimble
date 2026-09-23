@@ -50,6 +50,7 @@ add_library(
   common/EncodingTypeDispatch.h
   selection/EncodingSelectionPolicy.cpp
   selection/Statistics.cpp
+  subintsplit/SectionTransform.h
   subintsplit/SectionTransforms.cpp
   views/DeltaBlockEncodingView.h
   views/EncodingViewFactory.cpp
@@ -92,6 +93,7 @@ add_library(
   SubIntSplitMetrics.h
   SubIntSplitEstimator.h
   SubIntSplitRowFrame.h
+  SubIntSplitPlanRefiner.h
   SubIntSplitEncoding.h
   SubIntSplitDecodeProfile.h
   SubIntSplitDecodeCost.h

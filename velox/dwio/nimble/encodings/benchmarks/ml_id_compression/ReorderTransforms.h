@@ -270,8 +270,7 @@ inline std::vector<uint64_t> sortedAlphabetOf(
     const std::vector<uint64_t>& values) {
   std::vector<uint64_t> alphabet = values;
   std::sort(alphabet.begin(), alphabet.end());
-  alphabet.erase(
-      std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
+  alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
   return alphabet;
 }
 
@@ -355,9 +354,10 @@ inline std::vector<uint64_t> denseRelabel(
   std::vector<uint64_t> out;
   out.reserve(values.size());
   for (uint64_t value : values) {
-    out.push_back(static_cast<uint64_t>(
-        std::lower_bound(codebook.begin(), codebook.end(), value) -
-        codebook.begin()));
+    out.push_back(
+        static_cast<uint64_t>(
+            std::lower_bound(codebook.begin(), codebook.end(), value) -
+            codebook.begin()));
   }
   return out;
 }

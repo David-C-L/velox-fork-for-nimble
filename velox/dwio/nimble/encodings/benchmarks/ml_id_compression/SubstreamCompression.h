@@ -18,9 +18,9 @@
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
+#include <algorithm>
 #include <optional>
 #include <span>
-#include <algorithm>
 #include <string>
 #include <utility>
 

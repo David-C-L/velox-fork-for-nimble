@@ -529,8 +529,10 @@ TEST_F(ForEncodingTest, sliceKeepsResidualsForConstantSubranges) {
   for (const auto range :
        {Range{"subrangeEqualToReference", /*offset=*/0, /*length=*/64},
         Range{"subrangeAboveReference", /*offset=*/64, /*length=*/64},
-        Range{"aboveReferenceIntoConstantFrame", /*offset=*/64,
-              /*length=*/128},
+        Range{
+            "aboveReferenceIntoConstantFrame",
+            /*offset=*/64,
+            /*length=*/128},
         Range{"constantFrameOnly", /*offset=*/128, /*length=*/128}}) {
     SCOPED_TRACE(
         testing::Message() << "name=" << range.name << ", offset="
@@ -608,8 +610,7 @@ TEST_F(ForEncodingTest, roundTripsEveryBitWidthAlignedAndUnaligned) {
         testing::Message() << "type width=" << sizeof(T) * 8
                            << ", frame width=" << static_cast<int>(width));
     constexpr uint32_t kTypeBits = sizeof(T) * 8;
-    const uint64_t span =
-        width == 64 ? ~0ULL : ((1ULL << width) - 1ULL);
+    const uint64_t span = width == 64 ? ~0ULL : ((1ULL << width) - 1ULL);
     // A non-zero reference would overflow T once the residual spans the whole
     // type, so the widest frame of each type is referenced at zero.
     const T reference = width == kTypeBits ? T{0} : T{3};

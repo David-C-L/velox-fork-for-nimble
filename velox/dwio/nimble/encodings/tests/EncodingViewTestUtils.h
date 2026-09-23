@@ -108,8 +108,8 @@ inline std::vector<std::vector<std::pair<uint32_t, uint32_t>>> makeRangeLists(
        {3000, 1100},
        {4100, 1},
        {rowCount > 3 ? rowCount - 3 : 0, 3}}));
-  lists.push_back(clipped(
-      {{1000, 48}, {1100, 1}, {1101, 900}, {2010, 1}, {rowCount, 0}}));
+  lists.push_back(
+      clipped({{1000, 48}, {1100, 1}, {1101, 900}, {2010, 1}, {rowCount, 0}}));
   lists.push_back(clipped({{5, 0}, {6, 1}, {6, 0}, {7, 2}, {rowCount, 0}}));
   lists.push_back(clipped(
       {{100, 5},
@@ -133,8 +133,7 @@ void expectRangeListRead(
   for (const auto& [offset, length] : ranges) {
     numRows += length;
   }
-  SCOPED_TRACE(
-      fmt::format("numRanges={}, numRows={}", ranges.size(), numRows));
+  SCOPED_TRACE(fmt::format("numRanges={}, numRows={}", ranges.size(), numRows));
   // One past the end holds a sentinel, so a read that writes more rows than
   // the ranges add up to is caught rather than landing in unowned memory. A
   // plain array rather than std::vector, which has no data() for bool.

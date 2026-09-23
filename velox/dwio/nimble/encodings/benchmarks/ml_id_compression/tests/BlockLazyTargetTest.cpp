@@ -196,8 +196,7 @@ TEST(BlockLazyTargetTest, holdsFarLessThanFullMaterialisationAfterAFewProbes) {
   // lazy arm has not decoded, less the per-block index it keeps in order to
   // stay addressable -- one empty vector per block, which is real resident
   // memory and is deliberately counted rather than excused.
-  const size_t undecodedBytes =
-      (kRows - 4u * kBlockSize) * sizeof(int64_t);
+  const size_t undecodedBytes = (kRows - 4u * kBlockSize) * sizeof(int64_t);
   const size_t blockIndexBytes =
       (kRows / kBlockSize + 1u) * sizeof(std::vector<int64_t>);
   const size_t gap = full.residentBytes() - lazy->residentBytes();
@@ -270,8 +269,8 @@ TEST(BlockLazyTargetTest, encoderEntries) {
     }
     const auto bareName = entry.name;
     auto bareTarget = entry.factory(data, Encoding::Options{});
-    auto lazy = withBlockLazyMaterialization<int64_t>(
-        entry, kLazyBlockElementCount);
+    auto lazy =
+        withBlockLazyMaterialization<int64_t>(entry, kLazyBlockElementCount);
     EXPECT_EQ(lazy.name, bareName + "+lazy");
 
     auto lazyTarget = lazy.factory(data, Encoding::Options{});

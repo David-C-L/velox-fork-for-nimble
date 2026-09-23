@@ -29,8 +29,8 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
+#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
@@ -341,9 +341,10 @@ std::vector<PricedEncoding> sectionSelectionQuotes(
          static_cast<double>(estimate.value()),
          static_cast<double>(estimate.value() * factor)});
   }
-  std::stable_sort(quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
-    return a.cost < b.cost;
-  });
+  std::stable_sort(
+      quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
+        return a.cost < b.cost;
+      });
   return quotes;
 }
 
@@ -394,13 +395,16 @@ inline std::vector<PricedEncoding> plannerModelQuotes(
       quotes.push_back({encoding, bytes, bytes});
     }
   }
-  std::stable_sort(quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
-    return a.cost < b.cost;
-  });
+  std::stable_sort(
+      quotes.begin(), quotes.end(), [](const auto& a, const auto& b) {
+        return a.cost < b.cost;
+      });
   return quotes;
 }
 
-inline std::string formatQuote(const std::vector<PricedEncoding>& quotes, size_t rank) {
+inline std::string formatQuote(
+    const std::vector<PricedEncoding>& quotes,
+    size_t rank) {
   if (rank >= quotes.size()) {
     return "\t";
   }
@@ -465,7 +469,8 @@ inline std::vector<PricedEncoding> sectionSelectionQuotesAt(
     const Encoding::Options& sectionOptions) {
   const auto narrowed = [&]<typename S>() {
     std::vector<S> narrow(values.begin(), values.end());
-    return sectionSelectionQuotes<S>(std::span<const S>(narrow), sectionOptions);
+    return sectionSelectionQuotes<S>(
+        std::span<const S>(narrow), sectionOptions);
   };
   switch (storageBytes) {
     case 1:
@@ -500,7 +505,10 @@ inline std::string describeSubIntSplitSectionChoices(
     velox::memory::MemoryPool& pool) {
   namespace nimbleDetail = ::facebook::nimble::detail;
   auto root = EncodingFactory().create(
-      pool, stream, [](uint32_t) -> void* { return nullptr; }, Encoding::Options{});
+      pool,
+      stream,
+      [](uint32_t) -> void* { return nullptr; },
+      Encoding::Options{});
   if (root == nullptr ||
       (root->encodingType() != EncodingType::SubIntSplit &&
        root->encodingType() != EncodingType::SubIntSplitReordered)) {
@@ -535,7 +543,8 @@ inline std::string describeSubIntSplitSectionChoices(
           line.base == rowFrame.base) {
         return std::string("line");
       }
-      const auto step = nimbleDetail::subintsplit::fitSubIntSplitStepFrame(span);
+      const auto step =
+          nimbleDetail::subintsplit::fitSubIntSplitStepFrame(span);
       return step.slope == rowFrame.slope && step.base == rowFrame.base
           ? std::string("step")
           : std::string("unknown");
@@ -560,7 +569,8 @@ inline std::string describeSubIntSplitSectionChoices(
   std::vector<uint64_t> wholeValues(rows, 0);
   for (size_t s = 0; s < sections.size(); ++s) {
     const auto& section = sections[s];
-    const auto values = detail::decodeSectionValues(section, pool, sectionOptions);
+    const auto values =
+        detail::decodeSectionValues(section, pool, sectionOptions);
     const uint8_t transformId = transformInfo.anyTransform()
         ? transformInfo.transformIds[s]
         : uint8_t{0};
@@ -572,7 +582,10 @@ inline std::string describeSubIntSplitSectionChoices(
     const auto planner = detail::plannerModelQuotes(
         values, section.bitEnd - section.bitStart + 1);
     auto sectionEncoding = EncodingFactory().create(
-        pool, section.stream, [](uint32_t) -> void* { return nullptr; }, sectionOptions);
+        pool,
+        section.stream,
+        [](uint32_t) -> void* { return nullptr; },
+        sectionOptions);
     out += folly::to<std::string>(
         s,
         "\t",

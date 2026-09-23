@@ -236,14 +236,12 @@ int runBenchmark() {
           velox::bits::bitsRequired(statistics.max() - statistics.min());
       if (rangeBits <= (kTypeWidthBits * 3) / 4) {
         constexpr uint64_t kLegacyOverheadBytes = 6u + 2u + 4u * 6u + 4u * 8u;
-        legacyEstimate = static_cast<uint64_t>(
-                             0.90 *
-                             static_cast<double>(
-                                 FixedBitWidthEncoding<physicalType>::
-                                     estimateSize(
-                                         values.size(),
-                                         statistics,
-                                         Encoding::Options{}))) +
+        legacyEstimate =
+            static_cast<uint64_t>(
+                0.90 *
+                static_cast<double>(
+                    FixedBitWidthEncoding<physicalType>::estimateSize(
+                        values.size(), statistics, Encoding::Options{}))) +
             kLegacyOverheadBytes;
       }
     }
@@ -306,7 +304,10 @@ int runBenchmark() {
         {"estimate", SubIntSplitAdmission::kEstimate, false, false},
         {"estimate_screened", SubIntSplitAdmission::kEstimate, false, true},
         {"bitflip", SubIntSplitAdmission::kBitFlip, false, false},
-        {"bitflip_entropy", SubIntSplitAdmission::kBitFlipEntropy, false, false},
+        {"bitflip_entropy",
+         SubIntSplitAdmission::kBitFlipEntropy,
+         false,
+         false},
         {"bitflip_forced", SubIntSplitAdmission::kBitFlip, true, false},
         {"bitflip_entropy_forced",
          SubIntSplitAdmission::kBitFlipEntropy,
