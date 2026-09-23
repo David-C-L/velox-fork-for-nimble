@@ -44,6 +44,39 @@ DECLARE_string(mlidc_input_order);
 
 namespace facebook::nimble::mlidc {
 
+/// Switches on the upstream SubIntSplit features named in `features`, a
+/// comma-separated list, so one driver run can measure each against its off
+/// default. Throws on a name it does not know, rather than measuring a run
+/// that silently left the feature off.
+inline void applyUpstreamFeatures(
+    std::string_view features,
+    Encoding::Options& options) {
+  size_t start = 0;
+  while (start < features.size()) {
+    const size_t end = std::min(features.find(',', start), features.size());
+    const std::string_view name = features.substr(start, end - start);
+    if (name == "delta") {
+      options.subIntSplitDeltaPreTransform = true;
+    } else if (name == "trim") {
+      options.subIntSplitTrimConstantPlanes = true;
+    } else if (name == "prune") {
+      options.subIntSplitBoundaryPruneThreshold =
+          subintsplit::kBoundaryPruneThreshold;
+    } else if (name == "fold") {
+      options.subIntSplitFoldConstantSections = true;
+    } else if (name == "passthrough") {
+      options.subIntSplitPassThrough = true;
+    } else if (name == "visitorblock") {
+      options.subIntSplitVisitorBlockBuffer = true;
+    } else if (name == "huffmandeep") {
+      options.huffmanPriceLengthLimited = true;
+    } else if (!name.empty()) {
+      NIMBLE_UNSUPPORTED("Unknown upstream SubIntSplit feature: {}", name);
+    }
+    start = end + 1;
+  }
+}
+
 /// Holds the encoder and dataset suites a sweep driver walks, with the cache
 /// topology the measurements run against.
 ///
@@ -270,6 +303,7 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
       FLAGS_mlidc_sis_estimate_compression_guard;
   options.subIntSplitEstimateBitFlipScreen =
       FLAGS_mlidc_sis_estimate_bitflip_screen;
+  applyUpstreamFeatures(FLAGS_mlidc_sis_upstream_features, options);
   // Which arm is being built is known here and nowhere below it, so the encode
   // cache reads it from here rather than every encode signature growing an
   // argument it would only pass through.

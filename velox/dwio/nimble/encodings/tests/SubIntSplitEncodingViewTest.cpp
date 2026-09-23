@@ -192,8 +192,8 @@ TEST_F(SubIntSplitEncodingViewTest, readsThroughRowFrame) {
               compressionType,
               options,
               /*realNestedSelection=*/true);
-      nimble::detail::SubIntSplitRowFrame frame;
-      nimble::detail::parseSubIntSplitSections(
+      nimble::subintsplit::RowFrame frame;
+      nimble::subintsplit::parseSections(
           serialized, nimble::Encoding::kPrefixSize, nullptr, &frame);
       ASSERT_EQ(frame.slope, (uint64_t{1} << 28) + 1);
 
@@ -247,11 +247,13 @@ TEST_F(SubIntSplitEncodingViewTest, sharedHarness) {
       makeStructuredValues<int32_t>(pool_.get(), kRows),
       positions,
       /*baseOptions=*/{},
+      nimble::CompressionType::Uncompressed,
       /*realNestedSelection=*/true);
   expectReads<nimble::SubIntSplitEncoding<uint64_t>>(
       makeStructuredValues<uint64_t>(pool_.get(), kRows),
       positions,
       /*baseOptions=*/{},
+      nimble::CompressionType::Uncompressed,
       /*realNestedSelection=*/true);
 }
 

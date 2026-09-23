@@ -29,11 +29,11 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
 #include "velox/dwio/nimble/tools/EncodingUtilities.h"
 
 // What every node of an encoding tree costs, against what its selection was
@@ -184,7 +184,7 @@ inline std::string describeEncodingNodeEstimates(
   // SubIntSplit node itself is priced under column options -- it is the
   // column's own encoding; only what is below it is a section.
   const Encoding::Options sectionOptions =
-      ::facebook::nimble::detail::subintsplit::sectionEncodingOptions(options);
+      ::facebook::nimble::subintsplit::sectionEncodingOptions(options);
   const auto optionsForNode = [&](uint32_t level) -> const Encoding::Options& {
     for (uint32_t ancestor = 0; ancestor < level; ++ancestor) {
       if (ancestry[ancestor] == EncodingType::SubIntSplit ||
@@ -354,7 +354,7 @@ std::vector<PricedEncoding> sectionSelectionQuotes(
 inline std::vector<PricedEncoding> plannerModelQuotes(
     std::span<const uint64_t> values,
     int bitWidth) {
-  namespace sis = ::facebook::nimble::detail::subintsplit;
+  namespace sis = ::facebook::nimble::subintsplit;
   std::vector<uint64_t> sample;
   sis::sampleIntoU64<uint64_t>(values, sample, sis::defaultSamplerConfig());
   if (sample.empty()) {
@@ -380,7 +380,7 @@ inline std::vector<PricedEncoding> plannerModelQuotes(
         EncodingType::Delta,
         EncodingType::FOR,
         EncodingType::FrequencyPartition}) {
-    const auto cost = sis::bestSegmentCost(
+    const auto cost = sis::bestSectionCost(
         metrics,
         sample.size(),
         values.size(),
@@ -430,7 +430,7 @@ inline std::string formatQuotes(const std::vector<PricedEncoding>& quotes) {
 
 // Decodes every value of one SubIntSplit section, widened to 64 bits.
 inline std::vector<uint64_t> decodeSectionValues(
-    const ::facebook::nimble::detail::SubIntSplitSection& section,
+    const ::facebook::nimble::subintsplit::StoredSection& section,
     velox::memory::MemoryPool& pool,
     const Encoding::Options& sectionOptions) {
   auto encoding = EncodingFactory().create(
@@ -503,7 +503,7 @@ inline std::vector<PricedEncoding> sectionSelectionQuotesAt(
 inline std::string describeSubIntSplitSectionChoices(
     std::string_view stream,
     velox::memory::MemoryPool& pool) {
-  namespace nimbleDetail = ::facebook::nimble::detail;
+  namespace sis = ::facebook::nimble::subintsplit;
   auto root = EncodingFactory().create(
       pool,
       stream,
@@ -520,17 +520,17 @@ inline std::string describeSubIntSplitSectionChoices(
           root->dataType() == DataType::Float
       ? 32
       : 64;
-  nimbleDetail::SubIntSplitTransformInfo transformInfo;
-  nimbleDetail::SubIntSplitRowFrame rowFrame;
-  const auto sections = nimbleDetail::parseSubIntSplitSections(
-      stream, root->dataOffset(), &transformInfo, &rowFrame);
+  sis::TransformInfo transformInfo;
+  sis::RowFrame rowFrame;
+  const auto sections =
+      sis::parseSections(stream, root->dataOffset(), &transformInfo, &rowFrame);
   const Encoding::Options sectionOptions =
-      nimbleDetail::subintsplit::sectionEncodingOptions(Encoding::Options{});
+      sis::sectionEncodingOptions(Encoding::Options{});
 
   // Which fit produced the frame, refitted on the decoded column since the
-  // stream records only the line: "line" when fitSubIntSplitRowFrame
+  // stream records only the line: "line" when fitRowFrame
   // reproduces it (a slope * row + base fitted over 1,024-row strides), "step"
-  // when fitSubIntSplitStepFrame does (the adjacent step most rows take, base
+  // when fitStepFrame does (the adjacent step most rows take, base
   // zero), "none" without a frame.
   std::string frameKind = "none";
   if (rowFrame.active()) {
@@ -538,13 +538,12 @@ inline std::string describeSubIntSplitSectionChoices(
       std::vector<P> original(rows);
       root->materialize(rows, original.data());
       const std::span<const P> span{original};
-      const auto line = nimbleDetail::subintsplit::fitSubIntSplitRowFrame(span);
+      const auto line = sis::fitRowFrame(span);
       if (line.active() && line.slope == rowFrame.slope &&
           line.base == rowFrame.base) {
         return std::string("line");
       }
-      const auto step =
-          nimbleDetail::subintsplit::fitSubIntSplitStepFrame(span);
+      const auto step = sis::fitStepFrame(span);
       return step.slope == rowFrame.slope && step.base == rowFrame.base
           ? std::string("step")
           : std::string("unknown");

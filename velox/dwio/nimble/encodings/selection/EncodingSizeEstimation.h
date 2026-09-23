@@ -26,6 +26,7 @@
 #include "velox/dwio/nimble/encodings/DeltaBlockEncoding.h"
 #include "velox/dwio/nimble/encodings/DeltaEncoding.h"
 #include "velox/dwio/nimble/encodings/DictionaryEncoding.h"
+#include "velox/dwio/nimble/encodings/EliasFanoEncoding.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/ForEncoding.h"
 #include "velox/dwio/nimble/encodings/FrequencyPartitionEncoding.h"
@@ -363,7 +364,11 @@ struct EncodingSizeEstimation {
         return ConstantEncoding<T>::estimateSize(values, statistics, options);
       }
       case EncodingType::Huffman: {
-        if constexpr (isIntegralType<physicalType>()) {
+        // Gates on T, not physicalType: EncodingFactory reads Huffman back
+        // through RETURN_ENCODING_BY_INTEGER_TYPE, which rejects floating-point
+        // data types. Neighbouring cases may gate on physicalType because their
+        // read dispatch accepts it.
+        if constexpr (isIntegralType<T>()) {
           return HuffmanEncoding<T>::estimateSize(values, statistics, options);
         } else {
           return std::nullopt;
@@ -379,6 +384,14 @@ struct EncodingSizeEstimation {
       case EncodingType::DeltaBlock: {
         if constexpr (isIntegralType<T>()) {
           return DeltaBlockEncoding<T>::estimateSize(values, options);
+        } else {
+          return std::nullopt;
+        }
+      }
+      case EncodingType::EliasFano: {
+        if constexpr (isIntegralType<T>()) {
+          return EliasFanoEncoding<T>::estimateSize(
+              values, statistics, options);
         } else {
           return std::nullopt;
         }

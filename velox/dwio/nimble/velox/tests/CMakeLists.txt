@@ -90,24 +90,6 @@ add_executable(
   FieldWriterStatsTest.cpp
   TestUtils.h
 )
-
-# Lives here rather than with the encodings tests because it drives the
-# selective column readers through a written file, so it needs the reader and
-# writer stack that only this binary links. It was in encodings/tests and
-# referenced by no CMakeLists at all, so none of it had ever been compiled.
-if(NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
-  target_sources(nimble_velox_tests PRIVATE ReadWithVisitorTest.cpp)
-  # The visitor cases drive the selective column readers over a written file,
-  # so the reader stack has to be linked here: without it the binary fails to
-  # link on a build that does not pull those libraries in for another reason.
-  target_link_libraries(
-    nimble_velox_tests
-    nimble_encoding_layout_test_helper
-    nimble_velox_selective
-    nimble_velox_reader_factory
-    nimble_batch_reader
-  )
-endif()
 # BatchReaderTest accounts for almost all of this binary's runtime: its cases are
 # parameterized over sixteen combinations, and the whole suite runs well past
 # ctest's default fifteen hundred second limit as a single test. Register it as

@@ -30,6 +30,7 @@ target_link_libraries(nimble_encoding_layout_test_helper nimble_encodings)
 
 add_executable(
   nimble_encodings_tests
+  ALPEncodingTest.cpp
   ALPEncodingViewTest.cpp
   BufferedEncodingTest.cpp
   BlockBitPackingEncodingViewTest.cpp
@@ -37,10 +38,13 @@ add_executable(
   ConstantEncodingTest.cpp
   DictionaryEncodingTest.cpp
   DictionaryEncodingViewTest.cpp
+  EliasFanoEncodingTest.cpp
+  EliasFanoEncodingViewTest.cpp
   EncodingLayoutTest.cpp
   EncodingSelectionTest.cpp
   EncodingSliceTest.cpp
   EncodingViewFactoryTest.cpp
+  EncodingViewUtilsTest.cpp
   CompressionTest.cpp
   EncodingTest.cpp
   EncodingLegacyTest.cpp
@@ -57,6 +61,7 @@ add_executable(
   MainlyConstantEncodingTest.cpp
   MainlyConstantEncodingViewTest.cpp
   NullableEncodingTest.cpp
+  NullableEncodingViewTest.cpp
   OpenZLCompressorTest.cpp
   PFOREncodingViewTest.cpp
   PFOREncodingTest.cpp
@@ -87,6 +92,9 @@ if(NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
       SubIntSplitSizeEstimateTest.cpp
       EncodingSizeEstimationTest.cpp
       EstimatorAccuracyTest.cpp
+      SubIntSplitDecodeOptionsTest.cpp
+      SubIntSplitDeltaTest.cpp
+      SubIntSplitPlannerOptionsTest.cpp
   )
 endif()
 
@@ -94,6 +102,7 @@ add_test(nimble_encodings_tests nimble_encodings_tests)
 
 target_link_libraries(
   nimble_encodings_tests
+  nimble_encoding_layout_test_helper
   nimble_encodings_tests_utils
   nimble_encodings
   nimble_encodings_legacy

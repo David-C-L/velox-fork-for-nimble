@@ -28,10 +28,10 @@
 #include <gflags/gflags.h>
 
 #include "velox/dwio/nimble/common/Types.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitDecodeProfile.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/DriverSweep.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
+#include "velox/dwio/nimble/encodings/subintsplit/DecodeProfile.h"
 
 // Attributes a SubIntSplit bulk decode to its individual sections, so a slow
 // column can be traced to the one section (and sub-encoding) that limits it.

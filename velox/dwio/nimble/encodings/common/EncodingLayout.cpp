@@ -20,13 +20,14 @@
 #include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/common/Varint.h"
 #include "velox/dwio/nimble/encodings/ALPEncoding.h"
+#include "velox/dwio/nimble/encodings/BitRangeSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/FsstEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/common/EncodingUtils.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Format.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitBoundaries.h"
 
 namespace facebook::nimble {
 
@@ -185,11 +186,12 @@ EncodingLayout EncodingLayoutCapture::capture(
   if (encodingType == EncodingType::FixedBitWidth ||
       encodingType == EncodingType::Trivial ||
       encodingType == EncodingType::BlockBitPacking ||
-      encodingType == EncodingType::FOR) {
+      encodingType == EncodingType::FOR || encodingType == EncodingType::Fsst) {
     compressionType =
         encoding::peek<uint8_t, CompressionType>(encoding.data() + prefixSize);
   }
 
+  EncodingLayout::Config encodingConfig;
   std::vector<std::optional<const EncodingLayout>> children;
   switch (encodingType) {
     case EncodingType::FixedBitWidth:
@@ -197,6 +199,7 @@ EncodingLayout EncodingLayoutCapture::capture(
     case EncodingType::Constant:
     case EncodingType::Prefix:
     case EncodingType::DeltaBlock:
+    case EncodingType::EliasFano:
     case EncodingType::SimdForBitpack:
     case EncodingType::FrequencyPartition:
     case EncodingType::Huffman:
@@ -207,6 +210,19 @@ EncodingLayout EncodingLayoutCapture::capture(
       // stream, and the layout tree describes how data is encoded, not how a
       // slice was deferred. Reported as childless.
       break;
+    case EncodingType::BitRangeSplit: {
+      using Base = detail::BitRangeSplitEncodingBase;
+      Base::captureLayout(
+          encoding,
+          options,
+          [&](NestedEncodingIdentifier /* sectionIndex */,
+              const Base::Section& section) {
+            const char* position = section.data;
+            captureChild(children, position, section.dataBytes, options);
+          },
+          encodingConfig);
+      break;
+    }
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered: {
       // SubIntSplit decomposes its input into per-section bit-range
@@ -221,17 +237,17 @@ EncodingLayout EncodingLayoutCapture::capture(
       // a reordered stream a local walk would take the section headers from
       // the wrong offset and capture nonsense. A third reader of this header
       // is exactly what the shared one exists to prevent.
-      detail::SubIntSplitRowFrame rowFrame;
-      const auto sections = detail::parseSubIntSplitSections(
-          encoding, prefixSize, nullptr, &rowFrame);
+      subintsplit::RowFrame rowFrame;
+      const auto sections =
+          subintsplit::parseSections(encoding, prefixSize, nullptr, &rowFrame);
 
       children.reserve(sections.size());
-      std::vector<detail::subintsplit::SegmentPlan> boundaryPlans;
+      std::vector<subintsplit::SectionPlan> boundaryPlans;
       boundaryPlans.reserve(sections.size());
       for (const auto& section : sections) {
         children.emplace_back(
             EncodingLayoutCapture::capture(section.stream, options));
-        detail::subintsplit::SegmentPlan segment{};
+        subintsplit::SectionPlan segment{};
         segment.bitStart = section.bitStart;
         segment.bitEnd = section.bitEnd;
         boundaryPlans.push_back(segment);
@@ -240,11 +256,11 @@ EncodingLayout EncodingLayoutCapture::capture(
       // The captured type is the one the stream carries. Reporting a reordered
       // stream as plain SubIntSplit would describe a layout that decodes to
       // different values than the stream it came from.
-      auto config = detail::subintsplit::makePreserveSplitConfig(boundaryPlans);
+      auto config = subintsplit::makePreserveSplitConfig(boundaryPlans);
       if (rowFrame.active()) {
         config.emplace(
-            std::string(detail::subintsplit::kRowFrameConfigKey),
-            std::string(detail::subintsplit::kRowFramePresent));
+            std::string(subintsplit::kRowFrameConfigKey),
+            std::string(subintsplit::kRowFramePresent));
       }
       return {
           encodingType,
@@ -447,8 +463,7 @@ EncodingLayout EncodingLayoutCapture::capture(
 
   return {
       encodingType,
-      /*encodingConfig=*/
-      {},
+      std::move(encodingConfig),
       compressionType,
       std::move(children)};
 }

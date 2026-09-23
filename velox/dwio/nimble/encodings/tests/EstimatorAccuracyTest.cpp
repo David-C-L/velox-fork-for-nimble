@@ -47,13 +47,13 @@
 #include "velox/dwio/nimble/encodings/DeltaEncoding.h"
 #include "velox/dwio/nimble/encodings/ForEncoding.h"
 #include "velox/dwio/nimble/encodings/FrequencyPartitionEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
 
 using namespace facebook;
 using namespace facebook::nimble;
@@ -123,7 +123,7 @@ class EstimatorAccuracyTest : public ::testing::Test {
   // Section options, since every stream these estimators are judged on is a
   // SubIntSplit section and the options decide what the encoder writes.
   Encoding::Options options() const {
-    return detail::subintsplit::sectionEncodingOptions(Encoding::Options{});
+    return subintsplit::sectionEncodingOptions(Encoding::Options{});
   }
 
   // Bytes `encodingType` writes for `values`, through the real encoder.
@@ -152,12 +152,9 @@ class EstimatorAccuracyTest : public ::testing::Test {
   // What the planner's cost models quote for `values`, in bytes, so that a
   // model and an encode can be compared in the same unit.
   double plannerModelBytes(
-      double (*model)(
-          const detail::subintsplit::SegmentMetrics&,
-          size_t,
-          int) noexcept,
+      double (*model)(const subintsplit::SectionMetrics&, size_t, int) noexcept,
       const std::vector<uint64_t>& values) {
-    detail::subintsplit::MetricCollector collector;
+    subintsplit::MetricCollector collector;
     const auto metrics = collector.compute(values);
     return model(metrics, values.size(), 64) / 8.0;
   }
@@ -189,8 +186,7 @@ class EstimatorAccuracyTest : public ::testing::Test {
 // growing.
 TEST_F(EstimatorAccuracyTest, forModelOnHighEntropyStream) {
   const auto values = randomHighEntropyValues();
-  const double estimate =
-      plannerModelBytes(detail::subintsplit::forCostBits, values);
+  const double estimate = plannerModelBytes(subintsplit::forCostBits, values);
   const double actual =
       static_cast<double>(encodedBytes(EncodingType::FOR, values));
   expectRatioWithin("forModelHighEntropy", estimate, actual, 0.82, 1.05);
@@ -202,8 +198,7 @@ TEST_F(EstimatorAccuracyTest, forModelOnHighEntropyStream) {
 // win the sections it is best at.
 TEST_F(EstimatorAccuracyTest, forModelOnLocallyClusteredStream) {
   const auto values = locallyClusteredValues();
-  const double estimate =
-      plannerModelBytes(detail::subintsplit::forCostBits, values);
+  const double estimate = plannerModelBytes(subintsplit::forCostBits, values);
   const double actual =
       static_cast<double>(encodedBytes(EncodingType::FOR, values));
   expectRatioWithin("forModelClustered", estimate, actual, 0.65, 1.20);
@@ -248,8 +243,8 @@ TEST_F(EstimatorAccuracyTest, frequencyPartitionEstimatorOnSkewedStream) {
 // about the same encoding.
 TEST_F(EstimatorAccuracyTest, frequencyPartitionModelOnSkewedStream) {
   const auto values = skewedFrequencyValues();
-  const double estimate = plannerModelBytes(
-      detail::subintsplit::frequencyPartitionCostBits, values);
+  const double estimate =
+      plannerModelBytes(subintsplit::frequencyPartitionCostBits, values);
   const double actual = static_cast<double>(
       encodedBytes(EncodingType::FrequencyPartition, values));
   expectRatioWithin(

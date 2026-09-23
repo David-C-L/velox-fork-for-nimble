@@ -72,12 +72,13 @@
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/RLEEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Format.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionAccumulator.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 
 DEFINE_string(
     reorder_block_rows,
@@ -149,7 +150,7 @@ DEFINE_bool(
 namespace facebook::nimble::mlidc {
 namespace {
 
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 namespace rx = facebook::nimble::mlidc::reorder;
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -358,7 +359,7 @@ size_t bestSectionBytes(
     chosen = EncodingType::Trivial;
     return 0;
   }
-  switch (facebook::nimble::detail::subIntSplitSectionStorageBytes(width)) {
+  switch (facebook::nimble::subintsplit::sectionStorageBytes(width)) {
     case 1:
       return bestBytesNarrow<uint8_t>(values, inventory, compression, chosen);
     case 2:
@@ -1276,7 +1277,7 @@ int runBenchmark() {
     }
     const auto selection = selectSplits(
         shippedSamples, kBits, data.size(), defaultSelectorConfig());
-    const auto& segments = selection.segments;
+    const auto& segments = selection.sections;
     const auto numSections = static_cast<int>(segments.size());
     const auto candidates = buildCandidates(families, numSections);
 
@@ -1346,7 +1347,7 @@ int runBenchmark() {
       // it. The shipped-order split above is still what defines the arms
       // themselves, which is a property of how the data was written rather
       // than of how it is encoded.
-      std::vector<SegmentPlan> armSegments = segments;
+      std::vector<SectionPlan> armSegments = segments;
       if (!FLAGS_reorder_pin_splits) {
         std::vector<uint64_t> armSamples;
         sampleIntoU64(physical, armSamples, defaultSamplerConfig());
@@ -1354,7 +1355,7 @@ int runBenchmark() {
           armSegments =
               selectSplits(
                   armSamples, kBits, ordered.size(), defaultSelectorConfig())
-                  .segments;
+                  .sections;
         }
       }
       const auto armNumSections = static_cast<int>(armSegments.size());

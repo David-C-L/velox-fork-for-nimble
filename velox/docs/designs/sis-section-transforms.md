@@ -140,7 +140,7 @@ the structure it exploits.
 [section bytes...]
 ```
 
-`parseSubIntSplitSections` in `SubIntSplitAccumulate.h` is the single shared parser, so the
+`parseSubIntSplitSections` in `subintsplit/SectionAccumulator.h` is the single shared parser, so the
 change is made once, but both `SubIntSplitEncoding` and `SubIntSplitEncodingView` must honour
 it.
 
@@ -512,7 +512,7 @@ be building the smaller lever against a baseline that is about to move.
 
 No format change. No new encoding. The largest measured number in the whole study.
 
-**What the gap is.** The DP in `SubIntSplitSelector.h` costs every candidate bit range with
+**What the gap is.** The DP in `subintsplit/SplitSelector.h` costs every candidate bit range with
 `bestCostBits`, and that estimate is wrong in four separate ways:
 
 ```cpp
@@ -563,7 +563,7 @@ and FrequencyPartition, and corrects the MainlyConstant, Dictionary and Delta bi
 | `1beaab46b`, `db951ac40`, `410f2ff74` | FrequencyPartition cost model and index sizing |
 
 **What is missing is validation through the drivers, not the code.** Those commits touch only
-`SubIntSplitCostModels.h` and `SubIntSplitCostModelsTest.cpp`, which are unit tests over the
+`subintsplit/CostModel.h` and `SubIntSplitCostModelsTest.cpp`, which are unit tests over the
 cost functions themselves. No results directory references that branch, and although
 `MlIdCostModelOracleBenchmark` exists there it does not appear to have been run against it. A
 unit test can confirm a formula returns the number its author intended; it cannot show that the
@@ -657,7 +657,7 @@ the encoder needs a reason to look before it pays that.
 
 A cheap gate on the existing sample: if no section is a plausible key, meaning none has low
 enough cardinality to group by, or if grouping by the best candidate does not reduce run counts
-in the other sections, skip the whole family. The sampler in `SubIntSplitSampler.h` already
+in the other sections, skip the whole family. The sampler in `subintsplit/Sampler.h` already
 produces what this needs.
 
 Selection must also respect the read shape, since the key-derived permutation is O(block) per

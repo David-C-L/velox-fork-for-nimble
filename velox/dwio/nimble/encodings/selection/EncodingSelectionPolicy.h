@@ -29,12 +29,13 @@
 #include <vector>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/dwio/nimble/common/Constants.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
+#include "velox/dwio/nimble/encodings/BitRangeSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
+#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
 
 namespace facebook::nimble {
 
@@ -152,7 +153,13 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
   // should we allow trivial string lengths to be encoded using trivial
   // encoding?)
   for (const auto& entry : parentReadFactors) {
-    if (entry.first != parentEncodingType) {
+    // BitRangeSplit sections are restricted to encodings that can decode one
+    // of its bit ranges; every other parent only excludes itself.
+    const bool isCandidate = parentEncodingType == EncodingType::BitRangeSplit
+        ? detail::BitRangeSplitEncodingBase::isValidSectionEncodingCandidate(
+              entry.first)
+        : entry.first != parentEncodingType;
+    if (isCandidate) {
       nested.emplace_back(entry);
     }
   }
@@ -513,29 +520,28 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     if constexpr (
         isIntegralType<T>() &&
         (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
-      const auto admission =
-          static_cast<detail::subintsplit::SubIntSplitAdmission>(
-              options.subIntSplitAdmission);
+      const auto admission = static_cast<subintsplit::SubIntSplitAdmission>(
+          options.subIntSplitAdmission);
       const auto subIntSplit = std::find_if(
           candidateEncodingReadFactors.begin(),
           candidateEncodingReadFactors.end(),
           [](const auto& entry) {
             return entry.first == EncodingType::SubIntSplit;
           });
-      if (admission != detail::subintsplit::SubIntSplitAdmission::kEstimate &&
+      if (admission != subintsplit::SubIntSplitAdmission::kEstimate &&
           subIntSplit != candidateEncodingReadFactors.end()) {
         const bool admitted = options.subIntSplitAdmissionProfilePairs == 0
-            ? detail::subintsplit::bitFlipAdmits(
+            ? subintsplit::bitFlipAdmits(
                   statistics.bitFlipProfile(),
                   admission,
-                  detail::subintsplit::TopLevelPolicyConfig{})
-            : detail::subintsplit::bitFlipAdmits(
-                  detail::subintsplit::bitFlipAdmissionProfile(
+                  subintsplit::TopLevelPolicyConfig{})
+            : subintsplit::bitFlipAdmits(
+                  subintsplit::bitFlipAdmissionProfile(
                       values,
                       admission,
                       options.subIntSplitAdmissionProfilePairs),
                   admission,
-                  detail::subintsplit::TopLevelPolicyConfig{});
+                  subintsplit::TopLevelPolicyConfig{});
         if (!admitted) {
           candidateEncodingReadFactors.erase(subIntSplit);
         } else if (options.subIntSplitAdmissionForces) {
@@ -596,9 +602,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     const double decodeWeight = options.subIntSplitSectionSelection
         ? options.subIntSplitDecodeWeight
         : 0.0;
-    const auto decodePattern =
-        static_cast<detail::subintsplit::DecodeAccessPattern>(
-            options.subIntSplitDecodeAccessPattern);
+    const auto decodePattern = static_cast<subintsplit::DecodeAccessPattern>(
+        options.subIntSplitDecodeAccessPattern);
 
     // Costs are compared in double so that the decode term, which is in bytes
     // and can be large, does not lose the size term to rounding. With the
@@ -644,7 +649,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       // Size, as before, plus what reading the section back costs at the
       // caller's exchange rate. Section decode times add rather than max, so
       // one slow section is paid in full by every scan of the column, and
-      // choosing on size alone cannot see that. See SubIntSplitDecodeCost.h
+      // choosing on size alone cannot see that. See subintsplit/DecodeCost.h
       // for where the per-encoding rates come from and how well each is
       // supported by measurement.
       const double sizeCost =
@@ -656,14 +661,14 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       }
       double cost = sizeCost;
       if (decodeWeight != 0.0) {
-        const double nanosPerRow = detail::subintsplit::decodeNanosPerRow(
+        const double nanosPerRow = subintsplit::decodeNanosPerRow(
             encodingType,
             decodePattern,
-            static_cast<detail::subintsplit::DecodeReadPath>(
+            static_cast<subintsplit::DecodeReadPath>(
                 options.subIntSplitDecodeReadPath),
             static_cast<double>(estimatedSize.value()) * 8.0,
             values.size());
-        cost += detail::subintsplit::decodeCostBits(
+        cost += subintsplit::decodeCostBits(
                     nanosPerRow, values.size(), decodeWeight) /
             8.0;
       }

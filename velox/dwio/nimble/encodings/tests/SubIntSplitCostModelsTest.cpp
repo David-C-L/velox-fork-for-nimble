@@ -22,11 +22,11 @@
 
 #include <gtest/gtest.h>
 
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
 
 using namespace facebook::nimble;
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
 namespace {
 
@@ -161,7 +161,7 @@ std::vector<uint64_t> makeMainlyConstantValues() {
 TEST(SubIntSplitCostModelsTest, PforBeatsFixedBitWidthForBaselinePlusOutliers) {
   const std::vector<uint64_t> values = makePforFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 16;
@@ -180,7 +180,7 @@ TEST(
   // PFOR's fixed-base-bit-width approximation for this small an alphabet.
   const std::vector<uint64_t> values = makePforFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 16;
@@ -211,7 +211,7 @@ TEST(
     DeltaBlockIsFiniteAndCheaperThanDeltaForConstantStepData) {
   const std::vector<uint64_t> values = makeDeltaFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 28; // bit_width(199800000) == 28
@@ -245,7 +245,7 @@ TEST(
     BlockBitPackingBeatsFixedBitWidthForLocallyClusteredData) {
   const std::vector<uint64_t> values = makeBlockClusteredValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 20; // bit_width(750015) == 20
@@ -266,7 +266,7 @@ TEST(SubIntSplitCostModelsTest, SimdForBitpackIsFiniteAndCheaperThanTrivial) {
     values.push_back(static_cast<uint64_t>(i % 64)); // bit_width <= 6
   }
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 8;
@@ -287,7 +287,7 @@ TEST(
   // fixed-base-bit-width approximation for this small an alphabet.
   const std::vector<uint64_t> values = makePforFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 16;
@@ -323,12 +323,12 @@ TEST(SubIntSplitCostModelsTest, MetricCollectorScansBothWaysAlike) {
   // Any frequencies will do: the three-argument overload takes them as given
   // and this test is about everything else it returns.
   MetricCollector collector;
-  const SegmentMetrics counted =
+  const SectionMetrics counted =
       collector.compute(values, allCostModelRequiredFlags());
   FrequencyCounts supplied;
   supplied.uniqueCount = counted.uniqueCount;
   supplied.dominantCount = counted.dominantCount;
-  const SegmentMetrics scanned =
+  const SectionMetrics scanned =
       collector.compute(values, allCostModelRequiredFlags(), supplied);
 
   EXPECT_EQ(scanned.min, counted.min);
@@ -369,9 +369,9 @@ TEST(SubIntSplitCostModelsTest, MetricCollectorCountsBothWaysAlike) {
   }
 
   MetricCollector collector;
-  const SegmentMetrics direct =
+  const SectionMetrics direct =
       collector.compute(narrow, allCostModelRequiredFlags());
-  const SegmentMetrics hashed =
+  const SectionMetrics hashed =
       collector.compute(wide, allCostModelRequiredFlags());
 
   EXPECT_EQ(direct.uniqueCount, hashed.uniqueCount);
@@ -382,7 +382,7 @@ TEST(SubIntSplitCostModelsTest, MetricCollectorCountsBothWaysAlike) {
 
   // A reused collector must not carry counts between segments, which is the
   // failure a histogram cleared by walking what it touched would show first.
-  const SegmentMetrics again =
+  const SectionMetrics again =
       collector.compute(narrow, allCostModelRequiredFlags());
   EXPECT_EQ(again.uniqueCount, direct.uniqueCount);
   EXPECT_EQ(again.dominantCount, direct.dominantCount);
@@ -398,7 +398,7 @@ TEST(
   // it costs nothing.
   const std::vector<uint64_t> values = makePforFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 16;
@@ -448,7 +448,7 @@ TEST(
     values.push_back(65535);
   }
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 16;
@@ -465,7 +465,7 @@ TEST(
     BestCostBitsSelectsBlockBitPackingForLocallyClusteredData) {
   const std::vector<uint64_t> values = makeBlockClusteredValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 20;
@@ -480,7 +480,7 @@ TEST(
 TEST(SubIntSplitCostModelsTest, DeltaCostBitsFiniteForMonotonicData) {
   const std::vector<uint64_t> values = makeDeltaFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 28; // bit_width(199800000) == 28
@@ -496,7 +496,7 @@ TEST(SubIntSplitCostModelsTest, DeltaCostBitsFiniteForMonotonicData) {
 TEST(SubIntSplitCostModelsTest, DeltaCostBitsInfiniteForNonMonotonicData) {
   const std::vector<uint64_t> values = makeAlternatingValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 10; // bit_width(1000) == 10
@@ -508,7 +508,7 @@ TEST(SubIntSplitCostModelsTest, DeltaCostBitsInfiniteForNonMonotonicData) {
 TEST(SubIntSplitCostModelsTest, ForCostBitsFiniteAndPositive) {
   const std::vector<uint64_t> values = makeForFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 10; // bit_width(999) == 10
@@ -531,7 +531,7 @@ TEST(
   // cost keeps scaling with the (now exact, not byte-rounded) deltaBitWidth.
   const std::vector<uint64_t> values = makeDeltaFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 28; // bit_width(199800000) == 28
@@ -550,7 +550,7 @@ TEST(
   // (mostly) zero-width deltas beats FOR's per-frame local-range estimate.
   const std::vector<uint64_t> values = makeForFriendlyValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 10; // bit_width(999) == 10
@@ -580,7 +580,7 @@ TEST(
   }
   values[10] = 0;
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 10; // bit_width(999) == 10
@@ -597,7 +597,7 @@ TEST(
     FrequencyPartitionCostBitsFiniteForZipfianData) {
   const std::vector<uint64_t> values = makeZipfianValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   // Values 0..67 require 7 bits; FPE should be finite and beat fixed-bit-width
@@ -618,7 +618,7 @@ TEST(
     BestCostBitsSelectsFrequencyPartitionForZipfianData) {
   const std::vector<uint64_t> values = makeZipfianValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 7; // bit_width(67) == 7
@@ -633,7 +633,7 @@ TEST(
 TEST(SubIntSplitCostModelsTest, MainlyConstantCostBitsFiniteForDominantData) {
   const std::vector<uint64_t> values = makeMainlyConstantValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   // bit_width(227) == 8; MainlyConstant should be finite and beat FixedBitWidth
@@ -653,7 +653,7 @@ TEST(
     BestCostBitsSelectsMainlyConstantForDominantData) {
   const std::vector<uint64_t> values = makeMainlyConstantValues();
   MetricCollector collector;
-  const SegmentMetrics m =
+  const SectionMetrics m =
       collector.compute(values, allCostModelRequiredFlags());
 
   constexpr int kBitWidth = 8; // bit_width(227) == 8

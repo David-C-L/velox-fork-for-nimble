@@ -26,7 +26,7 @@
 #include "folly/container/F14Map.h"
 
 #include "velox/dwio/nimble/common/RadixSort.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
+#include "velox/dwio/nimble/encodings/subintsplit/RowFrame.h"
 
 namespace facebook::nimble::subintsplit {
 
@@ -598,7 +598,7 @@ class BitPlaneTransform : public SectionTransform {
 //
 // apply() fits the line when the state carries none and leaves the values
 // untouched when nothing fits, so an empty codebook means not applied. The
-// fit is the one SubIntSplitRowFrame.h has always run, so streams keep their
+// fit is the one subintsplit/RowFrame.h has always run, so streams keep their
 // bytes and their header.
 class RowFrameTransform : public SectionTransform {
  public:
@@ -651,15 +651,13 @@ class RowFrameTransform : public SectionTransform {
         fmt::format("Row frame needs a 32- or 64-bit column, got {}", width));
   }
 
-  static detail::SubIntSplitRowFrame fitWide(std::span<const uint64_t> values) {
-    return detail::subintsplit::fitSubIntSplitRowFrame(values);
+  static subintsplit::RowFrame fitWide(std::span<const uint64_t> values) {
+    return subintsplit::fitRowFrame(values);
   }
 
-  static detail::SubIntSplitRowFrame fitNarrowed(
-      std::span<const uint64_t> values) {
+  static subintsplit::RowFrame fitNarrowed(std::span<const uint64_t> values) {
     const std::vector<uint32_t> narrowed(values.begin(), values.end());
-    return detail::subintsplit::fitSubIntSplitRowFrame(
-        std::span<const uint32_t>(narrowed));
+    return subintsplit::fitRowFrame(std::span<const uint32_t>(narrowed));
   }
 
   // Adds sign * (slope * row + base) to every value, modulo the width. sign

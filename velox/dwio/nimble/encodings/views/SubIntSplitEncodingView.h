@@ -25,9 +25,10 @@
 
 #include "velox/common/memory/RawVector.h"
 #include "velox/dwio/nimble/common/Vector.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Format.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionAccumulator.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 #include "velox/dwio/nimble/encodings/views/EncodingView.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
@@ -161,9 +162,17 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
             this->encodingType_ == EncodingType::SubIntSplitReordered,
         "SubIntSplitEncodingView built over a stream that is not SubIntSplit.");
 
-    const auto parsed = detail::parseSubIntSplitSections(
-        data, this->dataOffset_, &transformInfo_, &rowFrame_);
+    uint8_t flags{0};
+    const auto parsed = subintsplit::parseSections(
+        data, this->dataOffset_, &transformInfo_, &rowFrame_, &flags);
     NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
+    // A delta stream's sections hold steps, not values, and a row is the sum
+    // of every step before it, so no section can be read at an index.
+    // createEncodingView serves such a stream through a full decode instead;
+    // reaching here with one would return steps as values.
+    NIMBLE_CHECK(
+        (flags & subintsplit::kFlagDelta) == 0,
+        "SubIntSplitEncodingView cannot index a delta stream.");
     // Validated before any section is built: a transform this reader does not
     // know would otherwise be skipped, and the values it returned would look
     // like ordinary ones.
@@ -252,7 +261,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   template <typename SectionT>
   static Section makeSection(
-      const detail::SubIntSplitSection& meta,
+      const subintsplit::StoredSection& meta,
       velox::memory::MemoryPool* pool,
       const Encoding::Options& options) {
     return Section{
@@ -286,11 +295,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     auto* values = reinterpret_cast<SectionT*>(scratch);
     section.view->read(offset, count, values);
     if (isFirst) {
-      detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(
-          values, output, count, section.mask, section.bitStart);
+      subintsplit::accumulateSection<true>(
+          values,
+          output,
+          count,
+          section.mask,
+          section.bitStart,
+          physicalType{0});
     } else {
-      detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
-          values, output, count, section.mask, section.bitStart);
+      subintsplit::accumulateSection<false>(
+          values,
+          output,
+          count,
+          section.mask,
+          section.bitStart,
+          physicalType{0});
     }
   }
 
@@ -300,8 +319,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     if (rowFrame_.active()) {
       value = static_cast<physicalType>(
           value +
-          detail::subIntSplitRowFramePrediction<physicalType>(
-              rowFrame_, index));
+          subintsplit::rowFramePrediction<physicalType>(rowFrame_, index));
     }
     return detail::castFromPhysicalType<T>(value);
   }
@@ -410,8 +428,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
 
     NIMBLE_CHECK(
-        transformInfo_.keySection !=
-            detail::SubIntSplitTransformInfo::kNoKeySection,
+        transformInfo_.keySection != subintsplit::TransformInfo::kNoKeySection,
         "A computable transform needs the key section it was ordered by.");
     // Taken from the key's own encoding where it has them, which spares
     // reading the whole key section a value at a time just to derive what the
@@ -500,7 +517,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     this->checkReadRange(offset, length);
     readResidualRange(offset, length, output);
     if (rowFrame_.active()) {
-      detail::addSubIntSplitRowFrame(rowFrame_, offset, output, length);
+      subintsplit::addRowFrame(rowFrame_, offset, output, length);
     }
   }
 
@@ -681,7 +698,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     readResidualRanges(ranges, output);
     if (rowFrame_.active()) {
       for (const auto& [offset, length] : ranges) {
-        detail::addSubIntSplitRowFrame(rowFrame_, offset, output, length);
+        subintsplit::addRowFrame(rowFrame_, offset, output, length);
         output += length;
       }
     }
@@ -1258,11 +1275,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         probed[i] = section.valueAt(*section.view, positions[offset + i]);
       }
       if (isFirst) {
-        detail::accumulateSubIntSplitSection<physicalType, uint64_t, true>(
-            probed.data(), output, length, section.mask, section.bitStart);
+        subintsplit::accumulateSection<true>(
+            probed.data(),
+            output,
+            length,
+            section.mask,
+            section.bitStart,
+            physicalType{0});
       } else {
-        detail::accumulateSubIntSplitSection<physicalType, uint64_t, false>(
-            probed.data(), output, length, section.mask, section.bitStart);
+        subintsplit::accumulateSection<false>(
+            probed.data(),
+            output,
+            length,
+            section.mask,
+            section.bitStart,
+            physicalType{0});
       }
     }
   }
@@ -1312,11 +1339,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       gathered[order[k].row] = block[k];
     }
     if (isFirst) {
-      detail::accumulateSubIntSplitSection<physicalType, SectionT, true>(
-          gathered, output, length, section.mask, section.bitStart);
+      subintsplit::accumulateSection<true>(
+          gathered,
+          output,
+          length,
+          section.mask,
+          section.bitStart,
+          physicalType{0});
     } else {
-      detail::accumulateSubIntSplitSection<physicalType, SectionT, false>(
-          gathered, output, length, section.mask, section.bitStart);
+      subintsplit::accumulateSection<false>(
+          gathered,
+          output,
+          length,
+          section.mask,
+          section.bitStart,
+          physicalType{0});
     }
   }
 
@@ -1528,7 +1565,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // key is worth widening at all.
     if (rewritesValues &&
         transformInfo_.keySection !=
-            detail::SubIntSplitTransformInfo::kNoKeySection) {
+            subintsplit::TransformInfo::kNoKeySection) {
       for (size_t i = 0; i < sections_.size(); ++i) {
         if (sections_[i].wireIndex != transformInfo_.keySection) {
           continue;
@@ -1700,10 +1737,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   const uint64_t viewId_;
 
   // Per-section transform metadata from the header, indexed by wire position.
-  detail::SubIntSplitTransformInfo transformInfo_;
+  subintsplit::TransformInfo transformInfo_;
   // Predictor the encoder subtracted before planning, inactive when it did
   // not. Added back by the three read overrides and nowhere else.
-  detail::SubIntSplitRowFrame rowFrame_;
+  subintsplit::RowFrame rowFrame_;
   // True where some section carries a Sequential transform, which is what
   // forces reads onto the block path.
   bool blockedSection_{false};

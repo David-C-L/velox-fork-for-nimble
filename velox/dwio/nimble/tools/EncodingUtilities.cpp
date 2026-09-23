@@ -16,9 +16,11 @@
 #include "velox/dwio/nimble/tools/EncodingUtilities.h"
 #include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/common/Varint.h"
+#include "velox/dwio/nimble/encodings/BitRangeSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/FsstEncoding.h"
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Format.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionAccumulator.h"
 #endif
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingUtils.h"
@@ -65,6 +67,7 @@ void extractCompressionType(
     case EncodingType::Varint:
     case EncodingType::Delta:
     case EncodingType::DeltaBlock:
+    case EncodingType::EliasFano:
     case EncodingType::Constant:
     case EncodingType::MainlyConstant:
     case EncodingType::Prefix:
@@ -72,6 +75,7 @@ void extractCompressionType(
     case EncodingType::Fsst:
     case EncodingType::PFOR:
     case EncodingType::SimdForBitpack:
+    case EncodingType::BitRangeSplit:
     // SubIntSplit integration is disabled; it carries no separate compression
     // byte, so treat it like the other encodings handled here.
     case EncodingType::SubIntSplit:
@@ -143,6 +147,7 @@ void traverseEncodings(
     case EncodingType::Constant:
     case EncodingType::Prefix:
     case EncodingType::DeltaBlock:
+    case EncodingType::EliasFano:
     case EncodingType::SimdForBitpack:
 #ifndef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
     // SubIntSplit integration is disabled in non-experimental builds; treat
@@ -153,6 +158,25 @@ void traverseEncodings(
     // stream, so there is nothing to traverse into here.
     case EncodingType::Slice: {
       // don't have any nested encoding
+      break;
+    }
+    case EncodingType::BitRangeSplit: {
+      detail::BitRangeSplitEncodingBase::visitSections(
+          stream,
+          Encoding::Options{
+              .useVarintRowCount = useVarintRowCount,
+          },
+          [&](NestedEncodingIdentifier section,
+              const detail::BitRangeSplitEncodingBase::Section& metadata) {
+            traverseEncodings(
+                {metadata.data, metadata.dataBytes},
+                level + 1,
+                section,
+                "Bits" + std::to_string(metadata.bitStart) + "-" +
+                    std::to_string(metadata.bitEnd),
+                useVarintRowCount,
+                visitor);
+          });
       break;
     }
     case EncodingType::ALP: {
@@ -433,8 +457,7 @@ void traverseEncodings(
       // Walked by the parser the encoding and its view share, so an optional
       // header block, like the row frame or the transform block, cannot
       // desynchronise this walk from the stream.
-      const auto sections =
-          detail::parseSubIntSplitSections(stream, dataOffset);
+      const auto sections = subintsplit::parseSections(stream, dataOffset);
       for (size_t s = 0; s < sections.size(); ++s) {
         traverseEncodings(
             sections[s].stream,

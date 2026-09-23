@@ -74,6 +74,7 @@ DECLARE_string(mlidc_dataset_name);
 DECLARE_string(mlidc_input_order);
 DECLARE_string(mlidc_substream_compression);
 DECLARE_bool(mlidc_sis_row_frame);
+DECLARE_string(mlidc_sis_upstream_features);
 DECLARE_bool(mlidc_sis_estimate_compression_guard);
 DECLARE_bool(mlidc_sis_estimate_bitflip_screen);
 DECLARE_string(mlidc_outer_compression);
@@ -1318,15 +1319,15 @@ Vector<T> applyInputOrder(Vector<T> data) {
     return uint64_t{0};
   };
   if (order.kind == "mergekey") {
-    const auto plan = ::facebook::nimble::detail::subintsplit::selectSplits(
+    const auto plan = ::facebook::nimble::subintsplit::selectSplits(
         values, static_cast<int>(sizeof(T) * 8), values.size());
-    NIMBLE_CHECK(!plan.segments.empty(), "Split selection found no sections.");
+    NIMBLE_CHECK(!plan.sections.empty(), "Split selection found no sections.");
     const size_t which = std::min<size_t>(
         static_cast<size_t>(std::max(0, order.param)),
-        plan.segments.size() - 1);
-    const int bitStart = plan.segments[which].bitStart;
+        plan.sections.size() - 1);
+    const int bitStart = plan.sections[which].bitStart;
     const int width =
-        plan.segments[which].bitEnd - plan.segments[which].bitStart + 1;
+        plan.sections[which].bitEnd - plan.sections[which].bitStart + 1;
     const uint64_t mask =
         (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
     const std::vector<uint64_t>* source = &values;

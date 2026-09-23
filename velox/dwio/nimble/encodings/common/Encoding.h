@@ -17,7 +17,6 @@
 
 #include "velox/buffer/BufferPool.h"
 #include "velox/common/base/BitUtil.h"
-#include "velox/common/base/SimdUtil.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/ColumnVisitors.h"
 #include "velox/dwio/common/DecoderUtil.h"
@@ -31,6 +30,7 @@
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace folly {
 class Executor;
@@ -302,14 +302,14 @@ class Encoding {
     /// because section decode times add rather than max. A four-bit section
     /// dragged the whole column and selection had no way to know.
     ///
-    /// See SubIntSplitDecodeCost.h for where the per-encoding rates come from
+    /// See subintsplit/DecodeCost.h for where the per-encoding rates come from
     /// and how well each is supported.
     double subIntSplitDecodeWeight{0.0};
 
     /// The read shape section decode is costed for when
     /// subIntSplitDecodeWeight is non-zero: 0 bulk, 1 point, 2 gather, 3
     /// range. Matches
-    /// detail::subintsplit::DecodeAccessPattern, and is a plain integer here
+    /// subintsplit::DecodeAccessPattern, and is a plain integer here
     /// for the same reason subIntSplitTransform is -- this header cannot see
     /// that enum.
     ///
@@ -322,7 +322,7 @@ class Encoding {
     uint8_t subIntSplitDecodeAccessPattern{0};
 
     /// The reader section decode is costed for when subIntSplitDecodeWeight is
-    /// non-zero. Matches detail::subintsplit::DecodeReadPath: 0 the cursor
+    /// non-zero. Matches subintsplit::DecodeReadPath: 0 the cursor
     /// (SubIntSplitEncoding::materialize) and 1 the view
     /// (SubIntSplitEncodingView), both with construction amortised; 2 and 3 the
     /// same readers paying each section's construction on every read.
@@ -398,13 +398,14 @@ class Encoding {
     bool subIntSplitHybridPlanner{false};
 
     /// How top-level selection admits SubIntSplit, as a
-    /// detail::subintsplit::SubIntSplitAdmission value. 0 (the default) keeps
+    /// subintsplit::SubIntSplitAdmission value. 0 (the default) keeps
     /// SubIntSplitEncoding::estimateSize competing with the other candidates.
     /// 1 offers SubIntSplit as a candidate exactly when the bit-flip profile's
     /// gradient gate admits the stream and withholds it otherwise; 2 also
-    /// requires the active-bit entropy guard (see SubIntSplitTopLevelPolicy.h).
-    /// Under 1 and 2 an admitted stream still has to win the ordinary size
-    /// comparison, unless subIntSplitAdmissionForces says otherwise.
+    /// requires the active-bit entropy guard (see
+    /// subintsplit/TopLevelPolicy.h). Under 1 and 2 an admitted stream still
+    /// has to win the ordinary size comparison, unless
+    /// subIntSplitAdmissionForces says otherwise.
     uint8_t subIntSplitAdmission{0};
 
     /// Whether a bit-flip admission decides on its own, rather than deciding
@@ -437,7 +438,7 @@ class Encoding {
     bool subIntSplitInNestedStreams{true};
 
     /// Whether SubIntSplit may subtract a fitted slope * row + base from every
-    /// value before planning its sections (see SubIntSplitRowFrame.h). A line
+    /// value before planning its sections (see subintsplit/RowFrame.h). A line
     /// frame is fitted only where nearly every 1'024-row stride of the column's
     /// low bits grows by the same multiple of the stride, and kept only where
     /// the planner prices the residuals below the values. Failing that, a step
@@ -540,6 +541,114 @@ class Encoding {
     /// until ALP is production-ready.
     bool allowNestedAlpSelection{false};
 
+    /// EXPERIMENTATION: Lets SubIntSplit zigzag-delta the stream before
+    /// splitting it into bit ranges, keeping whichever form encodes smaller.
+    ///
+    /// A monotone counter's low bits are maximally random viewed absolutely
+    /// but nearly constant viewed as deltas, so no per-bit-range encoding can
+    /// compress them while the delta form is trivial. This mirrors OpenZL,
+    /// where ZL_NODE_DELTA_INT feeds a downstream graph rather than acting as
+    /// a leaf codec. The zigzag step keeps decreasing runs from wrapping to
+    /// huge unsigned values.
+    ///
+    /// Delta-encoded streams can only be read sequentially from row 0: skip()
+    /// decodes every skipped row, so point and range reads cost a scan from
+    /// the start, and the EncodingView reads them through a full decode. The
+    /// delta form carries no row frame and no section transforms. Do not
+    /// enable for production until restatement points are added.
+    bool subIntSplitDeltaPreTransform{false};
+
+    /// Output elements SubIntSplit combines per pass when decoding.
+    ///
+    /// Measured flat across 4096/2048/1024/512 on 20 data patterns, so there is
+    /// no tuning win here on current hardware; the knob exists for unusual
+    /// cache geometries. 0 selects the default.
+    uint32_t subIntSplitDecodeChunkSize{0};
+
+    /// EXPERIMENTATION: Decode cost SubIntSplit's split planner charges per
+    /// additional section, in bits per value.
+    ///
+    /// The planner otherwise optimises storage alone and will buy a section for
+    /// a fraction of a percent of size while costing a full extra pass over the
+    /// output at decode. This term lets a caller trade a little storage back
+    /// for decode throughput. It changes the chosen split, so encoded output
+    /// differs from the default.
+    ///
+    /// 0.0 keeps the storage-only plan.
+    double subIntSplitDecodeCostBitsPerValue{0.0};
+
+    /// Samples SubIntSplit's split planner draws from the stream.
+    ///
+    /// The planner's cost grid is O(candidateBoundaries^2) cells and each cell
+    /// walks the whole sample, so this is the dominant term in encode time and
+    /// the reason SubIntSplit encodes slower than an encoding that is handed
+    /// its split. Fewer samples buy encode throughput at the risk of a
+    /// worse-informed split. 0 selects the default.
+    uint32_t subIntSplitPlannerMaxSamples{0};
+
+    /// Relative change in a bit plane's set-rate required before SubIntSplit's
+    /// planner will consider that position as a split boundary.
+    ///
+    /// Raising it prunes candidate boundaries, which shrinks the cost grid
+    /// quadratically -- the cheapest way to speed up planning, paid for in
+    /// split quality. Negative selects the default, which here is 0.0, no
+    /// pruning; upstream's threshold is subintsplit::kBoundaryPruneThreshold.
+    double subIntSplitBoundaryPruneThreshold{-1.0};
+
+    /// Hard ceiling on SubIntSplit's candidate split boundaries.
+    ///
+    /// The planner's cost grid is quadratic in boundaries, and a threshold
+    /// bounds them only indirectly -- a stream with many real field edges still
+    /// produces many. A cap makes planning O(cap^2) whatever the data, which is
+    /// what a writer with a latency budget needs. 0 is unlimited.
+    uint32_t subIntSplitMaxCandidateBoundaries{0};
+
+    /// Widest section SubIntSplit's planner scores, beyond the full active
+    /// range which is always scored. Trims the grid's upper triangle.
+    /// 0 is unlimited.
+    uint32_t subIntSplitMaxSectionWidth{0};
+
+    /// Widest section for which SubIntSplit collects unique and dominant-value
+    /// counts.
+    ///
+    /// That frequency pass is the expensive half of the planner's per-cell
+    /// metrics and only feeds the Dictionary and MainlyConstant cost models,
+    /// which need low cardinality to win. Above this width both are treated as
+    /// unusable and the pass is skipped. 0 is unlimited.
+    uint32_t subIntSplitFrequencyMetricsMaxWidth{0};
+
+    /// EXPERIMENTATION: Trims the bit planes constant across SubIntSplit's
+    /// planner sample before the split DP, storing each constant edge as one
+    /// Constant section and scoring the grid over the varying planes alone.
+    ///
+    /// Off by default. Planning is a small share of encode at production row
+    /// counts, and trimming can move the plan, so it changes encoded output.
+    /// Ignored for an edge narrower than the minimum section width, and when
+    /// subIntSplitAllowedEncodings excludes Constant.
+    bool subIntSplitTrimConstantPlanes{false};
+
+    /// Folds SubIntSplit's Constant sections into one pre-shifted word when a
+    /// stream is opened, so the decode loop never materialises them. Decode
+    /// only: encoded output is unchanged. Applies to streams without section
+    /// transforms.
+    bool subIntSplitFoldConstantSections{false};
+
+    /// Decodes a SubIntSplit stream whose one remaining section holds each
+    /// value verbatim straight into the caller's buffer, skipping the scratch
+    /// copy and the mask-and-shift pass. Decode only.
+    bool subIntSplitPassThrough{false};
+
+    /// Decodes SubIntSplit a block at a time on the readWithVisitor slow path,
+    /// instead of one value per section per call. Decode only; applies to
+    /// streams with no transform, row frame or delta.
+    bool subIntSplitVisitorBlockBuffer{false};
+
+    /// Prices a Huffman tree deeper than HuffmanEncoding::kMaxCodeBits at its
+    /// Shannon bound instead of declining it. encode() length-limits such a
+    /// tree, so it is encodable; declining it reproduces the selection made
+    /// before length limiting. Changes encoded output where Huffman then wins.
+    bool huffmanPriceLengthLimited{false};
+
     /// Per-column decoding statistics for timing decompression.
     velox::dwio::common::DecodingStats* decodingStats = nullptr;
 
@@ -549,7 +658,7 @@ class Encoding {
     /// for a dedicated, untimed attribution pass -- never for the pass whose
     /// throughput is being reported -- since the timing calls themselves cost
     /// cycles the reported Meps figures should not carry. See
-    /// SubIntSplitDecodeProfile.h.
+    /// subintsplit/DecodeProfile.h.
     SubIntSplitDecodeProfile* subIntSplitDecodeProfile = nullptr;
 
     /// Computes a key-derived transform's run ids, run values, sorted run

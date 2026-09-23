@@ -25,13 +25,13 @@
 #include <string>
 #include <vector>
 
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitDecodeCost.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 
 using namespace facebook::nimble;
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
 namespace {
 
@@ -67,14 +67,14 @@ void expectPartitionMatchesCounting(
     for (int r = l; r < bits; ++r) {
       extractor.extend(r);
       const std::vector<uint64_t>& segValues = extractor.values();
-      const SegmentMetrics counted = counting.compute(segValues, flags);
+      const SectionMetrics counted = counting.compute(segValues, flags);
       const RangeCounts rangeCounts = counter.counts(r);
-      const SegmentMetrics given =
+      const SectionMetrics given =
           supplied.compute(segValues, flags, rangeCounts);
       // The frequencies alone, through the path that scans for everything
       // else, so that both of the collector's supplied-counts paths are held
       // to the counting path.
-      const SegmentMetrics givenFrequencies =
+      const SectionMetrics givenFrequencies =
           supplied.compute(segValues, flags, rangeCounts.frequencies);
 
       const std::string where =
@@ -227,10 +227,10 @@ TEST(SubIntSplitSelectorTest, RangeCountsExtrapolateStreamCardinality) {
 
   const auto flags = allCostModelRequiredFlags();
   MetricCollector collector;
-  const SegmentMetrics counted = collector.compute(samples, flags);
+  const SectionMetrics counted = collector.compute(samples, flags);
   BitRangeCounter counter(samples);
   counter.reset(0);
-  const SegmentMetrics given =
+  const SectionMetrics given =
       collector.compute(samples, flags, counter.counts(kBits - 1));
 
   const double countedEstimate =
@@ -270,12 +270,12 @@ TEST(SubIntSplitSelectorTest, DecodeWeightZeroReproducesTheSizeOnlyPlan) {
       .weight = 0.0, .accessPattern = DecodeAccessPattern::Bulk};
   const auto weighted = selectSplits(samples, 32, samples.size(), cfg);
 
-  ASSERT_EQ(weighted.segments.size(), baseline.segments.size());
-  for (size_t i = 0; i < baseline.segments.size(); ++i) {
-    EXPECT_EQ(weighted.segments[i].bitStart, baseline.segments[i].bitStart);
-    EXPECT_EQ(weighted.segments[i].bitEnd, baseline.segments[i].bitEnd);
-    EXPECT_EQ(weighted.segments[i].encoding, baseline.segments[i].encoding);
-    EXPECT_DOUBLE_EQ(weighted.segments[i].cost, baseline.segments[i].cost);
+  ASSERT_EQ(weighted.sections.size(), baseline.sections.size());
+  for (size_t i = 0; i < baseline.sections.size(); ++i) {
+    EXPECT_EQ(weighted.sections[i].bitStart, baseline.sections[i].bitStart);
+    EXPECT_EQ(weighted.sections[i].bitEnd, baseline.sections[i].bitEnd);
+    EXPECT_EQ(weighted.sections[i].encoding, baseline.sections[i].encoding);
+    EXPECT_DOUBLE_EQ(weighted.sections[i].cost, baseline.sections[i].cost);
   }
   EXPECT_DOUBLE_EQ(weighted.totalCost, baseline.totalCost);
 }
@@ -288,8 +288,8 @@ TEST(SubIntSplitSelectorTest, KBestSplitsStartsWithTheDpPlanAndRisesInCost) {
   const auto cfg = defaultSelectorConfig();
   const AllowedEncodings all;
   const auto dp = selectSplitsRestricted(samples, 32, samples.size(), all, cfg);
-  const auto grid = buildSegmentCostGrid(
-      samples, 32, samples.size(), restrictedSegmentCostFn(all, cfg));
+  const auto grid = buildSectionCostGrid(
+      samples, 32, samples.size(), restrictedSectionCostFn(all, cfg));
   const auto plans = kBestSplits(grid, 32, cfg, 4);
 
   ASSERT_EQ(plans.size(), 4);
@@ -317,8 +317,8 @@ TEST(SubIntSplitSelectorTest, KBestSplitsCutOnlyWhereAllowed) {
   const auto samples = decodeCostSamples();
   const auto cfg = defaultSelectorConfig();
   const AllowedEncodings all;
-  const auto grid = buildSegmentCostGrid(
-      samples, 32, samples.size(), restrictedSegmentCostFn(all, cfg));
+  const auto grid = buildSectionCostGrid(
+      samples, 32, samples.size(), restrictedSectionCostFn(all, cfg));
   std::vector<bool> cuts(33, false);
   cuts[0] = true;
   cuts[16] = true;
@@ -345,12 +345,12 @@ TEST(SubIntSplitSelectorTest, KBestSplitsCutOnlyWhereAllowed) {
 TEST(SubIntSplitSelectorTest, SizeAndWeightedCostAgreeAtWeightZero) {
   const auto samples = decodeCostSamples();
   const auto plan = selectSplits(samples, 32, samples.size());
-  ASSERT_FALSE(plan.segments.empty());
-  for (const auto& segment : plan.segments) {
+  ASSERT_FALSE(plan.sections.empty());
+  for (const auto& segment : plan.sections) {
     EXPECT_DOUBLE_EQ(segment.sizeCostBits, segment.cost);
   }
   const double penalties = defaultSelectorConfig().splitPenalty *
-      static_cast<double>(plan.segments.size() - 1);
+      static_cast<double>(plan.sections.size() - 1);
   EXPECT_DOUBLE_EQ(plan.totalCost, plan.totalSizeBits + penalties);
 }
 
@@ -360,12 +360,12 @@ TEST(SubIntSplitSelectorTest, SizeAndWeightedCostAgreeAtWeightZero) {
 TEST(SubIntSplitSelectorTest, SizeOnlyPlanStillReportsItsDecodeCost) {
   const auto samples = decodeCostSamples();
   const auto plan = selectSplits(samples, 32, samples.size());
-  ASSERT_FALSE(plan.segments.empty());
+  ASSERT_FALSE(plan.sections.empty());
   EXPECT_GT(plan.totalDecodeNanosPerRow, 0.0);
   // Composition is additive over sections plus the per-section assembly term,
   // so the whole is never cheaper than its parts.
   double sum = 0.0;
-  for (const auto& segment : plan.segments) {
+  for (const auto& segment : plan.sections) {
     sum += segment.decodeNanosPerRow;
   }
   EXPECT_GE(plan.totalDecodeNanosPerRow, sum);
@@ -550,11 +550,11 @@ TEST(SubIntSplitSelectorTest, DecodeWeightZeroOnTheViewPathReproducesSizeOnly) {
       .readPath = DecodeReadPath::View};
   const auto view = selectSplits(samples, 32, samples.size(), cfg);
 
-  ASSERT_EQ(view.segments.size(), baseline.segments.size());
-  for (size_t i = 0; i < baseline.segments.size(); ++i) {
-    EXPECT_EQ(view.segments[i].bitStart, baseline.segments[i].bitStart);
-    EXPECT_EQ(view.segments[i].bitEnd, baseline.segments[i].bitEnd);
-    EXPECT_EQ(view.segments[i].encoding, baseline.segments[i].encoding);
+  ASSERT_EQ(view.sections.size(), baseline.sections.size());
+  for (size_t i = 0; i < baseline.sections.size(); ++i) {
+    EXPECT_EQ(view.sections[i].bitStart, baseline.sections[i].bitStart);
+    EXPECT_EQ(view.sections[i].bitEnd, baseline.sections[i].bitEnd);
+    EXPECT_EQ(view.sections[i].encoding, baseline.sections[i].encoding);
   }
   EXPECT_DOUBLE_EQ(view.totalCost, baseline.totalCost);
 }
@@ -576,7 +576,7 @@ TEST(SubIntSplitSelectorTest, InfiniteSizeCandidatesNeverWin) {
   cfg.decodeWeighting = DecodeCostWeighting{
       .weight = 0.5, .accessPattern = DecodeAccessPattern::Point};
   const auto plan = selectSplits(samples, 32, samples.size(), cfg);
-  ASSERT_FALSE(plan.segments.empty());
+  ASSERT_FALSE(plan.sections.empty());
   EXPECT_TRUE(std::isfinite(plan.totalCost));
   EXPECT_TRUE(std::isfinite(plan.totalDecodeNanosPerRow));
 }

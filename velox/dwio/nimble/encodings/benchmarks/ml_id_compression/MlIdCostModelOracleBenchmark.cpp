@@ -162,19 +162,19 @@
 #include "velox/dwio/nimble/encodings/PFOREncoding.h"
 #include "velox/dwio/nimble/encodings/RLEEncoding.h"
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSampler.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelection.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitBoundaries.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
+#include "velox/dwio/nimble/encodings/subintsplit/TopLevelPolicy.h"
 
 DEFINE_int32(
     hybrid_shortlist,
@@ -244,7 +244,7 @@ DEFINE_bool(
 namespace facebook::nimble::mlidc {
 namespace {
 
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
 struct CandidateEncoding {
   std::string name;
@@ -673,20 +673,20 @@ OracleDpResult oracleDp(
       break;
     }
     const auto& cell = grid[start][idx - 1];
-    result.segments.push_back(
+    result.sections.push_back(
         {start, idx - 1, cellEncoding(cell), cellBytes(cell)});
     // Reported unscaled, so the number stays a count of bytes the oracle
     // actually measured rather than a projection of them.
     result.totalBytes += cellBytes(cell);
     idx = start;
   }
-  std::reverse(result.segments.begin(), result.segments.end());
+  std::reverse(result.sections.begin(), result.sections.end());
   return result;
 }
 
 // The preserve-mode config that pins a SubIntSplit encode to `segments`.
 inline EncodingLayout::Config planConfigFor(
-    const std::vector<SegmentPlan>& segments) {
+    const std::vector<SectionPlan>& segments) {
   return EncodingLayout::Config{{
       {std::string(kSplitModeConfigKey), std::string(kSplitModePreserve)},
       {std::string(kSplitBoundariesConfigKey),
@@ -721,7 +721,7 @@ inline EncodingLayout::Config planConfigFor(
 template <typename Elem>
 std::optional<size_t> encodeColumn(
     const Vector<Elem>& column,
-    const std::vector<SegmentPlan>& segments,
+    const std::vector<SectionPlan>& segments,
     const facebook::nimble::Encoding::Options& columnOptions) {
   if (column.empty()) {
     return std::nullopt;
@@ -750,7 +750,7 @@ std::optional<size_t> encodeColumn(
 // and letting the encoder derive its own must produce identical bytes. That
 // equality is what the writer-reproduction check in runBenchmark asserts.
 template <typename Phys>
-std::vector<SegmentPlan> writerDerivedPlan(
+std::vector<SectionPlan> writerDerivedPlan(
     std::span<const Phys> physical,
     int kBits,
     const facebook::nimble::Encoding::Options& columnOptions) {
@@ -765,17 +765,17 @@ std::vector<SegmentPlan> writerDerivedPlan(
              physical.size(),
              columnOptions.subIntSplitAllowedEncodings,
              writerCfg)
-      .segments;
+      .sections;
 }
 
-// The oracle's segments as SegmentPlan, so both plans reach encodeColumn and
+// The oracle's segments as SectionPlan, so both plans reach encodeColumn and
 // serializeSplitBoundaries the same way.
-inline std::vector<SegmentPlan> toSegmentPlans(
+inline std::vector<SectionPlan> toSegmentPlans(
     const std::vector<OracleSegment>& segments) {
-  std::vector<SegmentPlan> plans;
+  std::vector<SectionPlan> plans;
   plans.reserve(segments.size());
   for (const auto& segment : segments) {
-    SegmentPlan plan;
+    SectionPlan plan;
     plan.bitStart = segment.bitStart;
     plan.bitEnd = segment.bitEnd;
     plan.encoding = segment.encoding;
@@ -1019,7 +1019,7 @@ int runBenchmark() {
     const auto writerPlan =
         writerDerivedPlan<Phys>(physical, kBits, columnOptions);
     const auto recomputeBytes =
-        encodeColumn<Elem>(data, std::vector<SegmentPlan>{}, columnOptions);
+        encodeColumn<Elem>(data, std::vector<SectionPlan>{}, columnOptions);
     const auto preserveBytes =
         encodeColumn<Elem>(data, writerPlan, columnOptions);
     const bool writerReproduced = recomputeBytes.has_value() &&
@@ -1189,7 +1189,7 @@ int runBenchmark() {
 
           // Cost model metrics + per-encoding estimates.
           const auto costModelStart = std::chrono::steady_clock::now();
-          const SegmentMetrics metrics =
+          const SectionMetrics metrics =
               collector.compute(sectionU64, requiredFlags);
           EncodingType modelBestEnc = EncodingType::Trivial;
           const double modelBestBits = bestCostBitsRestricted(
@@ -1484,7 +1484,7 @@ int runBenchmark() {
             csv.set("sample_size", static_cast<int64_t>(sampleSize));
             csv.set(
                 "min_segment_width",
-                static_cast<int64_t>(selectorCfg.minSegmentWidth));
+                static_cast<int64_t>(selectorCfg.minSectionWidth));
             csv.set("l", static_cast<int64_t>(l));
             csv.set("r", static_cast<int64_t>(r));
             csv.set("width", static_cast<int64_t>(width));
@@ -1677,7 +1677,7 @@ int runBenchmark() {
       // the best each of its own ranges could have reached, and what the whole
       // column encodes to under it.
       const auto scorePlan = [&](const std::string& planType,
-                                 const std::vector<SegmentPlan>& segments) {
+                                 const std::vector<SectionPlan>& segments) {
         size_t planSampleBytes = 0;
         size_t cellBestSum = 0;
         size_t regretBytes = 0;
@@ -1859,20 +1859,20 @@ int runBenchmark() {
         }
       };
 
-      scorePlan("autosis_sample_scale", autoSampleScale.segments);
-      scorePlan("autosis", autoFullScale.segments);
+      scorePlan("autosis_sample_scale", autoSampleScale.sections);
+      scorePlan("autosis", autoFullScale.sections);
       scorePlan(
-          "oracle_dp_sample_scale", toSegmentPlans(oracleSampleScale.segments));
-      scorePlan("oracle_dp", toSegmentPlans(oracleFullScale.segments));
+          "oracle_dp_sample_scale", toSegmentPlans(oracleSampleScale.sections));
+      scorePlan("oracle_dp", toSegmentPlans(oracleFullScale.sections));
       scorePlan(
-          "oracle_dp_selection", toSegmentPlans(selectionOracle.segments));
+          "oracle_dp_selection", toSegmentPlans(selectionOracle.sections));
       // An empty plan would make encodeColumn fall back to the writer's own
       // plan and score shipped bytes under this name, so refuse it loudly.
       NIMBLE_CHECK(
-          !estimatorDp.segments.empty(),
+          !estimatorDp.sections.empty(),
           "estimator_dp found no plan: {}",
           ds.name);
-      scorePlan("estimator_dp", toSegmentPlans(estimatorDp.segments));
+      scorePlan("estimator_dp", toSegmentPlans(estimatorDp.sections));
 
       // The hybrid planner: shortlist cheaply at this sample, then re-score
       // only the shortlisted ranges with selection's estimators on a larger
@@ -2038,9 +2038,9 @@ int runBenchmark() {
             1e3;
 
         const auto toPlan = [&](const RangePlan& ranges) {
-          std::vector<SegmentPlan> plan;
+          std::vector<SectionPlan> plan;
           for (const auto& [l, r] : ranges) {
-            SegmentPlan segment;
+            SectionPlan segment;
             segment.bitStart = l;
             segment.bitEnd = r;
             segment.encoding = rescoreRange(l, r).second;
@@ -2141,7 +2141,7 @@ int runBenchmark() {
       csv.set("sample_size", static_cast<int64_t>(sampleSize));
       csv.set(
           "min_segment_width",
-          static_cast<int64_t>(selectorCfg.minSegmentWidth));
+          static_cast<int64_t>(selectorCfg.minSectionWidth));
       csv.set("plan_type", "summary");
       csv.set("sample_seam_count", static_cast<int64_t>(sampleSeams));
       // The oracle is optimal over contiguous bit ranges of at least
@@ -2152,7 +2152,7 @@ int runBenchmark() {
       csv.set(
           "search_space",
           "contiguous_ranges_min_width_" +
-              std::to_string(selectorCfg.minSegmentWidth));
+              std::to_string(selectorCfg.minSectionWidth));
       csv.set("cost_scale", fullCostScale);
       csv.set("split_penalty_bits", selectorCfg.splitPenalty);
       csv.set("allow_huffman", FLAGS_allow_huffman ? int64_t{1} : int64_t{0});

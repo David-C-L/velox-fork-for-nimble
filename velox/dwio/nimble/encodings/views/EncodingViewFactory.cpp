@@ -19,14 +19,17 @@
 #include <array>
 
 #include "velox/dwio/nimble/encodings/views/ALPEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/BitRangeSplitEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/BlockBitPackingEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/ConstantEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/DeltaBlockEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/DictionaryEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/EliasFanoEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FOREncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FixedBitWidthEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/HuffmanEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/MainlyConstantEncodingView.h"
+#include "velox/dwio/nimble/encodings/views/NullableEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/PFOREncodingView.h"
 #include "velox/dwio/nimble/encodings/views/RLEEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/SimdForBitpackEncodingView.h"
@@ -45,6 +48,8 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
   using physicalType = typename TypeTraits<T>::physicalType;
   const auto encodingType = EncodingPrefix::encodingType(data);
   switch (encodingType) {
+    case EncodingType::Nullable:
+      return std::make_unique<NullableEncodingView<T>>(data, pool, options);
     case EncodingType::Constant:
       return std::make_unique<ConstantEncodingView<T>>(data, pool, options);
     case EncodingType::Trivial:
@@ -99,6 +104,13 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
       NIMBLE_INCOMPATIBLE_ENCODING(
           "DeltaBlock encoding only supports integral data types, got {}.",
           TypeTraits<T>::dataType);
+    case EncodingType::EliasFano:
+      if constexpr (isIntegralType<T>()) {
+        return std::make_unique<EliasFanoEncodingView<T>>(data, pool, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "EliasFano encoding only supports integral data types, got {}.",
+          TypeTraits<T>::dataType);
     case EncodingType::Huffman:
       if constexpr (
           isIntegralType<physicalType>() &&
@@ -131,11 +143,30 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
       if constexpr (
           isNumericType<physicalType>() &&
           (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
+        // A delta stream rebuilds each value from every step before it, so
+        // no section can be read at an index. It is decoded once instead, and
+        // indexed reads are served from that, which keeps the answer right
+        // at the cost of a full decode.
+        if (subintsplit::isDeltaStream(
+                data,
+                EncodingPrefix::prefixSize(data, options.useVarintRowCount))) {
+          return std::make_unique<detail::MaterializedEncodingView<T>>(
+              data, pool, options);
+        }
         return std::make_unique<SubIntSplitEncodingView<T>>(
             data, pool, options);
       }
       NIMBLE_INCOMPATIBLE_ENCODING(
           "SubIntSplit encoding only supports 32- and 64-bit numeric data types, got {}.",
+          TypeTraits<T>::dataType);
+    case EncodingType::BitRangeSplit:
+      if constexpr (isIntegralType<T>() && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        return std::make_unique<BitRangeSplitEncodingView<T>>(
+            data, pool, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "BitRangeSplit encoding only supports 32- and 64-bit integer data "
+          "types, got {}.",
           TypeTraits<T>::dataType);
     case EncodingType::BlockBitPacking:
       if constexpr (isNumericType<physicalType>()) {
@@ -174,6 +205,8 @@ INSTANTIATE_CREATE_TYPED_ENCODING_VIEW(std::string_view);
 
 bool supportsEncodingView(EncodingType encodingType) {
   // Keep in sync with the encoding dispatch in createTypedEncodingView().
+  // Nullable is intentionally excluded because its view requires the
+  // null-aware read API and cannot implement EncodingView::readAt.
   static constexpr std::array kViewableEncodings{
       EncodingType::Constant,
       EncodingType::Trivial,
@@ -185,9 +218,11 @@ bool supportsEncodingView(EncodingType encodingType) {
       EncodingType::RLE,
       EncodingType::FOR,
       EncodingType::DeltaBlock,
+      EncodingType::EliasFano,
       EncodingType::Huffman,
       EncodingType::PFOR,
       EncodingType::SimdForBitpack,
+      EncodingType::BitRangeSplit,
       EncodingType::BlockBitPacking,
       EncodingType::SubIntSplit,
       EncodingType::SubIntSplitReordered};

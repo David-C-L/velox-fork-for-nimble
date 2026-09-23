@@ -43,6 +43,7 @@ velox_add_test_headers(
   AblationPolicy.h
   AccessStructure.h
   Axes.h
+  BenchCommon.h
   BlockCodecTarget.h
   CachePolicy.h
   DriverSweep.h

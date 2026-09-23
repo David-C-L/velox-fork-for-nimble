@@ -27,9 +27,9 @@
 #include <vector>
 
 #include "velox/dwio/nimble/common/Types.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitCostModels.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitMetrics.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitSelector.h"
+#include "velox/dwio/nimble/encodings/subintsplit/CostModel.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 
 namespace facebook::nimble::mlidc {
 
@@ -123,9 +123,9 @@ inline std::vector<AblationRung> combinedLadder() {
 }
 
 namespace detail_ablation {
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
-// The cost-model dispatch lives in SubIntSplitCostModels.h and is shared with
+// The cost-model dispatch lives in subintsplit/CostModel.h and is shared with
 // the selector. An earlier version of this file kept its own copy, which went
 // stale twice over: it missed every encoding added since, and it did not follow
 // the cost function's signature when segment values were threaded through.
@@ -135,7 +135,7 @@ inline SelectorResult selectSplitsRestricted(
     size_t fullCount,
     const SelectorConfig& cfg,
     const std::unordered_set<EncodingType>& allowed) {
-  return facebook::nimble::detail::subintsplit::selectSplitsRestricted(
+  return facebook::nimble::subintsplit::selectSplitsRestricted(
       samples, kBits, fullCount, allowed, cfg);
 }
 

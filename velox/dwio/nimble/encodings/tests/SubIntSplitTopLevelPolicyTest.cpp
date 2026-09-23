@@ -24,14 +24,14 @@
 
 #include <gtest/gtest.h>
 
-#include "velox/dwio/nimble/encodings/SubIntSplitEstimator.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Estimator.h"
+#include "velox/dwio/nimble/encodings/subintsplit/TopLevelPolicy.h"
 
 using namespace facebook;
 using namespace facebook::nimble;
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
 namespace {
 

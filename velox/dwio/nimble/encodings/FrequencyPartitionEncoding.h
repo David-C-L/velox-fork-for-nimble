@@ -118,7 +118,7 @@ class FrequencyPartitionEncoding
   // over-selects FrequencyPartition while a pessimistic one merely
   // under-selects it. Kept as a named constant so the discount can be
   // measured independently of the base fix; see
-  // SubIntSplitCostModels.h's matching kFrequencyPartitionNestedIndexDiscount,
+  // subintsplit/CostModel.h's matching kFrequencyPartitionNestedIndexDiscount,
   // which must be updated together with this one.
   static constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
   static constexpr uint32_t kRankSampleStride = 256;

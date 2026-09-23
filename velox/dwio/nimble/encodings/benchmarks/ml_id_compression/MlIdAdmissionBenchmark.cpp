@@ -61,12 +61,12 @@
 #include <gflags/gflags.h>
 
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitTopLevelPolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/DriverSweep.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/TopLevelPolicy.h"
 
 DEFINE_int32(
     admission_repeats,
@@ -284,8 +284,8 @@ int runBenchmark() {
     csv.set("skipped", int64_t{0});
     csv.endRow();
 
-    using nimble::detail::subintsplit::SubIntSplitAdmission;
-    const nimble::detail::subintsplit::TopLevelPolicyConfig admissionConfig;
+    using nimble::subintsplit::SubIntSplitAdmission;
+    const nimble::subintsplit::TopLevelPolicyConfig admissionConfig;
     // The designs a column's admission can be decided by, each named for what
     // decides it: the size estimate alone, the estimate with the gradient gate
     // screening the split DP out, the gate deciding candidacy with the
@@ -328,9 +328,9 @@ int runBenchmark() {
         options.subIntSplitEstimateBitFlipScreen = bitFlipScreen;
         for (int repeat = 0; repeat < repeats; ++repeat) {
           auto start = Clock::now();
-          profile = nimble::detail::subintsplit::bitFlipAdmissionProfile(
+          profile = nimble::subintsplit::bitFlipAdmissionProfile(
               values, mode, pairCap);
-          admitted = nimble::detail::subintsplit::bitFlipAdmits(
+          admitted = nimble::subintsplit::bitFlipAdmits(
               profile, mode, admissionConfig);
           decisionNanos.push_back(elapsedNanos(start));
           // Fresh statistics, so a full-profile select pays for its profile.
@@ -345,9 +345,8 @@ int runBenchmark() {
               policy.select(values, statistics, options).encodingType;
           selectNanos.push_back(elapsedNanos(start));
         }
-        const auto boundaries =
-            nimble::detail::subintsplit::bitFlipGradientBoundaries(
-                profile, admissionConfig);
+        const auto boundaries = nimble::subintsplit::bitFlipGradientBoundaries(
+            profile, admissionConfig);
         csv.beginRow();
         csv.set("driver", std::string(kDriver));
         csv.set("dtype", elemTypeName<Elem>());
@@ -372,7 +371,7 @@ int runBenchmark() {
         csv.set("select_ns", median(selectNanos));
         csv.set(
             "active_flip_entropy",
-            nimble::detail::subintsplit::activeBitFlipEntropy(profile));
+            nimble::subintsplit::activeBitFlipEntropy(profile));
         csv.set(
             "gradient_boundaries", static_cast<int64_t>(boundaries.size()) - 2);
         csv.set(

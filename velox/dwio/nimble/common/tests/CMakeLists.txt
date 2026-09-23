@@ -32,6 +32,7 @@ add_executable(
   TestUtils.h
   NimbleCompare.h
   GTestUtils.h
+  ScopedFeatureGate.h
 )
 
 add_test(nimble_common_tests nimble_common_tests)

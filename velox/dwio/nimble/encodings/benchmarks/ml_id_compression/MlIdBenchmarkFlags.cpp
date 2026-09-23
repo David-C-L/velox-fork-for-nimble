@@ -132,6 +132,15 @@ DEFINE_bool(
     true,
     "Encoding::Options::subIntSplitRowFrame: whether SubIntSplit may subtract "
     "a fitted line or step from every value before planning its sections.");
+DEFINE_string(
+    mlidc_sis_upstream_features,
+    "",
+    "Comma-separated upstream SubIntSplit features to switch on, each off by "
+    "default: delta (subIntSplitDeltaPreTransform), trim "
+    "(subIntSplitTrimConstantPlanes), prune (subIntSplitBoundaryPruneThreshold "
+    "at upstream's 0.001), fold (subIntSplitFoldConstantSections), passthrough "
+    "(subIntSplitPassThrough), visitorblock (subIntSplitVisitorBlockBuffer), "
+    "huffmandeep (huffmanPriceLengthLimited).");
 DEFINE_bool(
     mlidc_sis_estimate_compression_guard,
     true,

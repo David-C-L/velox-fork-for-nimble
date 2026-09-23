@@ -25,10 +25,10 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Vector.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitBoundaries.h"
 #include "velox/dwio/nimble/encodings/tests/EncodingViewTestUtils.h"
 #include "velox/dwio/nimble/encodings/tests/TestUtils.h"
 #include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
@@ -101,8 +101,8 @@ TEST_F(TransformedEncodingTest, roundTripsThroughTheEncoding) {
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    detail::SubIntSplitTransformInfo info;
-    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    subintsplit::TransformInfo info;
+    subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_TRUE(info.anyTransform()) << toString(id) << " was not applied";
 
     auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
@@ -142,9 +142,9 @@ TEST_F(TransformedEncodingTest, capturesTheLayoutOfAReorderedStream) {
   const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       buffer, values, CompressionType::Uncompressed, options);
 
-  detail::SubIntSplitTransformInfo info;
+  subintsplit::TransformInfo info;
   const auto sections =
-      detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+      subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
   ASSERT_TRUE(info.anyTransform());
 
   const auto captured = EncodingLayoutCapture::capture(encoded, options);
@@ -159,9 +159,9 @@ TEST_F(TransformedEncodingTest, capturesTheLayoutOfAReorderedStream) {
   EXPECT_EQ(captured.childrenCount(), plainLayout.childrenCount());
   EXPECT_EQ(
       captured.config().get(
-          std::string(detail::subintsplit::kSplitBoundariesConfigKey)),
+          std::string(subintsplit::kSplitBoundariesConfigKey)),
       plainLayout.config().get(
-          std::string(detail::subintsplit::kSplitBoundariesConfigKey)));
+          std::string(subintsplit::kSplitBoundariesConfigKey)));
 }
 
 // A stream that chose no transform must be byte-identical to one written
@@ -203,8 +203,8 @@ TEST_F(TransformedEncodingTest, announcesTheTypeThatMatchesWhatItChose) {
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    detail::SubIntSplitTransformInfo info;
-    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    subintsplit::TransformInfo info;
+    subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     const auto type = static_cast<EncodingType>(encoded[0]);
     if (info.anyTransform()) {
       EXPECT_EQ(type, EncodingType::SubIntSplitReordered)
@@ -234,17 +234,16 @@ TEST_F(TransformedEncodingTest, neverTransformsTheKeySection) {
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    detail::SubIntSplitTransformInfo info;
+    subintsplit::TransformInfo info;
     const auto sections =
-        detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+        subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_FALSE(sections.empty());
     if (info.anyTransform()) {
       ASSERT_EQ(info.keySection, keySection);
       EXPECT_EQ(info.transformIds[keySection], 0)
           << "the key section must not carry a transform";
     } else {
-      EXPECT_EQ(
-          info.keySection, detail::SubIntSplitTransformInfo::kNoKeySection)
+      EXPECT_EQ(info.keySection, subintsplit::TransformInfo::kNoKeySection)
           << "no section was keyed, so none should be held back as a key";
     }
 
@@ -459,9 +458,9 @@ TEST_F(TransformedEncodingTest, keySearchReturnsOneOfTheAttemptsItPriced) {
   const auto searched = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       searchBuffer, values, CompressionType::Uncompressed, searchOptions);
 
-  detail::SubIntSplitTransformInfo info;
+  subintsplit::TransformInfo info;
   const auto sections =
-      detail::parseSubIntSplitSections(searched, Encoding::kPrefixSize, &info);
+      subintsplit::parseSections(searched, Encoding::kPrefixSize, &info);
   ASSERT_GT(sections.size(), 1u) << "a key search needs more than one section";
 
   auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
@@ -502,8 +501,8 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
   const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       buffer, values, CompressionType::Uncompressed, options);
 
-  detail::SubIntSplitTransformInfo info;
-  detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+  subintsplit::TransformInfo info;
+  subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
   ASSERT_TRUE(info.anyTransform()) << "KeyDerived was not applied";
   EXPECT_EQ(info.blockSize, 0u)
       << "a key-derived permutation should not be blocked";
@@ -548,8 +547,8 @@ TEST_F(TransformedEncodingTest, rangeListsAgreeWithTheSourceValues) {
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    detail::SubIntSplitTransformInfo info;
-    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    subintsplit::TransformInfo info;
+    subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_EQ(info.anyTransform(), id != TransformId::None)
         << toString(id) << " was not applied as requested";
 
@@ -602,8 +601,8 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
           values,
           CompressionType::Uncompressed,
           Encoding::Options{});
-  detail::SubIntSplitTransformInfo probeInfo;
-  const auto probeSections = detail::parseSubIntSplitSections(
+  subintsplit::TransformInfo probeInfo;
+  const auto probeSections = subintsplit::parseSections(
       probeEncoded, Encoding::kPrefixSize, &probeInfo);
   ASSERT_GE(probeSections.size(), 2u)
       << "test needs a multi-section column so keySection=1 is valid; "
@@ -614,8 +613,8 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
   const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       buffer, values, CompressionType::Uncompressed, options);
 
-  detail::SubIntSplitTransformInfo info;
-  detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+  subintsplit::TransformInfo info;
+  subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
   ASSERT_TRUE(info.anyTransform()) << "KeyDerived was not applied";
 
   SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
@@ -678,8 +677,8 @@ TEST_F(
     const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
         buffer, values, CompressionType::Uncompressed, options);
 
-    detail::SubIntSplitTransformInfo info;
-    detail::parseSubIntSplitSections(encoded, Encoding::kPrefixSize, &info);
+    subintsplit::TransformInfo info;
+    subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_TRUE(info.anyTransform()) << toString(id) << " was not applied";
 
     SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
@@ -743,8 +742,8 @@ TEST_F(
           valuesA,
           CompressionType::Uncompressed,
           Encoding::Options{});
-  detail::SubIntSplitTransformInfo probeInfoA;
-  const auto sectionsA = detail::parseSubIntSplitSections(
+  subintsplit::TransformInfo probeInfoA;
+  const auto sectionsA = subintsplit::parseSections(
       probeEncodedA, Encoding::kPrefixSize, &probeInfoA);
   ASSERT_GE(sectionsA.size(), 2u)
       << "test needs a multi-section column so keySection=1 is valid; "
@@ -754,8 +753,8 @@ TEST_F(
 
   const auto encodedA = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       bufferA, valuesA, CompressionType::Uncompressed, optionsA);
-  detail::SubIntSplitTransformInfo infoA;
-  detail::parseSubIntSplitSections(encodedA, Encoding::kPrefixSize, &infoA);
+  subintsplit::TransformInfo infoA;
+  subintsplit::parseSections(encodedA, Encoding::kPrefixSize, &infoA);
   ASSERT_TRUE(infoA.anyTransform())
       << "test precondition: KeyDerived must actually be selected for "
       << "stream A, or this test exercises nothing";
@@ -772,8 +771,8 @@ TEST_F(
           valuesB,
           CompressionType::Uncompressed,
           Encoding::Options{});
-  detail::SubIntSplitTransformInfo probeInfoB;
-  const auto sectionsB = detail::parseSubIntSplitSections(
+  subintsplit::TransformInfo probeInfoB;
+  const auto sectionsB = subintsplit::parseSections(
       probeEncodedB, Encoding::kPrefixSize, &probeInfoB);
   ASSERT_GE(sectionsB.size(), 2u)
       << "test needs a multi-section column so keySection=1 is valid; "
@@ -783,8 +782,8 @@ TEST_F(
 
   const auto encodedB = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
       bufferB, valuesB, CompressionType::Uncompressed, optionsB);
-  detail::SubIntSplitTransformInfo infoB;
-  detail::parseSubIntSplitSections(encodedB, Encoding::kPrefixSize, &infoB);
+  subintsplit::TransformInfo infoB;
+  subintsplit::parseSections(encodedB, Encoding::kPrefixSize, &infoB);
   ASSERT_TRUE(infoB.anyTransform())
       << "test precondition: KeyDerived must actually be selected for "
       << "stream B, or this test exercises nothing";

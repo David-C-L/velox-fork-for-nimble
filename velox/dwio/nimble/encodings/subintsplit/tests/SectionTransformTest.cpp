@@ -24,7 +24,7 @@
 #include <span>
 #include <vector>
 
-#include "velox/dwio/nimble/encodings/SubIntSplitRowFrame.h"
+#include "velox/dwio/nimble/encodings/subintsplit/RowFrame.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SectionTransform.h"
 
 using namespace facebook::nimble;
@@ -387,11 +387,10 @@ TEST(SectionTransformTest, rowFrameRoundTripsFromAnyFirstRow) {
       original[row] = (row * 3 + rng() % 7) & mask;
     }
     const auto expected = width == 32
-        ? detail::subintsplit::fitSubIntSplitRowFrame(
+        ? subintsplit::fitRowFrame(
               std::span<const uint32_t>(
                   std::vector<uint32_t>(original.begin(), original.end())))
-        : detail::subintsplit::fitSubIntSplitRowFrame(
-              std::span<const uint64_t>(original));
+        : subintsplit::fitRowFrame(std::span<const uint64_t>(original));
     ASSERT_TRUE(expected.active());
 
     const auto* transform = transformFor(TransformId::RowFrame);

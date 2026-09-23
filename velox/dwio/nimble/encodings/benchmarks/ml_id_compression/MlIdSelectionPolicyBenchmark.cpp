@@ -15,7 +15,7 @@
  */
 
 // bench_selection_policy: measures whether the bit-flip-probability
-// top-level policies (see SubIntSplitTopLevelPolicy.h for scope) would
+// top-level policies (see subintsplit/TopLevelPolicy.h for scope) would
 // correctly predict "SubIntSplit wins" if wired into production selection.
 //
 // For every dataset column this driver: computes the best cost among the
@@ -40,17 +40,17 @@
 
 #include <gflags/gflags.h>
 
-#include "velox/dwio/nimble/encodings/SubIntSplitEstimator.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Estimator.h"
 
 namespace {
 // Single source of truth for the gflag defaults below: mirrors
 // TopLevelPolicyConfig's own default member initializers.
-constexpr facebook::nimble::detail::subintsplit::TopLevelPolicyConfig
+constexpr facebook::nimble::subintsplit::TopLevelPolicyConfig
     kDefaultPolicyConfig{};
 } // namespace
 
@@ -80,7 +80,7 @@ namespace facebook::nimble::mlidc {
 namespace {
 
 using namespace facebook::nimble::detail;
-using namespace facebook::nimble::detail::subintsplit;
+using namespace facebook::nimble::subintsplit;
 
 // Runs `fn` `iterations` times and returns the minimum elapsed wall time, in
 // nanoseconds -- the minimum, rather than mean or median, is the standard

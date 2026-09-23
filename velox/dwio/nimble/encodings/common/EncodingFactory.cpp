@@ -19,11 +19,13 @@
 
 #include "velox/dwio/nimble/common/Exceptions.h"
 #include "velox/dwio/nimble/encodings/ALPEncoding.h"
+#include "velox/dwio/nimble/encodings/BitRangeSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/BlockBitPackingEncoding.h"
 #include "velox/dwio/nimble/encodings/ConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/DeltaBlockEncoding.h"
 #include "velox/dwio/nimble/encodings/DeltaEncoding.h"
 #include "velox/dwio/nimble/encodings/DictionaryEncoding.h"
+#include "velox/dwio/nimble/encodings/EliasFanoEncoding.h"
 #include "velox/dwio/nimble/encodings/EncodingSliceFactory.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/ForEncoding.h"
@@ -43,11 +45,7 @@
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
 #include "velox/dwio/nimble/encodings/SliceEncoding.h"
 #include "velox/dwio/nimble/encodings/SparseBoolEncoding.h"
-// SubIntSplit integration (re-enable for NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS;
-// was commented out by #636):
-#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#endif
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
@@ -165,6 +163,9 @@ std::unique_ptr<Encoding> EncodingFactory::create(
     case EncodingType::DeltaBlock: {
       RETURN_ENCODING_BY_INTEGER_TYPE(DeltaBlockEncoding, dataType);
     }
+    case EncodingType::EliasFano: {
+      RETURN_ENCODING_BY_INTEGER_TYPE(EliasFanoEncoding, dataType);
+    }
     case EncodingType::ALP: {
       switch (dataType) {
         case DataType::Float:
@@ -188,21 +189,24 @@ std::unique_ptr<Encoding> EncodingFactory::create(
     case EncodingType::SimdForBitpack: {
       RETURN_ENCODING_BY_NUMERIC_TYPE(SimdForBitpackEncoding, dataType);
     }
+    case EncodingType::BitRangeSplit: {
+      RETURN_ENCODING_BY_WIDE_INTEGER_TYPE(BitRangeSplitEncoding, dataType);
+    }
+    // Both types are read by the same class; the header says whether the
+    // sections carry a transform.
+    case EncodingType::SubIntSplit:
+    case EncodingType::SubIntSplitReordered: {
+      RETURN_ENCODING_BY_WIDE_NUMERIC_TYPE(SubIntSplitEncoding, dataType);
+    }
     case EncodingType::Huffman: {
       RETURN_ENCODING_BY_INTEGER_TYPE(HuffmanEncoding, dataType);
     }
     case EncodingType::FOR: {
       RETURN_ENCODING_BY_INTEGER_TYPE(ForEncoding, dataType);
     }
-    // SubIntSplit and FrequencyPartition integration (re-enabled for
+    // FrequencyPartition integration (re-enabled for
     // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    // Both types are read by the same class; the header says whether the
-    // sections carry a transform.
-    case EncodingType::SubIntSplit:
-    case EncodingType::SubIntSplitReordered: {
-      RETURN_ENCODING_BY_VARINT_TYPE(SubIntSplitEncoding, dataType);
-    }
     case EncodingType::FrequencyPartition: {
       RETURN_ENCODING_BY_NON_BOOL_TYPE(FrequencyPartitionEncoding, dataType);
     }
@@ -446,6 +450,15 @@ std::string_view EncodingFactory::encode(
           "DeltaBlock encoding only supports integral data types, got {}.",
           TypeTraits<T>::dataType);
     }
+    case EncodingType::EliasFano: {
+      if constexpr (isIntegralType<T>()) {
+        return EliasFanoEncoding<T>::encode(
+            selection, castedValues, buffer, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "EliasFano encoding only supports integral data types, got {}.",
+          TypeTraits<T>::dataType);
+    }
     case EncodingType::ALP: {
       if constexpr (isFloatingPointType<T>()) {
         return ALPEncoding<T>::encode(selection, castedValues, buffer, options);
@@ -480,6 +493,32 @@ std::string_view EncodingFactory::encode(
           "SimdForBitpack encoding only supports integral data types, got {}.",
           TypeTraits<T>::dataType);
     }
+    case EncodingType::BitRangeSplit: {
+      if constexpr (isIntegralType<T>() && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        return BitRangeSplitEncoding<T>::encode(
+            selection, castedValues, buffer, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "BitRangeSplit encoding only supports 32- and 64-bit integer data "
+          "types, got {}.",
+          TypeTraits<T>::dataType);
+    }
+    // Reachable when something names SubIntSplit explicitly, such as an
+    // encoding-layout replay or a benchmark, or when a caller puts SubIntSplit
+    // in the read factors: EncodingSizeEstimation prices it only for values it
+    // is handed, and it is absent from the default read factors.
+    case EncodingType::SubIntSplit: {
+      if constexpr (
+          isNumericType<physicalType>() &&
+          (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
+        return SubIntSplitEncoding<T>::encode(
+            selection, castedValues, buffer, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "SubIntSplit encoding only supports 32- and 64-bit numeric data "
+          "types, got {}.",
+          TypeTraits<T>::dataType);
+    }
     case EncodingType::Huffman: {
       if constexpr (isIntegralType<physicalType>()) {
         return HuffmanEncoding<T>::encode(
@@ -497,20 +536,6 @@ std::string_view EncodingFactory::encode(
           "FOR encoding only supports integral data types, got {}.",
           TypeTraits<T>::dataType);
     }
-    // SubIntSplit integration (re-enabled for
-    // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
-#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    case EncodingType::SubIntSplit: {
-      if constexpr (
-          isNumericType<physicalType>() &&
-          (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
-        return SubIntSplitEncoding<T>::encode(
-            selection, castedValues, buffer, options);
-      }
-      NIMBLE_INCOMPATIBLE_ENCODING(
-          "SubIntSplit encoding only supports 32- and 64-bit numeric types.");
-    }
-#endif
     default: {
       NIMBLE_UNSUPPORTED(
           "Encoding {} is not supported.", selection.encodingType());

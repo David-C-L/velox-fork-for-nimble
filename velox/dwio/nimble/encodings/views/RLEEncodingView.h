@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <span>
+#include <type_traits>
 #include <utility>
 
 #include <folly/CPortability.h>
@@ -57,8 +58,10 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     NIMBLE_CHECK_EQ(end, this->rowCount_);
 
     pos += runLengthsSize;
-    values_ = detail::createTypedEncodingView<T>(
-        {pos, static_cast<size_t>(data.end() - pos)}, this->pool_, options);
+    values_ = detail::createTypedEncodingView<runValueType>(
+        {pos, static_cast<size_t>(data.data() + data.size() - pos)},
+        this->pool_,
+        options);
     NIMBLE_CHECK_NOT_NULL(values_);
   }
 
@@ -71,7 +74,16 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     NIMBLE_CHECK_LT(index, this->rowCount_);
     const auto it = std::upper_bound(runEnds_.begin(), runEnds_.end(), index);
     NIMBLE_CHECK(it != runEnds_.end());
-    return values_->readAt(static_cast<uint32_t>(it - runEnds_.begin()));
+    const auto runIndex = static_cast<uint32_t>(it - runEnds_.begin());
+    // A run value stored as T is read typed, which skips the type-erased
+    // readAt(index, void*) hop on every point read.
+    if constexpr (std::is_same_v<runValueType, T>) {
+      return values_->readAt(runIndex);
+    } else {
+      physicalType value;
+      values_->readAt(runIndex, &value);
+      return detail::castFromPhysicalType<T>(value);
+    }
   }
 
   void readPhysical(uint32_t offset, uint32_t length, physicalType* output)
@@ -303,9 +315,13 @@ class RLEEncodingView final : public TypedEncodingView<T> {
   // permuted section that motivates it averages a few rows per run; the
   // sections it costs on run far longer, so this sits well clear of both.
   static constexpr uint32_t kMaxAverageRunLength = 32;
+  // RLE serializes floating run values with their logical type and all other
+  // run values with their physical type.
+  using runValueType =
+      std::conditional_t<isFloatingPointType<T>(), T, physicalType>;
 
   Vector<uint32_t> runEnds_;
-  std::unique_ptr<TypedEncodingView<T>> values_;
+  std::unique_ptr<TypedEncodingView<runValueType>> values_;
 };
 
 template <>
@@ -334,7 +350,7 @@ class RLEEncodingView<bool> final : public TypedEncodingView<bool> {
     NIMBLE_CHECK_EQ(end, this->rowCount_);
 
     pos += runLengthsSize;
-    NIMBLE_CHECK_EQ(pos + sizeof(bool), data.end());
+    NIMBLE_CHECK_EQ(pos + sizeof(bool), data.data() + data.size());
     initialValue_ = *reinterpret_cast<const bool*>(pos);
   }
 

@@ -212,6 +212,7 @@ constexpr uint64_t kMinPairFiles = 10;
 bool hasDataPrecondition(EncodingType encodingType) {
   return encodingType == EncodingType::Constant ||
       encodingType == EncodingType::DeltaBlock ||
+      encodingType == EncodingType::EliasFano ||
       encodingType == EncodingType::Huffman;
 }
 
@@ -397,6 +398,9 @@ void collectPhysicalStreamRoles(const Type& type, PhysicalStreamRoles& roles) {
       }
       return;
     }
+    case Kind::HybridFlatMap:
+      NIMBLE_UNSUPPORTED(
+          "Nimble writer fuzzer does not support hybrid FlatMap.");
   }
   NIMBLE_UNREACHABLE("Unsupported schema kind: {}.", type.kind());
 }
@@ -911,7 +915,8 @@ bool isTypeCompatible(EncodingType encodingType, DataType dataType) {
   if (encodingType == EncodingType::ALP) {
     return isFloatingPointDataType(dataType);
   }
-  if (encodingType == EncodingType::DeltaBlock) {
+  if (encodingType == EncodingType::DeltaBlock ||
+      encodingType == EncodingType::EliasFano) {
     return !isFloatingPointDataType(dataType);
   }
   // Varint's gate is isIntegralType<physicalType>() && sizeof(T) >= 4, so the
@@ -925,6 +930,7 @@ bool isTypeCompatible(EncodingType encodingType, DataType dataType) {
 
 bool isIntegralOnlyEncoding(EncodingType encodingType) {
   return encodingType == EncodingType::DeltaBlock ||
+      encodingType == EncodingType::EliasFano ||
       encodingType == EncodingType::PFOR ||
       encodingType == EncodingType::SimdForBitpack ||
       encodingType == EncodingType::Huffman;
@@ -1593,7 +1599,7 @@ void NimbleWriterFuzzer::verifySchemaAndStripeGroupConsistency(
       continue;
     }
 
-    std::vector<TabletReader::StreamLocation> locations(streamCount);
+    std::vector<TabletReader::StreamMetadata> locations(streamCount);
     tablet->streamLocations(stripeIdentifier, locations);
     const uint64_t stripeOffset = tablet->stripeOffset(stripe);
     const uint64_t stripeEnd = stripe + 1 < tablet->stripeCount()

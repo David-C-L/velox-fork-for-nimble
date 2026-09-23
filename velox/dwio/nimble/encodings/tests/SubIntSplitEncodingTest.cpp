@@ -33,13 +33,13 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Types.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitConfig.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingType.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitBoundaries.h"
 
 using namespace facebook;
 
@@ -163,7 +163,7 @@ std::vector<T> makeZipfianValues() {
 }
 
 template <typename T>
-std::vector<nimble::detail::subintsplit::SegmentPlan> makePreserveSegments() {
+std::vector<nimble::subintsplit::SectionPlan> makePreserveSegments() {
   if constexpr (sizeof(PhysicalType<T>) == 4) {
     return {{0, 7}, {8, 15}, {16, 31}};
   } else {
@@ -172,7 +172,7 @@ std::vector<nimble::detail::subintsplit::SegmentPlan> makePreserveSegments() {
 }
 
 template <typename T>
-std::vector<nimble::detail::subintsplit::SegmentPlan> makeFullWidthSegments() {
+std::vector<nimble::subintsplit::SectionPlan> makeFullWidthSegments() {
   return {{0, static_cast<int>(sizeof(PhysicalType<T>) * 8 - 1)}};
 }
 
@@ -366,20 +366,20 @@ void expectBitwiseEqual(
 
 template <typename T>
 nimble::EncodingLayout makePreserveLayout(
-    const std::vector<nimble::detail::subintsplit::SegmentPlan>& segments) {
+    const std::vector<nimble::subintsplit::SectionPlan>& segments) {
   std::vector<std::optional<const nimble::EncodingLayout>> children(
       segments.size());
   return nimble::EncodingLayout{
       nimble::EncodingType::SubIntSplit,
       nimble::EncodingLayout::Config{
-          nimble::detail::subintsplit::makePreserveSplitConfig(segments)},
+          nimble::subintsplit::makePreserveSplitConfig(segments)},
       nimble::CompressionType::Uncompressed,
       std::move(children)};
 }
 
 void expectSegmentsEqual(
-    const std::vector<nimble::detail::subintsplit::SegmentPlan>& expected,
-    const std::vector<nimble::detail::subintsplit::SegmentPlan>& actual) {
+    const std::vector<nimble::subintsplit::SectionPlan>& expected,
+    const std::vector<nimble::subintsplit::SectionPlan>& actual) {
   ASSERT_EQ(expected.size(), actual.size());
   for (size_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(expected[i].bitStart, actual[i].bitStart) << "segment " << i;
@@ -449,9 +449,9 @@ std::vector<uint64_t> makeTreeIds(uint32_t numRows, uint32_t seed) {
   return ids;
 }
 
-nimble::detail::SubIntSplitRowFrame parseRowFrame(std::string_view encoded) {
-  nimble::detail::SubIntSplitRowFrame frame;
-  nimble::detail::parseSubIntSplitSections(
+nimble::subintsplit::RowFrame parseRowFrame(std::string_view encoded) {
+  nimble::subintsplit::RowFrame frame;
+  nimble::subintsplit::parseSections(
       encoded, nimble::Encoding::kPrefixSize, nullptr, &frame);
   return frame;
 }
@@ -459,31 +459,26 @@ nimble::detail::SubIntSplitRowFrame parseRowFrame(std::string_view encoded) {
 } // namespace
 
 TEST(SubIntSplitConfigTests, boundarySerializationAndParsing) {
-  const std::vector<nimble::detail::subintsplit::SegmentPlan> segments{
+  const std::vector<nimble::subintsplit::SectionPlan> segments{
       {.bitStart = 0, .bitEnd = 7},
       {.bitStart = 8, .bitEnd = 15},
       {.bitStart = 16, .bitEnd = 31}};
 
   const auto serialized =
-      nimble::detail::subintsplit::serializeSplitBoundaries(segments);
+      nimble::subintsplit::serializeSplitBoundaries(segments);
   EXPECT_EQ(serialized, "0-7;8-15;16-31");
 
-  auto parsed =
-      nimble::detail::subintsplit::parseSplitBoundaries(serialized, 32);
+  auto parsed = nimble::subintsplit::parseSplitBoundaries(serialized, 32);
   ASSERT_TRUE(parsed.has_value());
   expectSegmentsEqual(segments, *parsed);
 
+  EXPECT_FALSE(nimble::subintsplit::parseSplitBoundaries("", 32).has_value());
   EXPECT_FALSE(
-      nimble::detail::subintsplit::parseSplitBoundaries("", 32).has_value());
+      nimble::subintsplit::parseSplitBoundaries("0-7;9-15", 16).has_value());
   EXPECT_FALSE(
-      nimble::detail::subintsplit::parseSplitBoundaries("0-7;9-15", 16)
-          .has_value());
+      nimble::subintsplit::parseSplitBoundaries("0-7;8-16", 16).has_value());
   EXPECT_FALSE(
-      nimble::detail::subintsplit::parseSplitBoundaries("0-7;8-16", 16)
-          .has_value());
-  EXPECT_FALSE(
-      nimble::detail::subintsplit::parseSplitBoundaries("0-7;8-15", 8)
-          .has_value());
+      nimble::subintsplit::parseSplitBoundaries("0-7;8-15", 8).has_value());
 }
 
 template <typename T>
@@ -516,12 +511,12 @@ TYPED_TEST(SubIntSplitEncodingTest, recomputeRoundTripAndReplay) {
   ASSERT_GT(captured.childrenCount(), 1u);
 
   const auto capturedMode = captured.config().get(
-      std::string(nimble::detail::subintsplit::kSplitModeConfigKey));
+      std::string(nimble::subintsplit::kSplitModeConfigKey));
   ASSERT_TRUE(capturedMode.has_value());
-  EXPECT_EQ(*capturedMode, nimble::detail::subintsplit::kSplitModePreserve);
+  EXPECT_EQ(*capturedMode, nimble::subintsplit::kSplitModePreserve);
 
   const auto capturedBoundaries = captured.config().get(
-      std::string(nimble::detail::subintsplit::kSplitBoundariesConfigKey));
+      std::string(nimble::subintsplit::kSplitBoundariesConfigKey));
   ASSERT_TRUE(capturedBoundaries.has_value());
 
   const auto decoded = decodeAll<T>(encoded, *this->pool_);
@@ -576,8 +571,8 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTripsTreeIds) {
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
   const auto ids = makeTreeIds(40'000, 7);
-  const auto fitted = nimble::detail::subintsplit::fitSubIntSplitRowFrame(
-      std::span<const uint64_t>(ids));
+  const auto fitted =
+      nimble::subintsplit::fitRowFrame(std::span<const uint64_t>(ids));
   EXPECT_EQ(fitted.slope, (uint64_t{1} << 28) + 1);
   // A leaf's post rank sits its depth below its pre rank, so the base is the
   // deepest leaf's distance and lifts every post field back to non-negative.
@@ -658,8 +653,8 @@ TEST(SubIntSplitEncodingTests, rowFrameRoundTrips32Bit) {
   for (uint32_t row = 0; row < values.size(); ++row) {
     values[row] = ((generator() % 16) << 24) | (row * 2 + generator() % 5);
   }
-  const auto fitted = nimble::detail::subintsplit::fitSubIntSplitRowFrame(
-      std::span<const uint32_t>(values));
+  const auto fitted =
+      nimble::subintsplit::fitRowFrame(std::span<const uint32_t>(values));
   EXPECT_EQ(fitted.slope, 2u);
   const auto encoded = nimble::EncodingFactory::encode<uint32_t>(
       std::make_unique<NonRecursiveSubIntSplitPolicy<uint32_t>>(),
@@ -703,13 +698,13 @@ std::vector<uint64_t> makeTimestampCounterIds(uint32_t numRows, uint32_t seed) {
 // stream is never larger for the offer, and where the frame is kept every read
 // path adds it back.
 TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
-  using nimble::detail::subintsplit::fitSubIntSplitRowFrame;
-  using nimble::detail::subintsplit::fitSubIntSplitStepFrame;
+  using nimble::subintsplit::fitRowFrame;
+  using nimble::subintsplit::fitStepFrame;
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
   const auto ids = makeTimestampCounterIds(65'536, 5);
-  EXPECT_FALSE(fitSubIntSplitRowFrame(std::span<const uint64_t>(ids)).active());
-  const auto fitted = fitSubIntSplitStepFrame(std::span<const uint64_t>(ids));
+  EXPECT_FALSE(fitRowFrame(std::span<const uint64_t>(ids)).active());
+  const auto fitted = fitStepFrame(std::span<const uint64_t>(ids));
   EXPECT_EQ(fitted.slope, 1u);
   EXPECT_EQ(fitted.base, 0u);
 
@@ -764,10 +759,8 @@ TEST(SubIntSplitEncodingTests, stepFrameRoundTripsTimestampCounterIds) {
     sorted += generator() % 100'000;
     unevenSorted[row] = sorted;
   }
-  EXPECT_FALSE(
-      fitSubIntSplitStepFrame(std::span<const uint64_t>(hashes)).active());
-  EXPECT_FALSE(fitSubIntSplitStepFrame(std::span<const uint64_t>(unevenSorted))
-                   .active());
+  EXPECT_FALSE(fitStepFrame(std::span<const uint64_t>(hashes)).active());
+  EXPECT_FALSE(fitStepFrame(std::span<const uint64_t>(unevenSorted)).active());
 }
 
 // Streams written before the row frame became a transform must still decode, so
@@ -803,7 +796,7 @@ TEST(
 // Columns that do not follow a line must not be charged a planner pass, and
 // their streams must stay byte-identical to ones written without frames.
 TEST(SubIntSplitEncodingTests, rowFrameIsNotFittedWithoutALine) {
-  using nimble::detail::subintsplit::fitSubIntSplitRowFrame;
+  using nimble::subintsplit::fitRowFrame;
   std::mt19937_64 generator{11};
   const uint32_t numRows = 40'000;
 
@@ -819,18 +812,14 @@ TEST(SubIntSplitEncodingTests, rowFrameIsNotFittedWithoutALine) {
     wrappingCounters[row] =
         0x1234'5678'9000'0000ULL | (((row / 64) & 0x3F) << 10) | (row & 0x3FF);
   }
+  EXPECT_FALSE(fitRowFrame(std::span<const uint64_t>(hashes)).active());
+  EXPECT_FALSE(fitRowFrame(std::span<const uint64_t>(unevenSorted)).active());
   EXPECT_FALSE(
-      fitSubIntSplitRowFrame(std::span<const uint64_t>(hashes)).active());
-  EXPECT_FALSE(
-      fitSubIntSplitRowFrame(std::span<const uint64_t>(unevenSorted)).active());
-  EXPECT_FALSE(
-      fitSubIntSplitRowFrame(std::span<const uint64_t>(wrappingCounters))
-          .active());
+      fitRowFrame(std::span<const uint64_t>(wrappingCounters)).active());
 
   // Too few strides to fit on, however straight the line.
   const auto shortIds = makeTreeIds(10'000, 7);
-  EXPECT_FALSE(
-      fitSubIntSplitRowFrame(std::span<const uint64_t>(shortIds)).active());
+  EXPECT_FALSE(fitRowFrame(std::span<const uint64_t>(shortIds)).active());
 
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
@@ -855,18 +844,18 @@ TEST(SubIntSplitEncodingTests, rowFrameEstimateBoundsEncodedSize) {
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
   const auto ids = makeTreeIds(60'000, 19);
-  const auto frame = nimble::detail::subintsplit::fitSubIntSplitRowFrame(
-      std::span<const uint64_t>(ids));
+  const auto frame =
+      nimble::subintsplit::fitRowFrame(std::span<const uint64_t>(ids));
   ASSERT_TRUE(frame.active());
   std::vector<uint64_t> residuals;
-  nimble::detail::subintsplit::subtractSubIntSplitRowFrame(
+  nimble::subintsplit::subtractRowFrame(
       frame, std::span<const uint64_t>(ids), residuals);
 
   const auto estimateBits = [](const std::vector<uint64_t>& values) {
     std::vector<uint64_t> sample;
-    nimble::detail::subintsplit::sampleIntoU64<uint64_t>(
-        values, sample, nimble::detail::subintsplit::defaultSamplerConfig());
-    return nimble::detail::subintsplit::selectSplitsRestricted(
+    nimble::subintsplit::sampleIntoU64<uint64_t>(
+        values, sample, nimble::subintsplit::defaultSamplerConfig());
+    return nimble::subintsplit::selectSplitsRestricted(
                sample, 64, values.size(), {})
         .totalSizeBits;
   };
@@ -907,8 +896,7 @@ TEST(SubIntSplitEncodingTests, rowFrameReplayFollowsCapturedLayout) {
   auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
   nimble::Buffer buffer{*pool};
   const auto ids = makeTreeIds(40'000, 7);
-  const auto frameKey =
-      std::string(nimble::detail::subintsplit::kRowFrameConfigKey);
+  const auto frameKey = std::string(nimble::subintsplit::kRowFrameConfigKey);
 
   const std::string framed{
       encodeWithNonRecursiveSubIntSplit<uint64_t>(ids, buffer)};
@@ -977,15 +965,14 @@ TEST(SubIntSplitEncodingTests, rowFrameIsRejectedByPreFrameParser) {
   constexpr uint8_t kOldNoKeySection = 0xFF;
 
   EXPECT_NE(flags, 0);
-  EXPECT_EQ(flags & nimble::detail::kSubIntSplitSectionTransformFlag, 0);
+  EXPECT_EQ(flags & nimble::subintsplit::kFlagTransforms, 0);
   const bool oldParserAcceptsKeySection =
       keySectionAsReadByOldParser == kOldNoKeySection ||
       keySectionAsReadByOldParser < splitCount;
   EXPECT_FALSE(oldParserAcceptsKeySection);
-  EXPECT_EQ(
-      keySectionAsReadByOldParser, nimble::detail::kSubIntSplitRowFrameGuard);
+  EXPECT_EQ(keySectionAsReadByOldParser, nimble::subintsplit::kRowFrameGuard);
   // The guard stays out of reach of any real split count.
-  EXPECT_GT(nimble::detail::kSubIntSplitRowFrameGuard, 64);
+  EXPECT_GT(nimble::subintsplit::kRowFrameGuard, 64);
 }
 
 // The flag byte and the frame's guard come off the wire, so a reader has to
@@ -1026,16 +1013,16 @@ TYPED_TEST(SubIntSplitEncodingTest, preserveRoundTripExplicitBoundaries) {
   ASSERT_EQ(captured.childrenCount(), segments.size());
 
   const auto capturedMode = captured.config().get(
-      std::string(nimble::detail::subintsplit::kSplitModeConfigKey));
+      std::string(nimble::subintsplit::kSplitModeConfigKey));
   ASSERT_TRUE(capturedMode.has_value());
-  EXPECT_EQ(*capturedMode, nimble::detail::subintsplit::kSplitModePreserve);
+  EXPECT_EQ(*capturedMode, nimble::subintsplit::kSplitModePreserve);
 
   const auto capturedBoundaries = captured.config().get(
-      std::string(nimble::detail::subintsplit::kSplitBoundariesConfigKey));
+      std::string(nimble::subintsplit::kSplitBoundariesConfigKey));
   ASSERT_TRUE(capturedBoundaries.has_value());
   EXPECT_EQ(
       *capturedBoundaries,
-      nimble::detail::subintsplit::serializeSplitBoundaries(segments));
+      nimble::subintsplit::serializeSplitBoundaries(segments));
 
   const auto decoded = decodeAll<T>(encoded, *this->pool_);
   expectBitwiseEqual(values, decoded);
@@ -1062,46 +1049,45 @@ std::vector<uint64_t> makeRandomLowRunHighValues() {
 // marks it and splitting there is clearly cheaper.
 TEST(SubIntSplitEncodingTests, hybridRefinementSplitsAtACheaperBitFlipCut) {
   const auto values = makeRandomLowRunHighValues();
-  const std::vector<std::vector<nimble::detail::subintsplit::SegmentPlan>>
-      shortlist{{{.bitStart = 0, .bitEnd = 63}}};
+  const std::vector<std::vector<nimble::subintsplit::SectionPlan>> shortlist{
+      {{.bitStart = 0, .bitEnd = 63}}};
   std::vector<bool> cuts(65, false);
   cuts[0] = true;
   cuts[48] = true;
   cuts[64] = true;
 
   const auto refined =
-      nimble::detail::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
+      nimble::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
           values,
           64,
           shortlist,
           cuts,
-          nimble::detail::subintsplit::defaultSelectorConfig(),
+          nimble::subintsplit::defaultSelectorConfig(),
           nimble::Encoding::Options{});
 
-  ASSERT_EQ(refined.segments.size(), 2);
-  EXPECT_EQ(refined.segments[0].bitEnd, 47);
-  EXPECT_EQ(refined.segments[1].bitStart, 48);
+  ASSERT_EQ(refined.sections.size(), 2);
+  EXPECT_EQ(refined.sections[0].bitEnd, 47);
+  EXPECT_EQ(refined.sections[1].bitStart, 48);
 }
 
 // A shortlisted plan that does not tile the bit positions is not priced, so
 // the writer falls back to the DP rather than encoding bits twice or never.
 TEST(SubIntSplitEncodingTests, hybridRefinementRejectsPlansThatDoNotTile) {
   const auto values = makeRandomLowRunHighValues();
-  const std::vector<std::vector<nimble::detail::subintsplit::SegmentPlan>>
-      shortlist{
-          {{.bitStart = 0, .bitEnd = 31}},
-          {{.bitStart = 0, .bitEnd = 40}, {.bitStart = 32, .bitEnd = 63}}};
+  const std::vector<std::vector<nimble::subintsplit::SectionPlan>> shortlist{
+      {{.bitStart = 0, .bitEnd = 31}},
+      {{.bitStart = 0, .bitEnd = 40}, {.bitStart = 32, .bitEnd = 63}}};
 
   const auto refined =
-      nimble::detail::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
+      nimble::subintsplit::SubIntSplitPlanRefiner::refine<uint64_t>(
           values,
           64,
           shortlist,
           {},
-          nimble::detail::subintsplit::defaultSelectorConfig(),
+          nimble::subintsplit::defaultSelectorConfig(),
           nimble::Encoding::Options{});
 
-  EXPECT_TRUE(refined.segments.empty());
+  EXPECT_TRUE(refined.sections.empty());
 }
 
 TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {
@@ -1111,8 +1097,8 @@ TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {
   nimble::EncodingLayout layout{
       nimble::EncodingType::SubIntSplit,
       nimble::EncodingLayout::Config{{
-          {std::string(nimble::detail::subintsplit::kSplitModeConfigKey),
-           std::string(nimble::detail::subintsplit::kSplitModePreserve)},
+          {std::string(nimble::subintsplit::kSplitModeConfigKey),
+           std::string(nimble::subintsplit::kSplitModePreserve)},
       }},
       nimble::CompressionType::Uncompressed};
 
@@ -1330,13 +1316,12 @@ template <typename T>
 size_t wholeValueSectionBytes(
     const std::vector<T>& values,
     nimble::Buffer& buffer) {
-  const std::vector<nimble::detail::subintsplit::SegmentPlan> wholeValue{
+  const std::vector<nimble::subintsplit::SectionPlan> wholeValue{
       {.bitStart = 0, .bitEnd = static_cast<int>(sizeof(T) * 8) - 1}};
   return nimble::EncodingFactory::encode<T>(
              std::make_unique<ExtendedSubIntSplitPolicy<T>>(
                  nimble::EncodingLayout::Config{
-                     nimble::detail::subintsplit::makePreserveSplitConfig(
-                         wholeValue)}),
+                     nimble::subintsplit::makePreserveSplitConfig(wholeValue)}),
              values,
              buffer)
       .size();
@@ -1384,11 +1369,11 @@ TEST(
       nimble::Statistics<uint64_t>::create(std::span<const uint64_t>(values));
   const size_t packedBytes =
       nimble::Encoding::kPrefixSize +
-      nimble::detail::subIntSplitSpecificHeaderSize(1) +
+      nimble::subintsplit::specificHeaderSize(1) +
       nimble::FixedBitWidthEncoding<uint64_t>::estimateSize(
           values.size(),
           statistics,
-          nimble::detail::subintsplit::sectionEncodingOptions({}));
+          nimble::subintsplit::sectionEncodingOptions({}));
   EXPECT_LE(encoded.size(), packedBytes);
 }
 
@@ -1409,21 +1394,21 @@ TEST(SubIntSplitEncodingTests, wholeValueFloorBoundsRunsOfWholeValues) {
 
   // What the planner alone would store: its own boundaries, replayed, which the
   // floor leaves alone.
-  auto plannerConfig = nimble::detail::subintsplit::defaultSelectorConfig();
+  auto plannerConfig = nimble::subintsplit::defaultSelectorConfig();
   plannerConfig.allowHuffman = false;
   plannerConfig.allowDeltaBlock = false;
   std::vector<uint64_t> sample;
-  nimble::detail::subintsplit::sampleIntoU64<uint64_t>(
+  nimble::subintsplit::sampleIntoU64<uint64_t>(
       std::span<const uint64_t>(values), sample);
-  const auto planned = nimble::detail::subintsplit::selectSplitsRestricted(
+  const auto planned = nimble::subintsplit::selectSplitsRestricted(
       sample, 64, values.size(), {}, plannerConfig);
-  ASSERT_GT(planned.segments.size(), 1u);
+  ASSERT_GT(planned.sections.size(), 1u);
   const size_t plannedBytes =
       nimble::EncodingFactory::encode<uint64_t>(
           std::make_unique<ExtendedSubIntSplitPolicy<uint64_t>>(
               nimble::EncodingLayout::Config{
-                  nimble::detail::subintsplit::makePreserveSplitConfig(
-                      planned.segments)}),
+                  nimble::subintsplit::makePreserveSplitConfig(
+                      planned.sections)}),
           values,
           buffer)
           .size();
@@ -1452,11 +1437,11 @@ TEST(SubIntSplitEncodingTests, fullWidthSingleSectionRoundTrip) {
 
   ASSERT_EQ(captured.childrenCount(), 1u);
   const auto capturedBoundaries = captured.config().get(
-      std::string(nimble::detail::subintsplit::kSplitBoundariesConfigKey));
+      std::string(nimble::subintsplit::kSplitBoundariesConfigKey));
   ASSERT_TRUE(capturedBoundaries.has_value());
   EXPECT_EQ(
       *capturedBoundaries,
-      nimble::detail::subintsplit::serializeSplitBoundaries(segments));
+      nimble::subintsplit::serializeSplitBoundaries(segments));
 
   const auto decoded = decodeAll<uint64_t>(encoded, *pool);
   expectBitwiseEqual(values, decoded);

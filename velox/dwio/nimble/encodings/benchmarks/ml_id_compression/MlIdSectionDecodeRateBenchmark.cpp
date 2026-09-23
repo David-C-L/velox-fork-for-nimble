@@ -29,19 +29,20 @@
 #include <gflags/gflags.h>
 
 #include "velox/dwio/nimble/common/Types.h"
-#include "velox/dwio/nimble/encodings/SubIntSplitAccumulate.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/DriverSweep.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/ElemType.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Format.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionAccumulator.h"
 #include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
 
 // Measures what each SubIntSplit section costs to read, on the cursor path and
 // on the view path, so the decode rates the split planner prices with can be
 // fitted for the path a reader actually takes.
 //
-// The rates in SubIntSplitDecodeCost.h were fitted from the section profile
+// The rates in subintsplit/DecodeCost.h were fitted from the section profile
 // driver, whose hook lives only in SubIntSplitEncoding's own materialize: they
 // describe the cursor path. The view path builds a different object per
 // section -- a real EncodingView where the encoding has one, and a
@@ -258,8 +259,8 @@ int runBenchmark() {
         continue;
       }
 
-      facebook::nimble::detail::SubIntSplitTransformInfo transformInfo;
-      const auto sections = facebook::nimble::detail::parseSubIntSplitSections(
+      facebook::nimble::subintsplit::TransformInfo transformInfo;
+      const auto sections = facebook::nimble::subintsplit::parseSections(
           stream,
           EncodingPrefix::prefixSize(stream, options.useVarintRowCount),
           &transformInfo);

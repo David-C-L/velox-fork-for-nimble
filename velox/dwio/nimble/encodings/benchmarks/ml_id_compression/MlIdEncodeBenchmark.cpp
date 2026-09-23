@@ -145,6 +145,10 @@ int runBenchmark() {
 
     for (const auto& enc : context.encoders) {
       facebook::nimble::Encoding::Options opts;
+      // Only the upstream feature switches are applied: the other sweep flags
+      // have never reached this driver, and applying them now would move every
+      // encode figure it has reported.
+      applyUpstreamFeatures(FLAGS_mlidc_sis_upstream_features, opts);
       std::unique_ptr<NimbleBenchTargetBase<Elem>> target;
 
       CacheController controller(hotPolicy, topo);
