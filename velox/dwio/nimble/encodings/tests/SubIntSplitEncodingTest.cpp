@@ -1115,10 +1115,6 @@ TEST(SubIntSplitEncodingTests, preserveModeRequiresBoundaries) {
       nimble::NimbleInternalError);
 }
 
-// Every header field is read straight off the wire, so a corrupt or truncated
-// stream arrives as arbitrary bytes. Each of these used to walk off the end of
-// the buffer, resize a vector by an attacker-chosen count, or shift by a
-// negative width, none of which reports anything.
 // The gate that decides whether a section is worth keying a permutation on
 // asks whether sorting by it would produce groups of at least four rows. It
 // answered that question from a 4096-row strided sample, and compared the
@@ -1245,6 +1241,10 @@ TEST(SubIntSplitEncodingTests, aLooserWidthBoundReachesTheSameVerdict) {
   }
 }
 
+// Every header field is read straight off the wire, so a corrupt or truncated
+// stream arrives as arbitrary bytes. Each of these used to walk off the end of
+// the buffer, resize a vector by an attacker-chosen count, or shift by a
+// negative width, none of which reports anything.
 TEST(SubIntSplitEncodingTests, truncatedStreamThrowsRatherThanReadingPastEnd) {
   const std::vector<uint64_t> values{
       0x1234567890000000ULL,
@@ -1306,6 +1306,80 @@ TEST(SubIntSplitEncodingTests, invalidSectionBitRangeThrows) {
   corrupted[headerPos] = static_cast<char>(0);
   corrupted[headerPos + 1] = static_cast<char>(200);
   EXPECT_THROW(decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException);
+}
+
+namespace {
+
+// A valid two-section stream of `values`, split at bit 32 of a 64-bit value,
+// with the offset of its SubIntSplit header. The values carry no row frame or
+// transform, so the section triples follow the two header bytes directly.
+std::pair<std::string, uint32_t> twoSectionStream(
+    velox::memory::MemoryPool& pool) {
+  std::vector<uint64_t> values(64);
+  std::mt19937_64 generator{5};
+  for (auto& value : values) {
+    value = generator();
+  }
+  const auto layout = makePreserveLayout<uint64_t>({{0, 31}, {32, 63}});
+  nimble::Buffer buffer{pool};
+  const std::string encoded{
+      encodeWithReplayLayout<uint64_t>(layout, values, buffer)};
+  const uint32_t dataOffset =
+      decodeEncoding<uint64_t>(encoded, pool)->dataOffset();
+  return {encoded, dataOffset};
+}
+
+} // namespace
+
+// A section covers at least one bit, so a 32-bit stream can hold at most 32
+// sections whatever the 64-bit limit allows.
+TEST(SubIntSplitEncodingTests, moreSectionsThanValueBitsThrows) {
+  std::vector<uint32_t> values(64);
+  std::iota(values.begin(), values.end(), 7u);
+  const auto layout =
+      makePreserveLayout<uint32_t>(makeFullWidthSegments<uint32_t>());
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  nimble::Buffer buffer{*pool};
+  std::string corrupted{
+      encodeWithReplayLayout<uint32_t>(layout, values, buffer)};
+  const uint32_t dataOffset =
+      decodeEncoding<uint32_t>(corrupted, *pool)->dataOffset();
+  corrupted[dataOffset] = static_cast<char>(33);
+  EXPECT_THROW(decodeAll<uint32_t>(corrupted, *pool), nimble::NimbleException);
+}
+
+// Values are reassembled by OR-ing each section in at its bit offset, so a
+// gap, an overlap or a top bit no section covers returns wrong values with
+// no error unless the header is rejected.
+TEST(SubIntSplitEncodingTests, sectionsThatDoNotTileTheValueThrow) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  const auto [encoded, dataOffset] = twoSectionStream(*pool);
+  ASSERT_EQ(static_cast<uint8_t>(encoded[dataOffset]), 2);
+  ASSERT_EQ(static_cast<uint8_t>(encoded[dataOffset + 1]), 0);
+  EXPECT_NO_THROW(decodeAll<uint64_t>(encoded, *pool));
+
+  const size_t first = dataOffset + nimble::subintsplit::kStreamHeaderSize;
+  const size_t second = first + nimble::subintsplit::kSectionHeaderSize;
+  const auto expectRejected = [&](size_t pos, uint8_t bit) {
+    std::string corrupted{encoded};
+    corrupted[pos] = static_cast<char>(bit);
+    EXPECT_THROW(decodeAll<uint64_t>(corrupted, *pool), nimble::NimbleException)
+        << "byte " << pos << " set to " << static_cast<int>(bit);
+  };
+  expectRejected(second, 33); // gap at bit 32
+  expectRejected(second, 31); // overlap at bit 31
+  expectRejected(second + 1, 62); // bit 63 uncovered
+  expectRejected(first, 1); // bit 0 uncovered
+}
+
+// The payloads are read back to back from the section sizes, so bytes the
+// sizes do not account for mean the header and the stream disagree.
+TEST(SubIntSplitEncodingTests, trailingBytesAfterTheSectionsThrow) {
+  auto pool = velox::memory::deprecatedAddDefaultLeafMemoryPool();
+  const auto [encoded, dataOffset] = twoSectionStream(*pool);
+  std::string padded{encoded};
+  padded.push_back('\0');
+  EXPECT_THROW(decodeAll<uint64_t>(padded, *pool), nimble::NimbleException);
 }
 
 namespace {

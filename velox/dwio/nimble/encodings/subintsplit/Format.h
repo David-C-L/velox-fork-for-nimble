@@ -20,6 +20,8 @@
 #include <vector>
 
 #include "velox/dwio/nimble/common/Exceptions.h"
+#include "velox/dwio/nimble/common/Types.h"
+#include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/subintsplit/BitSection.h"
 #include "velox/dwio/nimble/encodings/subintsplit/RowFrame.h"
@@ -57,6 +59,9 @@ inline constexpr uint8_t kFlagTransforms = 1u << 2;
 inline constexpr uint8_t kKnownFlags =
     kFlagDelta | kFlagRowFrame | kFlagTransforms;
 
+/// Bytes preceding the section header entries.
+inline constexpr uint32_t kStreamHeaderSize = 2;
+
 /// Bytes per section header entry: bitStart + bitEnd + encodedSize.
 inline constexpr uint32_t kSectionHeaderSize = 6;
 
@@ -64,7 +69,8 @@ inline constexpr uint32_t kSectionHeaderSize = 6;
 /// frame and transform blocks, the section payloads and the standard Encoding
 /// prefix.
 constexpr uint32_t specificHeaderSize(uint8_t numSections) noexcept {
-  return 2u + static_cast<uint32_t>(numSections) * kSectionHeaderSize;
+  return kStreamHeaderSize +
+      static_cast<uint32_t>(numSections) * kSectionHeaderSize;
 }
 
 /// The two bytes preceding the section headers.
@@ -116,6 +122,33 @@ inline bool isDeltaStream(std::string_view data, uint32_t dataOffset) {
   NIMBLE_CHECK_LE(
       dataOffset + 2, data.size(), "SubIntSplit stream is truncated.");
   return (static_cast<uint8_t>(data[dataOffset + 1]) & kFlagDelta) != 0;
+}
+
+/// Bits in one value of the stream, read from the data type in its Encoding
+/// prefix. The sections of a stream tile exactly this many bits.
+inline int streamValueBits(std::string_view data) {
+  NIMBLE_CHECK_FILE(
+      data.size() > static_cast<size_t>(EncodingPrefix::kDataTypeOffset),
+      "SubIntSplit stream is truncated.");
+  switch (static_cast<DataType>(data[EncodingPrefix::kDataTypeOffset])) {
+    case DataType::Int8:
+    case DataType::Uint8:
+      return 8;
+    case DataType::Int16:
+    case DataType::Uint16:
+      return 16;
+    case DataType::Int32:
+    case DataType::Uint32:
+    case DataType::Float:
+      return 32;
+    case DataType::Int64:
+    case DataType::Uint64:
+    case DataType::Double:
+      return 64;
+    default:
+      NIMBLE_CHECK_FILE(false, "SubIntSplit stream has an unsupported type.");
+      return 0;
+  }
 }
 
 /// Per-section transform metadata, as the header carries it.
@@ -191,14 +224,16 @@ inline std::vector<StoredSection> parseSections(
         "SubIntSplit stream is truncated.");
   };
 
+  const int valueBits = streamValueBits(data);
   requireBytes(2);
   const auto header = readStreamHeader(pos);
   const uint8_t numSections = header.numSections;
   NIMBLE_CHECK(numSections > 0, "SubIntSplit stream has no sections.");
-  // A section covers at least one bit of a 64-bit value, so there can be no
-  // more sections than bits.
-  NIMBLE_CHECK(
-      numSections <= 64, "SubIntSplit stream declares too many sections.");
+  // A section covers at least one bit of a value, so there can be no more
+  // sections than bits.
+  NIMBLE_CHECK_FILE(
+      numSections <= valueBits,
+      "SubIntSplit stream declares too many sections.");
   NIMBLE_CHECK_FILE(
       (header.flags & ~kKnownFlags) == 0,
       fmt::format("Unsupported SubIntSplit header flags: {}", header.flags));
@@ -251,17 +286,30 @@ inline std::vector<StoredSection> parseSections(
   // The triples are contiguous, so read them all before walking the payloads.
   std::vector<uint32_t> encodedSizes(numSections);
   requireBytes(static_cast<size_t>(numSections) * kSectionHeaderSize);
+  int nextBitStart = 0;
+  uint64_t payloadBytes = 0;
   for (uint8_t s = 0; s < numSections; ++s) {
     const auto entry = readSectionHeader(pos);
     sections[s].bitStart = entry.range.bitStart;
     sections[s].bitEnd = entry.range.bitEnd;
     encodedSizes[s] = entry.encodedSize;
+    payloadBytes += entry.encodedSize;
     // An inverted or out-of-range pair would give a negative or over-wide
-    // shift when the mask is built below.
-    NIMBLE_CHECK(
-        sections[s].bitEnd >= sections[s].bitStart && sections[s].bitEnd < 64,
-        "SubIntSplit section has an invalid bit range.");
+    // shift when the mask is built below, and a gap or an overlap would
+    // reassemble values from the wrong bits.
+    NIMBLE_CHECK_FILE(
+        sections[s].bitStart == nextBitStart &&
+            sections[s].bitEnd >= sections[s].bitStart &&
+            sections[s].bitEnd < valueBits,
+        "SubIntSplit sections must cover the value bits once, in order.");
+    nextBitStart = sections[s].bitEnd + 1;
   }
+  NIMBLE_CHECK_FILE(
+      nextBitStart == valueBits,
+      "SubIntSplit sections must cover the value bits once, in order.");
+  NIMBLE_CHECK_FILE(
+      payloadBytes == static_cast<uint64_t>(streamEnd - pos),
+      "SubIntSplit section payload sizes do not match the stream.");
 
   for (uint8_t s = 0; s < numSections; ++s) {
     auto& section = sections[s];
