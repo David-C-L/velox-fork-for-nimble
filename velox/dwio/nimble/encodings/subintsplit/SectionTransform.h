@@ -97,42 +97,7 @@ enum class PositionMapping : uint8_t {
   /// more than one read but still a bounded number, so this needs no block
   /// either.
   Gathered,
-  /// Undoing one row means undoing the rows around it. Only these need to be
-  /// applied in blocks, because the block is what bounds the undoing.
-  ///
-  /// No transform is currently Sequential. The Burrows-Wheeler pair was, and
-  /// was removed: a point read through this class rebuilds its whole block,
-  /// so with kTransformBlockSize rows at the ~5.6ns/row an untransformed
-  /// section decodes at, a probe costs ~23us against ~490ns for the same
-  /// column untransformed. That is a floor set by the class, not by the
-  /// implementation -- it holds even for an inversion that costs nothing --
-  /// and shrinking the block to escape it gives back the compression the
-  /// transform was adopted for. Weigh that before adding another one.
-  ///
-  /// If one is added: build any rank/select structure it needs with a
-  /// counting sort over the alphabet, O(n + sigma), not a comparison sort.
-  /// Burrows-Wheeler inversion here used std::stable_sort, and that single
-  /// line was 55-61% of decode time; replacing it measured 2.3x on both bulk
-  /// and point. The cost is easy to reintroduce and hard to see in a profile
-  /// without call-graph attribution, since it shows up as libstdc++ frames
-  /// rather than as anything named after the transform.
-  Sequential,
 };
-
-/// Rows a Sequential transform is applied to at a time.
-///
-/// A Sequential transform can only be undone over the same span it was applied
-/// to, so that span bounds what a reader must hold and how far a point lookup
-/// has to reconstruct. It matches the decoder's chunk size, which lets such a
-/// stream be undone inside the existing chunk loop rather than by materialising
-/// whole sections. The value is carried on the wire, so a later writer may
-/// choose a different one without breaking this reader.
-///
-/// Computable and InPlace transforms are not blocked: blocking them would cost
-/// compression -- a key-derived sort clusters far better over a section than
-/// over 4096 rows -- and buy nothing, since neither needs a bounded span to
-/// address a row.
-inline constexpr uint32_t kTransformBlockSize = 4096;
 
 /// Returns the name of a transform id, for logging and test failures.
 std::string toString(TransformId id);
@@ -230,12 +195,6 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key);
 /// State a transform produces at encode and needs back at decode. What it
 /// holds depends on the transform: a relabelling carries its codebook.
 struct TransformState {
-  /// Rotation index, which only the removed Burrows-Wheeler transforms ever
-  /// set. No remaining transform writes it, so it is always zero and costs
-  /// nothing to store; it stays because the stream layout reserves room for
-  /// it per block, and dropping it is a wire-format change rather than a
-  /// cleanup. Remove it whenever that layout is next revised.
-  uint32_t primaryIndex{0};
   /// Codebook for a relabelling. Entry i is the original value for code i.
   std::vector<uint64_t> codebook;
 

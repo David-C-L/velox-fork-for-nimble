@@ -743,12 +743,7 @@ std::string toString(TransformId id) {
 }
 
 size_t TransformState::sizeInBits(int width) const {
-  size_t bits = 0;
-  if (primaryIndex > 0) {
-    bits += 32;
-  }
-  bits += codebook.size() * static_cast<size_t>(width);
-  return bits;
+  return codebook.size() * static_cast<size_t>(width);
 }
 
 const SectionTransform* transformFor(TransformId id) {

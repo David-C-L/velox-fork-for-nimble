@@ -30,6 +30,8 @@
 //   [1 byte]  flags: kFlagDelta, kFlagRowFrame, kFlagTransforms
 //   [17 bytes, only with kFlagRowFrame]  {guard(1B), slope(8B), base(8B)}
 //   [transform block, only with kFlagTransforms]
+//     {keySection(1B), transformId(1B) per section, then per transformed
+//      section {codebookSize(4B), codebook(8B per entry)}}
 //   [numSections × 6 bytes]  {bitStart(1B), bitEnd(1B), encodedSize(4B)}
 //   [section_0_bytes][section_1_bytes]...[section_{N-1}_bytes]
 //
@@ -133,12 +135,6 @@ struct TransformInfo {
   std::vector<uint8_t> transformIds;
   /// Codebook per section, empty where the transform carries none.
   std::vector<std::vector<uint64_t>> codebooks;
-  /// Rows one non-elementwise transform covers. Zero when nothing is
-  /// transformed, or when every transform present is elementwise.
-  uint32_t blockSize{0};
-  /// Per-section, per-block state a transform needs back. Empty for a section
-  /// whose transform carries none.
-  std::vector<std::vector<uint32_t>> primaryIndices;
 
   bool anyTransform() const {
     for (uint8_t id : transformIds) {
@@ -158,7 +154,6 @@ inline uint32_t transformHeaderSize(const TransformInfo& info) {
     return 0;
   }
   uint32_t size = 1; // key section
-  size += 4; // block size
   size += static_cast<uint32_t>(info.transformIds.size()); // one id per section
   for (size_t i = 0; i < info.transformIds.size(); ++i) {
     if (info.transformIds[i] == 0) {
@@ -166,8 +161,6 @@ inline uint32_t transformHeaderSize(const TransformInfo& info) {
     }
     size += 4; // codebook entry count
     size += static_cast<uint32_t>(info.codebooks[i].size() * sizeof(uint64_t));
-    size += 4; // per-block state count
-    size += static_cast<uint32_t>(info.primaryIndices[i].size() * 4);
   }
   return size;
 }
@@ -250,7 +243,7 @@ inline std::vector<StoredSection> parseSections(
 
   if ((header.flags & kFlagTransforms) != 0) {
     TransformInfo parsed;
-    requireBytes(5 + numSections);
+    requireBytes(1 + numSections);
     parsed.keySection = encoding::read<uint8_t>(pos);
     // The key section is indexed directly when a transform inverts, so a bad
     // value here would read outside the section vector.
@@ -258,10 +251,8 @@ inline std::vector<StoredSection> parseSections(
         parsed.keySection == TransformInfo::kNoKeySection ||
             parsed.keySection < numSections,
         "SubIntSplit stream names a key section that does not exist.");
-    parsed.blockSize = encoding::readUint32(pos);
     parsed.transformIds.resize(numSections);
     parsed.codebooks.resize(numSections);
-    parsed.primaryIndices.resize(numSections);
     for (uint8_t s = 0; s < numSections; ++s) {
       parsed.transformIds[s] = encoding::read<uint8_t>(pos);
     }
@@ -278,13 +269,6 @@ inline std::vector<StoredSection> parseSections(
       for (uint32_t e = 0; e < entries; ++e) {
         parsed.codebooks[s][e] = encoding::read<uint64_t>(pos);
       }
-      requireBytes(4);
-      const uint32_t blocks = encoding::readUint32(pos);
-      requireBytes(static_cast<size_t>(blocks) * sizeof(uint32_t));
-      parsed.primaryIndices[s].resize(blocks);
-      for (uint32_t b = 0; b < blocks; ++b) {
-        parsed.primaryIndices[s][b] = encoding::readUint32(pos);
-      }
     }
     if (transformInfo != nullptr) {
       *transformInfo = std::move(parsed);
@@ -292,7 +276,6 @@ inline std::vector<StoredSection> parseSections(
   } else if (transformInfo != nullptr) {
     transformInfo->transformIds.assign(numSections, 0);
     transformInfo->codebooks.assign(numSections, {});
-    transformInfo->primaryIndices.assign(numSections, {});
   }
 
   std::vector<StoredSection> sections(numSections);

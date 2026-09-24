@@ -83,15 +83,14 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
     // and the two degenerate ends (1 and 64): bitplane's transpose walks
     // words and bit positions by width, so a width that leaves a remainder
     // is exactly where an off-by-one in that walk would show up. Counts
-    // include one that is not a multiple of kTransformBlockSize, so a
-    // family that blocks does not get to round-trip only on whole blocks.
+    // include ones that are not a multiple of any word or chunk size.
     for (size_t count :
          {size_t{1},
           size_t{2},
           size_t{7},
           size_t{256},
           size_t{1024},
-          static_cast<size_t>(subintsplit::kTransformBlockSize) + 37}) {
+          size_t{4'133}}) {
       for (int width : {1, 3, 5, 7, 8, 13, 16, 32, 40, 63, 64}) {
         for (auto shape :
              {Shape::Uniform,
@@ -264,14 +263,10 @@ TEST(SectionTransformTest, reportsHowItMapsPositions) {
       PositionMapping::Gathered);
   EXPECT_TRUE(transformFor(TransformId::BitPlane)->supportsPointAccess());
 
-  // Nothing is Sequential any more: the Burrows-Wheeler pair was the only
-  // such transform and was removed because a probe through that class has to
-  // rebuild a whole block. Asserted rather than left implicit, so that adding
-  // a transform that cannot answer a point read on its own has to change this
-  // test and account for the cost.
+  // Asserted rather than left implicit, so that adding a transform that
+  // cannot answer a point read on its own has to change this test and account
+  // for the cost.
   for (auto id : allTransforms()) {
-    EXPECT_NE(transformFor(id)->positionMapping(), PositionMapping::Sequential)
-        << toString(id);
     EXPECT_TRUE(transformFor(id)->supportsPointAccess()) << toString(id);
   }
 }

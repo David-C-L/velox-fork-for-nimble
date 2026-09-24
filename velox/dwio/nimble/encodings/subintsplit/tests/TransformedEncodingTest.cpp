@@ -504,8 +504,6 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
   subintsplit::TransformInfo info;
   subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
   ASSERT_TRUE(info.anyTransform()) << "KeyDerived was not applied";
-  EXPECT_EQ(info.blockSize, 0u)
-      << "a key-derived permutation should not be blocked";
 
   SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
   std::vector<uint64_t> bulk(values.size());
