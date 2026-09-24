@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <string>
 
@@ -263,13 +264,16 @@ TEST_F(EncodingSizeEstimationTest, numericTrivial) {
 TEST_F(EncodingSizeEstimationTest, numericFixedBitWidth) {
   using Est = detail::EncodingSizeEstimation<uint32_t>;
 
-  std::vector<uint32_t> data = {100, 101, 102, 103, 104};
+  // Enough rows that the fixed header does not outweigh the saving: 1000
+  // values spanning 1000 need 10 bits each rather than 32.
+  std::vector<uint32_t> data(1'000);
+  std::iota(data.begin(), data.end(), 100u);
   auto stats = Statistics<uint32_t>::create(data);
 
-  auto size =
-      Est::estimateSize(EncodingType::FixedBitWidth, 5, stats, defaultOptions_);
+  auto size = Est::estimateSize(
+      EncodingType::FixedBitWidth, data.size(), stats, defaultOptions_);
   ASSERT_TRUE(size.has_value());
-  EXPECT_LT(size.value(), 5 * sizeof(uint32_t));
+  EXPECT_LT(size.value(), data.size() * sizeof(uint32_t));
 }
 
 // Dense/high-cardinality data (most rows uncommon): the other-values stream is
