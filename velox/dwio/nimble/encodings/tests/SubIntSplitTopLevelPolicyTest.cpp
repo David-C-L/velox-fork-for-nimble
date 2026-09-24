@@ -35,6 +35,21 @@ using namespace facebook::nimble::subintsplit;
 
 namespace {
 
+// The default read factors with SubIntSplit among them. The defaults need not
+// list it, and these tests are about how selection treats it once it is a
+// candidate.
+std::vector<std::pair<EncodingType, float>> readFactorsWithSubIntSplit() {
+  auto readFactors =
+      ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors();
+  if (std::none_of(
+          readFactors.begin(), readFactors.end(), [](const auto& factor) {
+            return factor.first == EncodingType::SubIntSplit;
+          })) {
+    readFactors.emplace_back(EncodingType::SubIntSplit, 0.85f);
+  }
+  return readFactors;
+}
+
 // Fixed so the synthetic streams are reproducible across runs.
 constexpr uint64_t kSeed = 20260901;
 
@@ -115,7 +130,7 @@ EncodingType selectedUnder(
   options.subIntSplitAdmissionForces = forces;
   options.subIntSplitAdmissionProfilePairs = profilePairs;
   ManualEncodingSelectionPolicy<uint64_t> policy{
-      ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
+      readFactorsWithSubIntSplit(),
       CompressionOptions{},
       std::nullopt,
   };
@@ -282,9 +297,7 @@ TEST(SubIntSplitTopLevelPolicyTest, selectionFollowsAdmissionMode) {
     const std::span<const uint64_t> span(values);
     const auto statistics = Statistics<uint64_t>::create(span);
     ManualEncodingSelectionPolicy<uint64_t> policy{
-        ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
-        CompressionOptions{},
-        std::nullopt};
+        readFactorsWithSubIntSplit(), CompressionOptions{}, std::nullopt};
     Encoding::Options options;
     options.subIntSplitAdmission = mode;
     return policy.select(span, statistics, options).encodingType;
@@ -297,9 +310,7 @@ TEST(SubIntSplitTopLevelPolicyTest, selectionFollowsAdmissionMode) {
   const std::span<const uint64_t> span(packed);
   const auto statistics = Statistics<uint64_t>::create(span);
   ManualEncodingSelectionPolicy<uint64_t> policy{
-      ManualEncodingSelectionPolicyFactory::defaultEncodingReadFactors(),
-      CompressionOptions{},
-      std::nullopt};
+      readFactorsWithSubIntSplit(), CompressionOptions{}, std::nullopt};
   Encoding::Options options;
   options.subIntSplitAdmission = 2;
   options.subIntSplitAdmissionProfilePairs = 1'024;
