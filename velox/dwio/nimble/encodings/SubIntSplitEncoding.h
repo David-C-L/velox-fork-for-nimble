@@ -859,8 +859,14 @@ void SubIntSplitEncoding<T>::decodeUntransformed(
         std::min(decodeChunkSize_, rowCount - chunkStart);
     physicalType* chunkOutput = output + chunkStart;
 
-    for (size_t d = 0; d < dynamicSections_.size(); ++d) {
-      const size_t s = dynamicSections_[d];
+    // With nothing folded every section is dynamic and in order, so the
+    // indirection through dynamicSections_ is skipped: on a one-row read it is
+    // a dependent load per section, and those reads are what a gather issues.
+    const bool allDynamic = dynamicSections_.size() == sections_.size();
+    const uint32_t* dynamic = dynamicSections_.data();
+    const size_t numDynamic = dynamicSections_.size();
+    for (size_t d = 0; d < numDynamic; ++d) {
+      const size_t s = allDynamic ? d : dynamic[d];
       const auto& sec = sections_[s];
       const int shift = sec.bitStart;
       const uint64_t mask = sec.mask;
