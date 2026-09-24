@@ -136,13 +136,12 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
     std::copy_n(scratch_.data() + begin, count, dst);
   }
 
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     decompressAll();
-    for (const auto& [begin, count] : ranges) {
-      std::copy_n(scratch_.data() + begin, count, dst);
-      dst += count;
+    for (const auto& range : ranges) {
+      std::copy_n(scratch_.data() + range.startRow, range.numRows(), dst);
+      dst += range.numRows();
     }
   }
 

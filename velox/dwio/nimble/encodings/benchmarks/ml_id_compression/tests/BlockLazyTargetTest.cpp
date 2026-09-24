@@ -223,16 +223,18 @@ TEST(BlockLazyTargetTest, roundTripsAcrossBlockBoundaries) {
   }
 
   // A gather, served from whatever those reads left cached.
-  const std::vector<std::pair<uint32_t, uint32_t>> gather{
-      {5, 3}, {70, 2}, {500, 4}, {997, 3}};
+  const std::vector<nimble::RowRange> gather{
+      {5, 8}, {70, 72}, {500, 504}, {997, 1000}};
   uint32_t total = 0;
-  for (const auto& [begin, count] : gather) {
-    total += count;
+  for (const auto& range : gather) {
+    total += range.numRows();
   }
   std::vector<int64_t> out(total);
   target->skipThenMaterialize(gather, out.data());
   uint32_t cursor = 0;
-  for (const auto& [begin, count] : gather) {
+  for (const auto& range : gather) {
+    const uint32_t begin = range.startRow;
+    const uint32_t count = range.numRows();
     for (uint32_t i = 0; i < count; ++i) {
       ASSERT_EQ(out[cursor + i], data[begin + i]);
     }

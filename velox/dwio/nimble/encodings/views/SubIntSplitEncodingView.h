@@ -328,9 +328,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // Reads each range on its own, the way TypedEncodingView's default range
   // list read does, but in residuals.
   void readResidualRangesSeparately(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
-    for (const auto& [offset, length] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t offset = range.startRow;
+      const uint32_t length = range.numRows();
       if (length == 1) {
         *output = readResidualAt(offset);
       } else {
@@ -567,14 +569,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // decode, so reading a dense stretch in one go and discarding the rows
   // between the wanted ones is far cheaper than probing each wanted one.
   void readPhysicalRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const final {
-    for (const auto& [offset, length] : ranges) {
-      this->checkReadRange(offset, length);
+    for (const auto& range : ranges) {
+      this->checkReadRange(range.startRow, range.numRows());
     }
     readResidualRanges(ranges, output);
     if (rowFrame_.active()) {
-      for (const auto& [offset, length] : ranges) {
+      for (const auto& range : ranges) {
+        const uint32_t offset = range.startRow;
+        const uint32_t length = range.numRows();
         subintsplit::addRowFrame(rowFrame_, offset, output, length);
         output += length;
       }
@@ -582,7 +586,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   }
 
   void readResidualRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
     if (transformInfo_.anyTransform()) {
       readTransformedRanges(ranges, output);
@@ -601,12 +605,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // kViewChunkSize rows, so its staging buffer stays in L1 next to the
   // section scratch readPhysical() uses for the same rows.
   void readUntransformedRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
     alignas(64) physicalType staged[kViewChunkSize];
     size_t rangeIndex = 0;
     while (rangeIndex < ranges.size()) {
-      const auto [groupOffset, groupFirstLength] = ranges[rangeIndex];
+      const uint32_t groupOffset = ranges[rangeIndex].startRow;
+      const uint32_t groupFirstLength = ranges[rangeIndex].numRows();
       if (groupFirstLength == 0) {
         ++rangeIndex;
         continue;
@@ -622,7 +627,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       uint32_t groupEnd = groupOffset + groupFirstLength;
       size_t groupLast = rangeIndex;
       for (size_t next = rangeIndex + 1; next < ranges.size(); ++next) {
-        const auto [nextOffset, nextLength] = ranges[next];
+        const uint32_t nextOffset = ranges[next].startRow;
+        const uint32_t nextLength = ranges[next].numRows();
         if (nextLength == 0) {
           // Taken into the group so the copy loop below skips it in order.
           groupLast = next;
@@ -654,7 +660,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
       readResidualRange(groupOffset, groupEnd - groupOffset, staged);
       for (; rangeIndex <= groupLast; ++rangeIndex) {
-        const auto [offset, length] = ranges[rangeIndex];
+        const uint32_t offset = ranges[rangeIndex].startRow;
+        const uint32_t length = ranges[rangeIndex].numRows();
         std::copy_n(staged + (offset - groupOffset), length, output);
         output += length;
       }
@@ -673,12 +680,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // ranges rather than rows matters: four ranges of a quarter column each cost
   // four whole-column decodes read one at a time, and one read together.
   void readTransformedRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
     // One range is exactly what readPhysical() plans for, and it can decode
     // a whole-column request straight into the output.
     if (ranges.size() == 1) {
-      readResidualRange(ranges[0].first, ranges[0].second, output);
+      readResidualRange(ranges[0].startRow, ranges[0].numRows(), output);
       return;
     }
     const uint64_t rowCount = this->rowCount_;
@@ -697,11 +704,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // per-range price already separates those two cases, by charging a range
     // too short to sort at the probe rate.
     uint64_t totalRows = 0;
-    for (const auto& [offset, rangeLength] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t rangeLength = range.numRows();
       totalRows += rangeLength;
     }
     uint64_t piecewiseCost = 0;
-    for (const auto& [offset, rangeLength] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t rangeLength = range.numRows();
       const uint64_t length = rangeLength;
       if (length < kMinSpanLength) {
         piecewiseCost += length * kProbeCostInDecodedRows;
@@ -739,13 +748,15 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   // Decodes the column once and keeps the rows the list asked for.
   void readWholeColumnRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
     // Fully overwritten by readPhysicalBlock() below before being read.
     thread_local velox::raw_vector<physicalType> whole;
     whole.resize(this->rowCount_);
     readPhysicalBlock(0, this->rowCount_, whole.data());
-    for (const auto& [offset, length] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t offset = range.startRow;
+      const uint32_t length = range.numRows();
       std::copy_n(whole.data() + offset, length, output);
       output += length;
     }
@@ -911,7 +922,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   void readPermutedSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
-    const std::pair<uint32_t, uint32_t> one{offset, length};
+    const RowRange one{offset, offset + length};
     readPermutedSpanRanges({&one, 1}, length, output);
   }
 
@@ -926,7 +937,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // a range boundary happens to fall in. `totalRows` is the sum of the
   // lengths, which the caller has already computed to make this choice.
   void readPermutedSpanRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       uint32_t totalRows,
       physicalType* output) const {
     const auto& positions = positionMap();
@@ -957,7 +968,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     thread_local velox::raw_vector<SourceRow> order;
     order.resize(totalRows);
     uint32_t at = 0;
-    for (const auto& [rangeOffset, rangeLength] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t rangeOffset = range.startRow;
+      const uint32_t rangeLength = range.numRows();
       for (uint32_t i = 0; i < rangeLength; ++i, ++at) {
         order[at] = {positions[rangeOffset + i], at};
       }
@@ -982,7 +995,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         // already, so this is exactly readSectionChunk's job, one range at a
         // time.
         physicalType* rangeOutput = output;
-        for (const auto& [rangeOffset, rangeLength] : ranges) {
+        for (const auto& range : ranges) {
+          const uint32_t rangeOffset = range.startRow;
+          const uint32_t rangeLength = range.numRows();
           switch (section.storageBytes) {
             case 1:
               readSectionChunk<uint8_t>(
@@ -1141,12 +1156,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // for all of them. It also spares the per-block dispatch and the resize
     // that used to run once per block.
     //
-    // std::vector rather than raw_vector because raw_vector rejects
-    // std::pair: libstdc++ 11 does not call it trivially copyable even when
-    // both members are. clear() and push_back keep the capacity without the
-    // value-initialisation resize() would do, which is the cost that
-    // mattered here.
-    thread_local std::vector<std::pair<uint32_t, uint32_t>> blocks;
+    // clear() and push_back keep the capacity without the value-initialisation
+    // resize() would do, which is the cost that mattered here.
+    thread_local std::vector<RowRange> blocks;
     blocks.clear();
     uint32_t j = 0;
     while (j < length) {
@@ -1155,7 +1167,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
              order[blockEnd].source == order[blockEnd - 1].source + 1) {
         ++blockEnd;
       }
-      blocks.emplace_back(order[j].source, blockEnd - j);
+      blocks.emplace_back(order[j].source, order[j].source + (blockEnd - j));
       j = blockEnd;
     }
     // Same zero-fill hazard as `order` above: resized once per call now, to

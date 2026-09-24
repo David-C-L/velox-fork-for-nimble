@@ -68,12 +68,12 @@ class CountingTarget : public NimbleBenchTargetBase<int64_t> {
   }
 
   void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+      std::span<const nimble::RowRange> ranges,
       int64_t* dst) override {
     ++numFullDecodes_;
-    for (const auto& [begin, count] : ranges) {
-      std::copy_n(values_.data() + begin, count, dst);
-      dst += count;
+    for (const auto& range : ranges) {
+      std::copy_n(values_.data() + range.startRow, range.numRows(), dst);
+      dst += range.numRows();
     }
   }
 

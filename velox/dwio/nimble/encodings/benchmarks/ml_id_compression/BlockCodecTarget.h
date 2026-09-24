@@ -194,9 +194,8 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
     readRange(begin, count, dst);
   }
 
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     // The scratch block is reused across the ranges of one gather, because a
     // reader serving a gather holds one decompressed block at a time and two
     // ranges landing in the same block cost one decompression. It is dropped
@@ -204,9 +203,9 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
     // holding only compressed blocks pays for the first block of every new
     // read, which is what the point and range drivers measure.
     cachedBlock_ = kNoBlock;
-    for (const auto& [begin, count] : ranges) {
-      readRange(begin, count, dst);
-      dst += count;
+    for (const auto& range : ranges) {
+      readRange(range.startRow, range.numRows(), dst);
+      dst += range.numRows();
     }
     cachedBlock_ = kNoBlock;
   }
@@ -496,12 +495,11 @@ class BlockLazyTarget : public NimbleBenchTargetBase<T> {
     readRange(begin, count, dst);
   }
 
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
-    for (const auto& [begin, count] : ranges) {
-      readRange(begin, count, dst);
-      dst += count;
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
+    for (const auto& range : ranges) {
+      readRange(range.startRow, range.numRows(), dst);
+      dst += range.numRows();
     }
   }
 

@@ -44,8 +44,9 @@ namespace facebook::nimble::test {
 // column in one and in several ranges, single rows at strides either side of
 // where a planner might stop bridging gaps, random lists at several run
 // lengths and densities, ranges straddling 1024-row chunk edges and the
-// ragged tail, zero-length ranges, and ranges out of order or overlapping.
-// Every range is clipped to `rowCount`, so any column length is valid.
+// ragged tail. Every list is ascending, disjoint and free of empty ranges, as
+// EncodingView::read requires, and every range is clipped to `rowCount`, so
+// any column length is valid.
 inline std::vector<std::vector<std::pair<uint32_t, uint32_t>>> makeRangeLists(
     uint32_t rowCount) {
   using RangeList = std::vector<std::pair<uint32_t, uint32_t>>;
@@ -63,7 +64,6 @@ inline std::vector<std::vector<std::pair<uint32_t, uint32_t>>> makeRangeLists(
 
   lists.push_back({});
   lists.push_back(clipped({{0, rowCount}}));
-  lists.push_back(clipped({{0, rowCount}, {0, rowCount}}));
   const uint32_t quarter = rowCount / 4;
   lists.push_back(clipped(
       {{0, quarter},
@@ -111,14 +111,20 @@ inline std::vector<std::vector<std::pair<uint32_t, uint32_t>>> makeRangeLists(
   lists.push_back(
       clipped({{1000, 48}, {1100, 1}, {1101, 900}, {2010, 1}, {rowCount, 0}}));
   lists.push_back(clipped({{5, 0}, {6, 1}, {6, 0}, {7, 2}, {rowCount, 0}}));
-  lists.push_back(clipped(
-      {{100, 5},
-       {50, 10},
-       {52, 3},
-       {0, 1},
-       {rowCount > 0 ? rowCount - 1 : 0, 1},
-       {rowCount > 0 ? rowCount - 1 : 0, 1},
-       {60, 1}}));
+  // Clipping a short column can leave a list out of order or with empty
+  // ranges, which the read does not accept, so both are dropped here.
+  for (auto& list : lists) {
+    RangeList kept;
+    uint32_t end = 0;
+    for (const auto& [offset, length] : list) {
+      if (length == 0 || offset < end) {
+        continue;
+      }
+      kept.emplace_back(offset, length);
+      end = offset + length;
+    }
+    list = std::move(kept);
+  }
   return lists;
 }
 
@@ -144,7 +150,13 @@ void expectRangeListRead(
   }
   const auto buffer = std::make_unique<PhysicalType[]>(numRows + 1);
   std::fill_n(buffer.get(), numRows + 1, sentinel);
-  view.readRanges(ranges, buffer.get());
+  std::vector<nimble::RowRange> rowRanges;
+  for (const auto& [offset, length] : ranges) {
+    if (length > 0) {
+      rowRanges.emplace_back(offset, offset + length);
+    }
+  }
+  view.read(rowRanges, {}, buffer.get());
   const std::vector<PhysicalType> actual(
       buffer.get(), buffer.get() + numRows + 1);
   std::vector<PhysicalType> expected;

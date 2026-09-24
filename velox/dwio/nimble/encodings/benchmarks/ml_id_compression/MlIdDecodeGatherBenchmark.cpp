@@ -56,12 +56,12 @@ DEFINE_string(
 namespace facebook::nimble::mlidc {
 namespace {
 
-std::vector<std::pair<uint32_t, uint32_t>> toRanges(const GatherTrace& t) {
-  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+std::vector<nimble::RowRange> toRanges(const GatherTrace& t) {
+  std::vector<nimble::RowRange> ranges;
   ranges.reserve(t.ranges.size());
   for (const auto& r : t.ranges)
     ranges.emplace_back(
-        static_cast<uint32_t>(r.begin), static_cast<uint32_t>(r.size()));
+        static_cast<uint32_t>(r.begin), static_cast<uint32_t>(r.end));
   return ranges;
 }
 

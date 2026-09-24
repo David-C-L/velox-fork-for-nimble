@@ -102,11 +102,6 @@ TEST_F(RLEEncodingViewTest, rangeListReadsWalkAndReset) {
   // which leaves the cursor behind the rows it produced.
   nimble::test::expectRangeListRead(
       *view, rows, {{7, 3}, {64, 1}, {1'000, 2'048}, {30'000, 4}});
-
-  // Descending and overlapping: every range but the first has to restart the
-  // walk rather than trust the cursor.
-  nimble::test::expectRangeListRead(
-      *view, rows, {{30'000, 8}, {12, 4}, {29'999, 8}, {12, 4}, {0, 1}});
 }
 
 TEST_F(RLEEncodingViewTest, readsPhysicalNestedDeltaBlockValues) {

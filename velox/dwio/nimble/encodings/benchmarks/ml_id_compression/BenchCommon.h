@@ -195,13 +195,13 @@ class NimbleBenchTarget {
   // Gather pattern: for each [begin, count) range in sorted order, skip then
   // materialize.  dst must have space for the total number of rows across all
   // ranges.
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst) {
     auto& encoding = decoder();
     encoding.reset();
     uint32_t cursor = 0;
-    for (auto& [begin, count] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t begin = range.startRow;
+      const uint32_t count = range.numRows();
       if (begin > cursor) {
         encoding.skip(begin - cursor);
         cursor = begin;
@@ -278,7 +278,7 @@ struct NimbleBenchTargetBase {
   virtual void materializeAll(T* dst, uint32_t n) = 0;
   virtual void materializeRange(uint32_t begin, uint32_t count, T* dst) = 0;
   virtual void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+      std::span<const nimble::RowRange> ranges,
       T* dst) = 0;
   virtual size_t payloadSize() const = 0;
 
@@ -375,9 +375,8 @@ struct NimbleBenchTargetImpl
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
     target.materializeRange(begin, count, dst);
   }
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     target.skipThenMaterialize(ranges, dst);
   }
   size_t payloadSize() const override {
@@ -577,9 +576,8 @@ class NimbleViewBenchTargetImpl
   // selection's row ranges would pass it, so a view can plan across ranges
   // rather than answer them one by one. That also makes it the like-for-like
   // counterpart of a block codec that decompresses once and copies ranges out.
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     buildAccessStructure();
     view_->readRanges(ranges, dst);
   }
@@ -748,9 +746,8 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
     inner_->materializeRange(begin, count, dst);
   }
 
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     decompressAll();
     inner_->skipThenMaterialize(ranges, dst);
   }
@@ -921,13 +918,12 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
     std::copy_n(values_.data() + begin, count, dst);
   }
 
-  void skipThenMaterialize(
-      const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-      T* dst) override {
+  void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
+      override {
     buildAccessStructure();
-    for (const auto& [begin, count] : ranges) {
-      std::copy_n(values_.data() + begin, count, dst);
-      dst += count;
+    for (const auto& range : ranges) {
+      std::copy_n(values_.data() + range.startRow, range.numRows(), dst);
+      dst += range.numRows();
     }
   }
 

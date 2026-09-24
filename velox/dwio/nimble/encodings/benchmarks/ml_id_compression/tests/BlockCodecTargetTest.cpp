@@ -166,12 +166,12 @@ TYPED_TEST(BlockCodecTargetTest, gatherAcrossBlocks) {
   constexpr uint32_t kBlockSize = 64;
   constexpr uint32_t kRows = 200;
   const auto data = makeData<TypeParam>(kRows);
-  const std::vector<std::pair<uint32_t, uint32_t>> ranges{
-      {5, 3}, {9, 4}, {70, 2}, {126, 6}, {197, 3}};
+  const std::vector<nimble::RowRange> ranges{
+      {5, 8}, {9, 13}, {70, 72}, {126, 132}, {197, 200}};
 
   uint32_t total = 0;
-  for (const auto& [begin, count] : ranges) {
-    total += count;
+  for (const auto& range : ranges) {
+    total += range.numRows();
   }
 
   for (const auto codec : {Codec::kZstd, Codec::kOpenZL}) {
@@ -179,7 +179,9 @@ TYPED_TEST(BlockCodecTargetTest, gatherAcrossBlocks) {
     std::vector<TypeParam> out(total);
     target->skipThenMaterialize(ranges, out.data());
     uint32_t cursor = 0;
-    for (const auto& [begin, count] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t begin = range.startRow;
+      const uint32_t count = range.numRows();
       for (uint32_t i = 0; i < count; ++i) {
         ASSERT_EQ(out[cursor + i], data[begin + i]);
       }
@@ -241,7 +243,7 @@ TEST(BlockCodecTargetPropertyTest, gatherReusesOneBlockButNotAcrossCalls) {
   const auto data = makeData<int64_t>(1'000);
   auto target = encodeBlocks<int64_t>(Codec::kZstd, data, kBlockSize);
 
-  const std::vector<std::pair<uint32_t, uint32_t>> sameBlock{{5, 3}, {40, 3}};
+  const std::vector<nimble::RowRange> sameBlock{{5, 8}, {40, 43}};
   std::vector<int64_t> out(6);
   size_t before = target->numBlockDecodes();
   target->skipThenMaterialize(sameBlock, out.data());

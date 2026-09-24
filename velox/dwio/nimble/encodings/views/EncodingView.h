@@ -23,7 +23,6 @@
 #include <memory>
 #include <span>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "velox/common/memory/Memory.h"
@@ -58,16 +57,12 @@ class EncodingView {
   /// Reads physical values in the given row range into a typed output buffer.
   virtual void read(uint32_t offset, uint32_t length, void* output) const = 0;
 
-  /// Reads every (offset, length) range in `ranges`, in the order given, into
-  /// one typed output buffer with room for the sum of their lengths.
-  ///
-  /// Equivalent to calling read() or readAt() once per range, but hands the
-  /// view the whole list at once, so an encoding whose point reads cost far
-  /// more per row than a bulk decode can decode a dense stretch once instead
-  /// of probing it row by row.
-  virtual void readRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
-      void* output) const = 0;
+  /// Reads ascending, disjoint, non-empty ranges into one typed output buffer
+  /// with room for the sum of their lengths, without validating the list. For
+  /// a caller that built the ranges itself; read(std::span<const RowRange>,
+  /// ...) validates first.
+  virtual void readRanges(std::span<const RowRange> ranges, void* output)
+      const = 0;
 
   /// Hands back dense ids for rows [offset, offset + length), and the table of
   /// values those ids stand for, when this encoding already holds its values
@@ -218,32 +213,20 @@ class TypedEncodingView : public EncodingView {
     readPhysical(offset, length, static_cast<physicalType*>(output));
   }
 
-  void readRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
-      physicalType* output) const {
-    readRanges(ranges, static_cast<void*>(output));
-  }
-
-  void readRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
-      void* output) const final {
-    readPhysicalRanges(ranges, static_cast<physicalType*>(output));
-  }
-
   // Hands the whole range list to readPhysicalRanges, so a view that plans a
-  // scattered read across ranges serves this API as well as readRanges().
+  // scattered read across ranges can decode a dense stretch once instead of
+  // probing it row by row.
   uint32_t read(
       std::span<const RowRange> ranges,
       const std::function<void(uint32_t)>& /*setNull*/,
       void* output) const override {
     const auto numRows = this->checkReadRanges(ranges);
-    thread_local std::vector<std::pair<uint32_t, uint32_t>> offsetLengths;
-    offsetLengths.resize(ranges.size());
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      offsetLengths[i] = {ranges[i].startRow, ranges[i].numRows()};
-    }
-    readPhysicalRanges(offsetLengths, static_cast<physicalType*>(output));
+    readPhysicalRanges(ranges, static_cast<physicalType*>(output));
     return numRows;
+  }
+
+  void readRanges(std::span<const RowRange> ranges, void* output) const final {
+    readPhysicalRanges(ranges, static_cast<physicalType*>(output));
   }
 
  protected:
@@ -315,13 +298,14 @@ class TypedEncodingView : public EncodingView {
   // read is about as cheap per row as its bulk decode, which is most of them;
   // one where it is not overrides this to plan across the list.
   virtual void readPhysicalRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const {
-    for (const auto& [offset, length] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t length = range.numRows();
       if (length == 1) {
-        *output = readPhysicalAt(offset);
+        *output = readPhysicalAt(range.startRow);
       } else {
-        readPhysical(offset, length, output);
+        readPhysical(range.startRow, length, output);
       }
       output += length;
     }

@@ -159,14 +159,16 @@ class RLEEncodingView final : public TypedEncodingView<T> {
   // before the previous one ended restarts the walk with the binary search it
   // would have paid anyway.
   void readPhysicalRanges(
-      std::span<const std::pair<uint32_t, uint32_t>> ranges,
+      std::span<const RowRange> ranges,
       physicalType* output) const final {
     const uint32_t* const first = runEnds_.data();
     const uint32_t* const last = first + runEnds_.size();
     const uint32_t* run = first;
     // One past the highest row the cursor is known to be correct for.
     uint64_t walked = 0;
-    for (const auto& [offset, length] : ranges) {
+    for (const auto& range : ranges) {
+      const uint32_t offset = range.startRow;
+      const uint32_t length = range.numRows();
       if (length == 0) {
         continue;
       }
