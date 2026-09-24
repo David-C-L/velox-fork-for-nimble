@@ -61,7 +61,7 @@
 //   4+VV bytes: unencoded values (nested, if any)
 //
 // Wire format extension (any indexed mode — appended at end):
-//   1 byte: formatVersion (= kFormatVersion = 1)
+//   1 byte: formatVersion (= kFormatVersion = 2)
 //   1 byte: indexType (FreqPartIndexType)
 //   4 bytes: indexPayloadBytes
 //   [indexPayloadBytes bytes]: index payload (see below)
@@ -106,7 +106,9 @@ class FrequencyPartitionEncoding
   using cppDataType = T;
   using physicalType = typename TypeTraits<T>::physicalType;
 
-  static constexpr uint8_t kFormatVersion = 1;
+  // Version 2 nests the index streams; a version 1 index payload is laid out
+  // differently and is rejected rather than misread.
+  static constexpr uint8_t kFormatVersion = 2;
 
   // Discount for TierTagArray's tag-stream estimate in estimateSize(). 1.0
   // (no discount) is the safer default: an optimistic estimate over-selects
@@ -903,6 +905,10 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
     const uint32_t payloadBytes = encoding::readUint32(pos);
     const char* payloadStart = pos;
 
+    NIMBLE_CHECK_FILE(
+        fmtVer >= kFormatVersion,
+        fmt::format(
+            "Unsupported FrequencyPartition index format version: {}", fmtVer));
     if (fmtVer > kFormatVersion) {
       // Unknown format version — skip payload gracefully.
       pos += payloadBytes;
