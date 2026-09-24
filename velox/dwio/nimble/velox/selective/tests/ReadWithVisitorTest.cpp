@@ -1256,8 +1256,8 @@ TEST_P(ReadWithVisitorTest, denseNoFilterWithNullsPerValuesEncoding) {
     SCOPED_TRACE(toString(encodingType));
     auto ctx = makeFileContext(
         input,
-        makeSingleColumnWriterOptions(EncodingLayout{
-            encodingType, {}, CompressionType::Uncompressed}));
+        makeSingleColumnWriterOptions(
+            EncodingLayout{encodingType, {}, CompressionType::Uncompressed}));
     const auto layout = captureFirstColumnEncoding(*ctx);
     ASSERT_TRUE(layout.has_value());
     ASSERT_EQ(layout->encodingType(), encodingType);

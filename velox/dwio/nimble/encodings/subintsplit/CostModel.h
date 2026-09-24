@@ -32,10 +32,10 @@
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/SimdForBitpackEncoding.h"
 #include "velox/dwio/nimble/encodings/SparseBoolEncoding.h"
-#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
-#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
 
 // Per-segment cost models for SubIntSplitEncoding's DP selector.
 //

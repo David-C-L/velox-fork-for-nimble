@@ -295,16 +295,18 @@ TEST_F(SubIntSplitEncodingViewTest, nullableColumnRoundTrips) {
   for (uint32_t row = 0; row < kNullableRows; ++row) {
     isNonNull[row] = row % 7 != 0;
     if (isNonNull[row]) {
-      const auto value = static_cast<int64_t>((uint64_t{row} << 20) | (row % 13));
+      const auto value =
+          static_cast<int64_t>((uint64_t{row} << 20) | (row % 13));
       nonNullValues.push_back(value);
       expected[row] = value;
     }
   }
-  auto policy = std::make_unique<nimble::ManualEncodingSelectionPolicy<int64_t>>(
-      std::vector<std::pair<nimble::EncodingType, float>>{
-          {nimble::EncodingType::SubIntSplit, 1.0}},
-      nimble::CompressionOptions{},
-      std::nullopt);
+  auto policy =
+      std::make_unique<nimble::ManualEncodingSelectionPolicy<int64_t>>(
+          std::vector<std::pair<nimble::EncodingType, float>>{
+              {nimble::EncodingType::SubIntSplit, 1.0}},
+          nimble::CompressionOptions{},
+          std::nullopt);
   const auto encoded = nimble::EncodingFactory::encodeNullable<int64_t>(
       std::move(policy), nonNullValues, isNonNull, *buffer_);
 
@@ -324,7 +326,9 @@ TEST_F(SubIntSplitEncodingViewTest, nullableColumnRoundTrips) {
   EXPECT_EQ(numNonNulls, nonNullValues.size());
   for (uint32_t row = 0; row < kNullableRows; ++row) {
     SCOPED_TRACE(fmt::format("row={}", row));
-    EXPECT_EQ(velox::bits::isBitSet(nonNullBits.data(), row), expected[row].has_value());
+    EXPECT_EQ(
+        velox::bits::isBitSet(nonNullBits.data(), row),
+        expected[row].has_value());
     if (expected[row].has_value()) {
       EXPECT_EQ(values[row], *expected[row]);
     }
