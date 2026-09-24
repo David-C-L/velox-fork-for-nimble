@@ -314,9 +314,9 @@ TEST_F(TransformedEncodingTest, readsRangesThatStartInsideABlock) {
 
 // A transform is applied to a section only where it pays for itself, so
 // offering one can never produce a larger stream than not offering it. Without
-// this, a transform forced onto every section charges a codebook to the
-// sections that had nothing to gain, which on a high-cardinality column costs
-// more than the whole encoding.
+// this, a transform forced onto every section reorders sections that had
+// nothing to gain, which on a high-cardinality column costs more than the
+// whole encoding.
 TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
   const auto values = packedIdentifiers(16384);
 

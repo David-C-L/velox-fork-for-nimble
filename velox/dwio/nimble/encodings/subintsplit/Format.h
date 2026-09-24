@@ -30,8 +30,7 @@
 //   [1 byte]  flags: kFlagDelta, kFlagRowFrame, kFlagTransforms
 //   [17 bytes, only with kFlagRowFrame]  {guard(1B), slope(8B), base(8B)}
 //   [transform block, only with kFlagTransforms]
-//     {keySection(1B), transformId(1B) per section, then per transformed
-//      section {codebookSize(4B), codebook(8B per entry)}}
+//     {keySection(1B), transformId(1B) per section}
 //   [numSections × 6 bytes]  {bitStart(1B), bitEnd(1B), encodedSize(4B)}
 //   [section_0_bytes][section_1_bytes]...[section_{N-1}_bytes]
 //
@@ -131,8 +130,6 @@ struct TransformInfo {
   uint8_t keySection{kNoKeySection};
   /// Transform id per section, 0 where the section was left alone.
   std::vector<uint8_t> transformIds;
-  /// Codebook per section, empty where the transform carries none.
-  std::vector<std::vector<uint64_t>> codebooks;
 
   bool anyTransform() const {
     for (uint8_t id : transformIds) {
@@ -151,16 +148,8 @@ inline uint32_t transformHeaderSize(const TransformInfo& info) {
   if (!info.anyTransform()) {
     return 0;
   }
-  uint32_t size = 1; // key section
-  size += static_cast<uint32_t>(info.transformIds.size()); // one id per section
-  for (size_t i = 0; i < info.transformIds.size(); ++i) {
-    if (info.transformIds[i] == 0) {
-      continue;
-    }
-    size += 4; // codebook entry count
-    size += static_cast<uint32_t>(info.codebooks[i].size() * sizeof(uint64_t));
-  }
-  return size;
+  // The key section, then one id per section.
+  return 1 + static_cast<uint32_t>(info.transformIds.size());
 }
 
 /// One section of a SubIntSplit stream, as the header describes it: which bits
@@ -248,30 +237,14 @@ inline std::vector<StoredSection> parseSections(
             parsed.keySection < numSections,
         "SubIntSplit stream names a key section that does not exist.");
     parsed.transformIds.resize(numSections);
-    parsed.codebooks.resize(numSections);
     for (uint8_t s = 0; s < numSections; ++s) {
       parsed.transformIds[s] = encoding::read<uint8_t>(pos);
-    }
-    for (uint8_t s = 0; s < numSections; ++s) {
-      if (parsed.transformIds[s] == 0) {
-        continue;
-      }
-      requireBytes(4);
-      const uint32_t entries = encoding::readUint32(pos);
-      // Checked before resizing rather than after: the count is what decides
-      // the allocation, so a corrupt one has to be rejected before it is used.
-      requireBytes(static_cast<size_t>(entries) * sizeof(uint64_t));
-      parsed.codebooks[s].resize(entries);
-      for (uint32_t e = 0; e < entries; ++e) {
-        parsed.codebooks[s][e] = encoding::read<uint64_t>(pos);
-      }
     }
     if (transformInfo != nullptr) {
       *transformInfo = std::move(parsed);
     }
   } else if (transformInfo != nullptr) {
     transformInfo->transformIds.assign(numSections, 0);
-    transformInfo->codebooks.assign(numSections, {});
   }
 
   std::vector<StoredSection> sections(numSections);

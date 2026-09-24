@@ -2018,7 +2018,6 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   }
 
   transformInfo.transformIds.assign(splitCount, 0);
-  transformInfo.codebooks.assign(splitCount, {});
   transformInfo.keySection = subintsplit::TransformInfo::kNoKeySection;
 
   // Encodes one section at its storage width, reading row i's section value
@@ -2101,25 +2100,26 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
         s, storageBytes, [&sectionU64](uint32_t i) { return sectionU64[i]; });
   };
 
-  // Rewrites one section with the transform, and reports what the state it
-  // produced will cost on the wire, so the two candidates can be compared on
-  // the same terms.
+  // Rewrites one section with the transform, and reports the margin its
+  // encoding must clear to displace the untransformed one, so the two
+  // candidates can be compared on the same terms.
   const auto applyTransform =
       [&](const subintsplit::SectionTransform* transform,
           int width,
           const std::vector<uint64_t>& keyValues,
           std::span<const uint32_t> keyOrder,
-          std::vector<uint64_t>& sectionU64,
-          std::vector<uint64_t>& codebook) {
+          std::vector<uint64_t>& sectionU64) {
         subintsplit::TransformState state;
         subintsplit::TransformContext context{
             .keySection = keyValues, .width = width, .keyOrder = keyOrder};
         transform->apply(sectionU64, context, state);
-        codebook = std::move(state.codebook);
-        // The codebook and its count, plus a margin a transform must clear on
-        // top of them.
-        constexpr size_t kTransformMarginBytes{4};
-        return 4 + codebook.size() * sizeof(uint64_t) + kTransformMarginBytes;
+        NIMBLE_CHECK(
+            state.codebook.empty(),
+            "A section transform has no wire field for its state.");
+        // A transformed section costs one id byte on the wire. The margin is
+        // larger so that a transform has to save more than noise to be kept.
+        constexpr size_t kTransformMarginBytes{8};
+        return kTransformMarginBytes;
       };
 
   // Neither a section's extracted values nor its untransformed encoding
@@ -2325,7 +2325,6 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     Attempt attempt;
     attempt.sections.assign(splitCount, std::string_view{});
     attempt.info.transformIds.assign(splitCount, 0);
-    attempt.info.codebooks.assign(splitCount, {});
     attempt.info.keySection = subintsplit::TransformInfo::kNoKeySection;
 
     const std::vector<uint64_t> noKey;
@@ -2424,7 +2423,6 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       size_t bestCost = plain.size();
       std::string_view bestEncoded = plain;
       const subintsplit::SectionTransform* bestTransform = nullptr;
-      std::vector<uint64_t> bestCodebook;
 
       for (const auto* candidate : candidates) {
         // A key-derived candidate has nothing to gather by when this attempt
@@ -2434,14 +2432,12 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
           continue;
         }
         auto transformed = sectionU64;
-        std::vector<uint64_t> codebook;
         const size_t stateBytes = applyTransform(
             candidate,
             width,
             keyValues,
             std::span<const uint32_t>(keyPermutation),
-            transformed,
-            codebook);
+            transformed);
         const std::string_view alternative = encodeSection(s, sb, transformed);
         const size_t total = alternative.size() + stateBytes;
         // Only a transform that keys on another section moves rows, and only
@@ -2455,14 +2451,12 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
           bestCost = cost;
           bestEncoded = alternative;
           bestTransform = candidate;
-          bestCodebook = std::move(codebook);
         }
       }
 
       if (bestTransform != nullptr) {
         attempt.info.transformIds[s] =
             static_cast<uint8_t>(bestTransform->id());
-        attempt.info.codebooks[s] = std::move(bestCodebook);
         attempt.sections[s] = bestEncoded;
         attempt.totalBytes += bestBytes;
         attempt.costBytes += bestCost;
@@ -2681,16 +2675,6 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     encoding::write<uint8_t>(transformInfo.keySection, pos);
     for (uint8_t s = 0; s < splitCount; ++s) {
       encoding::write<uint8_t>(transformInfo.transformIds[s], pos);
-    }
-    for (uint8_t s = 0; s < splitCount; ++s) {
-      if (transformInfo.transformIds[s] == 0) {
-        continue;
-      }
-      const auto& codebook = transformInfo.codebooks[s];
-      encoding::writeUint32(static_cast<uint32_t>(codebook.size()), pos);
-      for (uint64_t entry : codebook) {
-        encoding::write<uint64_t>(entry, pos);
-      }
     }
   }
 

@@ -188,7 +188,6 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           transformInfo_.transformIds[wireIndex] != 0) {
         section.transform = subintsplit::transformForRaw(
             transformInfo_.transformIds[wireIndex]);
-        section.transformState.codebook = transformInfo_.codebooks[wireIndex];
         const auto mapping = section.transform->positionMapping();
         permutedSection_ = permutedSection_ ||
             mapping == subintsplit::PositionMapping::Permuted;
