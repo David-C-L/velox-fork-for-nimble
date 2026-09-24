@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/BenchCommon.h"
+#include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/OpenZLBenchTarget.h"
 
 // The chunked setting reports every axis over the column's own row numbers, so
 // a read that lands on the wrong chunk, or a boundary that drops or repeats a
@@ -179,10 +180,9 @@ TEST(ChunkedTargetTest, rangeListIsPartitionedPerChunk) {
 TEST(ChunkedTargetTest, realArmsRoundTrip) {
   constexpr uint32_t kRealRows = 5'000;
   const auto data = makeData(kRealRows);
-  const std::vector<std::string> arms{
+  std::vector<std::string> arms{
       "FixedBitWidth/view",
       "SIS/realNested+view",
-      "openzl/auto",
   };
   const std::vector<nimble::RowRange> ranges{
       {3, 9},
@@ -194,7 +194,11 @@ TEST(ChunkedTargetTest, realArmsRoundTrip) {
     numRangeRows += range.numRows();
   }
   size_t numFound{0};
-  for (const auto& entry : buildDefaultEncoders<int64_t>()) {
+  auto entries = buildDefaultEncoders<int64_t>();
+  // A blackbox codec, which the drivers register after the default arms.
+  entries.push_back(buildOpenZLEncoder<int64_t>());
+  arms.push_back("openzl/auto");
+  for (const auto& entry : entries) {
     if (std::find(arms.begin(), arms.end(), entry.name) == arms.end()) {
       continue;
     }

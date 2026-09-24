@@ -2184,6 +2184,55 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
+  // Each transform off, as chosen, and forced, for the transform ablation.
+  // Derived from an existing arm and differing from it in one switch, so any
+  // gap between the pair is that switch's. Chosen is the arm itself: the
+  // row frame is on by default in SIS/realNested, and the key-derived
+  // transform is offered in SIS/key_derived (off is SIS/realNested).
+  {
+    struct AblationArm {
+      const char* base;
+      const char* name;
+      std::function<void(Encoding::Options&)> apply;
+    };
+    const std::vector<AblationArm> ablations{
+        {"SIS/key_derived",
+         "SIS/key_derived_forced",
+         [](Encoding::Options& o) { o.subIntSplitForceApply = true; }},
+        {"SIS/realNested",
+         "SIS/row_frame_off",
+         [](Encoding::Options& o) { o.subIntSplitRowFrame = false; }},
+        {"SIS/realNested",
+         "SIS/row_frame_forced",
+         [](Encoding::Options& o) { o.subIntSplitRowFrameForceApply = true; }},
+    };
+    std::vector<EncoderEntry<T>> derived;
+    for (const auto& ablation : ablations) {
+      for (const char* suffix : {"", "+view"}) {
+        const auto base = std::find_if(
+            encoders.begin(), encoders.end(), [&](const auto& entry) {
+              return entry.name == std::string(ablation.base) + suffix;
+            });
+        if (base == encoders.end()) {
+          continue;
+        }
+        EncoderEntry<T> entry = *base;
+        entry.name = std::string(ablation.name) + suffix;
+        entry.factory = [factory = base->factory, apply = ablation.apply](
+                            const Vector<T>& data,
+                            const Encoding::Options& opts) {
+          Encoding::Options o = opts;
+          apply(o);
+          return factory(data, o);
+        };
+        derived.push_back(std::move(entry));
+      }
+    }
+    for (auto& entry : derived) {
+      encoders.push_back(std::move(entry));
+    }
+  }
+
   // The whitebox baselines are pure: none of their nested streams may be
   // SubIntSplit, so a baseline's bytes are that encoding's and any gain from
   // nesting SubIntSplit is charged to SubIntSplit. The writer's own
@@ -2244,14 +2293,6 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   const auto outerType = parseCompressionType(FLAGS_mlidc_outer_compression);
   for (auto& entry : encoders) {
     entry = withOuterCompression<T>(std::move(entry), outerType);
-  }
-
-  // Outermost, so a writer-sized chunk is what selection, the planner and any
-  // outer codec each see.
-  VELOX_CHECK_GE(FLAGS_mlidc_chunk_rows, 0);
-  for (auto& entry : encoders) {
-    entry = withChunking<T>(
-        std::move(entry), static_cast<uint32_t>(FLAGS_mlidc_chunk_rows));
   }
 
   return encoders;
