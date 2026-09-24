@@ -135,12 +135,17 @@ DEFINE_bool(
 DEFINE_string(
     mlidc_sis_upstream_features,
     "",
-    "Comma-separated upstream SubIntSplit features to switch on, each off by "
-    "default: delta (subIntSplitDeltaPreTransform), trim "
-    "(subIntSplitTrimConstantPlanes), prune (subIntSplitBoundaryPruneThreshold "
-    "at upstream's 0.001), fold (subIntSplitFoldConstantSections), passthrough "
-    "(subIntSplitPassThrough), visitorblock (subIntSplitVisitorBlockBuffer), "
-    "huffmandeep (huffmanPriceLengthLimited).");
+    "Comma-separated overrides of the upstream SubIntSplit switches; empty "
+    "keeps the library defaults. Each name sets its switch on, and the same "
+    "name prefixed with no- sets it off. Names, with their library default: "
+    "delta (subIntSplitDeltaPreTransform, off), trim "
+    "(subIntSplitTrimConstantPlanes, off), prune "
+    "(subIntSplitBoundaryPruneThreshold at upstream's 0.001; off means 0.0), "
+    "fold (subIntSplitFoldConstantSections, on), passthrough "
+    "(subIntSplitPassThrough, on), visitorblock (subIntSplitVisitorBlockBuffer, "
+    "off), huffmandeep (huffmanPriceLengthLimited, on). Example: "
+    "--mlidc_sis_upstream_features=no-fold,no-passthrough,no-huffmandeep "
+    "reproduces the pre-integration behaviour.");
 DEFINE_bool(
     mlidc_sis_estimate_compression_guard,
     true,

@@ -335,7 +335,7 @@ TEST_F(HuffmanEncodingTest, estimateAcceptsCodeTreeAtLimit) {
   // Fibonacci weights are what drive a Huffman tree to its deepest, so these
   // two tests sit either side of the 12-bit boundary: this one codes its
   // rarest symbol in exactly 12 bits and is priced exactly, the next needs 13
-  // and is priced only under Options::huffmanPriceLengthLimited.
+  // and is priced at its Shannon bound, since encode() length-limits it.
   constexpr std::array<uint32_t, 13> kFrequencies = {
       1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233};
   Vector<uint32_t> values{pool_.get()};
@@ -381,17 +381,17 @@ TEST_F(HuffmanEncodingTest, estimateAcceptsCodeTreePastLimit) {
   }
 
   const std::span<const uint32_t> input{values.data(), values.size()};
-  // Declined by default, which keeps selection as it was before encode()
-  // length-limited; priced once the option asks for it.
-  EXPECT_EQ(
+  // Priced by default, since encode() length-limits it; declined when the
+  // option asks for the selection made before length limiting.
+  EXPECT_NE(
       HuffmanEncoding<uint32_t>::estimateSize(
           input, Statistics<uint32_t>::create(input)),
       std::nullopt);
-  Encoding::Options priceLengthLimited;
-  priceLengthLimited.huffmanPriceLengthLimited = true;
-  EXPECT_NE(
+  Encoding::Options declineDeepTrees;
+  declineDeepTrees.huffmanPriceLengthLimited = false;
+  EXPECT_EQ(
       HuffmanEncoding<uint32_t>::estimateSize(
-          input, Statistics<uint32_t>::create(input), priceLengthLimited),
+          input, Statistics<uint32_t>::create(input), declineDeepTrees),
       std::nullopt);
 
   auto encoding = encode(values);
@@ -563,7 +563,9 @@ TEST_F(HuffmanEncodingTest, estimateMatchesExplicitHuffmanTree) {
     const bool fits =
         shape.maxCodeLength <= HuffmanEncoding<uint32_t>::kMaxCodeBits;
 
-    EXPECT_EQ(estimate.has_value(), fits)
+    // encode() length-limits a tree that does not fit, so by default every
+    // shape is priced; only one that fits is priced exactly.
+    EXPECT_TRUE(estimate.has_value())
         << "trial " << trial << " with " << symbolCount
         << " symbols reaching depth " << shape.maxCodeLength;
 

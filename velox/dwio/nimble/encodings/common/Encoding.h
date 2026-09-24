@@ -630,24 +630,29 @@ class Encoding {
     /// Folds SubIntSplit's Constant sections into one pre-shifted word when a
     /// stream is opened, so the decode loop never materialises them. Decode
     /// only: encoded output is unchanged. Applies to streams without section
-    /// transforms.
-    bool subIntSplitFoldConstantSections{false};
+    /// transforms. On by default: cursor bulk decode 1.5-3% faster (geomean
+    /// over 9 columns, up to 22%), no axis measurably slower.
+    bool subIntSplitFoldConstantSections{true};
 
     /// Decodes a SubIntSplit stream whose one remaining section holds each
     /// value verbatim straight into the caller's buffer, skipping the scratch
-    /// copy and the mask-and-shift pass. Decode only.
-    bool subIntSplitPassThrough{false};
+    /// copy and the mask-and-shift pass. Decode only. On by default: cursor
+    /// bulk decode 7-9% faster (geomean over 9 columns, up to 25%).
+    bool subIntSplitPassThrough{true};
 
     /// Decodes SubIntSplit a block at a time on the readWithVisitor slow path,
     /// instead of one value per section per call. Decode only; applies to
-    /// streams with no transform, row frame or delta.
+    /// streams with no transform, row frame or delta. Off until measured on a
+    /// workload that reaches the slow path.
     bool subIntSplitVisitorBlockBuffer{false};
 
     /// Prices a Huffman tree deeper than HuffmanEncoding::kMaxCodeBits at its
     /// Shannon bound instead of declining it. encode() length-limits such a
     /// tree, so it is encodable; declining it reproduces the selection made
-    /// before length limiting. Changes encoded output where Huffman then wins.
-    bool huffmanPriceLengthLimited{false};
+    /// before length limiting. On by default; changes encoded output where
+    /// Huffman then wins, which on the evaluation columns is one cell,
+    /// 0.29% smaller.
+    bool huffmanPriceLengthLimited{true};
 
     /// Per-column decoding statistics for timing decompression.
     velox::dwio::common::DecodingStats* decodingStats = nullptr;
