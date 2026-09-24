@@ -16,6 +16,8 @@
 #include "velox/dwio/nimble/encodings/tests/EncodingViewTestUtils.h"
 
 #include <bit>
+#include <numeric>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -24,6 +26,8 @@
 #include "velox/dwio/nimble/encodings/RLEEncoding.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
 #include "velox/dwio/nimble/encodings/VarintEncoding.h"
+#include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
+#include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/views/SubIntSplitEncodingView.h"
 
 using namespace facebook;
@@ -278,6 +282,75 @@ TEST_F(SubIntSplitEncodingViewTest, concurrent) {
 TEST_F(SubIntSplitEncodingViewTest, readsFloatingPointTypes) {
   expectViewMatches<float>(nimble::CompressionType::Uncompressed);
   expectViewMatches<double>(nimble::CompressionType::Uncompressed);
+}
+
+// A nullable column whose non-null values SubIntSplit stores: the Nullable
+// wrapper carries the nulls and the split carries the values, and both have to
+// come back through the encoding and through its view.
+TEST_F(SubIntSplitEncodingViewTest, nullableColumnRoundTrips) {
+  constexpr uint32_t kNullableRows = 2'000;
+  nimble::Vector<int64_t> nonNullValues{pool_.get()};
+  nimble::Vector<bool> isNonNull{pool_.get(), kNullableRows};
+  std::vector<std::optional<int64_t>> expected(kNullableRows);
+  for (uint32_t row = 0; row < kNullableRows; ++row) {
+    isNonNull[row] = row % 7 != 0;
+    if (isNonNull[row]) {
+      const auto value = static_cast<int64_t>((uint64_t{row} << 20) | (row % 13));
+      nonNullValues.push_back(value);
+      expected[row] = value;
+    }
+  }
+  auto policy = std::make_unique<nimble::ManualEncodingSelectionPolicy<int64_t>>(
+      std::vector<std::pair<nimble::EncodingType, float>>{
+          {nimble::EncodingType::SubIntSplit, 1.0}},
+      nimble::CompressionOptions{},
+      std::nullopt);
+  const auto encoded = nimble::EncodingFactory::encodeNullable<int64_t>(
+      std::move(policy), nonNullValues, isNonNull, *buffer_);
+
+  auto encoding = nimble::EncodingFactory().create(
+      *pool_, encoded, [](uint32_t) -> void* { return nullptr; });
+  ASSERT_EQ(encoding->encodingType(), nimble::EncodingType::Nullable);
+  ASSERT_NE(encoding->debugString(0).find("SubIntSplit"), std::string::npos);
+
+  // Through the encoding.
+  std::vector<int64_t> values(kNullableRows);
+  std::vector<uint64_t> nonNullBits(
+      velox::bits::nwords(kNullableRows), ~uint64_t{0});
+  const auto numNonNulls = encoding->materializeNullable(
+      kNullableRows, values.data(), [&]() -> void* {
+        return nonNullBits.data();
+      });
+  EXPECT_EQ(numNonNulls, nonNullValues.size());
+  for (uint32_t row = 0; row < kNullableRows; ++row) {
+    SCOPED_TRACE(fmt::format("row={}", row));
+    EXPECT_EQ(velox::bits::isBitSet(nonNullBits.data(), row), expected[row].has_value());
+    if (expected[row].has_value()) {
+      EXPECT_EQ(values[row], *expected[row]);
+    }
+  }
+
+  // Through the view.
+  auto view = nimble::createEncodingView(encoded, pool_.get());
+  ASSERT_NE(view, nullptr);
+  std::vector<uint32_t> indices(kNullableRows);
+  std::iota(indices.begin(), indices.end(), 0);
+  std::vector<int64_t> viewValues(kNullableRows);
+  std::vector<uint32_t> nullIndices;
+  const auto viewNonNulls = view->read(
+      indices,
+      [&](uint32_t outputIndex) { nullIndices.push_back(outputIndex); },
+      viewValues.data());
+  EXPECT_EQ(viewNonNulls + nullIndices.size(), kNullableRows);
+  std::vector<uint32_t> expectedNulls;
+  for (uint32_t row = 0; row < kNullableRows; ++row) {
+    if (!expected[row].has_value()) {
+      expectedNulls.push_back(row);
+    } else {
+      EXPECT_EQ(viewValues[row], *expected[row]) << "row=" << row;
+    }
+  }
+  EXPECT_EQ(nullIndices, expectedNulls);
 }
 
 // Constant sections are folded into a seed at construction and dropped from the
