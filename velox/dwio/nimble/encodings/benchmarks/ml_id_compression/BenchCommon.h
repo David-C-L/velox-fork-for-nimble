@@ -230,17 +230,10 @@ class NimbleBenchTarget {
     return &decoder();
   }
 
-  // The encoded bytes, whatever the Encoding allocated from this target's own
-  // pool, and any decoded span the Encoding keeps across reads. The last of
-  // those is not pool-backed -- a transformed SubIntSplit stream caches a
-  // decoded block in plain std::vectors -- so it has to be asked for
-  // separately or a resident-memory number would omit a decoded column.
+  // The encoded bytes and whatever the Encoding allocated from this target's
+  // own pool.
   size_t residentBytes() const {
-    size_t bytes = encoded_.size() + static_cast<size_t>(pool_->usedBytes());
-    if (encoding_ != nullptr) {
-      bytes += encoding_->decodeCacheBytes();
-    }
-    return bytes;
+    return encoded_.size() + static_cast<size_t>(pool_->usedBytes());
   }
 
   bool retainsDecodeCache() const {

@@ -718,15 +718,6 @@ class FrequencyPartitionEncoding
       return 0;
     }
     const uint8_t* tagBase = tagArray_.data();
-#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
-    if (!swarCountEnabledForBench_) {
-      uint32_t count = 0;
-      for (uint32_t j = begin; j < end; ++j) {
-        count += (unpackTagAt(tagBase, j, tagBits_) == target) ? 1 : 0;
-      }
-      return count;
-    }
-#endif
     const uint32_t fieldsPerWord = 64 / tagBits_;
     if (fieldsPerWord == 0) {
       // tagBits_ > 64 cannot happen (max 8), but guards against a nonsense
@@ -798,15 +789,10 @@ class FrequencyPartitionEncoding
     uint32_t scanStart = sampleStart;
     uint32_t rank =
         tierRankSamples_[tierIdx * numRankSamplesPerBucket_ + sampleIdx];
-#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
-    if (cursorReuseEnabledForBench_)
-#endif
-    {
-      if (cursorValid_[tierIdx] && cursorPos_[tierIdx] <= pos &&
-          cursorPos_[tierIdx] > scanStart) {
-        scanStart = cursorPos_[tierIdx];
-        rank = cursorRank_[tierIdx];
-      }
+    if (cursorValid_[tierIdx] && cursorPos_[tierIdx] <= pos &&
+        cursorPos_[tierIdx] > scanStart) {
+      scanStart = cursorPos_[tierIdx];
+      rank = cursorRank_[tierIdx];
     }
 
     const uint8_t numActiveTiers = static_cast<uint8_t>(tiers_.size());
@@ -821,41 +807,11 @@ class FrequencyPartitionEncoding
       }
     }
 
-#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
-    if (cursorReuseEnabledForBench_)
-#endif
-    {
-      cursorPos_[tierIdx] = pos;
-      cursorRank_[tierIdx] = rank;
-      cursorValid_[tierIdx] = true;
-    }
+    cursorPos_[tierIdx] = pos;
+    cursorRank_[tierIdx] = rank;
+    cursorValid_[tierIdx] = true;
     return rank;
   }
-
-#ifdef NIMBLE_FPE_TAGRANK_BENCH_HOOKS
- public:
-  // Testing-only knobs that isolate each tierRankAtForTag optimisation for
-  // benchmarking. Compiled in only under this macro, so the shipped binary
-  // (built without it) carries neither the flags nor the branch that reads
-  // them: both optimisations are unconditionally active there. Not part of
-  // the encoding format.
-  static void setSwarCountEnabledForBench(bool value) {
-    swarCountEnabledForBench_ = value;
-  }
-  static void setCursorReuseEnabledForBench(bool value) {
-    cursorReuseEnabledForBench_ = value;
-  }
-  // In-memory size of tierRankSamples_ in bytes, for reporting the space a
-  // larger kRankSampleStride gives back. This table is rebuilt at decode
-  // construction and never serialised, so it has no effect on payload_bytes.
-  size_t tierRankSamplesBytesForBench() const {
-    return tierRankSamples_.size() * sizeof(uint32_t);
-  }
-
- private:
-  inline static bool swarCountEnabledForBench_{true};
-  inline static bool cursorReuseEnabledForBench_{true};
-#endif
 
   // ---------------------------------------------------------------------------
   // Per-index-type decode helpers

@@ -795,19 +795,6 @@ class Encoding {
     NIMBLE_UNREACHABLE("materializeIndices on non-dictionary encoding");
   }
 
-  /// Bytes this encoding holds in decode caches that outlive a read, beyond
-  /// the encoded payload and beyond anything allocated from a memory pool.
-  ///
-  /// Exists because a benchmark cannot otherwise see them. A transformed
-  /// SubIntSplit stream keeps a decoded block across reset(), in plain
-  /// std::vectors rather than pool-backed ones, so neither the payload size
-  /// nor the pool's usedBytes() reports it and a resident-memory measurement
-  /// would understate that arm by the size of a decoded column. Returns zero
-  /// where there is no such cache, which is every encoding but that one.
-  virtual size_t decodeCacheBytes() const {
-    return 0;
-  }
-
   /// Whether reads leave a decoded span resident that later reads are served
   /// from, so that the first read after construction carries a cost the ones
   /// after it do not.
@@ -820,7 +807,7 @@ class Encoding {
     return false;
   }
 
-  /// Drops whatever decodeCacheBytes() counts, so the next read rebuilds it.
+  /// Drops the retained decoded span, so the next read rebuilds it.
   ///
   /// Paired with retainsDecodeCache() this is what lets a measurement separate
   /// the first read's cost from the rest. A no-op where there is no cache.

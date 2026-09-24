@@ -276,8 +276,7 @@ transform satisfies, so the "block" is the whole column: the first probe
 decodes every row and every probe after it copies out of that cache. Measured
 on a 1M-row column that is roughly 8 MB held against a 4.98 MB payload, and it
 is why such an arm reads flat in N while its untransformed twin scales
-linearly. `Encoding::decodeCacheBytes()` exposes it so `residentBytes()` can
-count it.
+linearly. `resident_bytes` does not count it.
 
 The same finding gives those arms a build cost the harness used to attribute
 nowhere: a whole-column decode hidden entirely by warmup. `Encoding` therefore

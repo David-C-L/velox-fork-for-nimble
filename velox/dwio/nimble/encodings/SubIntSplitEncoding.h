@@ -231,27 +231,6 @@ class SubIntSplitEncoding
       const Encoding::Options& options);
 #endif
 
-  // Adds the decoded-block cache and the per-section decode buffers, which are
-  // plain std::vectors and so invisible to both payloadSize() and the memory
-  // pool. blockCache_ survives reset() by design, so on a transformed stream
-  // this is a whole decoded column that a read leaves resident.
-  size_t decodeCacheBytes() const final {
-    size_t bytes = blockCache_.capacity() * sizeof(physicalType);
-    for (const auto& scratch : sectionScratch_) {
-      bytes += scratch.capacity() * sizeof(uint64_t);
-    }
-    for (const auto& native : sectionNative_) {
-      bytes += native.capacity();
-    }
-    bytes += fusedCursor_.capacity() * sizeof(uint32_t);
-    for (const auto& section : sections_) {
-      if (section.encoding != nullptr) {
-        bytes += section.encoding->decodeCacheBytes();
-      }
-    }
-    return bytes;
-  }
-
   // True exactly when this stream carries a transform, because that is when a
   // read is served out of blockCache_ and reset() keeps it. With no blocking
   // recorded in the header the span a transform is undone over is the whole
@@ -263,8 +242,7 @@ class SubIntSplitEncoding
 
   // Clears the cache so the next read decodes again. materializeTransformed
   // treats an empty blockCache_ as a miss, so this is a real invalidation and
-  // not a hint. shrink_to_fit releases the memory too, or decodeCacheBytes()
-  // would keep reporting a column that is no longer held.
+  // not a hint. shrink_to_fit releases the memory too.
   void dropDecodeCache() final {
     blockCache_.clear();
     blockCache_.shrink_to_fit();
