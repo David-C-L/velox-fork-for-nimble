@@ -48,7 +48,6 @@ add_library(
   subintsplit/BitSection.h
   subintsplit/CostModel.h
   subintsplit/DecodeCost.h
-  subintsplit/DecodeProfile.h
   subintsplit/DeltaTransform.h
   subintsplit/Estimator.h
   subintsplit/Format.h

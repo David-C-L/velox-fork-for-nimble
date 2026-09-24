@@ -21,19 +21,19 @@
 #include <span>
 #include <vector>
 
+#include "velox/dwio/nimble/encodings/selection/BitFlipProfile.h"
 #include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 #include "velox/dwio/nimble/encodings/subintsplit/TopLevelPolicy.h"
-#include "velox/dwio/nimble/encodings/selection/BitFlipProfile.h"
 
 // Standalone SubIntSplit cost estimator for benchmarking/testing the
 // bit-flip-probability top-level policies (see subintsplit/TopLevelPolicy.h
 // for scope) against real cost. Deliberately named differently from the
 // `estimateSize()` convention every production encoding follows (e.g.
 // DictionaryEncoding<T>::estimateSize): it exists only so tests and
-// benchmarks/ml_id_compression/MlIdSelectionPolicyBenchmark.cpp can compute
-// "what would SubIntSplit's real cost and the policies' gate decision have
-// been" without touching production selection code.
+// benchmarks can compute "what would SubIntSplit's real cost and the
+// policies' gate decision have been" without touching production selection
+// code.
 
 namespace facebook::nimble::subintsplit {
 

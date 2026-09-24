@@ -77,8 +77,6 @@ struct DecodingStats;
 
 namespace facebook::nimble {
 
-struct SubIntSplitDecodeProfile;
-
 class EncodingBufferPool;
 class SharedDictionaryAlphabet;
 
@@ -656,15 +654,6 @@ class Encoding {
 
     /// Per-column decoding statistics for timing decompression.
     velox::dwio::common::DecodingStats* decodingStats = nullptr;
-
-    /// Optional per-section decode attribution for SubIntSplitEncoding. Null
-    /// by default, so a normal decode pays only a null check. When set, bulk
-    /// decode records each section's own materialize() time into it. Meant
-    /// for a dedicated, untimed attribution pass -- never for the pass whose
-    /// throughput is being reported -- since the timing calls themselves cost
-    /// cycles the reported Meps figures should not carry. See
-    /// subintsplit/DecodeProfile.h.
-    SubIntSplitDecodeProfile* subIntSplitDecodeProfile = nullptr;
 
     /// Computes a key-derived transform's run ids, run values, sorted run
     /// order, and per-run start offsets once per block and shares them across

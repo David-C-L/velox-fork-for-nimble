@@ -31,8 +31,7 @@
 //     --mlidc_rows=524288 --mlidc_input_order=shipped
 //     --mlidc_encoders=Trivial,FixedBitWidth,Dictionary,RLE,MainlyConstant,PFOR/view,SimdForBitpack/view,FPE/fpe_pertier,SIS/realNested,SIS/hybrid
 //     --mlidc_output_csv=<out>/<name>.csv
-// then, over all columns:
-//   admission_confusion.py <out>/*.csv [--decision policy|estimate|<mode>]
+// then tabulate the confusion matrix over all columns' CSVs.
 //
 // Each column also gets one row_kind=admission row per bit-flip admission
 // mode (bitflip and bitflip_entropy, which gate candidacy and leave the size

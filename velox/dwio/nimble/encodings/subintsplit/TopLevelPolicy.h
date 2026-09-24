@@ -30,10 +30,8 @@
 // SubIntSplit by when Encoding::Options::subIntSplitAdmission asks for it;
 // the default admission is still SubIntSplitEncoding::estimateSize. See
 // benchmarks/ml_id_compression/MlIdAdmissionBenchmark.cpp for how the modes
-// compare against ground truth, and subintsplit/Estimator.h for how they're used
-// to gate a real cost estimate, and
-// benchmarks/ml_id_compression/MlIdSelectionPolicyBenchmark.cpp for how their
-// predictions are compared against ground truth.
+// compare against ground truth, and subintsplit/Estimator.h for how they're
+// used to gate a real cost estimate.
 
 namespace facebook::nimble::subintsplit {
 

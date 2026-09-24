@@ -17,7 +17,6 @@ sources compile to a stub `main` that exits non-zero.
 | `nimble_ml_id_decode_range_benchmark` | Contiguous-range decode throughput | yes |
 | `nimble_ml_id_decode_point_benchmark` | Single-probe point-lookup latency | yes |
 | `nimble_ml_id_decode_gather_benchmark` | Gather decode throughput over a (selectivity, run length) grid | yes |
-| `nimble_ml_id_amortisation_benchmark` | Cost of N operations against a one-time build, per access pattern | yes |
 | `nimble_ml_id_cost_model_oracle_benchmark` | SIS DP cost model against a measured oracle | no |
 | `nimble_ml_id_index_oracle_benchmark` | FPE index-type sweep | no |
 | `nimble_ml_id_ablation_benchmark` | Progressive encoding-set restriction for SIS sections | no |
@@ -217,17 +216,6 @@ the read time with the structure already built, so both numbers are on the same
 row and neither can be quoted without the other. This replaces the old
 `SIS/...+view+ctor` arms, which covered two view arms out of a dozen and put the
 two numbers on different rows.
-
-`nimble_ml_id_amortisation_benchmark` sweeps the axis itself. For every arm and
-each of the three access patterns, it runs 1, 4, 16, ... up to
-`--amortisation_max_ops` operations and reports both `time_ns` (structure
-already built) and `total_measured_ns` (structure discarded inside the timed
-region), so `total(N) = build + N * per_op` is recoverable and the crossover
-with the equivalent cursor arm is in the data. One operation is one call: a
-probe, a gather of `--amortisation_gather_ranges` ranges, or a read of
-`--amortisation_range_size` elements. The column is encoded once per arm and
-reused across every pattern and every step of the ladder, and
-`--mlidc_encode_cache_dir` removes the per-driver encode on top of that.
 
 Blackbox codecs are on the same curves. `openzl/auto` and `zstd/whole`
 decompress everything per read, which is what a reader holding only the

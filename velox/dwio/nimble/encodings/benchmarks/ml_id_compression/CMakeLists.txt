@@ -55,7 +55,6 @@ velox_add_test_headers(
   MeasureLoop.h
   OpenZLBenchTarget.h
   PointTraceGen.h
-  ReorderTransforms.h
   ResultWriter.h
   SelectiveTraceGen.h
   SubstreamCompression.h
@@ -102,20 +101,6 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_bulk_benchmark MlIdDecodeBulkBenchmark.cpp OPENZL
 )
 
-# MlIdDecodeSectionProfileBenchmark: attributes a SubIntSplit bulk decode to
-# its individual sections, using Options::subIntSplitDecodeProfile.
-nimble_add_ml_id_benchmark(
-  nimble_ml_id_decode_section_profile_benchmark
-  MlIdDecodeSectionProfileBenchmark.cpp
-)
-
-# MlIdSectionDecodeRateBenchmark: times each SubIntSplit section on the cursor
-# and view paths, to fit decode rates per read path.
-nimble_add_ml_id_benchmark(
-  nimble_ml_id_section_decode_rate_benchmark
-  MlIdSectionDecodeRateBenchmark.cpp
-)
-
 # MlIdAdmissionBenchmark: precision and recall of the SubIntSplit admission
 # heuristic against the bytes splitting actually saves.
 nimble_add_ml_id_benchmark(
@@ -143,13 +128,6 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_decode_gather_benchmark MlIdDecodeGatherBenchmark.cpp OPENZL
 )
 
-# MlIdAmortisationBenchmark: sweeps how many operations a one-time view or
-# materialisation build is amortised over, per access pattern, so the
-# break-even against the cursor path is derivable rather than argued.
-nimble_add_ml_id_benchmark(
-  nimble_ml_id_amortisation_benchmark MlIdAmortisationBenchmark.cpp OPENZL
-)
-
 # MlIdCostModelOracleBenchmark: validates SubIntSplit's DP cost model against an
 # oracle that actually encodes each candidate bit range.
 nimble_add_ml_id_benchmark(
@@ -167,24 +145,10 @@ nimble_add_ml_id_benchmark(
   nimble_ml_id_ablation_benchmark MlIdAblationBenchmark.cpp
 )
 
-# MlIdReorderOracleBenchmark: scores block-local reordering transforms for SIS
-# sections against the real cost of restoring the original row order.
-nimble_add_ml_id_benchmark(
-  nimble_ml_id_reorder_oracle_benchmark MlIdReorderOracleBenchmark.cpp
-)
-
 # MlIdSmokeBenchmark: encode + decode correctness check (no timing). Sweeps
 # every supported element type, so it is also the compile-coverage gate.
 nimble_add_ml_id_benchmark(
   nimble_ml_id_smoke_benchmark MlIdSmokeBenchmark.cpp
-)
-
-# MlIdSelectionPolicyBenchmark: measures whether the bit-flip-probability
-# top-level policies would correctly predict "SubIntSplit wins" against real
-# candidate encodings -- evidence-gathering only, does not touch production
-# selection.
-nimble_add_ml_id_benchmark(
-  nimble_ml_id_selection_policy_benchmark MlIdSelectionPolicyBenchmark.cpp
 )
 
 # Correctness tests for the block-codec arms. The benchmark drivers report
