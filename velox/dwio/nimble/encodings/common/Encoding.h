@@ -158,9 +158,9 @@ class Encoding {
     /// permutation is rebuilt from it at read time.
     uint8_t subIntSplitTransform = 0;
 
-    /// Lets the encoder choose a transform per section instead of being told
-    /// one, pricing every candidate against the untransformed encoding and
-    /// keeping the cheapest. Ignores subIntSplitTransform, which names a
+    /// Lets the encoder choose per section whether to apply the key-derived
+    /// transform, pricing it against the untransformed encoding and keeping
+    /// the cheaper. Ignores subIntSplitTransform, which names a
     /// single transform for every section, and is exclusive with
     /// subIntSplitForceApply, which asks the encoder to obey rather than
     /// choose. Costs one trial encode per candidate per section, so it buys

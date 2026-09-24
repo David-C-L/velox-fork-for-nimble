@@ -18,7 +18,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <random>
+#include <string>
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
@@ -72,13 +74,7 @@ class TransformedEncodingTest : public ::testing::Test {
 };
 
 std::vector<TransformId> transformsUnderTest() {
-  return {
-      TransformId::KeyDerived,
-      TransformId::RelabelFrequency,
-      TransformId::RelabelDense,
-      TransformId::RelabelGray,
-      TransformId::BitPlane,
-  };
+  return {TransformId::KeyDerived};
 }
 
 } // namespace
@@ -421,8 +417,7 @@ TEST_F(TransformedEncodingTest, autoSelectionRefusesToAlsoBeForced) {
   Encoding::Options options;
   options.subIntSplitAutoTransform = true;
   options.subIntSplitForceApply = true;
-  options.subIntSplitTransform =
-      static_cast<uint8_t>(TransformId::RelabelFrequency);
+  options.subIntSplitTransform = static_cast<uint8_t>(TransformId::KeyDerived);
   options.subIntSplitKeySection = 1;
 
   EXPECT_THROW(
@@ -524,8 +519,7 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
 // A range-list read on a transformed stream chooses once, for the whole list,
 // between reading each range the way a single-range read would and decoding
 // the column once and copying the ranges out. Both choices have to return the
-// source rows for every transform family: KeyDerived through the position
-// map, the relabellings in place, and BitPlane gathered. The lists include
+// source rows, KeyDerived through the position map. The lists include
 // sparse ones that stay per range and dense ones that decode the column, and
 // the untransformed stream is read the same way as the baseline.
 TEST_F(TransformedEncodingTest, rangeListsAgreeWithTheSourceValues) {
@@ -634,68 +628,46 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
   }
 }
 
-// permutesNarrowSectionsToo covers only KeyDerived's own width-switched path
-// (permuteSection). The InPlace (Relabel*) and Gathered (BitPlane) families
-// go through a different width-switched path entirely -- widenSectionRun
-// plus invert() on the widened section, in SubIntSplitEncodingView's
-// readPhysicalBlock -- and round 6 changed the scratch buffers that path
-// shares with every other family, without a narrow-width test for any of
-// them. This closes that gap: same narrow-section shape as
-// permutesNarrowSectionsToo, one non-KeyDerived transform per section.
-TEST_F(
-    TransformedEncodingTest,
-    narrowSectionsRoundTripForInPlaceAndGatheredTransforms) {
-  Vector<uint64_t> values{pool_.get()};
-  values.resize(20000);
-  std::mt19937_64 rng(53);
-  for (uint32_t i = 0; i < values.size(); ++i) {
-    // Ten low bits, so the transformed section is far narrower than a word,
-    // under a high field holding few distinct values -- the shape that first
-    // exercised the narrow path for KeyDerived, reused here for the families
-    // that never had a narrow-width test at all.
-    const uint64_t low = rng() % 1024;
-    const uint64_t high = rng() % 40;
-    values[i] = (high << 10) | low;
-  }
+// A retired transform id must be refused by every reader rather than decoded
+// without its inverse, which would hand back plausible wrong values.
+TEST_F(TransformedEncodingTest, readersRejectRetiredTransformIds) {
+  const auto values = packedIdentifiers(4096);
+  Buffer buffer{*pool_};
+  Encoding::Options options;
+  options.subIntSplitTransform = static_cast<uint8_t>(TransformId::KeyDerived);
+  options.subIntSplitKeySection = 1;
+  options.subIntSplitForceApply = true;
+  const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
+      buffer, values, CompressionType::Uncompressed, options);
 
-  for (auto id :
-       {TransformId::RelabelFrequency,
-        TransformId::RelabelDense,
-        TransformId::RelabelGray,
-        TransformId::BitPlane}) {
-    SCOPED_TRACE(toString(id));
-    Buffer buffer{*pool_};
-    Encoding::Options options;
-    options.subIntSplitTransform = static_cast<uint8_t>(id);
-    // Unused by these families (none needs a key section), but
-    // subIntSplitForceApply requires a pinned, valid one regardless -- a
-    // uniform precondition rather than one that varies by family.
-    options.subIntSplitKeySection = 1;
-    options.subIntSplitForceApply = true;
-    const auto encoded = test::Encoder<SubIntSplitEncoding<uint64_t>>::encode(
-        buffer, values, CompressionType::Uncompressed, options);
+  TransformInfo info;
+  parseSections(encoded, Encoding::kPrefixSize, &info);
+  const auto transformed = std::find_if(
+      info.transformIds.begin(), info.transformIds.end(), [](uint8_t id) {
+        return id != 0;
+      });
+  ASSERT_NE(transformed, info.transformIds.end());
+  // The ids follow the flags byte, the row frame block when present, and the
+  // key section byte.
+  const uint8_t flags =
+      static_cast<uint8_t>(encoded[Encoding::kPrefixSize + 1]);
+  const size_t idOffset = Encoding::kPrefixSize + 2 +
+      ((flags & kFlagRowFrame) != 0 ? kRowFrameHeaderSize : 0) + 1 +
+      (transformed - info.transformIds.begin());
+  ASSERT_EQ(
+      static_cast<uint8_t>(encoded[idOffset]),
+      static_cast<uint8_t>(TransformId::KeyDerived));
 
-    subintsplit::TransformInfo info;
-    subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
-    ASSERT_TRUE(info.anyTransform()) << toString(id) << " was not applied";
-
-    SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
-    std::vector<uint64_t> bulk(values.size());
-    view.read(0, values.size(), bulk.data());
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
-    }
-    for (uint32_t i = 0; i < values.size(); i += 97) {
-      ASSERT_EQ(view.readAt(i), values[i]) << "probe row " << i;
-    }
-
-    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-        *pool_, encoded, nullptr, options);
-    std::vector<uint64_t> sequential(values.size());
-    encoding->materialize(values.size(), sequential.data());
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(sequential[i], values[i]) << "sequential row " << i;
-    }
+  for (const uint8_t retired : {2, 3, 4, 5, 6, 7}) {
+    SCOPED_TRACE(static_cast<int>(retired));
+    std::string corrupt{encoded.data(), encoded.size()};
+    corrupt[idOffset] = static_cast<char>(retired);
+    EXPECT_THROW(
+        SubIntSplitEncoding<uint64_t>(*pool_, corrupt, nullptr, options),
+        NimbleUserError);
+    EXPECT_THROW(
+        (SubIntSplitEncodingView<uint64_t>{corrupt, pool_.get(), options}),
+        NimbleUserError);
   }
 }
 

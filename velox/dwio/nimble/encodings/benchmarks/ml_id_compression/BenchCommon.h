@@ -1913,10 +1913,6 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   {
     const std::vector<std::pair<subintsplit::TransformId, const char*>> arms{
         {subintsplit::TransformId::KeyDerived, "key_derived"},
-        {subintsplit::TransformId::RelabelFrequency, "relabel_frequency"},
-        {subintsplit::TransformId::RelabelDense, "relabel_dense"},
-        {subintsplit::TransformId::RelabelGray, "relabel_gray"},
-        {subintsplit::TransformId::BitPlane, "bitplane"},
     };
     for (const auto& [transformId, name] : arms) {
       const auto rawId = static_cast<uint8_t>(transformId);

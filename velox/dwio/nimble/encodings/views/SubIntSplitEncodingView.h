@@ -340,46 +340,16 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Reads one row where every transform present can address it directly: a
-  // relabelling is undone on the value, and a key-derived permutation is
-  // followed through the position map. Both are O(1) once the map exists.
+  // Reads one row. A key-derived section is followed through the position
+  // map, which is O(1) once the map exists.
   physicalType readOneRow(uint32_t index) const {
     const velox::raw_vector<uint32_t>* positions =
         permutedSection_ ? &positionMap() : nullptr;
     physicalType value = constantBits_;
     for (const auto& section : sections_) {
-      uint64_t sectionValue = 0;
-      const auto mapping = section.transform == nullptr
-          ? subintsplit::PositionMapping::InPlace
-          : section.transform->positionMapping();
-      switch (mapping) {
-        case subintsplit::PositionMapping::Permuted:
-          // One offset, taken from the map built off the key section.
-          sectionValue = section.valueAt(*section.view, (*positions)[index]);
-          break;
-        case subintsplit::PositionMapping::Gathered: {
-          // Several offsets, which only the transform knows; it asks for the
-          // words it needs and puts the row back together.
-          const subintsplit::TransformContext context{
-              .keySection = {}, .width = section.width};
-          sectionValue = section.transform->gatherRow(
-              index,
-              this->rowCount_,
-              context,
-              section.transformState,
-              [&section](uint32_t at) {
-                return section.valueAt(*section.view, at);
-              });
-          break;
-        }
-        default:
-          sectionValue = section.valueAt(*section.view, index);
-          if (section.transform != nullptr) {
-            sectionValue = section.transform->invertValue(
-                sectionValue, section.transformState);
-          }
-          break;
-      }
+      const uint64_t sectionValue = section.transform == nullptr
+          ? section.valueAt(*section.view, index)
+          : section.valueAt(*section.view, (*positions)[index]);
       value |= static_cast<physicalType>(sectionValue & section.mask)
           << section.bitStart;
     }
@@ -507,30 +477,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // row-by-row probe it replaced; one at 111 rows was already a clear win.
     // kMinSpanLength is a round number inside that gap, not a measured
     // boundary -- worth tightening once someone measures closer to it.
-    //
-    // An InPlace transform has no run structure to sort by -- each row is
-    // already independently addressable -- so it keeps the older two-way
-    // choice: gathering row by row wins for a short range, where decoding
-    // rows nobody asked for would dominate, and decoding the whole span
-    // wins once enough of it is wanted.
     if (transformInfo_.anyTransform()) {
-      if (permutedSection_) {
-        if (length < kMinSpanLength) {
-          readPermutedProbes(offset, length, output);
-          return;
-        }
-        if (length * kSpanAdvantageNumerator <
-            this->rowCount_ * kSpanAdvantageDenominator) {
-          readPermutedSpan(offset, length, output);
-          return;
-        }
-        readWholeSpan(offset, length, output);
+      if (length < kMinSpanLength) {
+        readPermutedProbes(offset, length, output);
         return;
       }
-      if (length * kGatherAdvantage < this->rowCount_) {
-        for (uint32_t i = 0; i < length; ++i) {
-          output[i] = readOneRow(offset + i);
-        }
+      if (length * kSpanAdvantageNumerator <
+          this->rowCount_ * kSpanAdvantageDenominator) {
+        readPermutedSpan(offset, length, output);
         return;
       }
       readWholeSpan(offset, length, output);
@@ -712,13 +666,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   //
   // A transformed stream cannot decode an arbitrary span cheaply the way an
   // untransformed one can: its bulk path is a whole-column decode, because a
-  // permuted section's rows are scattered across the column and a Gathered
-  // one's inverse needs rows outside the span. So the choice is made once for
-  // the list, by pricing each range at what readPhysical() would charge for
-  // it on its own, in units of one row of whole-column decode, and decoding
-  // the column once when that total reaches its row count. Pricing ranges
-  // rather than rows matters: four ranges of a quarter column each cost four
-  // whole-column decodes read one at a time, and one read together.
+  // permuted section's rows are scattered across the column. So the choice is
+  // made once for the list, by pricing each range at what readPhysical() would
+  // charge for it on its own, in units of one row of whole-column decode, and
+  // decoding the column once when that total reaches its row count. Pricing
+  // ranges rather than rows matters: four ranges of a quarter column each cost
+  // four whole-column decodes read one at a time, and one read together.
   void readTransformedRanges(
       std::span<const std::pair<uint32_t, uint32_t>> ranges,
       physicalType* output) const {
@@ -744,29 +697,21 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // per-range price already separates those two cases, by charging a range
     // too short to sort at the probe rate.
     uint64_t totalRows = 0;
-    if (permutedSection_) {
-      for (const auto& [offset, rangeLength] : ranges) {
-        totalRows += rangeLength;
-      }
+    for (const auto& [offset, rangeLength] : ranges) {
+      totalRows += rangeLength;
     }
     uint64_t piecewiseCost = 0;
     for (const auto& [offset, rangeLength] : ranges) {
       const uint64_t length = rangeLength;
-      if (permutedSection_) {
-        if (length < kMinSpanLength) {
-          piecewiseCost += length * kProbeCostInDecodedRows;
-        } else if (
-            length * kSpanAdvantageNumerator <
-            rowCount * kSpanAdvantageDenominator) {
-          // readPermutedSpan() levels with a whole-column decode at half the
-          // column, which makes one of its rows cost about two decoded ones.
-          piecewiseCost +=
-              length * kSpanAdvantageNumerator / kSpanAdvantageDenominator;
-        } else {
-          piecewiseCost += rowCount;
-        }
-      } else if (length * kGatherAdvantage < rowCount) {
+      if (length < kMinSpanLength) {
         piecewiseCost += length * kProbeCostInDecodedRows;
+      } else if (
+          length * kSpanAdvantageNumerator <
+          rowCount * kSpanAdvantageDenominator) {
+        // readPermutedSpan() levels with a whole-column decode at half the
+        // column, which makes one of its rows cost about two decoded ones.
+        piecewiseCost +=
+            length * kSpanAdvantageNumerator / kSpanAdvantageDenominator;
       } else {
         piecewiseCost += rowCount;
       }
@@ -781,7 +726,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       // likely to be split across two ranges of a request as to sit inside
       // one. Below kMinSpanLength rows in total the sort still has nothing
       // to amortise over, so the list falls back to probes per range.
-      if (permutedSection_ && totalRows >= kMinSpanLength) {
+      if (totalRows >= kMinSpanLength) {
         readPermutedSpanRanges(
             ranges, static_cast<uint32_t>(totalRows), output);
         return;
@@ -824,15 +769,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     velox::raw_vector<uint32_t> positions;
   };
 
-  // How much cheaper a gathered row is than a decoded one. Below this ratio of
-  // wanted rows to total rows, gathering only what was asked for wins; above
-  // it, decoding the span in order and undoing it wholesale wins even though
-  // it decodes rows nobody wanted. Only reached by an InPlace transform now;
-  // see kSpanAdvantageNumerator/Denominator for the Permuted equivalent.
-  static constexpr uint32_t kGatherAdvantage = 8;
-
-  // The Permuted equivalent of kGatherAdvantage, retuned once the radix
-  // sort replaced the comparison sort.
+  // The ratio of wanted rows to total rows below which spans beat decoding
+  // the column, retuned once the radix sort replaced the comparison sort.
   //
   // A ratio below 1 (5/6, the first retune) is not just a bad guess -- it is
   // structurally broken, because length * numerator < rowCount_ * denominator
@@ -1125,18 +1063,6 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       uint32_t offset,
       uint32_t length,
       physicalType* output) const {
-    // A run read does not undo a section's own transform, so a stream that
-    // also transforms a section in place keeps the per-row probe.
-    for (const auto& section : sections_) {
-      if (section.transform != nullptr &&
-          section.transform->positionMapping() !=
-              subintsplit::PositionMapping::Permuted) {
-        for (uint32_t i = 0; i < length; ++i) {
-          output[i] = readOneRow(offset + i);
-        }
-        return;
-      }
-    }
     const auto& positions = positionMap();
     const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
     if (seedWithConstant) {
@@ -1259,31 +1185,6 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Decodes `count` rows of one section in one go and widens them to 64 bits,
-  // which is the width every transform works in.
-  template <typename SectionT>
-  static void widenSectionRun(
-      const Section& section,
-      uint32_t offset,
-      uint32_t count,
-      velox::raw_vector<uint8_t>& scratch,
-      velox::raw_vector<uint64_t>& out) {
-    // The buffer comes from the caller, so its size is the caller's promise
-    // rather than anything visible here. Checked because breaking that promise
-    // writes past the end of the heap block and shows up as a segfault a long
-    // way from the cause, which is exactly what happened when the section
-    // reads were chunked and this call was not.
-    NIMBLE_CHECK_GE(
-        scratch.size(),
-        static_cast<size_t>(count) * sizeof(SectionT),
-        "SubIntSplit widening scratch is too small for the run.");
-    auto* values = reinterpret_cast<SectionT*>(scratch.data());
-    section.view->read(offset, count, values);
-    for (uint32_t row = 0; row < count; ++row) {
-      out[row] = static_cast<uint64_t>(values[row]);
-    }
-  }
-
   // Reads a permuted section at its own width, puts its rows back where they
   // belong, and accumulates them through the same kernel an untransformed
   // section uses.
@@ -1346,164 +1247,23 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Reads one whole transform block, undoing every transform on it.
-  //
-  // Sections are widened to 64 bits first so a transform never has to know
-  // which width its section was stored at, and the key section is inverted
-  // nowhere: it is stored in original order precisely so it can order the rest.
+  // Reads `blockCount` rows of a transformed stream from `blockStart`, putting
+  // every permuted section back in original row order. The key section is
+  // stored in original order, so it is read like an untransformed section.
   void readPhysicalBlock(
       uint32_t blockStart,
       uint32_t blockCount,
       physicalType* output) const {
-    // Read sequentially rather than a row at a time: the section views decode
-    // a run far faster than they answer the same number of separate probes,
-    // and this is the path a bulk read takes.
-    // Held per thread rather than allocated per call: a bulk read reaches this
-    // once per block, and the allocation showed up as the transform's cost when
-    // it belongs to the loop around it. Per thread because a view is read
-    // concurrently and holds no mutable state of its own.
-    // Both fully overwritten before being read: `scratch` in
-    // widenSectionRun(), and each entry of `sectionValues` in the same call,
-    // sized to exactly the range that call writes.
-    thread_local std::vector<velox::raw_vector<uint64_t>> sectionValues;
+    // One chunk's worth, held per thread because a view is read concurrently
+    // and holds no mutable state of its own. Kept to a chunk so a section's
+    // values stay in L1 on the way from its view to the accumulate kernel.
     thread_local velox::raw_vector<uint8_t> scratch;
-    // widenSectionRun() reads a whole block in one call, so it cannot share
-    // the chunk-sized buffer below. Keeping one buffer for both is what made
-    // shrinking that buffer overflow this one: the section reads were chunked
-    // and the widening was not, and a section wide enough to need widening
-    // then wrote a block's worth into a chunk's worth of space.
-    thread_local velox::raw_vector<uint8_t> widenScratch;
-    sectionValues.resize(sections_.size());
-    // One chunk's worth, not one block's. This used to be sized to the whole
-    // block, so a section's values were streamed through a buffer several
-    // times L2 on the way from its view to the accumulate kernel, which is an
-    // L3 round trip for data that is read once, immediately, by the next
-    // instruction. readPhysical has always sized its scratch to a chunk and
-    // kept it in L1; this path did not.
     scratch.resize(static_cast<size_t>(kViewChunkSize) * sizeof(physicalType));
-    // A widened read is per block, so this one is sized per block.
-    widenScratch.resize(static_cast<size_t>(blockCount) * sizeof(physicalType));
-    // A section is widened to 64 bits only where something will read it that
-    // way: a transform works in 64 bits, and the key section is handed to
-    // those transforms as context. A section that neither carries a transform
-    // nor keys one is assembled by the same kernel an untransformed stream
-    // uses, rather than paying for a widening and a scalar pass it has no use
-    // for.
     const auto isPermuted = [](const Section& section) {
       return section.transform != nullptr &&
           section.transform->positionMapping() ==
           subintsplit::PositionMapping::Permuted;
     };
-    // Only a section that a transform will rewrite in 64 bits needs widening,
-    // plus the key, which those transforms read as context. A permuted section
-    // is not rewritten at all -- its values only move -- so it stays at its own
-    // width and goes through the accumulate kernel like any other.
-    // The key is widened only for transforms that read it as context. A
-    // permuted section does not: it follows the position map, which was built
-    // from the key's own encoding. So when nothing on the stream rewrites
-    // values, the key section is never read as values at all, where before it
-    // was unpacked a second time to serve a span nobody looked at.
-    bool rewritesValues = false;
-    for (const auto& section : sections_) {
-      if (section.transform != nullptr && !isPermuted(section)) {
-        rewritesValues = true;
-        break;
-      }
-    }
-    const auto needsWidening = [this, &isPermuted, rewritesValues](
-                                   const Section& section) {
-      if (isPermuted(section)) {
-        return false;
-      }
-      if (section.transform != nullptr) {
-        return true;
-      }
-      return rewritesValues && section.wireIndex == transformInfo_.keySection;
-    };
-    for (size_t i = 0; i < sections_.size(); ++i) {
-      const auto& section = sections_[i];
-      if (!needsWidening(section)) {
-        continue;
-      }
-      auto& values = sectionValues[i];
-      values.resize(blockCount);
-      switch (section.storageBytes) {
-        case 1:
-          widenSectionRun<uint8_t>(
-              section, blockStart, blockCount, widenScratch, values);
-          break;
-        case 2:
-          widenSectionRun<uint16_t>(
-              section, blockStart, blockCount, widenScratch, values);
-          break;
-        case 4:
-          widenSectionRun<uint32_t>(
-              section, blockStart, blockCount, widenScratch, values);
-          break;
-        default:
-          widenSectionRun<uint64_t>(
-              section, blockStart, blockCount, widenScratch, values);
-          break;
-      }
-    }
-
-    std::span<const uint64_t> keySpan;
-    // Where the key's own encoding already holds dense ids -- a dictionary
-    // does -- they are taken rather than rebuilt. A transform that groups rows
-    // by key would otherwise hash every row to recover them.
-    thread_local std::vector<uint32_t> runIds;
-    thread_local std::vector<uint64_t> runValues;
-    runIds.clear();
-    runValues.clear();
-    // Only reached by invert() below, and only a section that rewrites values
-    // (not a permuted one) ever calls invert() with this context. Every
-    // transform that currently reads keySection/keyRunIds in its invert() is
-    // itself Permuted, so it never reaches that call either -- meaning a
-    // pure-Permuted stream (KeyDerived alone, the common case) has nothing
-    // downstream that will ever look at keySpan. Computing it anyway meant a
-    // bulk read and a run-id build (denseRunIds) on every call, for a result
-    // nothing read: skip the whole block when rewritesValues is false, the
-    // same condition needsWidening() above already uses to decide whether the
-    // key is worth widening at all.
-    if (rewritesValues &&
-        transformInfo_.keySection !=
-            subintsplit::TransformInfo::kNoKeySection) {
-      for (size_t i = 0; i < sections_.size(); ++i) {
-        if (sections_[i].wireIndex != transformInfo_.keySection) {
-          continue;
-        }
-        keySpan = std::span<const uint64_t>(
-            sectionValues[i].data(), sectionValues[i].size());
-        if (!sections_[i].view->denseRunIds(
-                blockStart, blockCount, runIds, runValues)) {
-          runIds.clear();
-          runValues.clear();
-        }
-        break;
-      }
-    }
-
-    for (size_t i = 0; i < sections_.size(); ++i) {
-      const auto& section = sections_[i];
-      if (section.transform == nullptr) {
-        continue;
-      }
-      // A permuted section was never widened and is put back where it belongs
-      // at its own width further down, so there is nothing to undo here.
-      if (isPermuted(section)) {
-        continue;
-      }
-      subintsplit::TransformState state = section.transformState;
-      subintsplit::TransformContext context{
-          .keySection = keySpan,
-          .width = section.width,
-          .keyRunIds = runIds,
-          .keyRunValues = runValues};
-      section.transform->invert(
-          std::span<uint64_t>(sectionValues[i].data(), sectionValues[i].size()),
-          context,
-          state);
-    }
 
     // A section that seeds writes the whole word, so the clear is only needed
     // where nothing will. readPhysical has always known this; this path did
@@ -1548,70 +1308,51 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
         }
         continue;
       }
-      if (!needsWidening(section)) {
-        // Straight through the accumulate kernel, from the section's own
-        // storage width, a chunk at a time so the scratch stays resident.
-        for (uint32_t chunk = 0; chunk < blockCount; chunk += kViewChunkSize) {
-          const uint32_t chunkCount =
-              std::min(kViewChunkSize, blockCount - chunk);
-          const uint32_t chunkStart = blockStart + chunk;
-          physicalType* chunkOutput = output + chunk;
-          switch (section.storageBytes) {
-            case 1:
-              readSectionChunk<uint8_t>(
-                  section,
-                  chunkStart,
-                  chunkCount,
-                  chunkOutput,
-                  sectionSeeds,
-                  scratch.data());
-              break;
-            case 2:
-              readSectionChunk<uint16_t>(
-                  section,
-                  chunkStart,
-                  chunkCount,
-                  chunkOutput,
-                  sectionSeeds,
-                  scratch.data());
-              break;
-            case 4:
-              readSectionChunk<uint32_t>(
-                  section,
-                  chunkStart,
-                  chunkCount,
-                  chunkOutput,
-                  sectionSeeds,
-                  scratch.data());
-              break;
-            default:
-              readSectionChunk<uint64_t>(
-                  section,
-                  chunkStart,
-                  chunkCount,
-                  chunkOutput,
-                  sectionSeeds,
-                  scratch.data());
-              break;
-          }
+      // Straight through the accumulate kernel, from the section's own
+      // storage width, a chunk at a time so the scratch stays resident.
+      for (uint32_t chunk = 0; chunk < blockCount; chunk += kViewChunkSize) {
+        const uint32_t chunkCount =
+            std::min(kViewChunkSize, blockCount - chunk);
+        const uint32_t chunkStart = blockStart + chunk;
+        physicalType* chunkOutput = output + chunk;
+        switch (section.storageBytes) {
+          case 1:
+            readSectionChunk<uint8_t>(
+                section,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
+                sectionSeeds,
+                scratch.data());
+            break;
+          case 2:
+            readSectionChunk<uint16_t>(
+                section,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
+                sectionSeeds,
+                scratch.data());
+            break;
+          case 4:
+            readSectionChunk<uint32_t>(
+                section,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
+                sectionSeeds,
+                scratch.data());
+            break;
+          default:
+            readSectionChunk<uint64_t>(
+                section,
+                chunkStart,
+                chunkCount,
+                chunkOutput,
+                sectionSeeds,
+                scratch.data());
+            break;
         }
-        continue;
-      }
-      // The third way a section can reach the output, and the one that has to
-      // seed too when it comes first: without this it ORs into memory nothing
-      // has written yet.
-      if (sectionSeeds) {
-        for (uint32_t row = 0; row < blockCount; ++row) {
-          output[row] =
-              static_cast<physicalType>(sectionValues[i][row] & section.mask)
-              << section.bitStart;
-        }
-        continue;
-      }
-      for (uint32_t row = 0; row < blockCount; ++row) {
-        output[row] |=
-            static_cast<physicalType>(sectionValues[i][row] & section.mask)
-            << section.bitStart;
       }
     }
   }
@@ -1637,7 +1378,7 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // not. Added back by the three read overrides and nowhere else.
   subintsplit::RowFrame rowFrame_;
   // True where some section carries a Permuted transform, so reads go through
-  // the position map. A Gathered transform needs no such map.
+  // the position map.
   bool permutedSection_{false};
 
   // Sections that vary per row. Constant sections are folded into constantBits_

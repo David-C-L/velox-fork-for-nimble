@@ -62,13 +62,7 @@ makeSection(size_t count, int width, Shape shape, uint64_t seed) {
 }
 
 std::vector<TransformId> allTransforms() {
-  return {
-      TransformId::KeyDerived,
-      TransformId::RelabelFrequency,
-      TransformId::RelabelDense,
-      TransformId::RelabelGray,
-      TransformId::BitPlane,
-  };
+  return {TransformId::KeyDerived};
 }
 
 } // namespace
@@ -79,11 +73,9 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
   for (auto id : allTransforms()) {
     const auto* transform = transformFor(id);
     ASSERT_NE(transform, nullptr) << toString(id);
-    // Widths include several that do not divide 64 evenly (5, 7, 13, 40, 63)
-    // and the two degenerate ends (1 and 64): bitplane's transpose walks
-    // words and bit positions by width, so a width that leaves a remainder
-    // is exactly where an off-by-one in that walk would show up. Counts
-    // include ones that are not a multiple of any word or chunk size.
+    // Widths include several that do not divide 64 evenly and the two
+    // degenerate ends (1 and 64). Counts include ones that are not a multiple
+    // of any word or chunk size.
     for (size_t count :
          {size_t{1},
           size_t{2},
@@ -105,7 +97,6 @@ TEST(SectionTransformTest, roundTripsEveryShapeAndWidth) {
           std::vector<uint64_t> values = original;
           TransformContext context{.keySection = key, .width = width};
           TransformState state;
-          transform->prepareSection(values, state);
           transform->apply(values, context, state);
           transform->invert(values, context, state);
 
@@ -126,7 +117,6 @@ TEST(SectionTransformTest, keyDerivedOnItsOwnKeyIsIdentityOrder) {
   const auto* transform = transformFor(TransformId::KeyDerived);
   TransformContext context{.keySection = key, .width = 6};
   TransformState state;
-  transform->prepareSection(values, state);
   transform->apply(values, context, state);
   EXPECT_TRUE(std::is_sorted(values.begin(), values.end()));
   transform->invert(values, context, state);
@@ -236,19 +226,7 @@ TEST(
 
 // Point access is what decides whether a transform may serve a point-lookup
 // read, so it is asserted rather than left to a comment.
-// Whether a transform must be applied in blocks follows from how it maps a row
-// to where that row was stored, and only one of the three ways needs blocking.
 TEST(SectionTransformTest, reportsHowItMapsPositions) {
-  // Values are rewritten where they stand.
-  for (auto id :
-       {TransformId::RelabelFrequency,
-        TransformId::RelabelDense,
-        TransformId::RelabelGray}) {
-    EXPECT_EQ(transformFor(id)->positionMapping(), PositionMapping::InPlace)
-        << toString(id);
-    EXPECT_TRUE(transformFor(id)->supportsPointAccess()) << toString(id);
-  }
-
   // Rows move, but the key section says where to, and it is stored in original
   // order, so a probe follows the map rather than rebuilding anything.
   EXPECT_EQ(
@@ -256,45 +234,11 @@ TEST(SectionTransformTest, reportsHowItMapsPositions) {
       PositionMapping::Permuted);
   EXPECT_TRUE(transformFor(TransformId::KeyDerived)->supportsPointAccess());
 
-  // A row is spread over computable offsets rather than sent to one, so it is
-  // reassembled rather than followed. Still nothing to rebuild.
-  EXPECT_EQ(
-      transformFor(TransformId::BitPlane)->positionMapping(),
-      PositionMapping::Gathered);
-  EXPECT_TRUE(transformFor(TransformId::BitPlane)->supportsPointAccess());
-
   // Asserted rather than left implicit, so that adding a transform that
   // cannot answer a point read on its own has to change this test and account
   // for the cost.
   for (auto id : allTransforms()) {
     EXPECT_TRUE(transformFor(id)->supportsPointAccess()) << toString(id);
-  }
-}
-
-// A gathered row must come back as the row that went in, or the arithmetic
-// that lets bit-plane skip blocking is wrong.
-TEST(SectionTransformTest, gatheredRowMatchesTheRowThatWentIn) {
-  constexpr int kWidth = 12;
-  std::mt19937_64 rng(7);
-  std::vector<uint64_t> values(3000);
-  for (auto& value : values) {
-    value = rng() % (1ULL << kWidth);
-  }
-
-  const auto* transform = transformFor(TransformId::BitPlane);
-  auto planes = values;
-  TransformState state;
-  const TransformContext context{.keySection = {}, .width = kWidth};
-  transform->apply(planes, context, state);
-
-  for (uint32_t i = 0; i < values.size(); ++i) {
-    const uint64_t got = transform->gatherRow(
-        i,
-        static_cast<uint32_t>(values.size()),
-        context,
-        state,
-        [&planes](uint32_t at) { return planes[at]; });
-    ASSERT_EQ(got, values[i]) << "row " << i;
   }
 }
 
@@ -324,12 +268,7 @@ TEST(SectionTransformTest, positionMapMatchesWhereTheTransformPutEachRow) {
 
 TEST(SectionTransformTest, onlyKeyDerivedNeedsAKeySection) {
   EXPECT_TRUE(transformFor(TransformId::KeyDerived)->needsKeySection());
-  for (auto id : allTransforms()) {
-    if (id == TransformId::KeyDerived) {
-      continue;
-    }
-    EXPECT_FALSE(transformFor(id)->needsKeySection()) << toString(id);
-  }
+  EXPECT_FALSE(transformFor(TransformId::RowFrame)->needsKeySection());
 }
 
 TEST(SectionTransformTest, noneHasNoTransform) {
@@ -339,20 +278,22 @@ TEST(SectionTransformTest, noneHasNoTransform) {
 // An unrecognised transform yields wrong values rather than obviously broken
 // ones, so a reader must fail instead of decoding.
 TEST(SectionTransformTest, unknownTransformIdThrows) {
-  EXPECT_THROW(transformForRaw(kTransformIdCount), NimbleUserError);
+  EXPECT_THROW(transformForRaw(9), NimbleUserError);
   EXPECT_THROW(transformForRaw(200), NimbleUserError);
   EXPECT_NO_THROW(transformForRaw(0));
-  EXPECT_NO_THROW(transformForRaw(kTransformIdCount - 1));
+  EXPECT_NO_THROW(
+      transformForRaw(static_cast<uint8_t>(TransformId::KeyDerived)));
 }
 
-// 5 and 6 were the Burrows-Wheeler pair. They sit inside the id range rather
-// than past its end, so rejecting them is a separate check from the bounds
-// one above and would not be caught by it. A reader must refuse them for the
-// same reason it refuses an unknown id: without the inverse it would hand
-// back plausible-looking wrong values.
-TEST(SectionTransformTest, removedBurrowsWheelerIdsThrow) {
-  EXPECT_THROW(transformForRaw(5), NimbleUserError);
-  EXPECT_THROW(transformForRaw(6), NimbleUserError);
+// 2 to 7 are retired transforms: the relabellings, the Burrows-Wheeler pair
+// and the bit-plane transposition. They sit inside the id range rather than
+// past its end, so rejecting them is a separate check from the bounds one
+// above. A reader must refuse them for the same reason it refuses an unknown
+// id: without the inverse it would hand back plausible-looking wrong values.
+TEST(SectionTransformTest, retiredIdsThrow) {
+  for (uint8_t id = 2; id <= 7; ++id) {
+    EXPECT_THROW(transformForRaw(id), NimbleUserError) << static_cast<int>(id);
+  }
 }
 
 // The row frame is a whole-value transform, so its id must never be accepted
@@ -417,25 +358,15 @@ TEST(SectionTransformTest, rowFrameLeavesUnfittedColumnsAlone) {
   EXPECT_EQ(values, original);
 }
 
-// Only the relabellings carry a codebook; the rest must not
-// silently cost anything to restore.
-TEST(SectionTransformTest, statePricesOnlyWhatItStores) {
-  const auto values = makeSection(256, 8, Shape::LowCardinality, 3);
+// A key-derived permutation is restored from the key section alone, so it
+// must not silently cost anything to store.
+TEST(SectionTransformTest, keyDerivedStoresNothing) {
+  auto values = makeSection(256, 8, Shape::LowCardinality, 3);
   const auto key = makeSection(256, 6, Shape::LowCardinality, 4);
-  for (auto id : allTransforms()) {
-    std::vector<uint64_t> scratch = values;
-    TransformContext context{.keySection = key, .width = 8};
-    TransformState state;
-    transformFor(id)->prepareSection(scratch, state);
-    transformFor(id)->apply(scratch, context, state);
-    const auto bits = state.sizeInBits(8);
-    if (id == TransformId::KeyDerived || id == TransformId::RelabelGray ||
-        id == TransformId::BitPlane) {
-      EXPECT_EQ(bits, 0u) << toString(id) << " should store nothing";
-    } else {
-      EXPECT_GT(bits, 0u) << toString(id) << " should store its codebook";
-    }
-  }
+  TransformContext context{.keySection = key, .width = 8};
+  TransformState state;
+  transformFor(TransformId::KeyDerived)->apply(values, context, state);
+  EXPECT_TRUE(state.codebook.empty());
 }
 
 #endif // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS

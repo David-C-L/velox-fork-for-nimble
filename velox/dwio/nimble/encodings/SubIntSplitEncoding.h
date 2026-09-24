@@ -433,10 +433,6 @@ class SubIntSplitEncoding
   // one's invert() rebuilding it. Reused across blocks purely to reuse
   // capacity; every field is fully overwritten before being read.
   subintsplit::KeyRunState keyRunState_;
-  // Fix B: KeyDerivedTransform::invert's own scratch, threaded through
-  // TransformContext::keyDerivedScratch so it reuses buffers across its
-  // calls instead of allocating six of them per call.
-  subintsplit::KeyDerivedScratch keyDerivedScratch_;
   // Fix 4: working run-start cursor for the fused key-derived accumulate
   // path (decodeTransformedColumn's assembly loop, not invert()), reused across
   // sections and blocks.
@@ -1184,32 +1180,6 @@ void SubIntSplitEncoding<T>::decodeTransformedColumn(
     }
   }
 
-  for (size_t s = 0; s < sections_.size(); ++s) {
-    const uint8_t id = transformInfo_.transformIds[s];
-    if (id == 0) {
-      continue;
-    }
-    const auto* transform = subintsplit::transformForRaw(id);
-    // Fix 4: a key-derived section is inverted inline in the assembly loop
-    // below instead of through invert(), so it is skipped here.
-    if (transform->id() == subintsplit::TransformId::KeyDerived) {
-      continue;
-    }
-    subintsplit::TransformState state;
-    state.codebook = transformInfo_.codebooks[s];
-    subintsplit::TransformContext context{
-        .keySection = keySpan,
-        .width = sections_[s].bitEnd - sections_[s].bitStart + 1};
-    if (haveSharedKeyRunState) {
-      context.keyRunIds = keyRunState_.runOfRow;
-      context.keyRunValues = keyRunState_.runValues;
-      context.keyRunSortedRank = keyRunState_.sortedRank;
-      context.keyRunStart = keyRunState_.runStart;
-    }
-    context.keyDerivedScratch = &keyDerivedScratch_;
-    transform->invert(sectionScratch_[s], context, state);
-  }
-
   // Accumulate one section at a time across the whole block, reusing the
   // same SIMD kernel the untransformed path calls from materialize():
   // section 0 initialises every output element, later sections OR their
@@ -1319,79 +1289,6 @@ void SubIntSplitEncoding<T>::decodeTransformedColumn(
 /// make the search stop pricing plans it had just decided it wanted.
 inline bool improvesOnBest(size_t candidateBytes, size_t bestBytes) noexcept {
   return candidateBytes < bestBytes;
-}
-
-// What the transform gates need to know about a section, counted only as far
-// as the answer stays in doubt.
-//
-// The distinct count stops the moment a relabelling is provably beaten, which
-// is a condition that only tightens as more distinct values are seen: both the
-// codebook it must store and the width of the codes it assigns grow together.
-// So the count abandoned here is a lower bound, and a lower bound is exactly
-// what licenses declining -- the true count can only make the case worse.
-//
-// Counting to the end would defeat the purpose. The sections that would cost
-// most to count are the ones with the most distinct values, which are the ones
-// this refuses first, so the early exit fires where the work is largest. This
-// is the same shape as groupsEnoughToKey above, and for the same reason.
-inline subintsplit::SectionProfile profileSection(
-    const std::vector<uint64_t>& values,
-    int width) {
-  subintsplit::SectionProfile profile;
-  profile.rowCount = values.size();
-  profile.width = width;
-  if (values.empty() || width <= 0) {
-    profile.distinctIsExact = true;
-    return profile;
-  }
-
-  // Relabelling is beaten once rowCount * (width - codeBits) stops exceeding
-  // distinct * width. Checked as it counts rather than after, so the pass ends
-  // at the first distinct value that settles it.
-  const auto beaten = [&](size_t distinct) {
-    if (distinct == 0) {
-      return false;
-    }
-    const int codeBits = distinct == 1 ? 1 : 64 - __builtin_clzll(distinct - 1);
-    if (codeBits >= width) {
-      return true;
-    }
-    const size_t saved =
-        profile.rowCount * static_cast<size_t>(width - codeBits);
-    return saved <= distinct * static_cast<size_t>(width);
-  };
-
-  // One bit per value the section can hold. Affordable only where the bitmap
-  // costs no more than the section already does, so it can never be the
-  // expensive half of this function; anything wider goes to the hash.
-  if (width < 64 && (size_t{1} << width) <= profile.rowCount * 8) {
-    std::vector<bool> seen(size_t{1} << width, false);
-    size_t distinct = 0;
-    for (const uint64_t value : values) {
-      if (!seen[value]) {
-        seen[value] = true;
-        if (beaten(++distinct)) {
-          profile.distinct = distinct;
-          return profile;
-        }
-      }
-    }
-    profile.distinct = distinct;
-    profile.distinctIsExact = true;
-    return profile;
-  }
-
-  folly::F14FastSet<uint64_t> seen;
-  seen.reserve(std::min<size_t>(profile.rowCount, 1u << 16));
-  for (const uint64_t value : values) {
-    if (seen.insert(value).second && beaten(seen.size())) {
-      profile.distinct = seen.size();
-      return profile;
-    }
-  }
-  profile.distinct = seen.size();
-  profile.distinctIsExact = true;
-  return profile;
 }
 
 // Whether sorting by these values would group anything.
@@ -2160,40 +2057,15 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   // Transforms the per-section search may choose between when the caller asks
   // for selection rather than naming one.
   //
-  // A reordering and a value transform are not alternatives in the same sense.
-  // There is one row order per block -- every section is a bit-slice of the
+  // There is one row order per stream -- every section is a bit-slice of the
   // same rows -- so the key-derived permutation is built once per candidate
-  // key and sections opt into it individually. The value transforms rewrite
-  // values inside a section and move no row, so each section chooses its own
-  // freely. Both end up in transformIds[s], which is why one section can be
-  // key-derived while its neighbour is relabelled, and why no section can
-  // carry a second, different row order. That is a property of the wire format
-  // and of the forced arms, not of the list below, which offers one candidate.
+  // key and sections opt into it individually.
   std::vector<const subintsplit::SectionTransform*> candidates;
   if (options.subIntSplitAutoTransform) {
     NIMBLE_CHECK(
         !options.subIntSplitForceApply,
         "subIntSplitAutoTransform and subIntSplitForceApply are exclusive: "
         "one asks the encoder to choose, the other to obey.");
-    // Only the key-derived permutation is offered here. RelabelFrequency,
-    // RelabelDense, RelabelGray and BitPlane keep their implementations,
-    // their tests, their wire ids and their forced benchmark arms; this list
-    // is solely what automatic selection prices, and withholding a transform
-    // from it does not retire the transform.
-    //
-    // Measured across six real columns and six arrival orders: per-section
-    // mixing beat the best forced single transform in 5 of 26 cells, by 0.03%
-    // to 2.79%, while key-derived alone accounted for nearly all of the gain
-    // on 16 of the 21 cells that adopted anything at all. Pricing four
-    // further candidates per section bought that, and cost a trial encode
-    // each -- encode ran 2.41x to 35.52x slower than carrying no transform
-    // layer, which is what ruled selection out as a default.
-    //
-    // The unrestricted five-candidate version is preserved on the
-    // sis-transform-auto branch. Restore it from there rather than rebuilding
-    // this list by hand, and re-measure encode first: the cost scales with
-    // how many candidates a section prices, not with how many it keeps, so
-    // adding one back is not free even where it is never chosen.
     candidates.push_back(
         subintsplit::transformFor(subintsplit::TransformId::KeyDerived));
   } else if (transform != nullptr) {
@@ -2312,14 +2184,10 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
           std::vector<uint64_t>& sectionU64,
           std::vector<uint64_t>& codebook) {
         subintsplit::TransformState state;
-        transform->prepareSection(sectionU64, state);
-        codebook = state.codebook;
         subintsplit::TransformContext context{
             .keySection = keyValues, .width = width, .keyOrder = keyOrder};
         transform->apply(sectionU64, context, state);
-        if (codebook.empty()) {
-          codebook = std::move(state.codebook);
-        }
+        codebook = std::move(state.codebook);
         // The codebook and its count, plus a margin a transform must clear on
         // top of them.
         constexpr size_t kTransformMarginBytes{4};
@@ -2654,23 +2522,11 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       const subintsplit::SectionTransform* bestTransform = nullptr;
       std::vector<uint64_t> bestCodebook;
 
-      // Profiled once per section, not once per candidate, and only where
-      // there is more than one candidate to tell apart -- a caller who named a
-      // single transform is asking for it to be priced, not screened.
-      subintsplit::SectionProfile profile;
-      if (candidates.size() > 1) {
-        profile = profileSection(sectionU64, width);
-      }
-
       for (const auto* candidate : candidates) {
         // A key-derived candidate has nothing to gather by when this attempt
         // found no usable key, and pricing it would encode the section a
         // second time to reach the same bytes as plain.
         if (candidate->needsKeySection() && keyPermutation.empty()) {
-          continue;
-        }
-        // Skips the trial encode where the candidate could not have won it.
-        if (candidates.size() > 1 && !candidate->mightPay(profile)) {
           continue;
         }
         auto transformed = sectionU64;

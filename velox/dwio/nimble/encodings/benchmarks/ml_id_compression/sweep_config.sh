@@ -38,15 +38,12 @@ ARMS_ALL="Trivial,FixedBitWidth,Dictionary,RLE,RLE/view,FixedBitWidth/view,\
 Dictionary/view,PFOR/view,SimdForBitpack/view,\
 FPE/fpe_noindex,FPE/fpe_pertier,FPE/fpe_elias,\
 SIS/realNested,SIS/realNested+view,SIS/key_derived,SIS/key_derived+view,\
-SIS/relabel_frequency,SIS/relabel_frequency+view,\
-SIS/relabel_dense,SIS/relabel_dense+view,\
-SIS/relabel_gray,SIS/relabel_gray+view,\
-SIS/bitplane,SIS/bitplane+view,SIS/auto,SIS/auto+view,\
+SIS/auto,SIS/auto+view,\
 SIS/huffOn,SIS/huffOn+view,SIS/huffOn/key_derived,SIS/huffOn/key_derived+view,\
 openzl/auto"
 
 # The access drivers take the whole SIS family, the OpenZL baseline, the
-# FixedBitWidth pair, and the FPE index variants. 24 arms rather than 31: the
+# FixedBitWidth pair, and the FPE index variants. Fewer arms than compression: the
 # grid reductions do not pay for themselves without this, because measurements
 # are cells multiplied by arms.
 #
@@ -75,10 +72,7 @@ openzl/auto"
 # compresses-better-probes-worse case that compression numbers alone hide.
 ARMS_ACCESS="SIS/realNested,SIS/realNested+view,\
 SIS/key_derived,SIS/key_derived+view,\
-SIS/relabel_frequency,SIS/relabel_frequency+view,\
-SIS/relabel_dense,SIS/relabel_dense+view,\
-SIS/relabel_gray,SIS/relabel_gray+view,\
-SIS/bitplane,SIS/bitplane+view,SIS/auto,SIS/auto+view,\
+SIS/auto,SIS/auto+view,\
 SIS/huffOn,SIS/huffOn+view,SIS/huffOn/key_derived,SIS/huffOn/key_derived+view,\
 openzl/auto,FixedBitWidth,FixedBitWidth/view,\
 FPE/fpe_noindex,FPE/fpe_pertier,FPE/fpe_elias"
@@ -93,8 +87,7 @@ FPE/fpe_noindex,FPE/fpe_pertier,FPE/fpe_elias"
 # If the view ever gains an encode-time component, that equivalence breaks and
 # these arms have to come back. See METHODOLOGY.md.
 ARMS_ENCODE="SIS/realNested,SIS/auto,SIS/huffOn,SIS/huffOn/key_derived,\
-SIS/key_derived,SIS/relabel_dense,SIS/relabel_frequency,SIS/relabel_gray,\
-SIS/bitplane,openzl/auto,FixedBitWidth,\
+SIS/key_derived,openzl/auto,FixedBitWidth,\
 FPE/fpe_noindex,FPE/fpe_pertier,FPE/fpe_elias"
 
 # --- gather ladders ---------------------------------------------------------
