@@ -371,17 +371,9 @@ void screenNumericCandidatesBySample(
     return;
   }
 
-  // Contiguous blocks spread over the stream, so that runs, frames and local
-  // ranges survive in the sample the way they occur in the stream.
   constexpr size_t kBlocks{8};
-  const size_t blockRows = std::max<size_t>(sampleRows / kBlocks, 1);
-  const size_t stride = values.size() / kBlocks;
-  std::vector<physicalType> sample;
-  sample.reserve(kBlocks * blockRows);
-  for (size_t block = 0; block < kBlocks; ++block) {
-    const auto first = values.begin() + block * stride;
-    sample.insert(sample.end(), first, first + blockRows);
-  }
+  const auto sample = sampleSpreadBlocks(
+      values, kBlocks, std::max<size_t>(sampleRows / kBlocks, 1));
   const std::span<const physicalType> sampleValues{sample};
   const auto sampleStatistics = Statistics<physicalType>::create(sampleValues);
 

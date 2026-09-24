@@ -74,8 +74,7 @@ class RangePricer {
       return it->second;
     }
     const int width = bitEnd - bitStart + 1;
-    const uint64_t mask =
-        width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+    const uint64_t mask = widthMask(width);
     RangePrice price;
     switch (storageWidthBits(width)) {
       case 8:

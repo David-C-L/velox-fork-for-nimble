@@ -507,24 +507,51 @@ struct SelectorResult {
 // more, and without knowing how much larger the stream is there is no way to
 // say how much of one the sample saw.
 //
-// buildSectionCostGrid costs every bit range [l..r] of `samples`, scaled to
-// `fullCount` rows, as a row-major sz*sz grid indexed l * sz + r;
-// selectSplitsImpl runs the DP over it. `samples` must be non-empty and `sz` in
-// [1, 64] for the grid.
+// buildSectionCostGrid costs the bit ranges [l..r] of `samples` that `layout`
+// admits, scaled to `fullCount` rows, as a row-major sz*sz grid indexed
+// l * sz + r; selectSplitsImpl runs the DP over it. `samples` must be
+// non-empty and `sz` in [1, 64] for the grid. An unrestricted layout scores
+// every cell. Otherwise the whole range [0, sz) is always scored, so the DP
+// keeps a fallback, the constant edges of a trimmed range are free Constant
+// cells, and every other cell must lie inside the varying range and start and
+// end on candidate boundaries.
 template <typename CostFn>
 inline std::vector<SectionCost> buildSectionCostGrid(
     const std::vector<uint64_t>& samples,
     int sz,
     size_t fullCount,
+    const SelectorConfig& cfg,
+    const GridLayout& layout,
     CostFn&& costFn) {
-  const MetricFlags requiredFlags = allCostModelRequiredFlags();
-  MetricCollector collector;
-
   std::vector<SectionCost> bestCost(sz * sz);
+  const auto constantCell = [] {
+    SectionCost cell;
+    cell.weightedBits = 0.0;
+    cell.sizeBits = 0.0;
+    cell.decodeNanosPerRow = 0.0;
+    cell.encoding = EncodingType::Constant;
+    cell.trimmedEdge = true;
+    return cell;
+  };
+  if (!layout.unrestricted && layout.allConstant) {
+    bestCost[sz - 1] = constantCell();
+    return bestCost;
+  }
+  if (!layout.unrestricted && layout.lo > 0) {
+    bestCost[layout.lo - 1] = constantCell();
+  }
+  if (!layout.unrestricted && layout.hi < sz - 1) {
+    bestCost[(layout.hi + 1) * sz + (sz - 1)] = constantCell();
+  }
 
+  const MetricFlags allFlags = allCostModelRequiredFlags();
+  const MetricFlags withoutFrequency = allFlags &
+      ~static_cast<MetricFlags>(MetricFlag::UniqueCount) &
+      ~static_cast<MetricFlags>(MetricFlag::DominantValue) &
+      ~static_cast<MetricFlags>(MetricFlag::FrequencyTiers);
+  MetricCollector collector;
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
-
   // BitRangeCounter cannot describe a capped count. Capping freezes the
   // running maximum at whichever element crossed the cap, which is a property
   // of the order the values arrived in, and sorting discards that order by
@@ -540,95 +567,13 @@ inline std::vector<SectionCost> buildSectionCostGrid(
   if (rangeCounts) {
     counter.emplace(samples);
   }
-
-  for (int l = 0; l < sz; ++l) {
-    extractor.reset(l);
-    if (rangeCounts) {
-      counter->reset(l);
-    }
-    for (int r = l; r < sz; ++r) {
-      extractor.extend(r);
-      const std::vector<uint64_t>& segValues = extractor.values();
-      const SectionMetrics metrics = rangeCounts
-          ? collector.compute(segValues, requiredFlags, counter->counts(r))
-          : collector.compute(segValues, requiredFlags);
-      const int bitWidth = r - l + 1;
-
-      SectionCost cell =
-          costFn(metrics, numSamples, fullCount, bitWidth, segValues);
-
-      // Both cost figures are per-sample and scale to the full stream; the
-      // decode rate is already per row and must not be scaled with them.
-      const double scale =
-          static_cast<double>(fullCount) / static_cast<double>(numSamples);
-      cell.weightedBits *= scale;
-      cell.sizeBits *= scale;
-
-      bestCost[l * sz + r] = cell;
-    }
-  }
-  return bestCost;
-}
-
-/// As buildSectionCostGrid above, scoring only the cells `layout` admits. An
-/// unrestricted layout scores every cell exactly as the overload above does.
-/// Otherwise the whole range [0, sz) is always scored, so the DP keeps a
-/// fallback, the constant edges of a trimmed range are free Constant cells,
-/// and every other cell must lie inside the varying range and start and end on
-/// candidate boundaries.
-template <typename CostFn>
-inline std::vector<SectionCost> buildSectionCostGrid(
-    const std::vector<uint64_t>& samples,
-    int sz,
-    size_t fullCount,
-    const SelectorConfig& cfg,
-    const GridLayout& layout,
-    CostFn&& costFn) {
-  if (layout.unrestricted) {
-    return buildSectionCostGrid(
-        samples, sz, fullCount, std::forward<CostFn>(costFn));
-  }
-  std::vector<SectionCost> bestCost(sz * sz);
-  const auto constantCell = [] {
-    SectionCost cell;
-    cell.weightedBits = 0.0;
-    cell.sizeBits = 0.0;
-    cell.decodeNanosPerRow = 0.0;
-    cell.encoding = EncodingType::Constant;
-    cell.trimmedEdge = true;
-    return cell;
-  };
-  if (layout.allConstant) {
-    bestCost[sz - 1] = constantCell();
-    return bestCost;
-  }
-  if (layout.lo > 0) {
-    bestCost[layout.lo - 1] = constantCell();
-  }
-  if (layout.hi < sz - 1) {
-    bestCost[(layout.hi + 1) * sz + (sz - 1)] = constantCell();
-  }
-
-  const MetricFlags allFlags = allCostModelRequiredFlags();
-  const MetricFlags withoutFrequency = allFlags &
-      ~static_cast<MetricFlags>(MetricFlag::UniqueCount) &
-      ~static_cast<MetricFlags>(MetricFlag::DominantValue) &
-      ~static_cast<MetricFlags>(MetricFlag::FrequencyTiers);
-  MetricCollector collector;
-  BitRangeExtractor extractor(samples);
-  const size_t numSamples = samples.size();
-  // See buildSectionCostGrid above for why this is a fallback.
-  const bool rangeCounts = numSamples <= MetricCollector::kUniqueCountCap;
-  std::optional<BitRangeCounter> counter;
-  if (rangeCounts) {
-    counter.emplace(samples);
-  }
   const double scale =
       static_cast<double>(fullCount) / static_cast<double>(numSamples);
 
   for (int l = 0; l < sz; ++l) {
-    const bool activeStart = l >= layout.lo && l <= layout.hi &&
-        layout.isBoundary[static_cast<size_t>(l)] != 0;
+    const bool activeStart = layout.unrestricted ||
+        (l >= layout.lo && l <= layout.hi &&
+         layout.isBoundary[static_cast<size_t>(l)] != 0);
     if (!activeStart && l != 0) {
       continue;
     }
@@ -640,7 +585,7 @@ inline std::vector<SectionCost> buildSectionCostGrid(
       const bool wholeRange = l == 0 && r == sz - 1;
       const bool isActiveRange = l == layout.lo && r == layout.hi;
       const int bitWidth = r - l + 1;
-      if (!wholeRange) {
+      if (!layout.unrestricted && !wholeRange) {
         if (!activeStart || r > layout.hi ||
             layout.isBoundary[static_cast<size_t>(r + 1)] == 0) {
           continue;
@@ -652,7 +597,8 @@ inline std::vector<SectionCost> buildSectionCostGrid(
       }
       extractor.extend(r);
       const std::vector<uint64_t>& segValues = extractor.values();
-      const bool wantFrequency = cfg.frequencyMetricsMaxWidth <= 0 ||
+      const bool wantFrequency = layout.unrestricted ||
+          cfg.frequencyMetricsMaxWidth <= 0 ||
           bitWidth <= cfg.frequencyMetricsMaxWidth;
       const MetricFlags flags = wantFrequency ? allFlags : withoutFrequency;
       SectionMetrics metrics;
@@ -673,6 +619,22 @@ inline std::vector<SectionCost> buildSectionCostGrid(
     }
   }
   return bestCost;
+}
+
+/// As above, over every cell.
+template <typename CostFn>
+inline std::vector<SectionCost> buildSectionCostGrid(
+    const std::vector<uint64_t>& samples,
+    int sz,
+    size_t fullCount,
+    CostFn&& costFn) {
+  return buildSectionCostGrid(
+      samples,
+      sz,
+      fullCount,
+      SelectorConfig{},
+      GridLayout{},
+      std::forward<CostFn>(costFn));
 }
 
 // Runs the split DP over a grid buildSectionCostGrid already costed, so a
@@ -696,9 +658,9 @@ inline SelectorResult selectSplitsOverGrid(
       if (!std::isfinite(choice.weightedBits)) {
         continue;
       }
-      const double splitCost =
-          startsFreeSection(bestCost, j, choice) ? 0.0
-                                                     : sectionPenaltyBits(cfg);
+      const double splitCost = startsFreeSection(bestCost, j, choice)
+          ? 0.0
+          : sectionPenaltyBits(cfg);
       const double candidate = dp[j] + choice.weightedBits + splitCost;
       if (candidate < dp[i]) {
         dp[i] = candidate;

@@ -2030,8 +2030,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
   // width it is working in.
   const auto extractSection = [&](const auto& seg) {
     const int width = seg.bitEnd - seg.bitStart + 1;
-    const uint64_t mask =
-        (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+    const uint64_t mask = subintsplit::widthMask(width);
     // Appended rather than sized and then overwritten. Sizing it first would
     // clear a buffer as long as the column, once per section, that the loop
     // below writes over completely.
@@ -2299,8 +2298,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     const auto& seg = segments[probeSection];
     const int width = seg.bitEnd - seg.bitStart + 1;
     sectionStorage[probeSection] = sectionStorageBytes(width);
-    const uint64_t mask =
-        (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+    const uint64_t mask = subintsplit::widthMask(width);
     plainEncoded[probeSection] = encodeSectionFrom(
         probeSection,
         sectionStorage[probeSection],
@@ -2330,8 +2328,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       options.subIntSplitSectionExecutor->add([&, s, width]() {
         try {
           const auto& segment = segments[s];
-          const uint64_t mask =
-              (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+          const uint64_t mask = subintsplit::widthMask(width);
           plainEncoded[s] = encodeSectionInto(
               s,
               sectionStorage[s],
@@ -2367,8 +2364,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
     const int width = seg.bitEnd - seg.bitStart + 1;
     sectionStorage[s] = sectionStorageBytes(width);
     if (candidates.empty()) {
-      const uint64_t mask =
-          (width >= 64) ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
+      const uint64_t mask = subintsplit::widthMask(width);
       plainEncoded[s] = encodeSectionFrom(
           s, sectionStorage[s], [&values, &seg, mask](uint32_t i) {
             uint64_t value = 0;
@@ -2832,12 +2828,7 @@ SubIntSplitEncoding<T>::sampleWholeValue(
   std::vector<physicalType> sample;
   std::span<const physicalType> priced = values;
   if (values.size() > 2 * kSampleBlocks * kSampleBlockRows) {
-    sample.reserve(kSampleBlocks * kSampleBlockRows);
-    const size_t stride = values.size() / kSampleBlocks;
-    for (size_t block = 0; block < kSampleBlocks; ++block) {
-      const auto first = values.begin() + block * stride;
-      sample.insert(sample.end(), first, first + kSampleBlockRows);
-    }
+    sample = sampleSpreadBlocks(values, kSampleBlocks, kSampleBlockRows);
     priced = sample;
   }
   const auto sampleStatistics = Statistics<physicalType>::create(priced);
