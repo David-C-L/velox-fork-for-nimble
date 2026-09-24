@@ -70,6 +70,33 @@ class TransformedEncodingTest : public ::testing::Test {
     return values;
   }
 
+  // Decodes `encoded` through the encoding's bulk path and checks every row.
+  template <typename Values>
+  void expectMaterializes(
+      std::string_view encoded,
+      const Values& values,
+      const Encoding::Options& options) {
+    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
+        *pool_, encoded, nullptr, options);
+    std::vector<uint64_t> decoded(values.size());
+    encoding->materialize(values.size(), decoded.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(decoded[i], values[i]) << "row " << i;
+    }
+  }
+
+  // Reads `encoded` through the view's bulk read and checks every row.
+  template <typename Values>
+  static void expectViewReads(
+      const SubIntSplitEncodingView<uint64_t>& view,
+      const Values& values) {
+    std::vector<uint64_t> bulk(values.size());
+    view.read(0, values.size(), bulk.data());
+    for (size_t i = 0; i < values.size(); ++i) {
+      ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
+    }
+  }
+
   std::shared_ptr<velox::memory::MemoryPool> pool_;
 };
 
@@ -100,17 +127,8 @@ TEST_F(TransformedEncodingTest, roundTripsThroughTheEncoding) {
     subintsplit::TransformInfo info;
     subintsplit::parseSections(encoded, Encoding::kPrefixSize, &info);
     ASSERT_TRUE(info.anyTransform()) << toString(id) << " was not applied";
-
-    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-        *pool_, encoded, nullptr, options);
-    Vector<uint64_t> decoded{pool_.get()};
-    decoded.resize(values.size());
-    encoding->materialize(values.size(), decoded.data());
-
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(decoded[i], values[i])
-          << toString(id) << " differs at row " << i;
-    }
+    SCOPED_TRACE(toString(id));
+    expectMaterializes(encoded, values, options);
   }
 }
 
@@ -243,14 +261,7 @@ TEST_F(TransformedEncodingTest, neverTransformsTheKeySection) {
           << "no section was keyed, so none should be held back as a key";
     }
 
-    Vector<uint64_t> decoded{pool_.get()};
-    decoded.resize(values.size());
-    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-        *pool_, encoded, nullptr, options);
-    encoding->materialize(values.size(), decoded.data());
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(decoded[i], values[i]) << "differs at row " << i;
-    }
+    expectMaterializes(encoded, values, options);
   }
 }
 
@@ -325,13 +336,8 @@ TEST_F(TransformedEncodingTest, neverChoosesATransformThatCosts) {
         << toString(id) << " was applied where it did not pay";
 
     // Whatever it chose still has to read back.
-    auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-        *pool_, offered, nullptr, options);
-    std::vector<uint64_t> decoded(values.size());
-    encoding->materialize(values.size(), decoded.data());
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_EQ(decoded[i], values[i]) << toString(id) << " at row " << i;
-    }
+    SCOPED_TRACE(toString(id));
+    expectMaterializes(offered, values, options);
   }
 }
 
@@ -354,13 +360,7 @@ TEST_F(TransformedEncodingTest, autoSelectionNeverCostsMoreThanNoTransform) {
 
   EXPECT_LE(chosen.size(), plain.size());
 
-  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-      *pool_, chosen, nullptr, options);
-  std::vector<uint64_t> decoded(values.size());
-  encoding->materialize(values.size(), decoded.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(decoded[i], values[i]) << "row " << i;
-  }
+  expectMaterializes(chosen, values, options);
 }
 
 // Sections encoded concurrently are the sections encoded one after another:
@@ -458,13 +458,7 @@ TEST_F(TransformedEncodingTest, keySearchReturnsOneOfTheAttemptsItPriced) {
       subintsplit::parseSections(searched, Encoding::kPrefixSize, &info);
   ASSERT_GT(sections.size(), 1u) << "a key search needs more than one section";
 
-  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-      *pool_, searched, nullptr, searchOptions);
-  std::vector<uint64_t> decoded(values.size());
-  encoding->materialize(values.size(), decoded.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(decoded[i], values[i]) << "row " << i;
-  }
+  expectMaterializes(searched, values, searchOptions);
 
   bool matchedSomeCandidate = false;
   for (uint8_t candidate = 0; candidate < sections.size(); ++candidate) {
@@ -501,11 +495,7 @@ TEST_F(TransformedEncodingTest, keyDerivedProbesAgreeWithAFullDecode) {
   ASSERT_TRUE(info.anyTransform()) << "KeyDerived was not applied";
 
   SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
-  std::vector<uint64_t> bulk(values.size());
-  view.read(0, values.size(), bulk.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
-  }
+  expectViewReads(view, values);
   // Probed out of order, so a map that only worked when walked forwards would
   // be caught.
   for (uint32_t i = 8999; i < values.size(); i -= 331) {
@@ -610,22 +600,11 @@ TEST_F(TransformedEncodingTest, permutesNarrowSectionsToo) {
   ASSERT_TRUE(info.anyTransform()) << "KeyDerived was not applied";
 
   SubIntSplitEncodingView<uint64_t> view{encoded, pool_.get(), options};
-  std::vector<uint64_t> bulk(values.size());
-  view.read(0, values.size(), bulk.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(bulk[i], values[i]) << "bulk row " << i;
-  }
+  expectViewReads(view, values);
   for (uint32_t i = 0; i < values.size(); i += 97) {
     ASSERT_EQ(view.readAt(i), values[i]) << "probe row " << i;
   }
-
-  auto encoding = std::make_unique<SubIntSplitEncoding<uint64_t>>(
-      *pool_, encoded, nullptr, options);
-  std::vector<uint64_t> sequential(values.size());
-  encoding->materialize(values.size(), sequential.data());
-  for (size_t i = 0; i < values.size(); ++i) {
-    ASSERT_EQ(sequential[i], values[i]) << "sequential row " << i;
-  }
+  expectMaterializes(encoded, values, options);
 }
 
 // A retired transform id must be refused by every reader rather than decoded
@@ -776,10 +755,9 @@ TEST_F(
   alignas(ViewType) unsigned char storage[sizeof(ViewType)];
 
   auto* viewA = new (storage) ViewType(encodedA, pool_.get(), optionsA);
-  std::vector<uint64_t> bulkA(valuesA.size());
-  viewA->read(0, valuesA.size(), bulkA.data());
-  for (size_t i = 0; i < valuesA.size(); ++i) {
-    ASSERT_EQ(bulkA[i], valuesA[i]) << "stream A row " << i;
+  {
+    SCOPED_TRACE("stream A");
+    expectViewReads(*viewA, valuesA);
   }
   const void* addressA = static_cast<void*>(viewA);
   viewA->~ViewType();
@@ -792,10 +770,9 @@ TEST_F(
   ASSERT_EQ(static_cast<void*>(viewB), addressA)
       << "test precondition: placement-new must reuse the same address, or "
       << "this test exercises nothing";
-  std::vector<uint64_t> bulkB(valuesB.size());
-  viewB->read(0, valuesB.size(), bulkB.data());
-  for (size_t i = 0; i < valuesB.size(); ++i) {
-    ASSERT_EQ(bulkB[i], valuesB[i]) << "stream B row " << i;
+  {
+    SCOPED_TRACE("stream B");
+    expectViewReads(*viewB, valuesB);
   }
   viewB->~ViewType();
 }
