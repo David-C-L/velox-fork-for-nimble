@@ -25,12 +25,12 @@
 #include <optional>
 #include <utility>
 
-#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
 #include "velox/dwio/nimble/encodings/SubIntSplitEncoding.h"
-#include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSelectionPolicy.h"
 #include "velox/dwio/nimble/encodings/selection/EncodingSizeEstimation.h"
 #include "velox/dwio/nimble/encodings/selection/Statistics.h"
+#include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
+#include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
 
 namespace facebook::nimble::subintsplit {
 namespace {
@@ -331,8 +331,7 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
     const SelectorConfig& selectorConfig,
     const Encoding::Options& options) {
   SamplerConfig samplerConfig = defaultSamplerConfig();
-  samplerConfig.maxSamples =
-      std::max<size_t>(options.subIntSplitHybridRescoreSamples, 1);
+  samplerConfig.maxSamples = kHybridRescoreSamples;
   std::vector<uint64_t> samples;
   sampleIntoU64<PhysicalType>(values, samples, samplerConfig);
   if (samples.empty() || shortlist.empty()) {

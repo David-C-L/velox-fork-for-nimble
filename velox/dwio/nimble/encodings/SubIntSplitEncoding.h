@@ -466,18 +466,6 @@ class SubIntSplitEncoding
   // path (decodeTransformBlock's assembly loop, not invert()), reused across
   // sections and blocks.
   std::vector<uint32_t> fusedCursor_;
-  // Fix 4, only when fix A is off: per-section key-run bookkeeping the fused
-  // accumulate path builds itself, reused across calls purely for capacity.
-  subintsplit::KeyRunState fusedKeyRunState_;
-
-  // Runtime switches for the four assembly-path optimisations under
-  // measurement (see Encoding::Options for what each does). All default
-  // true; production always wants every one. Checked once per block, never
-  // per row, so flipping them costs nothing measurable on its own.
-  bool optReuseKeyRuns_{true};
-  bool optReuseScratch_{true};
-  bool optFuseInvertAssembly_{true};
-  bool optAssembleDirect_{true};
 
   // Decodes a stream whose sections carry a transform, out of whole blocks.
   void materializeTransformed(uint32_t rowCount, physicalType* output);
@@ -658,13 +646,6 @@ SubIntSplitEncoding<T>::SubIntSplitEncoding(
     passThrough_ = only.bitStart == 0 &&
         only.storageBytes == sizeof(physicalType) && only.mask == kFullMask;
   }
-
-  // Fixed for the stream's life, since Options never changes after
-  // construction; see Encoding::Options for what each switch does.
-  optReuseKeyRuns_ = options.subIntSplitReuseKeyRuns;
-  optReuseScratch_ = options.subIntSplitReuseScratch;
-  optFuseInvertAssembly_ = options.subIntSplitFuseInvertAssembly;
-  optAssembleDirect_ = options.subIntSplitAssembleDirect;
 }
 
 template <typename T>
@@ -1125,8 +1106,7 @@ void SubIntSplitEncoding<T>::materializeTransformed(
     // A read that starts mid-block, or does not consume the block fully,
     // still goes through blockCache_ exactly as before, which is what keeps
     // partial reads and point probes unaffected.
-    if (optAssembleDirect_ && wantsWholeSpan && from == 0 &&
-        rowCount - produced >= blockCount) {
+    if (wantsWholeSpan && from == 0 && rowCount - produced >= blockCount) {
       decodeTransformBlock(blockStart, blockSize, output + produced);
       produced += blockCount;
       continue;
@@ -1257,12 +1237,9 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
 
   // Fix A: build the key's run bookkeeping once, here, when at least one
   // section in this block is actually keyed on it, and share it with every
-  // such section's invert() through TransformContext instead of letting each
-  // one rebuild it. Skipped (haveSharedKeyRunState stays false) when the
-  // switch is off, in which case invert() rebuilds it itself, exactly as
-  // before either fix existed.
+  // such section instead of letting each one rebuild it.
   bool haveSharedKeyRunState = false;
-  if (optReuseKeyRuns_ && !keySpan.empty()) {
+  if (!keySpan.empty()) {
     for (size_t s = 0; s < sections_.size(); ++s) {
       const uint8_t id = transformInfo_.transformIds[s];
       if (id != 0 &&
@@ -1286,8 +1263,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     const auto* transform = subintsplit::transformForRaw(id);
     // Fix 4: a key-derived section is inverted inline in the assembly loop
     // below instead of through invert(), so it is skipped here.
-    if (optFuseInvertAssembly_ &&
-        transform->id() == subintsplit::TransformId::KeyDerived) {
+    if (transform->id() == subintsplit::TransformId::KeyDerived) {
       continue;
     }
     subintsplit::TransformState state;
@@ -1305,9 +1281,7 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
       context.keyRunSortedRank = keyRunState_.sortedRank;
       context.keyRunStart = keyRunState_.runStart;
     }
-    if (optReuseScratch_) {
-      context.keyDerivedScratch = &keyDerivedScratch_;
-    }
+    context.keyDerivedScratch = &keyDerivedScratch_;
     transform->invert(sectionScratch_[s], context, state);
   }
 
@@ -1339,20 +1313,18 @@ void SubIntSplitEncoding<T>::decodeTransformBlock(
     // pass, instead of invert() merging into a temporary buffer that
     // accumulateSection would otherwise read right back out of
     // sectionScratch_.
-    if (optFuseInvertAssembly_ && id != 0 &&
+    if (id != 0 &&
         subintsplit::transformForRaw(id)->id() ==
             subintsplit::TransformId::KeyDerived) {
-      const subintsplit::KeyRunState* runState;
-      if (haveSharedKeyRunState) {
-        runState = &keyRunState_;
-      } else {
-        subintsplit::buildKeyRunState(keySpan, fusedKeyRunState_);
-        runState = &fusedKeyRunState_;
-      }
-      fusedCursor_.assign(runState->runStart.begin(), runState->runStart.end());
+      // A key-derived section is only ever written beside a key section.
+      NIMBLE_CHECK(
+          haveSharedKeyRunState,
+          "SubIntSplit key-derived section has no key section.");
+      fusedCursor_.assign(
+          keyRunState_.runStart.begin(), keyRunState_.runStart.end());
       const uint64_t* src = sectionScratch_[s].data();
-      const uint32_t* runOfRow = runState->runOfRow.data();
-      const uint32_t* sortedRank = runState->sortedRank.data();
+      const uint32_t* runOfRow = keyRunState_.runOfRow.data();
+      const uint32_t* sortedRank = keyRunState_.sortedRank.data();
       uint32_t* cursor = fusedCursor_.data();
       if (isFirst) {
         for (uint32_t i = 0; i < blockCount; ++i) {
@@ -2137,7 +2109,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
                   planning->grid,
                   kBits,
                   selectorConfig,
-                  options.subIntSplitHybridShortlist,
+                  subintsplit::kHybridShortlist,
                   cuts)
             : subintsplit::shortlistSplitsRestricted(
                   sampleBuf,
@@ -2145,7 +2117,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
                   valueCount,
                   options.subIntSplitAllowedEncodings,
                   selectorConfig,
-                  options.subIntSplitHybridShortlist,
+                  subintsplit::kHybridShortlist,
                   cuts);
         auto refined =
             subintsplit::SubIntSplitPlanRefiner::refine<physicalType>(

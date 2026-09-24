@@ -46,8 +46,9 @@ namespace facebook::nimble::mlidc {
 
 /// Overrides the upstream SubIntSplit switches named in `features`, a
 /// comma-separated list where a name sets its switch on and no-<name> sets it
-/// off, so one driver run can measure each against the library default. Throws on a name it does not know, rather than measuring a run
-/// that silently left the feature off.
+/// off, so one driver run can measure each against the library default. Throws
+/// on a name it does not know, rather than measuring a run that silently left
+/// the feature off.
 inline void applyUpstreamFeatures(
     std::string_view features,
     Encoding::Options& options) {
@@ -262,14 +263,6 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
     std::string_view driver,
     const std::string& dataset) {
   facebook::nimble::Encoding::Options options;
-  // The four assembly-path switches apply uniformly to every arm's decode
-  // side: each EncoderEntry::factory either forwards `options` unchanged or
-  // copies it before overriding unrelated fields, so setting them here once
-  // reaches every arm without threading them through every factory.
-  options.subIntSplitReuseKeyRuns = FLAGS_mlidc_reuse_key_runs;
-  options.subIntSplitReuseScratch = FLAGS_mlidc_reuse_scratch;
-  options.subIntSplitFuseInvertAssembly = FLAGS_mlidc_fuse_invert_assembly;
-  options.subIntSplitAssembleDirect = FLAGS_mlidc_assemble_direct;
   // Withdraws FrequencyPartition from the encodings the split planner may
   // cost a section against, leaving every other candidate in place. False,
   // the default, is production behaviour. Withdrawing an encoding moves the

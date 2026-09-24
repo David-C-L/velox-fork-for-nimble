@@ -382,13 +382,13 @@ class Encoding {
     /// The DP prices ranges with cost models that, measured against whole-
     /// column encodes, name the cheapest encoding for a range about a fifth of
     /// the time. The hybrid planner keeps the DP as a cheap shortlister: it
-    /// takes the subIntSplitHybridShortlist cheapest plans, plus plans cut only
+    /// takes subintsplit::kHybridShortlist cheapest plans, plus plans cut only
     /// at the bit-flip profile's gradient boundaries and the DP's own plan,
     /// re-prices only the ranges those plans use with the estimators section
-    /// selection itself uses, on subIntSplitHybridRescoreSamples rows, and then
-    /// refines the winner by moving, merging and splitting boundaries under the
-    /// same pricing. Decode weighting and subIntSplitMaxSizeRegression apply to
-    /// the re-priced plans.
+    /// selection itself uses, on subintsplit::kHybridRescoreSamples rows, and
+    /// then refines the winner by moving, merging and splitting boundaries
+    /// under the same pricing. Decode weighting and
+    /// subIntSplitMaxSizeRegression apply to the re-priced plans.
     ///
     /// Off by default. On seven ID columns it stored every column in no more
     /// bytes than the DP's plan and up to 18% fewer, for roughly twice the
@@ -500,17 +500,6 @@ class Encoding {
     /// On for a writer that expects mostly negatives, where skipping a 7.2 ms
     /// DP per column is what the gate is for.
     bool subIntSplitEstimateBitFlipScreen{false};
-
-    /// How many of the split DP's cheapest plans the hybrid planner re-prices,
-    /// and separately how many bit-flip-restricted plans. Only read when
-    /// subIntSplitHybridPlanner is set.
-    uint32_t subIntSplitHybridShortlist{8};
-
-    /// Rows sampled to re-price the hybrid planner's shortlisted ranges. Only
-    /// the ranges in shortlisted plans and refinement moves are priced at this
-    /// size, which is what keeps a larger sample affordable. Only read when
-    /// subIntSplitHybridPlanner is set.
-    uint32_t subIntSplitHybridRescoreSamples{16'384};
 
     /// Rows a stream's costly candidates are first priced on, before selection
     /// decides whether to price them on the whole stream. Zero, the default,
@@ -654,31 +643,6 @@ class Encoding {
 
     /// Per-column decoding statistics for timing decompression.
     velox::dwio::common::DecodingStats* decodingStats = nullptr;
-
-    /// Computes a key-derived transform's run ids, run values, sorted run
-    /// order, and per-run start offsets once per block and shares them across
-    /// every section keyed on that block's key, instead of each section's
-    /// invert() rebuilding them from scratch. Default true; false reproduces
-    /// the per-section rebuild for the assembly ablation.
-    bool subIntSplitReuseKeyRuns = true;
-
-    /// Reuses scratch buffers for KeyDerivedTransform::invert across blocks
-    /// instead of allocating them per call. Default true; false reproduces
-    /// the per-call allocation for the assembly ablation.
-    bool subIntSplitReuseScratch = true;
-
-    /// Fuses a key-derived section's invert() into assembly: instead of
-    /// merging into a temporary buffer, copying it back into the section's
-    /// values, and letting assembly read them again, the merge reads and the
-    /// output OR happen in the same pass. Default true; false keeps the
-    /// merge-then-assemble path for the assembly ablation.
-    bool subIntSplitFuseInvertAssembly = true;
-
-    /// Assembles a whole-block bulk read directly into the caller's output
-    /// buffer, skipping the copy out of blockCache_. Partial reads and point
-    /// probes are unaffected: they still populate and read blockCache_ as
-    /// before. Default true; false keeps the copy for the assembly ablation.
-    bool subIntSplitAssembleDirect = true;
 
     /// Direct alphabet for SharedDictionary encodings when the read path has
     /// already resolved the dictionary bound to this value stream.

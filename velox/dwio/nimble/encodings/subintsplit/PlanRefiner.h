@@ -18,10 +18,19 @@
 #include <span>
 #include <vector>
 
-#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 #include "velox/dwio/nimble/encodings/common/Encoding.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 
 namespace facebook::nimble::subintsplit {
+
+/// How many of the split DP's cheapest plans the hybrid planner re-prices,
+/// and separately how many bit-flip-restricted plans.
+inline constexpr uint32_t kHybridShortlist{8};
+
+/// Rows sampled to re-price the hybrid planner's shortlisted ranges. Only the
+/// ranges in shortlisted plans and refinement moves are priced at this size,
+/// which is what keeps a larger sample affordable.
+inline constexpr uint32_t kHybridRescoreSamples{16'384};
 
 /// A split plan the hybrid planner settled on, with the re-priced totals it
 /// was chosen on, both in bits for the full stream.
