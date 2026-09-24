@@ -92,9 +92,8 @@ int runBenchmark() {
     return 1;
   }
 
-  // An explicit ladder overrides the generated axis. Kept as an override
-  // rather than a new default so that a run without the flags reproduces every
-  // earlier sweep exactly.
+  // An explicit ladder overrides the generated axis, kept as an override
+  // rather than a new default so a run without the flags stays reproducible.
   const auto parseDoubles = [](const std::string& text) {
     std::vector<double> out;
     std::stringstream ss(text);

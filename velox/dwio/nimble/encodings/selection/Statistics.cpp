@@ -31,13 +31,12 @@ namespace {
 
 constexpr uint32_t kMaxDenseRangeSize{4096};
 
-// Ranges below this are counted with a table where the stream has enough rows
-// to amortise clearing and scanning it, which covers every long 16-bit stream.
+// Ranges below this are counted with a table, amortising the cost of
+// clearing and scanning it.
 constexpr uint64_t kMaxTableRangeSize{65'536};
 
-// Distinct values past which counting abandons the hash map for a sort. The
-// map stays within L2 up to here, which is where hashing each row is still
-// cheaper than a radix pass over all of them.
+// Distinct values past which counting abandons the hash map for a sort,
+// since the map no longer fits in L2 cache above this point.
 constexpr size_t kMaxHashDistinctCount{16'384};
 
 template <typename T, typename InputType>
@@ -90,8 +89,8 @@ MapType<T, InputType> populateHashUniqueCounts(
 template <typename T>
 using SortedType = typename UniqueValueCounts<T, T>::SortedType;
 
-// Counts over [minValue, minValue + rangeSize) with a table indexed by offset,
-// which emits the entries already in value order.
+// Counts over [minValue, minValue + rangeSize) with a table indexed by
+// offset, emitting entries already in value order.
 template <typename T>
 SortedType<T> populateRangeUniqueCounts(
     std::span<const T> values,
@@ -104,9 +103,7 @@ SortedType<T> populateRangeUniqueCounts(
   }
 
   std::vector<uint64_t> counts(rangeSize);
-  // Rows are spread over four tables in turn wherever they fit in cache and in
-  // 32-bit counts. A stream of few distinct values increments the same counter
-  // on consecutive rows, and a single table serialises those increments
+  // Four tables avoid serialising consecutive increments to the same counter
   // through store forwarding.
   const size_t numValues = values.size();
   if (rangeSize <= kMaxDenseRangeSize &&
@@ -151,11 +148,9 @@ SortedType<T> populateRangeUniqueCounts(
   return uniqueCounts;
 }
 
-// Counts by sorting a copy of the values. A hash map spends a cache miss per
-// distinct value once it outgrows the cache, and on a near-unique stream of a
-// million rows that is most of what building Statistics costs; a radix sort
-// over the offsets from min touches memory sequentially and needs only as many
-// passes as the range has bits.
+// Counts by sorting a copy of the values via a radix sort over the offsets
+// from min, avoiding the cache misses a hash map takes once it outgrows the
+// cache.
 template <typename T>
 SortedType<T>
 populateSortedUniqueCounts(std::span<const T> values, T minValue, T maxValue) {
@@ -190,10 +185,9 @@ populateSortedUniqueCounts(std::span<const T> values, T minValue, T maxValue) {
   return uniqueCounts;
 }
 
-// Hash counts while the distinct values stay few enough for the map to live in
-// cache, and returns nothing once they outgrow that, leaving the stream to the
-// sort. The prefix hashed before giving up is bounded by the limit, not by the
-// row count, on any stream whose distinct values arrive early.
+// Hash counts while the distinct values stay few enough for the map to live
+// in cache, returning nullopt once they outgrow that so the caller falls back
+// to the sort.
 template <typename T>
 std::optional<MapType<T, T>> populateBoundedHashUniqueCounts(
     std::span<const T> values,
@@ -232,28 +226,20 @@ uint64_t countTrueValues(std::span<const bool> values) {
 
 template <typename T, typename InputType>
 void Statistics<T, InputType>::populateRepeats(bool collectRunValues) const {
-  // Numbers take the run lengths in the same pass and read the repeat metrics
-  // off them. The only estimator asking a number stream for its repeats, RLE's,
-  // asks for the lengths next, which used to be a second pass over the rows;
-  // and the scalar loop below branches on every row, which mispredicts on a
-  // stream whose runs are short and irregular. Booleans keep the loop: RLE
-  // prices their lengths from the repeat metrics alone, so building the
-  // lengths would fault in a buffer nothing reads.
+  // Numbers take the run lengths in this pass rather than in a scalar loop
+  // that branches on every row. Booleans keep the loop: RLE prices their
+  // lengths from the repeat metrics alone, so building them would be wasted.
   if constexpr (!nimble::isStringType<T>() && !nimble::isBoolType<T>()) {
     if (!collectRunValues) {
       const size_t size = data_.size();
-      // Counted first, in a pass that vectorises, so that the lengths are
-      // allocated for the runs rather than for the rows: a stream of long runs
-      // would otherwise clear and fault in a row-sized buffer for a handful.
+      // Counted first, in a pass that vectorises, so lengths are allocated
+      // for the runs rather than for the rows.
       size_t transitions{0};
       for (size_t i = 1; i < size; ++i) {
         transitions += static_cast<size_t>(data_[i] != data_[i - 1]);
       }
       const size_t runs = transitions + 1;
       std::vector<uint32_t> lengths(runs);
-      // Every row is written as the end of the current run, and the run index
-      // only advances past it where the next row differs, so the ends of runs
-      // are collected without a branch. The index never passes the last run.
       size_t run{0};
       for (size_t i = 1; i < size; ++i) {
         lengths[run] = static_cast<uint32_t>(i);
@@ -411,7 +397,7 @@ void Statistics<T, InputType>::populateUniques() const {
     const T minValue = min();
     const T maxValue = max();
     // Cheapest first: a table while the range is small against the rows, a
-    // hash map while the distinct values are few, and a sort otherwise.
+    // hash map while distinct values are few, a sort otherwise.
     const uint64_t rangeDistance = integralRangeDistance(maxValue, minValue);
     if (const auto rangeSize =
             denseRangeSize(minValue, maxValue, data_.size())) {
@@ -427,13 +413,9 @@ void Statistics<T, InputType>::populateUniques() const {
               data_, minValue, static_cast<size_t>(rangeDistance) + 1));
     } else if (data_.size() <= kMaxHashDistinctCount) {
       // A stream this short can never outgrow the bounded map, so hashing
-      // would count every row into a map grown by rehashing as it fills. The
-      // split planner's refiner prices thousands of 16,384-row slices of wide
-      // bit ranges this way, most of them near-unique, and the rehashing was
-      // about a sixth of what pricing them cost. The sort is bounded by the row
-      // count whatever the cardinality. Every reader of the counts is
-      // independent of their order: MainlyConstant breaks count ties by value,
-      // Huffman sorts the frequencies, and the rest read sizes or sums.
+      // would only pay for rehashing as the map grows. The sort is bounded by
+      // the row count whatever the cardinality, and every reader of the
+      // counts is independent of their order.
       uniqueCounts_.emplace(
           std::in_place,
           populateSortedUniqueCounts<T>(data_, minValue, maxValue));
@@ -457,9 +439,8 @@ template <typename T, typename InputType>
 void Statistics<T, InputType>::populateMinMaxBlocks(uint16_t blockSize) const {
   static_assert(std::is_unsigned_v<T>);
   // Block by block rather than value by value, so the min and max of each
-  // block are two reductions over a contiguous span that the compiler can
-  // vectorise, where per-value bookkeeping of the block boundary could not be.
-  // A block size of zero never closes a block, which leaves one block.
+  // block are two reductions over a contiguous span the compiler can
+  // vectorise. A block size of zero leaves one block.
   const size_t size = data_.size();
   const size_t step = blockSize == 0 ? std::max<size_t>(size, 1) : blockSize;
   std::vector<BlockStats> blocks;
@@ -484,13 +465,9 @@ void Statistics<T, InputType>::populateMinMaxBlocks(uint16_t blockSize) const {
 template <typename T, typename InputType>
 void Statistics<T, InputType>::populateBucketCounts() const {
   using UnsignedT = typename std::make_unsigned<T>::type;
-  // Bucket k holds the offsets from min whose bit width falls in [8, 15) for
-  // k = 1, [15, 22) for k = 2 and so on in steps of 7, with bucket 0 below 8
-  // and the last bucket cut at the type's width. An offset reaches bucket k
-  // exactly when it is at least 1 << 7k, so each bucket is the difference of
-  // two threshold counts, and a threshold count is a compare-and-sum over the
-  // rows that vectorises. Counting a bit width per row cannot, and its
-  // increments into a handful of counters stall on store forwarding.
+  // Each bucket is the difference of two threshold counts, and a threshold
+  // count is a compare-and-sum over the rows that vectorises, unlike counting
+  // a bit width per row directly.
   const size_t numBuckets = sizeof(T) * 8 / 7 + 1;
   const auto base = static_cast<UnsignedT>(min());
   std::vector<uint64_t> reaching(numBuckets + 1, 0);
@@ -524,18 +501,12 @@ void Statistics<T, InputType>::populateAdjacentPairStats() const {
   static_assert(nimble::isIntegralType<T>());
   static_assert(std::is_same_v<T, InputType>);
   AdjacentPairStats stats;
-  // Compared in the unsigned physical domain, which is the domain the encodings
-  // that read this store their deltas in. A signed comparison here would report
-  // steps no delta stream can hold.
+  // Compared in the unsigned physical domain, which is the domain the
+  // encodings that read this store their deltas in; a signed comparison here
+  // would report steps no delta stream can hold.
   using unsignedType = typename std::make_unsigned<T>::type;
-  //
-  // Written so the loop vectorises, which a conditional on each step's
-  // direction prevented: the step is the larger of the pair less the smaller,
-  // both of which have vector instructions, a step rises exactly when the
-  // larger is the later value, and a falling step is masked to zero, which
-  // never exceeds a largest increase that starts at zero. On a million random
-  // rows this took 0.3 ms against 3.7 to 4.7 ms for a conditional that picked
-  // the subtraction, for every integer width but 64 bits, where it took 0.9.
+  // Written to avoid a conditional on each step's direction: a falling step
+  // is masked to zero rather than branched around.
   constexpr size_t kBlock{4'096};
   const size_t size = data_.size();
   for (size_t start = 1; start < size; start += kBlock) {
@@ -778,7 +749,6 @@ template void Statistics<std::string_view>::populateStringLength() const;
 template void Statistics<std::string_view, std::string>::populateStringLength()
     const;
 
-// populateBitFlipProfile works on integral types only
 template void Statistics<int8_t>::populateBitFlipProfile() const;
 template void Statistics<uint8_t>::populateBitFlipProfile() const;
 template void Statistics<int16_t>::populateBitFlipProfile() const;
@@ -788,7 +758,6 @@ template void Statistics<uint32_t>::populateBitFlipProfile() const;
 template void Statistics<int64_t>::populateBitFlipProfile() const;
 template void Statistics<uint64_t>::populateBitFlipProfile() const;
 
-// populateDistinctLowerBound works on integral types only
 template void Statistics<int8_t>::populateDistinctLowerBound() const;
 template void Statistics<uint8_t>::populateDistinctLowerBound() const;
 template void Statistics<int16_t>::populateDistinctLowerBound() const;
@@ -798,7 +767,6 @@ template void Statistics<uint32_t>::populateDistinctLowerBound() const;
 template void Statistics<int64_t>::populateDistinctLowerBound() const;
 template void Statistics<uint64_t>::populateDistinctLowerBound() const;
 
-// populateAdjacentPairStats works on integral types only
 template void Statistics<int8_t>::populateAdjacentPairStats() const;
 template void Statistics<uint8_t>::populateAdjacentPairStats() const;
 template void Statistics<int16_t>::populateAdjacentPairStats() const;

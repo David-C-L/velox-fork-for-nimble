@@ -31,30 +31,17 @@
 namespace facebook::nimble::subintsplit {
 
 // The decoder reproduces exactly this permutation by re-sorting the key
-// section, which is why nothing needs storing.
-//
-// Radix rather than comparison, and a stable radix over the whole key gives
-// the same permutation a stable comparison sort does, so the encoded bytes do
-// not move. What it costs is set by how wide the key is rather than by how
-// many rows there are: a key narrow enough to be worth keying on -- and this
-// transform only pays where the key groups rows, which needs few distinct
-// values -- sorts in one pass. The width is read off the keys rather than
-// taken from the section's bit range, which bounds no tighter and would have
-// to be plumbed here.
+// section, so nothing needs storing. Must be a stable sort so the encoded
+// bytes do not move under it.
 std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
-  // Appended rather than sized and then overwritten, so no row is written
-  // twice: once as a zero and once as itself.
   const auto rowCount = static_cast<uint32_t>(key.size());
   const int keyBits = significantBits(key);
   std::vector<uint32_t> order;
   order.reserve(rowCount);
 
-  // A key that fits in 32 bits travels with its row, packed above it, so each
-  // pass reads the key from the item it is moving rather than from the key
-  // section at a random row. Rows start ascending and the sort is stable, so
-  // the permutation is the one sorting row indices by key gives. On a wide key
-  // that needs several passes, the indirect read was a cache miss per row per
-  // pass and most of what a key search cost.
+  // A key that fits in 32 bits travels packed with its row above it, so each
+  // radix pass reads the key from the item being moved rather than a random
+  // row of the key section.
   if (keyBits <= 32) {
     std::vector<uint64_t> packed;
     packed.reserve(rowCount);
@@ -75,11 +62,6 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
   for (uint32_t row = 0; row < rowCount; ++row) {
     order.push_back(row);
   }
-  // Constructed per call. Keeping one between calls avoids reallocating a
-  // column-sized scratch for every candidate the key search tries, but a
-  // thread_local one measured 5.9 ms slower on a five-section column, so the
-  // reuse has to come from threading a sorter through the call rather than
-  // from storage duration.
   RadixSort<uint32_t> sorter;
   sorter.sortStable(
       std::span<uint32_t>(order),
@@ -91,14 +73,7 @@ std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key) {
 namespace {
 
 // Every element of the scratch is written before it is read, so it is
-// allocated without being cleared: a std::vector would zero a section-sized
-// buffer that the loop below overwrites in full, which is the same traffic
-// again for nothing.
-//
-// The copy back stays. Removing it would mean gathering out of the plain values
-// into a separate destination rather than permuting a copy of them in place,
-// and the transform interface has no way to say that today, so it belongs in
-// its own change rather than being smuggled into this one.
+// allocated without being cleared.
 void gather(std::span<uint64_t> values, std::span<const uint32_t> order) {
   const size_t count = values.size();
   const auto scratch = std::make_unique_for_overwrite<uint64_t[]>(count);
@@ -193,32 +168,17 @@ class KeyDerivedTransform : public SectionTransform {
       return;
     }
 
-    // The permutation this undoes is not an arbitrary one: it is a stable sort
-    // by the key, so a row sits at its key's run start plus its rank within
-    // that run. Undoing it is therefore a k-way merge -- walk the rows in
-    // order and take the next value from that row's run -- rather than a
-    // scatter. The writes come out sequential and the reads follow k cursors
-    // that only move forward, so the cost is set by how many distinct keys
-    // there are rather than by how far apart a permutation threw things.
+    // The permutation this undoes is a stable sort by the key, so a row sits
+    // at its key's run start plus its rank within that run. Undoing it is
+    // therefore a k-way merge (walk rows in order, take the next value from
+    // that row's run) rather than a scatter.
     //
-    // k is small wherever this transform pays: it pays by grouping rows, which
-    // needs the key to have far fewer values than the section has rows.
-    // Runs are numbered in one pass over the rows. The table that numbers them
-    // is a flat open-addressed one rather than a node-based map: it holds only
-    // as many entries as there are distinct keys, which is few wherever this
-    // transform pays, so it stays in cache, where a map that chases a pointer
-    // per row does not. Profiling put nearly half of all first-level read
-    // misses in this function, and they were those probes.
-    // The reader hands over dense run ids, run values, sorted run order, and
-    // per-run start offsets where a caller already built them -- shared
-    // across every section keyed on the same block's key -- through
-    // TransformContext. Rebuilding them means hashing every row and sorting
-    // the runs to recover bookkeeping that was already there, and profiling
-    // put that at a third of the instructions on one column. `given` reflects
-    // whether the caller supplied that whole bundle. The context documents
-    // each field as independently optional, and the view hands over run ids
-    // and values without sorted ranks or run starts, so run ids alone do not
-    // imply the rest: indexing an empty keyRunStart read past the end.
+    // `given` reflects whether the caller supplied the whole run-bookkeeping
+    // bundle (dense run ids, run values, sorted run order, per-run starts)
+    // through TransformContext, shared across every section keyed on the same
+    // block's key. The fields are documented as independently optional, but
+    // run ids alone do not imply the rest: indexing an empty keyRunStart
+    // would read past the end.
     KeyDerivedScratch localScratch;
     KeyDerivedScratch& scratch = context.keyDerivedScratch != nullptr
         ? *context.keyDerivedScratch
@@ -243,9 +203,8 @@ class KeyDerivedTransform : public SectionTransform {
     NIMBLE_CHECK_EQ(
         runOfRow.size(), count, "Key-derived needs one run id per row.");
 
-    // cursor starts as a copy of runStart because several sections may share
-    // the same runStart read-only, while the merge below consumes cursor by
-    // incrementing it.
+    // Copies runStart because several sections may share it read-only, while
+    // the merge below consumes cursor by incrementing it.
     scratch.cursor.assign(runStart.begin(), runStart.end());
     scratch.rows.resize(count);
     for (size_t i = 0; i < count; ++i) {
@@ -271,9 +230,7 @@ class KeyDerivedTransform : public SectionTransform {
     }
 
     // Where a row went is its run's start plus how many rows of that run came
-    // before it, so this counts rather than sorts. Sorting the rows to find
-    // out was the whole cost of a gather: profiling a gather put a stable sort
-    // of the column at the top, rebuilt every time a reader wanted the map.
+    // before it, so this counts rather than sorts.
     std::vector<uint32_t> derivedIds;
     std::vector<uint64_t> derivedValues;
     const bool given = !context.keyRunIds.empty();
@@ -333,15 +290,12 @@ class KeyDerivedTransform : public SectionTransform {
 };
 
 // The row frame as a transform. A column whose values climb by a steady step
-// per row, such as pre/post-order ids, spends its high bits on that climb;
-// subtracting the line leaves residuals whose sections are narrow. Every row
-// stays addressable, since the inverse is one multiply-add by the row index,
-// which is what admits it alongside the other in-place transforms.
+// per row spends its high bits on that climb; subtracting the line leaves
+// residuals whose sections are narrow. Every row stays addressable, since the
+// inverse is one multiply-add by the row index.
 //
 // apply() fits the line when the state carries none and leaves the values
-// untouched when nothing fits, so an empty codebook means not applied. The
-// fit is the one subintsplit/RowFrame.h has always run, so streams keep their
-// bytes and their header.
+// untouched when nothing fits, so an empty codebook means not applied.
 class RowFrameTransform : public SectionTransform {
  public:
   TransformId id() const override {

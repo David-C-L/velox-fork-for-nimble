@@ -96,9 +96,8 @@ class DictionaryEncoding
       const Encoding::Options& options = {});
 
   /// Dictionary's price for `rowCount` rows holding `uniqueCount` distinct
-  /// integers in [minValue, maxValue], which is everything the integer price
-  /// reads. It never falls as uniqueCount rises, so a lower bound on the
-  /// distinct count prices a lower bound on the encoding.
+  /// integers in [minValue, maxValue]. Monotonic in uniqueCount, so a lower
+  /// bound on the distinct count prices a lower bound on the encoding.
   static uint64_t estimateIntegralSize(
       uint64_t rowCount,
       uint64_t uniqueCount,

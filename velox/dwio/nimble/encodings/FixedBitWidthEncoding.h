@@ -129,22 +129,12 @@ class FixedBitWidthEncoding final
   static constexpr int kPrefixSize = 2 + sizeof(T);
 
   // Bytes the packed payload occupies in the stream, which is what
-  // FixedBitArray::bufferSize reserves and what encode() writes.
-  //
-  // CHANGES SELECTION. This used to return nbytes(bitWidth * count) and omit
-  // the seven bytes bufferSize adds so that decoding can read whole machine
-  // words past the last value. encode() reserves that slop in the serialized
-  // encoding, so it is part of the size, and leaving it out made this estimate
-  // smaller than the encoding it estimates -- always, by exactly seven bytes.
-  //
-  // The case for adding them is selection stability on small nodes, not
-  // compression. On a whole column seven bytes is nothing: measured across
-  // twelve column and order pairs it moved compression by 0.002%, which is why
-  // this was shelved when it was first found. A per-node audit changed the
-  // case. On the 13-to-31-byte metadata streams inside an encoding tree it is a
-  // 29% to 70% error, and those are the streams read on every access, where the
-  // size term is too small to separate candidates and a wrong estimate picks
-  // near-arbitrarily among encodings with very different decode costs.
+  // FixedBitArray::bufferSize reserves and what encode() writes, including
+  // the slop bytes bufferSize adds so decoding can read whole machine words
+  // past the last value. Omitting that slop understates the size on small
+  // streams, where the estimate is too small to separate candidates and a
+  // wrong estimate can pick among encodings with very different decode
+  // costs.
   static uint64_t bitPackedBytes(
       uint64_t minValue,
       uint64_t maxValue,

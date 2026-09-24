@@ -327,17 +327,10 @@ typename HuffmanEncoding<T>::physicalType HuffmanEncoding<T>::decodeValue(
   NIMBLE_UNREACHABLE("Invalid Huffman row {}", row);
 }
 
-// Decodes the run in one forward pass over the bitstream.
-//
-// decodeValue replays from the nearest checkpoint on every call, so asking it
-// for a whole run re-decoded the same prefix once per row: with a stride of
-// kCheckpointStride that is ~128 redundant symbol decodes per row. Codes are
-// variable length, so a row's bit offset genuinely is only reachable by
-// decoding forward -- but only once, not once per row. The replay to the
-// starting row is still paid, bounded by the stride and charged per call.
-//
-// decodeValue is left as it is: it remains the point path, where there is no
-// preceding row to carry a bit offset from.
+// Decodes the run in one forward pass over the bitstream, rather than calling
+// decodeValue per row: codes are variable length, so a row's bit offset is
+// only reachable by decoding forward from the nearest checkpoint, and doing
+// that once per row in the run would repeat the shared prefix each time.
 template <typename T>
 void HuffmanEncoding<T>::materialize(uint32_t rowCount, void* buffer) {
   NIMBLE_DCHECK_LE(currentRow_ + rowCount, this->rowCount_);
@@ -379,20 +372,16 @@ std::optional<uint64_t> HuffmanEncoding<T>::codeBits(
   const size_t symbolCount = frequencies.size();
   std::sort(frequencies.begin(), frequencies.end());
 
-  // buildCodeLengths pops its queue in (frequency, node index) order, and two
-  // sorted sequences reproduce that order exactly: the leaves, sorted by
-  // frequency just above, and the internal nodes, which Huffman creates in
-  // nondecreasing weight order and which therefore stay sorted in creation
-  // order. Every leaf index is below every internal index, so a tie across the
-  // two sequences goes to the leaf. Merging them builds the same tree with no
-  // heap and no nodes, and carrying a height alongside each weight finds the
-  // deepest code without walking a tree that no longer exists.
+  // Leaves sorted by frequency and internal nodes created in nondecreasing
+  // weight order are each already sorted, so merging the two sequences
+  // reproduces the same pop order a heap-based build would use, with ties
+  // going to the leaf. This builds the same tree with no heap and no nodes;
+  // carrying a height alongside each weight finds the deepest code without
+  // walking a tree that no longer exists.
   //
-  // The merged weights are also the answer to how long the bitstream is. A
-  // merge puts one more bit on every row underneath it, so summing the weight
-  // of each internal node counts every row's count once per node standing above
-  // it, which is sum(f * l). No tree and no per-symbol lengths are needed to
-  // total it.
+  // The merged weights also give the bitstream length directly: a merge puts
+  // one more bit on every row underneath it, so summing each internal node's
+  // weight totals sum(f * l) with no tree or per-symbol lengths needed.
   struct Subtree {
     uint64_t weight;
     uint8_t height;
@@ -443,13 +432,9 @@ std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     return std::nullopt;
   }
 
-  // Both questions left to answer -- how many bits the codes take, and whether
-  // the longest of them fits in kMaxCodeBits -- depend only on the multiset of
-  // frequencies, never on which value carries which count. Symbol identity
-  // reaches the tree solely as a tie-break between equally frequent leaves, and
-  // exchanging two equally weighted leaves moves no leaf to a different depth.
-  // So the counts Statistics is already holding answer both, and no pass over
-  // the values is needed to rebuild them.
+  // Bit count and max-depth feasibility depend only on the multiset of
+  // frequencies, not on which value carries which count, so the counts
+  // Statistics already holds are enough; no pass over the values is needed.
   std::vector<uint32_t> frequencies;
   frequencies.reserve(uniqueCounts->size());
   for (const auto& [value, count] : uniqueCounts.value()) {
@@ -457,25 +442,13 @@ std::optional<uint64_t> HuffmanEncoding<T>::estimateSize(
     frequencies.push_back(static_cast<uint32_t>(count));
   }
 
-  // CHANGES SELECTION. This used to charge Shannon lengths,
-  // count * ceil(log2(rows / count)) summed over the symbols. Those satisfy
-  // Kraft's inequality and Huffman is optimal over prefix codes, so the old
-  // number was an upper bound on what Huffman actually writes, sometimes a
-  // loose one: on {129, 64, 64} it charged 513 bits for a stream Huffman codes
-  // in 385. The estimate was therefore biased against Huffman, and selection
-  // passed over it in cases where it would have won. codeBits returns what the
-  // encoder will really write, so Huffman is priced on its own terms and gets
-  // picked more often wherever it is a candidate.
-  //
-  // SubIntSplit is no longer one of those places: its planner does not score
-  // Huffman by default any more, for reasons in
-  // Encoding::Options::subIntSplitAllowHuffman. So what this now moves is the
-  // other callers of this estimator, which is where being right is the point.
+  // codeBits returns what the encoder will really write, pricing Huffman on
+  // its own terms rather than on a Shannon-length upper bound.
   //
   // A tree deeper than kMaxCodeBits is declined unless
   // Options::huffmanPriceLengthLimited is set: encode() length-limits it
-  // rather than failing, and a length-limited code is no shorter than the
-  // Shannon lengths, so those are a sound bound to price it at.
+  // rather than failing, and the Shannon lengths are a sound bound for a
+  // length-limited code, which is never shorter.
   auto encodedBits = codeBits(frequencies);
   if (!encodedBits.has_value()) {
     if (!options.huffmanPriceLengthLimited) {

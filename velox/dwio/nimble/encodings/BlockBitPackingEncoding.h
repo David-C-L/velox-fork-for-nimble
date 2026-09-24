@@ -168,14 +168,11 @@ class BlockBitPackingEncoding final
   }
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Statistics-only overload for general encoding selection (e.g. as a
-  /// SubIntSplit segment candidate), where only `Statistics<physicalType>` --
-  /// not the raw values -- is available. Without raw values, true per-block
-  /// locality can't be observed; this approximates a "typical" per-block bit
-  /// width as the ~50%-coverage point of `statistics.bucketCounts()` (median
-  /// bit width of value - min), analogous to how PFOREncoding's
-  /// `selectBaseBitWidth` picks a 90%-coverage baseline. This is a coarser
-  /// approximation than the span-based overload above.
+  /// Statistics-only overload for callers with only `Statistics<physicalType>`,
+  /// not the raw values. Without raw values, true per-block locality can't be
+  /// observed, so this approximates a typical per-block bit width from
+  /// `statistics.bucketCounts()`; it is coarser than the span-based overload
+  /// above.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,
@@ -633,9 +630,7 @@ BlockBitPackingEncoding<T>::makeBlockInfo(
     uint32_t count) {
   auto blockValues = values.subspan(start, count);
   // Reduced by value rather than located with std::minmax_element, whose
-  // compare-and-branch per row mispredicts on unordered blocks. Only the
-  // extremes are read, never where they occur. The split planner prices every
-  // bit range of its sample this way, so this loop runs for each of them.
+  // compare-and-branch per row mispredicts on unordered blocks.
   physicalType minValue = blockValues[0];
   physicalType maxValue = minValue;
   for (const physicalType value : blockValues) {

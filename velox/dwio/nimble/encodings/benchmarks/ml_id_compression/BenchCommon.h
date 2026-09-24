@@ -100,13 +100,9 @@ namespace facebook::nimble::mlidc {
 // Per-target memory pools
 // ---------------------------------------------------------------------------
 
-// Returns a leaf pool of this target's own, so that what a target allocates is
-// attributable to it rather than pooled with every other arm in the sweep.
-//
-// benchmarks::benchmarkPool() is itself a leaf, so it cannot have children; a
-// target that shared it would report the whole sweep's allocations as its own.
-// A view's index structures are allocated here, which is what makes them
-// measured rather than estimated from bits per element.
+// Returns a leaf pool of this target's own, so allocations are attributable
+// to it rather than pooled with every other arm in the sweep. A view's index
+// structures are allocated here, so they are measured rather than estimated.
 inline std::shared_ptr<velox::memory::MemoryPool> makeTargetPool() {
   static std::atomic<size_t> nextId{0};
   return velox::memory::memoryManager()->addLeafPool(
@@ -120,11 +116,9 @@ inline std::shared_ptr<velox::memory::MemoryPool> makeTargetPool() {
 // serialised bytes in an internal Buffer together with a live Encoding object
 // ready for decode operations.
 
-/// Whether NimbleBenchTarget::encode() leaves the decoder to be built on first
-/// use. The encode driver sets it: it times encode(), and building a decoder is
-/// not part of an encode, while OpenZL's target, timed beside these, builds
-/// none. Every other driver keeps the eager build, which keeps construction out
-/// of the reads they time.
+/// Whether NimbleBenchTarget::encode() leaves the decoder to be built on
+/// first use. The encode driver sets it, so decoder construction is not
+/// charged to encode(); every other driver keeps the eager build.
 inline bool& deferDecoderConstruction() {
   static bool defer{false};
   return defer;
@@ -145,9 +139,7 @@ class NimbleBenchTarget {
     Buffer buf{*pool_};
     constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
     // The key hashes every input value and two fingerprints, so it is built
-    // only where a cache will read it. The encode driver times this call with
-    // the cache off, and hashing the column was charged to every Nimble arm's
-    // encode time and to no other target's.
+    // only where a cache will read it.
     const bool caching = !cacheDir().empty();
     const auto armId = caching ? cacheArmIdentity(options, realNestedSelection)
                                : std::string{};
@@ -284,36 +276,24 @@ struct NimbleBenchTargetBase {
 
   /// Bytes this target holds in memory to serve reads, including the encoded
   /// payload, anything decoded and kept, and any index structure built over
-  /// it.
-  ///
-  /// Pure, for the reason readPath() is: a target that quietly held a decoded
-  /// copy of the column would otherwise be compared on time alone against one
-  /// that held only compressed bytes, and the two would look like the same
-  /// deployment at very different footprints. That is exactly the error this
-  /// column exists to expose, so no target may decline to answer.
-  ///
-  /// Sampled after a workload rather than after construction: a target that
-  /// materialises lazily has no final footprint until something has read from
-  /// it.
+  /// it. Pure, so a target that quietly held a decoded copy cannot be
+  /// compared on time alone against one holding only compressed bytes.
+  /// Sampled after a workload, since lazily materialising targets have no
+  /// final footprint until something has read from them.
   virtual size_t residentBytes() const = 0;
 
   virtual std::vector<std::span<const std::byte>> internalBuffers() const = 0;
 
   /// How a partial read reaches its rows.
   ///
-  /// Pure, so every target answers and no driver has to infer it from the
-  /// arm's name. Naming a target "+view" does not make its reads indexed, and
-  /// wrapping one in an outer codec makes them whole-payload without renaming
-  /// anything.
+  /// Pure, so every target answers rather than a driver inferring it from
+  /// the arm's name.
   virtual ReadPath readPath() const = 0;
 
   /// Whether reads are served from a structure this target builds once and
-  /// then reuses: a view's indexed accessors, or a decoded buffer.
-  ///
-  /// False means every read pays the same cost, so the build cost is zero and
-  /// the per-read cost is the whole cost. That is a real answer rather than a
-  /// missing one, and an amortisation curve needs it in order to show the
-  /// flat line a cursor arm draws.
+  /// then reuses: a view's indexed accessors, or a decoded buffer. False
+  /// means every read pays the same cost, which an amortisation curve needs
+  /// in order to show the flat line a cursor arm draws.
   virtual bool buildsAccessStructure() const {
     return false;
   }
@@ -322,11 +302,9 @@ struct NimbleBenchTargetBase {
   /// Idempotent, and a no-op where there is nothing to build.
   virtual void buildAccessStructure() {}
 
-  /// Drops it, so the next read builds it again.
-  ///
-  /// Paired with buildAccessStructure() this is what lets one run report a
-  /// construction cost and a per-read cost separately, instead of a second arm
-  /// reporting the other one.
+  /// Drops it, so the next read builds it again. Paired with
+  /// buildAccessStructure() this lets one run report construction cost and
+  /// per-read cost separately.
   virtual void discardAccessStructure() {}
 
   /// Returns the encoding tree, for reporting which nested encodings a
@@ -337,10 +315,8 @@ struct NimbleBenchTargetBase {
   }
 
   /// The same tree as describe(), one node per line and keyed by path.
-  ///
   /// describe() nests children inside their parent's line, which reads well
-  /// and parses badly -- a node's position in that text depends on its
-  /// siblings, and two scripts have already misread it. See
+  /// but parses badly since a node's position depends on its siblings. See
   /// tools::getEncodingTreeLabel.
   virtual std::string describeTree() {
     return {};
@@ -395,14 +371,10 @@ struct NimbleBenchTargetImpl
     return target.residentBytes();
   }
 
-  // Usually nothing is built once and reused, and this is false. The exception
-  // is a stream that keeps a decoded span across reads, which among the
-  // encodings here means a transformed SubIntSplit plan: its first probe
-  // decodes the whole column into that cache and every probe after it copies
-  // out of it, so the arm has a one-time build however sequential its
-  // interface looks. Reporting false there would charge that decode to
-  // whichever read came first, or hide it in warmup, and leave a per-probe
-  // figure that is really the cost of a memcpy.
+  // Usually nothing is built once and reused, and this is false. The
+  // exception is a transformed SubIntSplit plan, whose first probe decodes
+  // the whole column into a cache that later probes copy out of, giving the
+  // arm a one-time build despite its sequential interface.
   bool buildsAccessStructure() const override {
     return target.retainsDecodeCache();
   }
@@ -464,13 +436,9 @@ struct NimbleBenchTargetImpl
 // NimbleViewBenchTargetImpl<EncodingT>
 // ---------------------------------------------------------------------------
 // Encodes exactly as NimbleBenchTargetImpl does, then reads through an
-// EncodingView instead of an Encoding.
-//
-// The two differ only in how a read is addressed. An Encoding carries a
-// sequential cursor, so reaching row i means traversing from wherever the
-// cursor is; a view is addressed by index. Pairing each view entry with its
-// sequential twin in the encoder list makes that the only variable between
-// them, since the encoded bytes are identical.
+// EncodingView instead of an Encoding. The two differ only in how a read is
+// addressed: sequential cursor vs. index. Pairing each view entry with its
+// sequential twin makes that the only variable between them.
 template <typename EncodingT>
 class NimbleViewBenchTargetImpl
     : public NimbleBenchTargetBase<typename EncodingT::cppDataType> {
@@ -479,11 +447,7 @@ class NimbleViewBenchTargetImpl
 
   // True for the same reason makeEncoderEntry defaults to it: a composite
   // encoding is nothing but its sub-streams, and writing them Trivial reports
-  // the encoding at its worst. This half of the pair was missed when the
-  // cursor targets were corrected, which left Dictionary/view and RLE/view at
-  // 96.000 bits per element on a 64-bit column -- exactly 1.5x raw, and read
-  // as those encodings expanding the data by half when it was the harness
-  // doing it. Their cursor twins measured 64.044 and 64.000 at the same time.
+  // the encoding at its worst.
   void encode(const Vector<T>& data, const Encoding::Options& opts) override {
     encodeWith(data, opts, /*realNestedSelection=*/true);
   }
@@ -559,9 +523,8 @@ class NimbleViewBenchTargetImpl
     view_->read(0, n, dst);
   }
 
-  // A single-row read goes through readAt rather than a length-1 range: that is
-  // the API a point lookup would actually use, and the one the point driver is
-  // meant to be measuring.
+  // A single-row read goes through readAt rather than a length-1 range: that
+  // is the API a point lookup would actually use.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
     buildAccessStructure();
     if (count == 1) {
@@ -572,10 +535,8 @@ class NimbleViewBenchTargetImpl
   }
 
   // No cursor, so no skip: each range is resolved from its own index. The
-  // whole list goes to the view in one call, the way a reader holding a
-  // selection's row ranges would pass it, so a view can plan across ranges
-  // rather than answer them one by one. That also makes it the like-for-like
-  // counterpart of a block codec that decompresses once and copies ranges out.
+  // whole list goes to the view in one call, so it can plan across ranges
+  // rather than answer them one by one.
   void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
       override {
     buildAccessStructure();
@@ -587,10 +548,8 @@ class NimbleViewBenchTargetImpl
   }
 
   // The encoded bytes plus whatever the view allocated from this target's own
-  // pool. That second term is the point of the per-target pool: a view's index
-  // structures, and the buffer a MaterializedEncodingView decodes a viewless
-  // section into, are pool-backed, so they are measured here rather than
-  // estimated from bits per element.
+  // pool: a view's index structures, and any viewless section's decode
+  // buffer, are pool-backed and so measured here rather than estimated.
   size_t residentBytes() const override {
     return encoded_.size() + static_cast<size_t>(pool_->usedBytes());
   }
@@ -653,9 +612,7 @@ struct EncoderEntry {
   bool fastSkip{false};
   bool randomAccess{false};
   // Whether a read must first decompress the entire payload is deliberately
-  // not a field here. It used to be, and --mlidc_outer_compression made it
-  // wrong: that flag wraps every arm in a whole-payload codec without any of
-  // them declaring one. Drivers ask the target through
+  // not a field here: drivers ask the target through
   // NimbleBenchTargetBase::readPath() instead.
 
   // Factory: construct a fresh target and encode the given data.
@@ -670,15 +627,9 @@ struct EncoderEntry {
 // realNestedSelection defaults to true because that is what a writer does.
 // An encoding built from sub-streams -- Dictionary's alphabet and indices,
 // RLE's values and lengths -- is nothing but those sub-streams, and with
-// selection off they are written Trivial, so the arm reports the encoding at
-// its worst rather than as anyone would ship it. It cost us a whole
-// measurement: a top-level Delta arm came back at 65.0006 bits/elem on every
-// column and every arrival order, identical and data-independent, because its
-// three children were unencoded while its own algorithm worked perfectly.
-//
-// Encodings with no sub-streams, Trivial and FixedBitWidth among them, encode
-// byte-identically either way, so this is a correction to the composite arms
-// and a no-op for the flat ones.
+// selection off they are written Trivial, reporting the encoding at its
+// worst rather than as anyone would ship it. Encodings with no sub-streams
+// encode byte-identically either way, so this is a no-op for the flat ones.
 template <typename EncodingT>
 EncoderEntry<typename EncodingT::cppDataType> makeEncoderEntry(
     std::string name,
@@ -764,9 +715,8 @@ class OuterCompressedTarget : public NimbleBenchTargetBase<T> {
   }
 
   // The compressed payload, whatever the inner target still holds, and the
-  // buffer the last read decompressed into. All three are resident at once
-  // while a read is being served, which is the footprint this deployment
-  // actually has.
+  // buffer the last read decompressed into: all three are resident at once
+  // while a read is being served.
   size_t residentBytes() const override {
     return compressed_.size() + inner_->residentBytes() +
         (lastDecompressed_ != nullptr
@@ -879,19 +829,12 @@ EncoderEntry<T> withOuterCompression(
 // Decodes the column once on the first access and serves everything after it
 // from the decoded buffer.
 //
-// A blackbox codec has no addressable interior, so OpenZLBenchTarget answers a
-// one-row probe by decompressing the column, and answers the next one by
-// decompressing it again. That is what a reader holding only the compressed
-// frame pays, and it is the honest number for that deployment. It is not the
-// only deployment. A reader that expects to come back can decompress once, keep
-// the rows, and serve the rest from memory; this decorator is that reader. It
-// is what puts a blackbox codec on the same amortisation curve as a view --
-// one build cost, a cheap per-read cost, and a break-even against the cursor
-// path somewhere between them -- instead of leaving it as a single number six
-// orders of magnitude off everything else.
-//
-// The structure is MaterializedEncodingView's, which does exactly this for a
-// section whose own encoding has no view.
+// A blackbox codec has no addressable interior, so OpenZLBenchTarget
+// decompresses the whole column on every probe. A reader that expects to
+// come back can instead decompress once and serve the rest from memory; this
+// decorator is that reader, putting a blackbox codec on the same
+// amortisation curve as a view. The structure is MaterializedEncodingView's,
+// which does exactly this for a section whose own encoding has no view.
 template <typename T>
 class MaterializingTarget : public NimbleBenchTargetBase<T> {
  public:
@@ -927,9 +870,8 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
     }
   }
 
-  // Indexed once the buffer exists, which is the claim this arm makes. What it
-  // costs to get there is the build cost, and it is reported separately rather
-  // than folded in or left out.
+  // Indexed once the buffer exists. What it costs to get there is the build
+  // cost, reported separately rather than folded in.
   ReadPath readPath() const override {
     return ReadPath::kIndexed;
   }
@@ -955,8 +897,7 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
   }
 
   /// Times the inner target has been decoded since construction.
-  /// Instrumentation for the tests that pin "decoded once, not once per read";
-  /// never read on a timed path.
+  /// Instrumentation for tests pinning "decoded once, not once per read".
   size_t numBuilds() const {
     return numBuilds_;
   }
@@ -968,10 +909,8 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
   }
 
   // What it occupies on disk is payloadSize(); what it occupies in memory is
-  // this, and for a materialised arm the two differ by a whole decoded column.
-  // Reporting only the first is what let a materialised blackbox codec look
-  // dominant on a time axis while holding more uncompressed bytes than the
-  // compressed column it was beating.
+  // this, and for a materialised arm the two differ by a whole decoded
+  // column.
   size_t residentBytes() const override {
     return inner_->residentBytes() + values_.capacity() * sizeof(T);
   }
@@ -1000,11 +939,8 @@ class MaterializingTarget : public NimbleBenchTargetBase<T> {
 };
 
 // Wraps entry's factory so its target decodes once and serves reads from the
-// decoded buffer.
-//
-// Named "+materialize" for the reason "+view" is: the pair encodes to the same
-// bytes and differs only in how a read is addressed, so the two rows are
-// comparable and the difference between them is what the one-time build buys.
+// decoded buffer. Named "+materialize" for the reason "+view" is: the pair
+// encodes to the same bytes and differs only in how a read is addressed.
 template <typename T>
 EncoderEntry<T> withMaterializedAccess(EncoderEntry<T> entry) {
   entry.name += "+materialize";
@@ -1017,8 +953,8 @@ EncoderEntry<T> withMaterializedAccess(EncoderEntry<T> entry) {
                       const Vector<T>& data, const Encoding::Options& opts) {
     auto target = std::make_unique<MaterializingTarget<T>>(
         inner(data, opts), static_cast<uint32_t>(data.size()));
-    // The inner factory has already encoded; calling encode() here would encode
-    // a second time.
+    // The inner factory has already encoded; calling encode() here would
+    // encode a second time.
     return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(target));
   };
   return entry;
@@ -1278,11 +1214,9 @@ T parseColumnValue(const std::string& line) {
 // tools and the results cross-check. That tool parses int64 only
 // (tools/encoding_bench/EncodingBench.cpp:121), so the other types are an
 // extension this suite makes alone.
-// Presents the column in the arrival order the run asked for.
-//
-// The order is applied once, to the input, before anything is encoded. Every
-// encoder then sees the same rows in the same order, so the ablation compares
-// transforms against each other on one input rather than comparing inputs.
+// Presents the column in the arrival order the run asked for. The order is
+// applied once, to the input, before anything is encoded, so every encoder
+// sees the same rows in the same order.
 template <typename T>
 Vector<T> applyInputOrder(Vector<T> data) {
   const auto order = mlidc::parseInputOrder(FLAGS_mlidc_input_order);
@@ -1297,9 +1231,8 @@ Vector<T> applyInputOrder(Vector<T> data) {
     values[i] = bits;
   }
 
-  // mergekey partitions by a field the value already carries, so the key is a
-  // real section of the real split rather than an arbitrary bit range: that is
-  // what makes the interleave undoable from a section the decoder has read.
+  // mergekey partitions by a field the value already carries, so the key is
+  // a real section of the real split rather than an arbitrary bit range.
   std::function<uint64_t(uint32_t)> keyOf = [](uint32_t) {
     return uint64_t{0};
   };
@@ -1486,29 +1419,21 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
       makeEncoderEntry<RLEEncoding<T>>(
           "RLE", "Baseline", "rle", true, true, false));
   // Top value plus exceptions: a dominant value, a boolean vector marking the
-  // rows that hold it, and a child encoding for the rest. This is the arm that
-  // corresponds to BtrBlocks' FREQUENCY64 and FastLanes' frequency, both of
-  // which store a dominant value plus a positional exception set. It was in
-  // the default candidate list (EncodingSelectionPolicy.cpp's
-  // defaultEncodingReadFactors) but had no top-level bench arm, so the
-  // cross-format comparison had an empty cell on our side for a codec we
-  // implement. FPE is not this encoding -- it partitions into frequency tiers.
+  // rows that hold it, and a child encoding for the rest. Corresponds to
+  // BtrBlocks' FREQUENCY64 and FastLanes' frequency. FPE is not this
+  // encoding -- it partitions into frequency tiers.
   encoders.push_back(
       makeEncoderEntry<MainlyConstantEncoding<T>>(
           "MainlyConstant", "Baseline", "mainly_constant", true, false, false));
   // Huffman has no top-level arm of its own, only the SIS/huffOn and huffOff
-  // planner flag, so its own decode throughput has never been measured here.
-  // The withdrawal of Huffman from SubIntSplit's nested candidates rests on a
-  // bulk decode figure, which makes that figure worth measuring directly.
+  // planner flag.
   encoders.push_back(
       makeEncoderEntry<HuffmanEncoding<T>>(
           "Huffman", "Baseline", "huffman", true, false, false));
 
-  // Read-path variants. Each encodes byte-for-byte identically to the entry it
-  // shadows and differs only in reading by index rather than by cursor, so the
-  // pair isolates what indexed access is worth. Pairs SubIntSplitEncodingView's
-  // point-lookup number against other whitebox encodings' own view-vs-no-view
-  // speedup, not just against OpenZL.
+  // Read-path variants. Each encodes byte-for-byte identically to the entry
+  // it shadows and differs only in reading by index rather than by cursor,
+  // isolating what indexed access is worth.
   {
     EncoderEntry<T> entry;
     entry.name = "RLE/view";
@@ -1613,33 +1538,22 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
-  // All four index types are carried. fpe_tagtag was dropped once on the
-  // grounds that it was "dominated on every axis it could have won on ... only
-  // mid-table on size"; that was measured before the arms encoded with real
-  // nested selection, and it is false. On Corporations/score, where frequency
-  // partitioning does real work rather than degenerating to a dictionary,
-  // TierTagArray is the cheapest correct index by 21.6%, and by 29.7% on
-  // num_employees. The earlier reading came from identifier columns where all
-  // tiers are sparse and Elias-Fano wins instead -- right about its own inputs,
-  // wrong as a generalisation.
-  //
-  // It is still not usable as a default, on speed rather than size: 7.2 Meps
-  // bulk against PerTierBitmaps' 120.3, a 16.7x gap that is the same 16.0x the
-  // old build measured, so the fixes did not move it. The cause is in
-  // materializeImpl, which is a per-row random-access loop for every indexed
-  // mode; tagtag rescans up to kRankSampleStride tags per row where a bitmap
-  // reads one superblock and a few popcounts.
+  // All four index types are carried. TierTagArray is the cheapest correct
+  // index where frequency partitioning does real work rather than
+  // degenerating to a dictionary, though it is still not usable as a default
+  // on speed: materializeImpl is a per-row random-access loop for every
+  // indexed mode, and tagtag rescans up to kRankSampleStride tags per row
+  // where a bitmap reads one superblock and a few popcounts.
   //
   // fpe_noindex is not a candidate at all. It materializes in tier-reordered
   // space -- it encodes the multiset, not the sequence -- which is why every
   // driver skips its validation. It is carried only as the floor the correct
-  // modes are paying above, and it must never enter a comparison as an option.
+  // modes are paying above, and it must never enter a comparison as an
+  // option.
   //
   // The index type is carried explicitly rather than derived from the loop
-  // position. Dropping fpe_tagtag from the names left the position-derived
-  // form silently mislabelling: index 2 is EliasFano in FreqPartIndexType but
-  // became the third surviving name, so the arm reporting itself as
-  // fpe_elias was encoding TierTagArray and EliasFano was unreachable.
+  // position, since FreqPartIndexType's own ordering does not match the
+  // surviving name list.
   const std::array<std::string, 4> fpeNames = {
       "fpe_noindex", "fpe_pertier", "fpe_tagtag", "fpe_elias"};
   const std::array<uint8_t, 4> fpeIndexType = {0, 1, 2, 3};
@@ -1661,14 +1575,10 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
           NimbleBenchTargetImpl<FrequencyPartitionEncoding<T>>>();
       Encoding::Options o = opts;
       o.frequencyPartitionIndex = indexType;
-      // Real nested selection, for the same reason the baseline arms need it:
-      // FrequencyPartition is its per-tier key arrays and tier dictionaries,
-      // and with selection off those are written Trivial at 32 bits per key
-      // and 64 bits per dictionary entry, so tiering cannot pay by
-      // construction. That is why these arms reported 96.00 bits per element
-      // on four of six columns -- a 32-bit-key dictionary, byte for byte --
-      // and why every index delta came out a structural constant independent
-      // of the data.
+      // Real nested selection, for the same reason the baseline arms need
+      // it: FrequencyPartition is its per-tier key arrays and tier
+      // dictionaries, and with selection off those are written Trivial, so
+      // tiering cannot pay by construction.
       impl->target.encode(data, o, /*realNestedSelection=*/true);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
@@ -1676,13 +1586,11 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   }
 
   {
-    // Same as FPE/fpe_tagtag, with Options::frequencyPartitionResolveTierValues
-    // set: TierTagArray resolves indices[rank] -> dictionary index into a
-    // per-tier rank -> value table at decode construction, so decode reads it
-    // directly instead of chasing dictionary[indices[rank]]. Measures the
-    // opt-in load-chain shortening against the default-off arm above; payload
-    // bytes are identical between the two, since this table is never
-    // serialised.
+    // Same as FPE/fpe_tagtag, with
+    // Options::frequencyPartitionResolveTierValues set: TierTagArray
+    // resolves indices[rank] -> dictionary index into a per-tier
+    // rank -> value table at decode construction, so decode reads it
+    // directly instead of chasing dictionary[indices[rank]].
     EncoderEntry<T> entry;
     entry.name = "FPE/fpe_tagtag_resolved";
     entry.family = "FrequencyPartition";
@@ -1726,9 +1634,9 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     // region. Where a section's encoding has no real view -- FrequencyPartition
     // and Delta are the two that matter here -- the fallback
     // MaterializedEncodingView decodes that whole section in its constructor,
-    // so those arms report a partial decode. This pair repeats them with the
-    // construction inside the measurement, which is the like-for-like number
-    // against the cursor arms.
+    // so those arms report a partial decode. This pair repeats them with
+    // construction inside the measurement, the like-for-like number against
+    // the cursor arms.
     EncoderEntry<T> entry;
     entry.name = "SIS/realNested+view+ctor";
     entry.family = "SubIntSplit";
@@ -1798,11 +1706,10 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     // Options::frequencyPartitionResolveTierValues set. SubIntSplit's
     // sectionEncodingOptions copies the caller's options, so the flag reaches
     // every section: a FrequencyPartition section then resolves
-    // indices[rank] -> dictionary index into a per-tier rank -> value table at
-    // decode construction, and the read does one load where it did two. The
-    // sections are where this path spends 78 to 88% of its time, so this is
-    // the lever the assembly work does not reach. Payload is identical to the
-    // arm above, since the table is never serialised; the cost is memory.
+    // indices[rank] -> dictionary index into a per-tier rank -> value table
+    // at decode construction, and the read does one load where it did two.
+    // Payload is identical to the arm above, since the table is never
+    // serialised; the cost is memory.
     EncoderEntry<T> entry;
     entry.name = "SIS/realNested+resolved";
     entry.family = "SubIntSplit";
@@ -1823,9 +1730,8 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
   }
 
   {
-    // The transformed counterpart of the arm above, so the same question can
-    // be asked of the key-derived path, whose sections carry the same
-    // FrequencyPartition encodings.
+    // The transformed counterpart of the arm above, asking the same question
+    // of the key-derived path.
     EncoderEntry<T> entry;
     entry.name = "SIS/key_derived+resolved";
     entry.family = "SubIntSplit";
@@ -1898,12 +1804,6 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
-  // SIS/legacyCost and SIS/legacyCost+view are dropped, together with the
-  // legacy inventory they were the only readers of. They pinned the cost
-  // models SubIntSplit scored before Delta, FOR, PFOR, Huffman, DeltaBlock,
-  // BlockBitPacking, SimdForBitpack and FrequencyPartition were added, which
-  // is a comparison nothing now proposes returning to.
-
   // One entry per transform, so the ablation is an encoder row rather than a
   // new loop in every driver: bulk, gather and point pick these up unchanged.
   {
@@ -1966,16 +1866,13 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
-  // The transform arms above each pin one transform for the whole column. This
-  // pair instead lets the encoder pick per section, which is what production
-  // would run: it is the only arm whose compression is reachable without a
-  // caller who already knows which transform the column wants. Priced against
-  // SIS/realNested, which is the same encoder with the search switched off.
+  // The transform arms above each pin one transform for the whole column.
+  // This pair instead lets the encoder pick per section, which is what
+  // production would run. Priced against SIS/realNested, the same encoder
+  // with the search switched off.
   {
     // SIS/hybrid_auto and its view take their split boundaries from the
-    // hybrid planner and then run the same per-section transform search, so
-    // against SIS/hybrid they differ only by the search and against SIS/auto
-    // only by the plan.
+    // hybrid planner and then run the same per-section transform search.
     struct AutoArm {
       const char* name;
       bool withView;
@@ -2020,17 +1917,11 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     }
   }
 
-  // Whether SubIntSplit's planner may cost a bit range as Huffman. Off is now
-  // the default, so huffOn is the arm that reproduces the older behaviour.
-  //
-  // What moves is not which encoding a section gets. Huffman cannot be one on
-  // this path: sections are selected by the policy
-  // BenchEncodingSelectionPolicy::createImpl builds, whose candidates are the
-  // default read factors, and Huffman is not among them. What moves is where
-  // the split boundaries fall, because the planner costs Huffman when it
-  // scores a bit range and the DP minimises over those costs. The sections
-  // those boundaries produce are what a read then pays for, which is how an
-  // encoding that is never read decided read speed.
+  // Whether SubIntSplit's planner may cost a bit range as Huffman. Off is
+  // now the default, so huffOn is the arm that reproduces the older
+  // behaviour. Huffman itself is never chosen for a section here; what
+  // moves is where the split boundaries fall, since the planner costs
+  // Huffman when scoring a bit range and the DP minimises over those costs.
   //
   // Names avoid commas: the --mlidc_encoders filter splits its list on them.
   {
@@ -2039,14 +1930,9 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         {static_cast<uint8_t>(subintsplit::TransformId::KeyDerived),
          "key_derived"},
     };
-    // Only huffOn. The huffOff arms encoded byte-identically to
-    // SIS/realNested in 26 of 26 cells, and huffOff/key_derived to
-    // SIS/key_derived in 26 of 26, so all four were measuring something that
-    // already had a row in the table.
-    //
-    // huffOn is kept because it is not a duplicate: it differs from
-    // realNested in 9 of 26 cells, which makes it a real ablation of what
-    // costing Huffman does to where the split boundaries fall.
+    // Only huffOn. The huffOff arms encoded byte-identically to the
+    // corresponding non-huffman arms already in the table, so only huffOn
+    // is a real ablation of what costing Huffman does to split boundaries.
     for (const bool allowHuffman : {true}) {
       for (const auto& transformArm : transformArms) {
         const uint8_t rawId = transformArm.first;
@@ -2104,11 +1990,9 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
 
   // The whitebox baselines are pure: none of their nested streams may be
   // SubIntSplit, so a baseline's bytes are that encoding's and any gain from
-  // nesting SubIntSplit is charged to SubIntSplit. The writer's own selection
-  // does nest it, and on bing_quadkey RLE reached 22.83 bits per value only
-  // through SubIntSplit run values, which read as RLE beating SubIntSplit. The
-  // "+nestedSIS" arms keep the writer's candidates for the encodings where
-  // nesting has been seen to matter, so the difference stays measurable.
+  // nesting SubIntSplit is charged to SubIntSplit. The writer's own
+  // selection does nest it, though, so the "+nestedSIS" arms keep the
+  // writer's candidates for encodings where nesting has been seen to matter.
   {
     const std::vector<std::string> pureArms{
         "Trivial",

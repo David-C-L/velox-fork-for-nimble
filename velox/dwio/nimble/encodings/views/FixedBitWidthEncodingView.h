@@ -67,13 +67,10 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
     fixedBitArray_.bulkGetWithBaseline(offset, length, output, baseline_);
   }
 
-  // A fixed-bit-width section's raw values already sit in a small dense
-  // range, [0, 2^bitWidth_), so a run id can come from a direct-mapped table
-  // translating value to id instead of hashing every row into an F14FastMap:
-  // one pass filling the table, one pass reading it. Declined past a width
-  // where that table would stop being the small-alphabet case this exists
-  // for -- a section needing more bits than that to represent its range was
-  // not chosen for having few distinct values.
+  // Raw values already sit in [0, 2^bitWidth_), so a direct-mapped table can
+  // translate value to id without hashing. Declined past
+  // kMaxDirectTableBitWidth, since a section needing that many bits was not
+  // chosen for having few distinct values.
   bool denseRunIds(
       uint32_t offset,
       uint32_t length,
@@ -85,12 +82,8 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
     }
     this->checkReadRange(offset, length);
 
-    // Raw, pre-baseline values: what the table is sized and indexed by. The
-    // baseline is folded back in only when a value's id is first assigned,
-    // to record the value a caller actually sees. Every element is
-    // overwritten below -- by the fill for bitWidth_ == 0, by
-    // bulkGetWithBaseline otherwise -- so nothing is ever read before it is
-    // written and an uninitialised allocation costs nothing here.
+    // Raw, pre-baseline values; every element is overwritten below before
+    // being read, so the uninitialised allocation is safe.
     velox::raw_vector<physicalType> raw(length);
     if (bitWidth_ == 0) {
       std::fill(raw.begin(), raw.end(), physicalType{0});
@@ -101,13 +94,8 @@ class FixedBitWidthEncodingView final : public TypedEncodingView<T> {
 
     constexpr uint32_t kUnassigned = std::numeric_limits<uint32_t>::max();
     const uint32_t alphabetSize = uint32_t{1} << bitWidth_;
-    // Load-bearing: kUnassigned is a real sentinel a lookup below tests for,
-    // not padding waiting to be overwritten, so this fill stays.
+    // kUnassigned is a sentinel tested for below, not just initial padding.
     std::vector<uint32_t> valueToId(alphabetSize, kUnassigned);
-    // Built by appending into reserved capacity rather than resizing to
-    // `length` up front: the interface fixes `ids` as std::vector<uint32_t>,
-    // and resizing it first would zero-fill every row only to have this loop
-    // overwrite every one of them again.
     ids.clear();
     ids.reserve(length);
     table.clear();

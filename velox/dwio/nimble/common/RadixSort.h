@@ -29,11 +29,8 @@
 namespace facebook::nimble {
 
 /// Bits needed to hold every one of `keys`: the smallest w for which every key
-/// is below 1 << w. Zero when every key is zero.
-///
-/// Pairs with RadixSort, whose pass count follows the width of the keys rather
-/// than the width of their type. Costs one sequential pass, which buys back
-/// more than it spends whenever the keys are narrower than their type.
+/// is below 1 << w. Zero when every key is zero. Pairs with RadixSort, whose
+/// pass count follows the width of the keys rather than their type's width.
 template <typename Key>
 int significantBits(std::span<const Key> keys) {
   static_assert(
@@ -47,30 +44,22 @@ int significantBits(std::span<const Key> keys) {
 
 /// Stable least-significant-digit radix sort, with the number of passes set by
 /// how wide the keys actually are rather than by the width of their type: a
-/// ten-bit key is one pass, not eight.
-///
-/// Stability is as much the point as the speed. A stable radix sort over the
-/// whole key produces exactly the permutation std::stable_sort produces with a
-/// less-than comparator on that key, so it substitutes for one without moving
+/// ten-bit key is one pass, not eight. Stability means it substitutes for
+/// std::stable_sort with a less-than comparator on the key, without moving
 /// any output that depends on the order.
 ///
 /// Holds its scratch buffers, so a caller that sorts repeatedly should keep an
 /// instance rather than construct one per call.
 ///
 /// TODO: SubIntSplitEncodingView::radixSortBySource does this same job for its
-/// own row type, fixed at four passes over a 32-bit index, and could adopt
-/// this. It deliberately has not yet: that header is on the decode path, where
-/// edits have moved throughput by several percent through code layout alone,
-/// so rewiring it belongs in its own change with its own decode measurement.
+/// own row type and could adopt this instead.
 template <typename Item>
 class RadixSort {
  public:
   /// Stably sorts `items` by `keyOf(item)`, which must return an unsigned
-  /// integer below 1 << keyBits. Equal keys keep their relative order. A
-  /// keyBits of zero leaves `items` untouched, every key then being equal.
-  ///
-  /// A keyBits wider than the keys really are costs passes and nothing else;
-  /// one narrower is a caller error, and sorts on the low bits.
+  /// integer below 1 << keyBits. A keyBits wider than the keys really are
+  /// costs passes and nothing else; one narrower is a caller error and sorts
+  /// on the low bits only.
   template <typename KeyFn>
   void sortStable(std::span<Item> items, KeyFn&& keyOf, int keyBits) {
     static_assert(
@@ -87,17 +76,14 @@ class RadixSort {
         size_t{std::numeric_limits<uint32_t>::max()},
         "RadixSort counts bucket offsets in 32 bits.");
 
-    // Digits are as wide as the histogram can afford. A bucket array wider
-    // than the array being sorted costs more to clear than the pass it saves,
-    // so the digit narrows toward kMinDigitBits on short inputs.
+    // Narrows toward kMinDigitBits on short inputs, since a wide bucket array
+    // costs more to clear than the pass it saves.
     int digitBits = kMaxDigitBits;
     while (digitBits > kMinDigitBits && (size_t{1} << digitBits) > count) {
       --digitBits;
     }
     const int passes = (keyBits + digitBits - 1) / digitBits;
-    // Rebalanced across the passes it turned out to need, so a nineteen-bit
-    // key is two ten-bit passes rather than a sixteen-bit pass followed by a
-    // three-bit one over the same oversized table.
+    // Rebalanced across the passes needed, avoiding an oversized final pass.
     digitBits = (keyBits + passes - 1) / passes;
     const size_t buckets = size_t{1} << digitBits;
     const uint64_t digitMask = buckets - 1;
@@ -105,10 +91,8 @@ class RadixSort {
     scratch_.resize(count);
     counts_.assign(buckets, 0u);
 
-    // Passes alternate between the caller's array and the scratch. Starting in
-    // the scratch when the pass count is odd lands the result back in the
-    // caller's array, for one copy in, which is what an odd number of passes
-    // has to pay somewhere.
+    // Starting in the scratch when the pass count is odd lands the final
+    // result back in the caller's array.
     Item* source = items.data();
     Item* destination = scratch_.data();
     if (passes % 2 == 1) {
@@ -132,8 +116,8 @@ class RadixSort {
         counts_[bucket] = offset;
         offset += bucketCount;
       }
-      // Walked forward, appending to each bucket in turn, which is what keeps
-      // equal keys in the order they arrived.
+      // Walked forward, appending to each bucket, to keep equal keys in the
+      // order they arrived.
       for (size_t i = 0; i < count; ++i) {
         const size_t digit = static_cast<size_t>(
             (static_cast<uint64_t>(keyOf(source[i])) >> shift) & digitMask);
@@ -144,12 +128,9 @@ class RadixSort {
   }
 
  private:
-  // A digit no wider than this keeps the count table at 4K entries, and with it
-  // the scatter's write positions, within cache. Sixteen-bit digits save a pass
-  // on wide keys and lose more than that to misses: sorting a million random
-  // keys on taz took 26.6 ms with 16-bit digits against 24.2 ms with this cap
-  // for 32-bit keys, 40.1 against 30.3 for 48-bit keys and 49.7 against 41.0
-  // for 64-bit keys, and was no slower at any other width or size measured.
+  // A digit no wider than this keeps the count table, and the scatter's write
+  // positions, within cache; wider digits save a pass but lose more than that
+  // to cache misses.
   static constexpr int kMaxDigitBits = 12;
   // Narrowing past this trades a pass for a table too small to be worth it on
   // any input large enough to reach for a radix sort.

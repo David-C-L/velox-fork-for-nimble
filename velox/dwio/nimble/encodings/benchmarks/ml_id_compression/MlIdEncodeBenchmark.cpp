@@ -50,16 +50,11 @@ int runBenchmark() {
   const size_t iters = static_cast<size_t>(FLAGS_mlidc_iters);
   const uint64_t seed = static_cast<uint64_t>(FLAGS_mlidc_seed);
 
-  // The encode cache is switched off here, whatever was asked for.
-  //
-  // This driver times enc.factory(), and the cache sits inside it: with a
-  // cache directory set, the first iteration would encode and store, and every
-  // iteration after it would load. measure() reports the median, so the number
-  // would be a cache read rather than an encode -- wrong, and wrong by a
-  // consistent factor across every arm, which is the hardest kind of error to
-  // notice. Refused in code rather than left to whoever writes the launcher,
-  // because the failure is silent and the flag is one every other driver wants
-  // set.
+  // The encode cache is switched off here, whatever was asked for. This
+  // driver times enc.factory(), and the cache sits inside it: with a cache
+  // directory set, later iterations would load instead of encode, silently
+  // skewing the measured median. Refused in code rather than left to
+  // whoever writes the launcher, since the failure would be silent.
   {
     std::string cacheDir;
     gflags::GetCommandLineOption("mlidc_encode_cache_dir", &cacheDir);
@@ -145,9 +140,8 @@ int runBenchmark() {
 
     for (const auto& enc : context.encoders) {
       facebook::nimble::Encoding::Options opts;
-      // Only the upstream feature switches are applied: the other sweep flags
-      // have never reached this driver, and applying them now would move every
-      // encode figure it has reported.
+      // Only the upstream feature switches are applied here; other sweep
+      // flags do not reach this driver.
       applyUpstreamFeatures(FLAGS_mlidc_sis_upstream_features, opts);
       std::unique_ptr<NimbleBenchTargetBase<Elem>> target;
 

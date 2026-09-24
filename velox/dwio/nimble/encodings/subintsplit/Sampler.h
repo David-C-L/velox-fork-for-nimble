@@ -26,20 +26,15 @@
 // Writes into a caller-supplied std::vector<uint64_t> so the allocation can
 // be reused across multiple encode() calls or DP iterations. Values are
 // stored as uint64_t (physical bit pattern, zero-extended for <64-bit types).
-//
-// Config is passed explicitly; callers obtain a default via
-// defaultSamplerConfig() and may override fields before calling.
 
 namespace facebook::nimble::subintsplit {
 
 struct SamplerConfig {
-  // Maximum number of samples to draw. The split selector runs an
-  // O(kBits^2 * sampleSize) DP over this sample (larger
-  // samples sharpen the cost estimates only marginally while making encode
-  // dramatically slower (especially for 64-bit types)).
+  // Caps the split selector's O(kBits^2 * sampleSize) DP cost; larger samples
+  // sharpen cost estimates only marginally while slowing encode a lot.
   size_t maxSamples{2'048};
-  // Contiguous block size for block-stratified sampling.
-  // 0 → use uniform stride sampling instead.
+  // Contiguous block size for block-stratified sampling; 0 selects uniform
+  // stride sampling instead.
   size_t blockSize{128};
 };
 
@@ -47,17 +42,13 @@ inline SamplerConfig defaultSamplerConfig() noexcept {
   return SamplerConfig{.maxSamples = 2'048, .blockSize = 128};
 }
 
-// Fill `out` with up to cfg.maxSamples uint64_t values drawn from `values`.
-// Block-stratified sampling (when cfg.blockSize > 0) preserves local temporal
-// structure, which is important for accurate run-length and frame-residual
-// metrics. Stride sampling (blockSize == 0) spreads samples uniformly.
-//
-// Writes directly into `out` (which is resized); no heap allocation occurs if
-// `out` already has sufficient capacity.
-// Draws the same sample as sampleIntoU64 and, when `rows` is not null, records
-// the row each sample came from alongside it. Anything positional evaluated
-// over the sample -- a row frame's prediction for a row, say -- needs those
-// rows, and the alternative is materialising the whole stream to get at them.
+// Fills `out` with up to cfg.maxSamples uint64_t values drawn from `values`,
+// resizing in place. Block-stratified sampling (cfg.blockSize > 0) preserves
+// local temporal structure, needed for accurate run-length and frame-residual
+// metrics; stride sampling spreads samples uniformly. When `rows` is not
+// null, records the row each sample came from, for callers that need to
+// evaluate something positional over the sample without materialising the
+// whole stream.
 template <typename physicalType>
 void sampleIntoU64WithRows(
     std::span<const physicalType> values,
@@ -90,7 +81,6 @@ void sampleIntoU64WithRows(
   };
 
   if (cfg.blockSize > 0) {
-    // Block-stratified: evenly-spaced contiguous windows.
     const size_t numBlocks = std::max<size_t>(1, target / cfg.blockSize);
     const size_t blockStride = std::max<size_t>(1, n / numBlocks);
     for (size_t b = 0; b < numBlocks && out.size() < target; ++b) {
@@ -101,7 +91,6 @@ void sampleIntoU64WithRows(
       }
     }
   } else {
-    // Uniform stride sampling.
     const size_t stride = std::max<size_t>(1, n / target);
     for (size_t i = 0; i < n; i += stride) {
       take(i);

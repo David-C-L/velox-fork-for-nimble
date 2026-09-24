@@ -26,35 +26,30 @@
 #include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 #include "velox/dwio/nimble/encodings/subintsplit/TopLevelPolicy.h"
 
-// Standalone SubIntSplit cost estimator for benchmarking/testing the
-// bit-flip-probability top-level policies (see subintsplit/TopLevelPolicy.h
-// for scope) against real cost. Deliberately named differently from the
-// `estimateSize()` convention every production encoding follows (e.g.
-// DictionaryEncoding<T>::estimateSize): it exists only so tests and
-// benchmarks can compute "what would SubIntSplit's real cost and the
-// policies' gate decision have been" without touching production selection
-// code.
+// Standalone SubIntSplit cost estimator for benchmarking and testing the
+// top-level policies (see TopLevelPolicy.h) against real cost, kept out of
+// production selection code and named apart from the `estimateSize()`
+// convention production encodings follow.
 
 namespace facebook::nimble::subintsplit {
 
 struct EstimatorResult {
-  // True when the variance gate predicted "worth costing SubIntSplit" (or
-  // the gate was bypassed via `applyGate = false`).
+  // Whether the variance gate predicted SubIntSplit worth costing (or the
+  // gate was bypassed via `applyGate = false`).
   bool gatePassed{false};
-  // The DP's total estimated cost in bits, only meaningful when
-  // `estimatedBytes` is set.
+  // The DP's total estimated cost in bits; meaningful only if `estimatedBytes`
+  // is set.
   double estimatedBits{0.0};
-  // ceil(estimatedBits / 8), or nullopt when the gate predicted "skip" (no
-  // DP was run) or the sample was empty.
+  // ceil(estimatedBits / 8), or nullopt if the gate skipped the DP or the
+  // sample was empty.
   std::optional<uint64_t> estimatedBytes;
-  // The bit-flip profile computed from `values`, always populated.
+  // Bit-flip profile computed from `values`, always populated.
   BitFlipProfile profile;
 };
 
 // Computes SubIntSplit's real estimated size for `values`, gated by the
-// variance policy (unless `applyGate` is false, e.g. to compute an
-// unconstrained ground-truth cost). Always runs the DP's full, unconstrained
-// grid search.
+// variance policy unless `applyGate` is false (e.g. for an unconstrained
+// ground-truth cost).
 template <typename PhysicalType>
 EstimatorResult estimateSubIntSplitSize(
     std::span<const PhysicalType> values,

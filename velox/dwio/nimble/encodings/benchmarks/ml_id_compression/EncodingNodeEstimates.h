@@ -39,33 +39,25 @@
 // What every node of an encoding tree costs, against what its selection was
 // quoted for it.
 //
-// The accuracy work on this branch measured ratios over the oracle's chosen
-// plan segments, which are top-level sections only. Nested children -- a
-// Dictionary's indices, a FOR frame index, a Delta restatement stream -- were
-// never in that population, and they are not like sections: they are short,
-// structurally regular, and often near-degenerate. An estimator can score 1.00
-// on sections and be badly wrong on them.
+// Nested children -- a Dictionary's indices, a FOR frame index, a Delta
+// restatement stream -- are not like top-level sections: they are short,
+// structurally regular, and often near-degenerate, so an estimator can score
+// well on sections and be badly wrong on them. Such an error also hides by
+// construction: on a small stream inside a multi-megabyte column, selection
+// is nearly indifferent between candidates, so a bad estimate there costs
+// almost nothing in bytes while a metadata stream that is read on every
+// access can still cost a great deal in decode.
 //
-// Such an error also hides by construction. Selection minimises size times read
-// factor, so on a five kilobyte stream inside a multi-megabyte column the
-// product is negligible either way and selection is nearly indifferent -- it
-// takes whichever estimate reads smaller. Being wrong there costs almost
-// nothing in bytes, which is why no size measurement flags it, and can cost a
-// great deal in decode, because a metadata stream is read on every access.
-//
-// The estimate is recomputed rather than captured from the writer. Logging what
-// select() computes would be cheaper still, but select() does not know where in
-// the tree it sits, so the log would have to be joined to the tree by call
-// order -- and a positional join over this format has already misread a tree
-// twice. Decoding each node and re-asking EncodingSizeEstimation costs one
-// materialize per node and is keyed by path by construction. It also needs no
-// change to the writer, so nothing is added to the encode path.
+// The estimate is recomputed rather than captured from the writer, since
+// select() does not know where in the tree it sits, so logging its result
+// would need a positional join over the tree that has proven unreliable.
+// Decoding each node and re-asking EncodingSizeEstimation is keyed by path
+// by construction and needs no change to the writer.
 namespace facebook::nimble::mlidc {
 
 // Runs `fn` instantiated on the logical type behind `dataType`. Returns false
-// for types this does not cover, which today means strings: their estimators
-// need a string buffer factory to decode against, and the columns this is for
-// have no string nodes.
+// for types this does not cover, which today means strings, since their
+// estimators need a string buffer factory to decode against.
 template <typename Fn>
 bool dispatchNodeDataType(DataType dataType, Fn&& fn) {
   switch (dataType) {
@@ -108,13 +100,8 @@ bool dispatchNodeDataType(DataType dataType, Fn&& fn) {
 }
 
 // Whether a node carries the values of its parent or the bookkeeping that
-// addresses them.
-//
-// This is the split that decides whether a bad estimate here is one bug or a
-// class of them, so it is named at the source rather than left to a script's
-// guess about what a stream called "BitOffsets" is. Keyed on the nested
-// encoding name traverseEncodings assigns, which is the encoding's own term for
-// the child.
+// addresses them. Keyed on the nested encoding name traverseEncodings
+// assigns, which is the encoding's own term for the child.
 inline std::string_view encodingNodeKind(std::string_view nestedEncodingName) {
   if (nestedEncodingName.empty()) {
     return "root";
@@ -144,22 +131,16 @@ inline std::string_view encodingNodeKind(std::string_view nestedEncodingName) {
 
 /// One line per node: what it cost, what it was quoted, and the ratio.
 ///
-/// Tab separated with a leading `#` header. `ratio` is actual over estimate on
-/// the same convention the per-encoding figures use, so above one means the
-/// node costs more than selection was told. An empty estimate means the node's
-/// type is not covered by dispatchNodeDataType, or decoding it threw.
+/// Tab separated with a leading `#` header. `ratio` is actual over estimate
+/// on the same convention the per-encoding figures use, so above one means
+/// the node costs more than selection was told. An empty estimate means the
+/// node's type is not covered by dispatchNodeDataType, or decoding it threw.
 ///
-/// `pricedWith` and `exactBits` say which options priced each node, because
-/// getting that wrong is not hypothetical here. The first run of this function
-/// priced every node under column options, while the writer prices everything
-/// below a SubIntSplit under section options, where FixedBitWidth packs at the
-/// exact bit width instead of rounding up to a byte. That inflated every
-/// estimate routed through FixedBitWidthEncoding::estimateSize -- on a two-bit
-/// stream, fourfold -- and produced an over-estimation tail that read as an
-/// estimator defect. The tell was that the estimators which never call it
-/// (DeltaBlock, SimdForBitpack, Trivial, Constant) scored exactly 1.00 at all
-/// twenty-two nodes where they appeared. A run that states its own assumptions
-/// is the cheapest guard against repeating that.
+/// `pricedWith` and `exactBits` say which options priced each node: the
+/// writer prices everything below a SubIntSplit under section options,
+/// where FixedBitWidth packs at the exact bit width instead of rounding up
+/// to a byte, and pricing a node under the wrong options silently inflates
+/// its estimate. A run that states its own assumptions guards against that.
 inline std::string describeEncodingNodeEstimates(
     std::string_view stream,
     velox::memory::MemoryPool& pool,
@@ -168,21 +149,18 @@ inline std::string describeEncodingNodeEstimates(
       "#depth\tpath\tkind\tencoding\tdataType\trows\tactual\testimate"
       "\tratio\tpricedWith\texactBits\n";
   std::vector<std::string> path;
-  // The encoding at each level of the current path, so a node can ask what its
-  // ancestors are. Truncated and pushed alongside `path`, which is sound for
-  // the same reason: the traversal is depth-first and pre-order.
+  // The encoding at each level of the current path, so a node can ask what
+  // its ancestors are. Truncated and pushed alongside `path`, since the
+  // traversal is depth-first and pre-order.
   std::vector<EncodingType> ancestry;
 
-  // Options the writer would have priced this node under.
-  //
-  // SubIntSplit is singled out because it is the one encoding that overrides
-  // its options for everything beneath it: it derives section options once and
-  // hands those to every section, and encodeNested carries them down from
-  // there, so the whole subtree is encoded under them rather than under the
-  // column's. Any other parent passes its own options through unchanged, so
-  // for every other node the column's options are what the writer used. The
-  // SubIntSplit node itself is priced under column options -- it is the
-  // column's own encoding; only what is below it is a section.
+  // Options the writer would have priced this node under. SubIntSplit is
+  // singled out because it is the one encoding that overrides its options
+  // for everything beneath it: it derives section options once and hands
+  // those to every section, so the whole subtree is encoded under them
+  // rather than under the column's. The SubIntSplit node itself is priced
+  // under column options -- it is the column's own encoding; only what is
+  // below it is a section.
   const Encoding::Options sectionOptions =
       ::facebook::nimble::subintsplit::sectionEncodingOptions(options);
   const auto optionsForNode = [&](uint32_t level) -> const Encoding::Options& {
@@ -249,12 +227,9 @@ inline std::string describeEncodingNodeEstimates(
             const auto statistics = Statistics<P>::create(span);
             // The same function selection consults, asked for the encoding
             // this node actually got, over the values it actually holds.
-            //
-            // Fully qualified on purpose. Several headers in this namespace
+            // Fully qualified on purpose: several headers in this namespace
             // declare an `mlidc::detail`, so an unqualified `detail::` here
-            // resolves to that one and never reaches nimble's -- and inside a
-            // template the failure surfaces as a parse error on the `<`,
-            // nowhere near the name that could not be found.
+            // would resolve to that one instead of nimble's.
             estimate = ::facebook::nimble::detail::EncodingSizeEstimation<
                 T>::estimateSize(encodingType, span, statistics, nodeOptions);
           } catch (...) {
@@ -288,9 +263,7 @@ inline std::string describeEncodingNodeEstimates(
         } else {
           out += "\t";
         }
-        // Which options priced this node, stated rather than assumed. The
-        // second column is the one that matters: it is the option whose
-        // default cost this instrument its first run.
+        // Which options priced this node, stated rather than assumed.
         out += folly::to<std::string>(
             "\t",
             &nodeOptions == &sectionOptions ? "section" : "column",
@@ -309,8 +282,8 @@ namespace detail {
 struct PricedEncoding {
   EncodingType encoding;
   double bytes;
-  // What selection compares, bytes times the effective read factor. Equal to
-  // bytes for the planner's models, which weigh no factor.
+  // What selection compares: bytes times the effective read factor. Equal
+  // to bytes for the planner's models, which weigh no factor.
   double cost;
 };
 
@@ -487,19 +460,16 @@ inline std::vector<PricedEncoding> sectionSelectionQuotesAt(
 } // namespace detail
 
 /// Why a SubIntSplit stream's plan looks the way it does, one line per
-/// section and one for the whole value, empty when `stream` is not SubIntSplit.
+/// section and one for the whole value, empty when `stream` is not
+/// SubIntSplit.
 ///
-/// For each section: its bits, transform and encoding, the bytes it took, the
-/// two cheapest candidates as section selection costs them (estimate times
-/// effective read factor, the comparison that chose the encoding), and the two
-/// cheapest of the split planner's models for the same bits (the prices that
-/// placed the boundaries). `all` lists every selection quote as
-/// encoding=estimate/cost. The `whole` line prices the value as one section,
-/// which is the alternative every split was chosen over; it is omitted when a
-/// transform reorders rows, since the stored sections no longer reassemble the
-/// values. Quotes are recomputed from the stored values under default options,
-/// so a stream written with a decode weight or a transform search may have
-/// been chosen on other terms.
+/// For each section: its bits, transform and encoding, the bytes it took,
+/// the two cheapest candidates as section selection costs them, and the two
+/// cheapest of the split planner's models for the same bits. `all` lists
+/// every selection quote as encoding=estimate/cost. The `whole` line prices
+/// the value as one section, the alternative every split was chosen over;
+/// it is omitted when a transform reorders rows, since the stored sections
+/// no longer reassemble the values.
 inline std::string describeSubIntSplitSectionChoices(
     std::string_view stream,
     velox::memory::MemoryPool& pool) {
@@ -528,10 +498,8 @@ inline std::string describeSubIntSplitSectionChoices(
       sis::sectionEncodingOptions(Encoding::Options{});
 
   // Which fit produced the frame, refitted on the decoded column since the
-  // stream records only the line: "line" when fitRowFrame
-  // reproduces it (a slope * row + base fitted over 1,024-row strides), "step"
-  // when fitStepFrame does (the adjacent step most rows take, base
-  // zero), "none" without a frame.
+  // stream records only the line: "line" when fitRowFrame reproduces it,
+  // "step" when fitStepFrame does, "none" without a frame.
   std::string frameKind = "none";
   if (rowFrame.active()) {
     const auto kindOf = [&]<typename P>() {

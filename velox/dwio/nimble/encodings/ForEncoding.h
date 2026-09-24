@@ -97,20 +97,10 @@ class ForEncoding final
   /// Size estimate measured over the values, walking the frames encode() will
   /// build.
   ///
-  /// CHANGES SELECTION. The statistics-only estimate below derived a frame's
-  /// local range from range / (rowCount - 1) scaled by the frame size, which
-  /// assumes values are spread evenly across [min, max] in row order. Unsorted
-  /// data does not do that, and a frame of it spans close to the whole range,
-  /// so the packed payload -- the term that dominates -- came out about half
-  /// what it costs. Measured against real encodes the quote was 1.67x under at
-  /// the median, enough for FOR to win sections it then made larger.
-  ///
   /// A frame's local range cannot be recovered from any global adjacent-pair
   /// statistic: small steps and a wide local span are compatible, and so are
   /// large steps and a narrow one. Framing is a property of the values in
-  /// position, so the only way to price it is to look. That is the shape the
-  /// evidence endorses -- the estimators that walk their data measure exactly
-  /// right, while every one that infers from a summary is at least 1.5x under.
+  /// position, so the only way to price it accurately is to look.
   static uint64_t estimateSize(
       std::span<const physicalType> values,
       const Encoding::Options& options = {}) {
@@ -177,11 +167,7 @@ class ForEncoding final
   ///
   /// Deliberately conservative: without the values there is no way to know how
   /// much a frame's local range narrows against the column's, so this assumes
-  /// it does not narrow at all. That over-states FOR on data framing would
-  /// help, which costs a candidate it might have won; the alternative is the
-  /// assumption this replaced, which under-stated it on data framing does not
-  /// help and cost the section it then inflated. An estimator that cannot
-  /// measure should decline to sell.
+  /// it does not narrow at all.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,
@@ -236,9 +222,8 @@ class ForEncoding final
         FixedBitWidthEncoding<uint64_t>::estimateSize(
             frames, /*minValue=*/0, totalBits, options));
 
-    // EncodingPrefix::kFixedPrefixSize(6) + FOR-specific fixed fields
-    // (compressionType + frameSize + numFrames + enableBitOffsets = 10), plus
-    // each of the four sub-streams' 4-byte size prefix.
+    // Fixed prefix plus FOR's own fixed fields, plus each of the four
+    // sub-streams' 4-byte size prefix.
     constexpr uint64_t kForSpecificFixedFieldsSize = 10;
     return EncodingPrefix::kFixedPrefixSize + kForSpecificFixedFieldsSize + 4 +
         bitWidthsSize + 4 + referencesSize + 4 + bitOffsetsSize + 4;
@@ -382,10 +367,7 @@ class ForEncoding final
   //
   // A frame whose values are all equal has a zero residual range and needs no
   // payload bits: the reference alone reconstructs every value. Width 0 says
-  // so, which costs the frame nothing in the packed payload and lets the
-  // decoders skip bit extraction for it entirely. Width 0 is unambiguous
-  // against streams written before this rung existed, because rounding up a
-  // non-zero range never produces it.
+  // so, letting decoders skip bit extraction for it entirely.
   static uint8_t minBitWidth(uint64_t maxValue) {
     if (maxValue == 0) {
       return 0;
@@ -401,20 +383,9 @@ class ForEncoding final
     return 64;
   }
 
-  // Prices a frame for the size estimators, which deliberately stop one rung
-  // short of what the encoder writes.
-  //
-  // minBitWidth gives a constant frame width 0 and the encoder emits it that
-  // way, but selection compares this estimate against other encodings'
-  // estimates, and FOR's is already optimistic about what FOR really
-  // produces. On the snowflake [4..11] section the estimate beat RLE while
-  // the encoded result was 184,457 bytes against RLE's 127,160. Letting the
-  // zero rung shrink the estimate as well compounds that existing error and
-  // pulls sections onto FOR that RLE encodes better, which cost more than the
-  // rung saved. Holding a constant frame at one bit leaves selection exactly
-  // where it was before the rung and errs in the direction that does not lose
-  // the section. The divergence from minBitWidth is intentional; a future
-  // change that makes the estimator accurate could remove it.
+  // Prices a frame for the size estimators one rung above minBitWidth:
+  // letting the zero-width rung shrink the estimate too would make FOR look
+  // cheaper than it decodes, biasing selection toward it.
   static uint8_t estimateBitWidth(uint64_t maxValue) {
     return std::max<uint8_t>(minBitWidth(maxValue), uint8_t{1});
   }
@@ -604,11 +575,10 @@ void ForEncoding<T>::decodeRange(
 
     // Topping the buffer up a byte at a time only keeps every bit while at
     // most 56 bits are already buffered; past that the byte's high bits are
-    // shifted out of the 64-bit buffer and lost, and a 64-bit value then also
-    // hits `bitBuffer >>= 64`, which is undefined and on x86 leaves the buffer
-    // untouched, so every later value in the frame repeats the same garbage.
-    // Values wider than 56 bits are therefore assembled from what the buffer
-    // already holds plus the low bits of the next byte.
+    // shifted out of the 64-bit buffer and lost, and a 64-bit value would also
+    // hit `bitBuffer >>= 64`, which is undefined. Values wider than 56 bits
+    // are therefore assembled from what the buffer already holds plus the low
+    // bits of the next byte.
     if (bitWidth > 56) {
       for (uint32_t i = 0; i < rowsToDecode; ++i) {
         while (bitsInBuffer <= 56 && bitsInBuffer < bitWidth) {
@@ -649,18 +619,13 @@ void ForEncoding<T>::decodeRange(
     }
   };
 
-  // Byte-aligned narrow widths (1, 2 and 4 bits) unpacked a 64-bit word at a
-  // time: 64, 32 or 16 values per load, with the shift and the mask constant,
-  // in place of decodeBitStream's per-value refill test. A fresh encode starts
-  // every frame at a multiple of 128 values, which is byte aligned at every
-  // legal bit width, so this covers every frame an encode produces at these
-  // widths. A sliced stream can start part-way through a byte and keeps the
-  // bit-stream path.
+  // Byte-aligned narrow widths (1, 2 and 4 bits) unpack a 64-bit word at a
+  // time in place of decodeBitStream's per-value refill test; a sliced stream
+  // can start part-way through a byte and keeps the bit-stream path instead.
   //
   // The last load is bounded by the end of the packed payload rather than
-  // relying on trailing slack the way FixedBitArray does: FOR's packed data is
-  // the final field of the encoding, so nothing guarantees readable bytes past
-  // it.
+  // relying on trailing slack: FOR's packed data is the final field of the
+  // encoding, so nothing guarantees readable bytes past it.
   const uint8_t* const packedDataEnd =
       reinterpret_cast<const uint8_t*>(packedData_) + header_.packedDataSize;
 
@@ -684,8 +649,6 @@ void ForEncoding<T>::decodeRange(
     }
 
     if (row < rowsToDecode) {
-      // Consuming whole words leaves the cursor byte aligned, so what is left
-      // is a byte-aligned bit stream.
       decodeBitStream(
           byteCursor,
           0,

@@ -32,12 +32,8 @@ namespace facebook::nimble {
 
 /// Each distinct value of a stream with the number of rows holding it.
 ///
-/// Held either as a hash map or as a vector sorted by value. Which one a
-/// stream gets is a cost decision made in Statistics and nothing else: the
-/// entries are the same, only the order they iterate in differs, and every
-/// consumer is indifferent to that order: MainlyConstant breaks count ties by
-/// value, and the other estimators read only the number of entries and the
-/// multiset of counts.
+/// Held either as a hash map or as a vector sorted by value, a cost decision
+/// made in Statistics; consumers are indifferent to the iteration order.
 template <typename T, typename InputType = T>
 class UniqueValueCounts {
  public:
@@ -299,10 +295,9 @@ class Statistics {
 
   /// A lower bound on the number of distinct values: the number of distinct
   /// offsets from min in their low kDistinctBoundBits bits. Exact where the
-  /// unique counts are already built, or where every offset fits in those
-  /// bits. Otherwise costs one pass and a bitmap that fits in L2, a fraction of
-  /// what counting the distinct values costs, which is what makes it worth
-  /// asking before an estimate that only needs to know the count is not small.
+  /// unique counts are already built or every offset fits in those bits;
+  /// otherwise costs one pass and an L2-sized bitmap, far cheaper than
+  /// counting the distinct values outright.
   uint64_t distinctLowerBound() const {
     static_assert(nimble::isIntegralType<T>());
     if (uniqueCounts_.has_value() && uniqueCounts_->has_value()) {
@@ -349,7 +344,6 @@ class Statistics {
     if (runLengths_.has_value()) {
       return runLengths_.value();
     }
-    // Numbers build the lengths with the repeat metrics.
     if constexpr (!nimble::isStringType<T>() && !nimble::isBoolType<T>()) {
       if (!data_.empty()) {
         populateRepeats();
@@ -379,30 +373,20 @@ class Statistics {
     uint64_t max;
   };
 
-  /// Aggregates over adjacent value pairs, in input order.
-  ///
-  /// Grouped because they come from one pass over consecutive pairs: asking
-  /// for any of them costs the same walk, so splitting them into separate
-  /// lazily-populated fields would only buy the chance to walk twice.
-  ///
-  /// Named for what it measures rather than for its first caller. Delta needs
-  /// all three, FOR's frame reasoning starts from the same pass, and anything
-  /// else reasoning about consecutive values wants exactly this shape.
+  /// Aggregates over adjacent value pairs, in input order. Grouped because
+  /// they all come from one pass over consecutive pairs.
   struct AdjacentPairStats {
     /// Pairs where the later value is not below the earlier one, i.e. steps an
     /// encoding storing non-negative deltas can represent without restating.
     uint64_t nonDecreasingCount{0};
-    /// Largest step over a non-decreasing pair. A fixed-width delta array has
-    /// to cover the widest delta it stores, so this and not the average is what
-    /// sizes one.
+    /// Largest step over a non-decreasing pair; sizes a fixed-width delta
+    /// array, which must cover the widest delta it stores.
     uint64_t maxIncrease{0};
-    /// Sum of |v[i] - v[i-1]| over every pair, from which an average step
-    /// follows for a caller that wants one.
+    /// Sum of |v[i] - v[i-1]| over every pair.
     uint64_t sumAbsoluteDelta{0};
   };
 
-  /// See AdjacentPairStats. Empty for a stream of fewer than two values, where
-  /// there are no pairs to measure.
+  /// See AdjacentPairStats. Empty for a stream of fewer than two values.
   const AdjacentPairStats& adjacentPairStats() const noexcept {
     static_assert(nimble::isIntegralType<T>());
     if (!adjacentPairStats_.has_value()) {
@@ -421,11 +405,10 @@ class Statistics {
     return minMaxBlocks_.value();
   }
 
-  /// Per-bit-position bit-flip-probability profile (XOR-count-and-divide
-  /// between consecutive values), plus its variance and discrete gradient
-  /// across bit positions. Used to cheaply predict whether a stream is
-  /// likely to contain multiple concatenated bit-field distributions (see
-  /// subintsplit/TopLevelPolicy.h for consumers and scope).
+  /// Per-bit-position bit-flip-probability profile between consecutive
+  /// values, plus its variance and discrete gradient. Used to cheaply predict
+  /// whether a stream is likely to contain multiple concatenated bit-field
+  /// distributions (see subintsplit/TopLevelPolicy.h).
   const BitFlipProfile& bitFlipProfile() const noexcept {
     static_assert(nimble::isIntegralType<T>());
     if (!bitFlipProfile_.has_value()) {
@@ -483,9 +466,8 @@ class Statistics {
 };
 
 /// Copies `numBlocks` contiguous blocks of `blockRows` rows, spread evenly
-/// over `values`, so that runs, frames and local ranges survive in the sample
-/// the way they occur in the stream. `values` must hold at least
-/// `numBlocks * blockRows` rows.
+/// over `values`, so runs, frames and local ranges survive in the sample.
+/// `values` must hold at least `numBlocks * blockRows` rows.
 template <typename T>
 std::vector<T> sampleSpreadBlocks(
     std::span<const T> values,

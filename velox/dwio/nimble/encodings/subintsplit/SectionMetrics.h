@@ -27,11 +27,8 @@
 #include "velox/common/base/SimdUtil.h"
 
 // Lightweight per-segment metric collection for SubIntSplitEncoding's DP
-// planner. Deliberately minimal: only the statistics needed by the cost
-// models are computed, with no HLL, no entropy, and no residual-frame
-// tracking. Nimble's Statistics<T> class already handles those heavier
-// computations for full-stream outer selection; this collector handles the
-// 64×64 bit-range grid on a small sample.
+// planner. Deliberately minimal, unlike Nimble's Statistics<T>, since it
+// runs over the 64x64 bit-range grid on a small sample.
 
 namespace facebook::nimble::subintsplit {
 
@@ -76,33 +73,23 @@ struct SectionMetrics {
 
   // bitWidthBuckets[i] counts values v with bit_width(v) in [7*i, 7*i+6],
   // for i in [0, 8]; bucket 9 catches bit_width(v) >= 63. Approximates
-  // PFOREncoding<T>::selectBaseBitWidth's bit_width(v - min) histogram using
-  // bit_width(v) directly (segment values are already small bit-slices, so
-  // `min` is usually close to 0). See PFOREncoding.h's selectBaseBitWidth.
+  // PFOREncoding<T>::selectBaseBitWidth's histogram directly on bit_width(v)
+  // rather than bit_width(v - min), since segment values are already small.
   std::array<uint32_t, 10> bitWidthBuckets{};
 
-  // Sum of |v[i] - v[i-1]| over consecutive pairs, and the count of pairs
-  // where v[i] >= v[i-1] (non-decreasing, i.e. encodable as a positive delta
-  // without a restatement). Used by deltaCostBits/forCostBits to estimate the
-  // average step size and the monotonic-non-decreasing fraction.
+  // Sum of |v[i] - v[i-1]| and count of non-decreasing pairs, used to
+  // estimate average step size and monotonic fraction for delta/FOR costs.
   uint64_t sumAbsDelta{0};
   size_t monotonicCount{0};
 
-  // Max of (v[i] - v[i-1]) over non-decreasing pairs only -- i.e. the largest
-  // delta DeltaEncoding would actually have to bit-pack (decreasing pairs are
-  // restated, not delta-encoded). A fixed-width packed array must be sized to
-  // this max, not the average; using the average alone underestimates the
-  // required bit width whenever the delta distribution is right-skewed.
+  // Max delta over non-decreasing pairs only, since decreasing pairs are
+  // restated rather than delta-encoded. A fixed-width packed array must be
+  // sized to this max, not the average, or a skewed distribution overflows it.
   uint64_t maxDelta{0};
 
-  // How many distinct values were seen exactly once, and exactly twice, over
-  // the rows that were actually counted (the whole segment, or the prefix
-  // scanned before the unique cap stopped the counting).
-  //
-  // These are what lets the stream's distinct count be estimated rather than
-  // read off the sample. A value seen once suggests others like it went
-  // unseen; a value seen twice says the sample is starting to saturate. See
-  // estimatedStreamUniqueCount in subintsplit/CostModel.h, the only consumer.
+  // Distinct values seen exactly once and exactly twice, over the rows
+  // actually counted. Feeds estimatedStreamUniqueCount in CostModel.h to
+  // extrapolate the stream's distinct count from the sample.
   size_t singletonCount{0};
   size_t doubletonCount{0};
   // Rows counted into singletonCount/doubletonCount. Equal to the segment
@@ -110,12 +97,9 @@ struct SectionMetrics {
   // estimate matters most, so the two must travel together.
   size_t countedRows{0};
 
-  // Cumulative fraction of values covered by the top-1/2/4/8 most-frequent
-  // distinct values. Only valid when FrequencyTiers was requested AND
-  // uniqueCountCapped == false (i.e. uniqueCount <= kUniqueCountCap).
-  // topKCoverage[0] = fraction for top-1, [1] = top-2, [2] = top-4,
-  // [3] = top-8. Used by frequencyPartitionCostBits to estimate tier encoding
-  // gains.
+  // Cumulative coverage fraction for the top-1/2/4/8 most-frequent distinct
+  // values, valid only when FrequencyTiers was requested and
+  // uniqueCountCapped is false.
   std::array<double, 4> topKCoverage{};
 };
 
@@ -144,13 +128,8 @@ struct RangeCounts {
 };
 
 // Keeps the eight largest frequencies offered to it, descending and
-// zero-padded.
-//
-// Coverage never needs more than eight, so sorting every distinct value's
-// count does far more work than the answer requires. The zero padding is what
-// makes a short alphabet fall out on its own: summing past the end adds zeros
-// and leaves the whole segment, which is the total a sorted walk reaches by
-// running out of frequencies to add.
+// zero-padded, since coverage never needs more than eight and the zero
+// padding lets a short alphabet's coverage sum correctly past its end.
 class LargestFrequencies {
  public:
   void offer(uint32_t frequency) noexcept {
@@ -173,33 +152,21 @@ class LargestFrequencies {
   std::array<uint32_t, 8> largest_{};
 };
 
-// Single-pass metric collector for extracted bit-range values.
-// Counts unique and dominant values two ways -- a direct-indexed histogram
-// where the values are narrow enough to index, a frequency map otherwise
-// (capped at kUniqueCountCap) -- and counts runs from a running prev-value
-// comparison.
-//
-// Both counting structures are reusable members: the split selector calls
-// compute() for every bit-range in an O(kBits^2) grid, so allocating fresh
-// ones per call dominated encode time. Clearing and reusing them preserves
-// their capacity across calls and avoids that allocation churn.
+// Single-pass metric collector for extracted bit-range values. Counts unique
+// and dominant values two ways -- a direct-indexed histogram where values are
+// narrow enough to index, a frequency map otherwise (capped at
+// kUniqueCountCap). Its counting structures are reusable members so that
+// compute(), called once per bit-range in an O(kBits^2) grid, avoids
+// reallocating them each time.
 class MetricCollector {
  public:
   static constexpr size_t kUniqueCountCap = 1
       << 14; // 16K cap (lighter than full HLL)
 
   // Segments whose values fit in this many bits are counted in a
-  // direct-indexed array rather than a hash map. The table is 2^16 counters,
-  // 256KB, but a segment touches one slot per distinct value and only those
-  // are cleared again, so what stays resident is the segment's cardinality
-  // rather than the table.
-  //
-  // The split selector no longer reaches either counting path: it maintains an
-  // equality partition across its inner loop and supplies the counts through
-  // the FrequencyCounts overload below, which covers every width and costs no
-  // hashing at any of them. Both paths remain for compute()'s other callers,
-  // which hold no such partition. So neither shows in an encode profile, and
-  // that is expected rather than evidence they are dead.
+  // direct-indexed array rather than a hash map. Only touched slots are
+  // cleared afterward, so the table's resident cost tracks the segment's
+  // cardinality rather than its full size.
   static constexpr int kDirectHistogramBits = 16;
 
   // Maps bit_width(v) to a bucket index in [0, 9], grouping every 7 bits.
@@ -263,16 +230,9 @@ class MetricCollector {
 
  private:
   // The scan metrics that depend on row order beyond adjacency: extremes and
-  // the delta statistics. Integer accumulations only, so reassociating them
-  // is exact; see scanAll.
-  //
-  // Vectorised over signed 64-bit lanes, which is exact while every value is
-  // below 2^63: adjacent differences then fit in a signed word, a difference
-  // is non-negative exactly when the pair rises, and signed and unsigned
-  // extremes agree. Every bit range the split grid prices narrower than 64
-  // bits qualifies, and the loop checks rather than assumes it, rescanning
-  // unsigned otherwise. The scalar form of this loop kept its counters in
-  // memory and was most of what pricing a range cost.
+  // delta statistics. Vectorised over signed 64-bit lanes, which is exact
+  // only while every value stays below 2^63; the loop checks that bound
+  // rather than assuming it, falling back to an unsigned rescan otherwise.
   static SectionMetrics scanMinMaxAndDeltas(
       const std::vector<uint64_t>& values) {
     using Batch = xsimd::batch<int64_t>;
@@ -357,21 +317,10 @@ class MetricCollector {
   }
 
   // The four scan metrics, for the caller that wants all of them and supplies
-  // the frequencies itself. That is every call the split selector makes.
-  //
-  // The general path tests five loop-invariant flags per element. Five
-  // independent flags is thirty-two loop versions, far past what a compiler
-  // will unswitch, so the tests sit in the body and stand between it and any
-  // vectorisation of work that is otherwise ideal for it: a vector min and
-  // max, a shifted compare for runs, a masked max and a horizontal add for the
-  // deltas.
-  //
-  // Nothing about what is computed changes here. Same operands, same
-  // comparisons, same results. The accumulations do reassociate, which is
-  // exact and only exact because every one of them is an integer operation:
-  // unsigned addition is associative and commutative modulo 2^64, overflow
-  // included, and so are min and max. No floating point enters this loop --
-  // avgRunLength is one division afterwards, from the same integer count.
+  // the frequencies itself. Written without the general path's five
+  // loop-invariant flag tests, which stand between the body and the
+  // vectorisation this hot loop needs. The accumulations reassociate safely
+  // since every one is an integer operation.
   static SectionMetrics scanAll(const std::vector<uint64_t>& values) {
     const size_t count = values.size();
     const uint64_t first = values[0];
@@ -416,23 +365,9 @@ class MetricCollector {
     out.monotonicCount = monotonic;
     out.maxDelta = maxDelta;
 
-    // The histogram gets its own pass, scalar, in the same form the general
-    // path uses. It is deliberately not in the loop above, and fusing it back
-    // in will make this slower rather than faster.
-    //
-    // The tempting version counts how many values clear each of the nine
-    // bucket thresholds and differences the counts, which removes the indexed
-    // increment -- a scatter, which does not vectorise -- and reads on paper
-    // like nine compares and adds against a leading-zero count, a divide and a
-    // store. It does not fit. Nine counters and nine threshold constants, on
-    // top of the six accumulators above, want twenty-six vector registers
-    // where the machine has sixteen. Measured, the counters went to the stack:
-    // seven times the vector stack traffic of the scalar original on the same
-    // instruction count, and twelve percent slower end to end.
-    //
-    // One more pass over values that are already resident costs far less than
-    // that, and it keeps this metric on arithmetic identical to the path it
-    // has to agree with.
+    // The histogram gets its own scalar pass rather than being fused into the
+    // loop above: its indexed increment is a scatter that does not vectorise,
+    // and folding it in would spill the loop's accumulators to the stack.
     for (size_t i = 0; i < count; ++i) {
       ++out.bitWidthBuckets[bitWidthBucket(values[i])];
     }
@@ -483,23 +418,19 @@ class MetricCollector {
       return scanned;
     }
 
-    // How wide the values actually are decides how they get counted, and an OR
-    // across the segment bounds them: every value is below
-    // 1 << bit_width(orOfValues). The pass costs a fraction of the hash pass it
-    // lets us avoid, and it bounds tighter than the segment's nominal width
-    // would, so a wide bit range whose sampled values happen to be small is
-    // still counted directly.
+    // An OR across the segment bounds every value below
+    // 1 << bit_width(orOfValues), tighter than the segment's nominal width,
+    // so a wide bit range whose sampled values happen to be small still gets
+    // counted directly instead of falling back to the hash map.
     bool useDirectHistogram = false;
     if (doFreq) {
       uint64_t orOfValues = 0;
       for (size_t i = 0; i < n; ++i) {
         orOfValues |= values[i];
       }
-      // The n bound is not about memory. Past kUniqueCountCap distinct values
-      // the map path stops counting and freezes what it has, and a direct
-      // histogram cannot reproduce those frozen counts. It never has to: a
-      // segment of at most kUniqueCountCap values cannot hold more distinct
-      // ones than that.
+      // The n bound guards correctness, not memory: past kUniqueCountCap the
+      // map path freezes its counts, which a direct histogram cannot
+      // reproduce, but a segment that small can never exceed the cap anyway.
       useDirectHistogram = std::bit_width(orOfValues) <= kDirectHistogramBits &&
           n <= kUniqueCountCap;
       if (useDirectHistogram && counts_.empty()) {
@@ -595,14 +526,10 @@ class MetricCollector {
           : (capped ? (kUniqueCountCap + 1) : freqMap_.size());
       out.uniqueCountCapped = capped;
 
-      // Frequencies of one and two, for the stream cardinality estimate.
-      //
-      // Taken even when the count was capped. Capping stops new keys being
-      // inserted, so what the map holds afterwards describes the rows scanned
-      // up to that point -- a prefix of the segment, which is still a sample of
-      // the same stream and still carries the repetition signal. Discarding it
-      // would leave the estimate with nothing but the cap itself, which is the
-      // number that caused the trouble in the first place.
+      // Frequencies of one and two feed the stream cardinality estimate, and
+      // are taken even when capped: the map still describes a valid prefix
+      // of the segment, which carries the repetition signal the estimate
+      // needs.
       if (supplied != nullptr) {
         out.singletonCount = supplied->singletonCount;
         out.doubletonCount = supplied->doubletonCount;

@@ -186,10 +186,9 @@ int runBenchmark() {
           std::span<std::byte>(reinterpret_cast<std::byte*>(&sink), kElemSize));
 
       // What building the access structure costs, measured once and reported
-      // beside the per-probe time rather than folded into it. A view arm
-      // therefore reports both numbers from one run, and no arm can report
-      // only the flattering one. Leaves the structure built, which is what the
-      // probe measurement below is meant to find.
+      // beside the per-probe time rather than folded into it, so a view arm
+      // reports both numbers from one run. Leaves the structure built for the
+      // probe measurement below.
       const auto build = measureAccessStructureBuild<Elem>(
           encSpec, cell.controller, cell.targets, *target);
 
@@ -237,8 +236,6 @@ int runBenchmark() {
       csv.set("clock_overhead_ns", clockOverhead.median_ns);
       // True when the arm answers a one-row probe by decoding more than one
       // row: a cursor replay from row zero, a whole block, or a whole payload.
-      // Asked of the target, so it no longer reads 1 for every arm including
-      // the view arms it exists to separate.
       csv.set(
           "emulated_point_read",
           servesPointReadDirectly(target->readPath()) ? int64_t{0}

@@ -95,32 +95,13 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     auto it = std::upper_bound(runEnds_.begin(), runEnds_.end(), offset);
     NIMBLE_CHECK(it != runEnds_.end());
 
-    // Reading the run values in bulk replaces one virtual call per run with
-    // one for the whole read. That is what a near-whole-column read of a
-    // section carrying a key-derived permutation wants: many short runs,
-    // where the per-run dispatch is the cost and the fill it guards is not
-    // (8.7 ns per row, and 73% of a transformed bulk decode, before this).
-    //
-    // Two things disqualify a read from it, and both are free to test here.
-    //
-    // A short read: locating the last run costs a second binary search over
-    // every run end in the section, and charging that to a read covering a
-    // hundred rows loses more than the handful of probes it saves. The span
-    // path issues those by the thousand, and it showed up as a gather
-    // regression at mid run lengths. Gating on the run count did not recover
-    // it, because the search is paid before the count is known.
-    //
-    // A section of long runs: the saving is one virtual call per run, so it
-    // only outruns the extra search when the fill each call guards is small.
-    // A Dictionary index stream already amortises the dispatch over long
-    // fills, and taking the bulk read there costs it.
-    //
-    // A read is short only in absolute terms. SubIntSplitEncodingView reads a
-    // section kViewChunkSize rows at a time, so gating on a fraction of the
-    // section kept every one of those chunks on the per-run path: a
-    // short-run section that read at 3 ns per row in one call read at 36 ns
-    // per row in 1024-row chunks. A read of kMinBulkRunValueLength rows or more
-    // amortises the second search whatever fraction of the section it is.
+    // Reading run values in bulk replaces one virtual call per run with one
+    // for the whole read, which only pays off when runs are short (so the
+    // per-run dispatch dominates) and the read is long enough to amortise the
+    // extra binary search this path needs to locate the last run. The length
+    // gate is an absolute row count rather than a fraction of the section,
+    // since SubIntSplitEncodingView reads fixed-size chunks regardless of
+    // section size and a fraction-based gate would keep those off this path.
     if ((length >= kMinBulkRunValueLength ||
          length * kBulkRunValueDenominator >=
              this->rowCount_ * kBulkRunValueNumerator) &&
@@ -143,21 +124,12 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Answers a whole range list from one forward walk of the run ends.
-  //
-  // Read one range at a time -- which is what the default does -- each range
-  // pays a binary search over every run end in the section. A section grouped
-  // by a key has one run per distinct key, so that search is over hundreds of
-  // thousands of entries and misses cache on nearly every step, and it is the
-  // whole cost of a read whose ranges are a row or two each. That is exactly
-  // the list SubIntSplitEncodingView's permuted span read hands down: it sorts
-  // its source indices before reading, so the ranges arrive ascending and each
-  // one starts close to where the last ended.
-  //
-  // Ascending is not promised by the interface, only produced by the caller
-  // that matters, so it is tested rather than assumed: a range that starts
-  // before the previous one ended restarts the walk with the binary search it
-  // would have paid anyway.
+  // Answers a whole range list from one forward walk of the run ends, rather
+  // than a fresh binary search per range: worthwhile when a section has many
+  // runs and ranges arrive roughly ascending, each starting close to where
+  // the last ended, which is the case for a caller that sorts indices before
+  // reading. Ascending order is not guaranteed by the interface, so a range
+  // starting before the previous one ended falls back to a binary search.
   void readPhysicalRanges(
       std::span<const RowRange> ranges,
       physicalType* output) const final {
@@ -210,9 +182,8 @@ class RLEEncodingView final : public TypedEncodingView<T> {
   }
 
   // First run end above `row`, searched forward from `run` in O(log gap)
-  // rather than O(log runCount): a range list that steps a little way at a
-  // time never touches the far end of the table, which is what keeps this off
-  // the cache misses a fresh binary search pays on every call.
+  // rather than O(log runCount), so a nearby step avoids the cache misses a
+  // fresh binary search over the whole table would pay.
   static const uint32_t*
   advanceToRun(const uint32_t* run, const uint32_t* last, uint32_t row) {
     if (run == last || *run > row) {
@@ -229,11 +200,9 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     return std::upper_bound(below + 1, above, row);
   }
 
-  // Kept out of line deliberately. Inlining it into readPhysical() cost an
-  // untransformed bulk decode 7.7% even with the branch made unreachable, so
-  // the loss was code layout in a header this widely included rather than
-  // anything the new path executes. Out of line, readPhysical() keeps the
-  // shape it had and only a read that takes this branch pays for it.
+  // Kept out of line so that readPhysical()'s common path is unaffected by
+  // this code's presence; only a call that actually takes this branch pays
+  // for it.
   FOLLY_NOINLINE void readRunsInBulk(
       uint32_t offset,
       uint32_t length,
@@ -251,19 +220,12 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     runValues.resize(runCount);
     values_->read(firstRun, runCount, runValues.data());
 
-    // std::fill over a run costs two mispredicting branches: its own
-    // vectorised body is guarded on the element count, and the count here is
-    // whatever the run happened to be. The section this path exists for has
-    // been grouped by a key, so its runs are short -- the gate below admits
-    // only sections averaging kMaxAverageRunLength or less, and the shape that
-    // motivated this averages about four rows. Measured on it: 51.3M branch
-    // mispredicts against 18.2M for the untransformed read of the same rows,
-    // an extra 1.27 per run, with IPC at 1.24 against 1.99.
-    //
-    // So store a fixed width unconditionally and advance by the run length
-    // instead. A short run overshoots into the next run's output, which the
-    // next store then overwrites, and the loop below stops early enough that
-    // the overshoot never leaves the caller's buffer.
+    // std::fill's vectorised body is guarded on the element count, which
+    // mispredicts badly when runs are short, as they are on the sections this
+    // path targets. Storing a fixed width unconditionally and advancing by
+    // the run length avoids that branch; a short run overshoots into the next
+    // run's output, which the next store overwrites, and the loop below stops
+    // early enough that the overshoot never leaves the caller's buffer.
     constexpr uint32_t kLanes = 32 / sizeof(physicalType);
 
     uint32_t outputOffset{0};
@@ -277,8 +239,6 @@ class RLEEncodingView final : public TypedEncodingView<T> {
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         out[lane] = value;
       }
-      // Only a run longer than one store needs the rest, which on a section
-      // this path accepts is the minority of runs.
       if (count > kLanes) {
         std::fill(out + kLanes, out + count, value);
       }
@@ -301,21 +261,17 @@ class RLEEncodingView final : public TypedEncodingView<T> {
   }
 
   // Fraction of the section a read must cover before the bulk run-value read
-  // is worth its second binary search. Half: the whole-column read that
-  // motivates it sits at 1, and the span path's reads sit orders of magnitude
-  // below, so the boundary is not delicate and is not tuned finely.
+  // is worth its extra binary search.
   static constexpr uint32_t kBulkRunValueNumerator = 1;
   static constexpr uint32_t kBulkRunValueDenominator = 2;
 
   // Rows at or above which a read takes the bulk run-value path regardless of
-  // the section's size. Below SubIntSplitEncodingView's 1024-row chunk, so its
-  // chunked reads qualify, and well above the 11- and 111-row span reads that
-  // measured a regression when they paid the second search.
+  // the section's size, so a caller reading in fixed-size chunks still
+  // qualifies.
   static constexpr uint32_t kMinBulkRunValueLength = 512;
 
-  // Longest average run for which the bulk run-value read still pays. The
-  // permuted section that motivates it averages a few rows per run; the
-  // sections it costs on run far longer, so this sits well clear of both.
+  // Longest average run length for which the bulk run-value read still pays
+  // off; sections with longer runs skip it.
   static constexpr uint32_t kMaxAverageRunLength = 32;
   // RLE serializes floating run values with their logical type and all other
   // run values with their physical type.

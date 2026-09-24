@@ -167,11 +167,8 @@ int runBenchmark() {
               reinterpret_cast<std::byte*>(sink.data()),
               static_cast<size_t>(n) * kElemSize));
 
-      // This is where a view's construction cost used to disappear. A bulk
-      // read through a view built in encodeWith reported only the read, and
-      // where a section fell back to MaterializedEncodingView that read was a
-      // copy out of a buffer someone else had decoded. Both halves are on the
-      // row now.
+      // A view's construction cost is charged here so a bulk read through a
+      // view accounts for both build and read, not just the read.
       const auto build = measureAccessStructureBuild<Elem>(
           spec, cell.controller, cell.targets, *target);
 

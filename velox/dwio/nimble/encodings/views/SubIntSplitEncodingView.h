@@ -37,21 +37,13 @@ namespace facebook::nimble {
 
 namespace detail {
 
-/// Serves indexed reads over a stream that has no EncodingView of its own —
-/// e.g. a SubIntSplit section whose sub-stream is Zstd-compressed. Nimble
-/// decompresses eagerly inside the Encoding constructor and has no
-/// self-describing compressed-stream format for a view to attach to, so
-/// there is nothing to wrap. This class instead decodes the stream once,
-/// into an owned physicalType[rowCount] array, and serves each indexed read
-/// from that array directly. Construction is not cheap and the array costs
-/// rowCount * sizeof(physicalType), so it is the fallback path, not the
-/// common one: of the eight encodings in the default nested inventory only
-/// Varint has no view, so on an uncompressed column this class is rarely
-/// built.
+/// Serves indexed reads over a stream that has no EncodingView of its own by
+/// decoding it once into an owned array and serving each indexed read from
+/// that. Construction cost and memory are O(rowCount), so this is a fallback
+/// path, not the common one.
 ///
-/// Nothing here is SubIntSplit-specific. SharedDictionaryAlphabet hand-rolls
-/// the same fallback and could be simplified by this class; move it to views/
-/// if that is done.
+/// Not SubIntSplit-specific; SharedDictionaryAlphabet hand-rolls the same
+/// fallback and could reuse this if moved to views/.
 template <typename T>
 class MaterializedEncodingView final : public TypedEncodingView<T> {
  public:
@@ -94,15 +86,9 @@ class MaterializedEncodingView final : public TypedEncodingView<T> {
 };
 
 // Prefers a view over a stream, decoding once when it cannot have one.
-//
-// Attempting construction is the only available test. A predicate cannot
-// replace it: compression nests, so an RLE stream reports viewable while its
-// run values are compressed a level down, and views signal both that and an
-// incompatible type by throwing. See the
-// compressionNestsBelowTheOuterEncoding test.
-//
-// Not specific to SubIntSplit sections: any caller assembling indexed
-// accessors over sub-streams of unknown viewability can reuse this.
+// Attempting construction is the only available test: compression nests, so
+// a stream can report viewable while a nested stream is not, and views
+// signal both that and an incompatible type by throwing.
 template <typename SectionT>
 std::unique_ptr<EncodingView> makeSectionView(
     std::string_view stream,
@@ -161,10 +147,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     const auto parsed = subintsplit::parseSections(
         data, this->dataOffset_, &transformInfo_, &rowFrame_, &flags);
     NIMBLE_CHECK(!parsed.empty(), "SubIntSplit stream has no sections.");
-    // A delta stream's sections hold steps, not values, and a row is the sum
-    // of every step before it, so no section can be read at an index.
-    // createEncodingView serves such a stream through a full decode instead;
-    // reaching here with one would return steps as values.
+    // A delta stream's sections hold steps rather than values, so no section
+    // can be read at an index; the factory routes such streams to a full
+    // decode instead.
     NIMBLE_CHECK(
         (flags & subintsplit::kFlagDelta) == 0,
         "SubIntSplitEncodingView cannot index a delta stream.");
@@ -196,10 +181,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
       NIMBLE_CHECK_EQ(section.view->rowCount(), this->rowCount_);
 
-      // A Constant section contributes the same bits to every row, so resolve
-      // it now and keep it out of the per-row work entirely.
-      // Recorded on every section, transformed or not: the key section is
-      // untransformed by design, and it is still addressed by wire position.
+      // Recorded on every section, since it is what addresses per-section
+      // transform state, independent of position in sections_.
       section.wireIndex = wireIndex;
       if (!transformInfo_.transformIds.empty() &&
           transformInfo_.transformIds[wireIndex] != 0) {
@@ -358,21 +341,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     return value;
   }
 
-  // Where each original row's value was stored, built once and then reused.
-  //
-  // This is what makes a key-derived permutation cost a probe an indirection
-  // rather than a reconstruction, and so what lets it span a whole section
-  // instead of being cut into blocks. It is derived from the key section
-  // alone, which reaches the reader in original order, so no transformed value
-  // is read to build it. Held per thread, since a view is read concurrently
-  // and keeps no mutable state of its own -- but thread-local is not enough
-  // by itself: the cache is keyed on viewId_, not on `this`, because `this`
-  // is just an address, and a destroyed view's address can be handed to a
-  // new, unrelated one. A unit test that placement-news a second,
-  // larger-rowCount_ view over a first one's address found this the hard
-  // way: a stale hit returned a positions array sized for the first view's
-  // row count, and the caller indexed it up to the second view's, which
-  // segfaults rather than merely answering wrong.
+  // Maps each original row to the source position it was permuted from, built
+  // once per view and reused. Held per thread, since a view is read
+  // concurrently and keeps no mutable state of its own; the cache is keyed on
+  // viewId_ rather than `this`, since a destroyed view's address can be
+  // reused by an unrelated one and a stale hit would index this array with a
+  // mismatched row count.
   const velox::raw_vector<uint32_t>& positionMap() const {
     thread_local PositionCache cache;
     if (cache.owner == viewId_) {
@@ -389,9 +363,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     NIMBLE_CHECK(
         transformInfo_.keySection != subintsplit::TransformInfo::kNoKeySection,
         "A computable transform needs the key section it was ordered by.");
-    // Taken from the key's own encoding where it has them, which spares
-    // reading the whole key section a value at a time just to derive what the
-    // encoding already held.
+    // Prefers the key section's own dense run ids when it has them, avoiding
+    // a value-at-a-time read of the whole key section.
     std::vector<uint32_t> runIds;
     std::vector<uint64_t> runValues;
     std::vector<uint64_t> keyValues;
@@ -449,36 +422,15 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
 
-    // A stream whose transforms can all address a row directly has two ways
-    // to be read, and which one depends on whether the mapping is Permuted.
-    //
-    // A key-derived permutation is a stable sort by the key, so the position
-    // map's cursor for a given run advances by exactly one on each of that
-    // run's occurrences, wherever in row order they fall: two occurrences of
-    // the same run sit at consecutive source indices even when other runs'
-    // rows come between them in the request. readPermutedSpan finds those
-    // runs by sorting the requested rows' source indices -- which brings a
-    // run's scattered occurrences together, since they are exactly a block
-    // of consecutive integers -- then reads each block in one bulk call and
-    // scatters the results back into row order. The first version of this
-    // only merged rows already adjacent in the request, which misses a run
-    // whose occurrences are spread through it and was most of the reason it
-    // measured worse than expected: 1024 calls averaging 32 rows apiece
-    // where the sorted version issues close to one call per distinct run.
-    //
-    // Below kSpanAdvantageNumerator/kSpanAdvantageDenominator of the
-    // column, spans beat decoding it whole -- see the constants themselves
-    // for where that ratio comes from. Above it, decoding the column in
-    // order and keeping the slice wins, the same choice this file has made
-    // since 556894e55.
-    //
-    // Below kMinSpanLength, spans lose to a plain gather for a different
-    // reason: the radix sort's own fixed cost (four passes, each clearing a
-    // count table) no longer has enough rows to amortise over. A range read
-    // at 11 rows measured slightly slower once the sort was added than the
-    // row-by-row probe it replaced; one at 111 rows was already a clear win.
-    // kMinSpanLength is a round number inside that gap, not a measured
-    // boundary -- worth tightening once someone measures closer to it.
+    // A permuted section is read one of three ways depending on range length.
+    // A key-derived permutation is a stable sort by key, so a run's scattered
+    // occurrences map to a contiguous block of source indices; readPermutedSpan
+    // sorts the requested rows' source indices to bring each run's occurrences
+    // together, then reads each block in one bulk call. That sort has a fixed
+    // cost that only pays off once the range is long enough (kMinSpanLength);
+    // shorter ranges probe row by row instead. Above kSpanAdvantageNumerator/
+    // kSpanAdvantageDenominator of the column, decoding it whole and keeping
+    // the slice wins outright.
     if (transformInfo_.anyTransform()) {
       if (length < kMinSpanLength) {
         readPermutedProbes(offset, length, output);
@@ -515,10 +467,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       for (size_t s = 0; s < sections_.size(); ++s) {
         const auto& section = sections_[s];
         const bool isFirst = !seedWithConstant && s == 0;
-        // Switched rather than called through section.readChunk, which costs
-        // 4% of bulk throughput: an indirect call stops the compiler inlining
-        // the AVX2 accumulate kernel into the loop. The switch itself is noise
-        // at one per chunk per section.
+        // Switched rather than called through a function pointer, so the
+        // compiler can inline the accumulate kernel into the loop.
         switch (section.storageBytes) {
           case 1:
             readSectionChunk<uint8_t>(
@@ -563,11 +513,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Plans a scattered read across the whole range list, which a per-range
-  // loop cannot: a row read on its own costs a virtual probe per section, one
-  // to two orders of magnitude more than the same row costs inside a bulk
-  // decode, so reading a dense stretch in one go and discarding the rows
-  // between the wanted ones is far cheaper than probing each wanted one.
+  // Plans a scattered read across the whole range list rather than probing
+  // each range independently, since reading a dense stretch and discarding
+  // unwanted rows is far cheaper than a per-row virtual probe per section.
   void readPhysicalRanges(
       std::span<const RowRange> ranges,
       physicalType* output) const final {
@@ -595,15 +543,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     readUntransformedRanges(ranges, output);
   }
 
-  // Groups nearby ranges and decodes each group's covering span once.
-  //
-  // Bridging a gap of g rows costs g rows of bulk decode; not bridging it
-  // costs one more read call, which is about one probe, so a gap is worth
-  // bridging exactly when it is at most kProbeCostInDecodedRows. Grouping by
-  // that local rule makes every group cheaper to decode whole than piecewise
-  // without needing a density test over the group. A group is also capped at
-  // kViewChunkSize rows, so its staging buffer stays in L1 next to the
-  // section scratch readPhysical() uses for the same rows.
+  // Groups nearby ranges and decodes each group's covering span once. A gap
+  // between ranges is worth bridging exactly when it costs at most
+  // kProbeCostInDecodedRows, since that is the cost of a separate read call
+  // instead. Groups are capped at kViewChunkSize rows so the staging buffer
+  // stays in L1.
   void readUntransformedRanges(
       std::span<const RowRange> ranges,
       physicalType* output) const {
@@ -669,16 +613,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   }
 
   // Chooses between one whole-column decode and reading each range the way
-  // readPhysical() would read it alone.
-  //
-  // A transformed stream cannot decode an arbitrary span cheaply the way an
-  // untransformed one can: its bulk path is a whole-column decode, because a
-  // permuted section's rows are scattered across the column. So the choice is
-  // made once for the list, by pricing each range at what readPhysical() would
-  // charge for it on its own, in units of one row of whole-column decode, and
-  // decoding the column once when that total reaches its row count. Pricing
-  // ranges rather than rows matters: four ranges of a quarter column each cost
-  // four whole-column decodes read one at a time, and one read together.
+  // readPhysical() would read it alone. A transformed stream's bulk path is
+  // always a whole-column decode, since a permuted section's rows are
+  // scattered across it, so the choice is made once for the list by pricing
+  // each range at what it would cost read alone, in units of one row of
+  // whole-column decode, and decoding the column once that total reaches its
+  // row count.
   void readTransformedRanges(
       std::span<const RowRange> ranges,
       physicalType* output) const {
@@ -689,20 +629,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       return;
     }
     const uint64_t rowCount = this->rowCount_;
-    // A permuted stream still prices range by range to decide whether to
-    // decode the column, and only then reads the ranges it keeps as one
-    // span.
-    //
-    // Pricing the list as a whole instead -- charging the span path's two
-    // decoded rows per requested row, which is what a single range is
-    // charged -- reads the cost of a scattered request wrongly and was
-    // measured doing so: a gather of 173,015 rows in ranges of two, a third
-    // of the column, priced under a whole-column decode and lost 3x to one.
-    // The reason is that a row of a long range shares its block with its
-    // neighbours and a row of a two-row range does not, so the same row
-    // count costs the span path far more when it arrives scattered. The
-    // per-range price already separates those two cases, by charging a range
-    // too short to sort at the probe rate.
+    // Prices range by range rather than pricing the whole list at a uniform
+    // per-row rate: a row from a long range shares its decoded block with its
+    // neighbours while a row from a short, scattered range does not, so the
+    // same total row count can cost very differently depending on how it is
+    // split into ranges.
     uint64_t totalRows = 0;
     for (const auto& range : ranges) {
       const uint32_t rangeLength = range.numRows();
@@ -729,12 +660,10 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       }
     }
     if (piecewiseCost < rowCount) {
-      // Worth reading piecewise, and a permuted stream reads the whole list
-      // as one span rather than one range at a time: the sort, the grouping
-      // and the scratch are fixed per call, and a run's occurrences are as
-      // likely to be split across two ranges of a request as to sit inside
-      // one. Below kMinSpanLength rows in total the sort still has nothing
-      // to amortise over, so the list falls back to probes per range.
+      // Worth reading piecewise; the whole list is read as one span rather
+      // than range by range, since a run's occurrences may be split across
+      // ranges. Below kMinSpanLength rows total, the sort has nothing to
+      // amortise, so the list falls back to per-range probes.
       if (totalRows >= kMinSpanLength) {
         readPermutedSpanRanges(
             ranges, static_cast<uint32_t>(totalRows), output);
@@ -762,12 +691,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // What one row read on its own costs, in rows of bulk decode. Measured on
-  // the six 524288-row paper columns, where a hot point probe through the
-  // view took 110 to 710 ns and bulk decode 1.1 to 5.9 ns a row: a ratio of
-  // 69 to 147. Set below that range, because near the crossover either
-  // choice costs about the same, and a ratio set too high decodes gaps that
-  // a column with cheap probes should have skipped.
+  // What one row read on its own costs, in rows of bulk decode. Set
+  // conservatively below the measured probe-to-decode ratio, since a value
+  // set too high decodes gaps that a column with cheap probes should skip.
   static constexpr uint64_t kProbeCostInDecodedRows = 64;
 
   // The position map for one view, held per thread. Keyed on the view, since
@@ -781,67 +707,26 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   };
 
   // The ratio of wanted rows to total rows below which spans beat decoding
-  // the column, retuned once the radix sort replaced the comparison sort.
-  //
-  // A ratio below 1 (5/6, the first retune) is not just a bad guess -- it is
-  // structurally broken, because length * numerator < rowCount_ * denominator
-  // is true at length == rowCount_ whenever numerator < denominator. That
-  // sent the whole-column request down the span path, which sorts the
-  // position map against itself to rediscover that the section should be
-  // read sequentially -- exactly the O(n) waste flagged as a reason not to
-  // reuse this path for bulk decode in the first place, and it cost 3.3x on
-  // both bulk decode and whole-column ranged reads before anyone connected
-  // the two. A ratio at or above 1 cannot make this mistake: at length ==
-  // rowCount_, numerator >= denominator makes the comparison false
-  // unconditionally, so the whole-column case always falls through to
-  // readWholeSpan regardless of how the ratio is tuned from here.
-  //
-  // 2/1 is set from where spans and the fallback were measured level: at
-  // B = rowCount_/2 on NPI's 524288 rows, spans read 7.31 ms against the
-  // fallback's 7.05, and past that point spans lose by a growing margin.
-  //
-  // Re-measured at 4/1 -- a whole-column decode from a quarter of the column
-  // rather than a half -- on the same five columns. It is neutral below the
-  // boundary it moves (0.95 to 1.02 at B = 64 to 32,768) and splits at
-  // B = 131,072, the length it changes: 1.53 on publicbi_npi and 1.28 on
-  // osm_s2_l30, 0.84 on snowflake and 0.83 on bing_quadkey, median 1.01. A
-  // ratio that helps one column as much as it costs another is not a better
-  // ratio, so this stays at 2/1.
+  // the column. Must stay at or above 1: below it, length * numerator <
+  // rowCount_ * denominator becomes true even at length == rowCount_,
+  // wrongly sending a whole-column request down the span path, which then
+  // pays an O(n) sort to rediscover that sequential reading was right all
+  // along.
   static constexpr uint32_t kSpanAdvantageNumerator = 2;
   static constexpr uint32_t kSpanAdvantageDenominator = 1;
 
-  // Below this many rows, the radix sort's own fixed cost -- four passes,
-  // each clearing a 256-entry count table -- has too little to amortise and
-  // readPermutedProbes() wins instead. Measured on the range driver at
-  // 524,288 rows over lengths 4 to 256 for SIS/key_derived+view and
-  // SIS/auto+view: the span path is faster from 24 rows on osm_h3_r9,
-  // osm_s2_l30, snowflake and xmark_prepost_full (from 16 on three of them),
-  // while publicbi_npi prefers probes at every length up to 256. 24 minimises
-  // the summed log slowdown against the faster path over lengths 16 to 48.
-  //
-  // Re-measured once the span path handed its blocks down as one range list,
-  // by building a variant with this at 2^30 -- probes at every length -- and
-  // running the range driver at B = 8 to 131,072 on the five 524,288-row
-  // columns whose plan has a permuted section. Probes are level at B = 8
-  // (0.96 to 1.01 of the span path, which is the same code either way) and
-  // lose everywhere above it: 0.94 at worst and 0.20 at best for B = 64,
-  // 0.12 to 0.75 by B = 131,072. publicbi_npi is still the closest call at
-  // B = 64, at 0.93, which is the column the original note said prefers
-  // probes; nothing here argues for moving the boundary.
+  // Below this many rows, the radix sort's own fixed cost has too little to
+  // amortise and readPermutedProbes() wins instead.
   static constexpr uint32_t kMinSpanLength = 24;
 
   // Decodes every section in order across the whole column, undoes the
-  // transforms over that span, and keeps the requested rows.
-  //
-  // This is what a bulk read of a computable transform should cost: the
-  // sections come off their encodings sequentially, and the inverse is a
-  // permutation applied once, rather than a random access per row.
+  // transform over that span, and keeps the requested rows: sections come
+  // off their encodings sequentially and the inverse is applied once, rather
+  // than a random access per row.
   void readWholeSpan(uint32_t offset, uint32_t length, physicalType* output)
       const {
-    // A read of the entire column is the common case here and needs no staging
-    // buffer: the span and the output are the same rows, so decode into the
-    // caller's memory directly. Anything narrower still has to decode the span
-    // it depends on and keep the part asked for.
+    // Reading the entire column needs no staging buffer since the span and
+    // the output are the same rows.
     if (offset == 0 && length == this->rowCount_) {
       readPhysicalBlock(0, this->rowCount_, output);
       return;
@@ -854,45 +739,25 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   }
 
   // Reads a partial range of a Permuted-mapped stream in O(length + spans
-  // touched) rather than O(length) point probes.
-  //
-  // Cost model, measured: a first ranged read on a fresh view still pays the
-  // position map's O(n) build (positionMap() is cached per view -- see its
-  // own comment -- so this is a one-time cost per view, not per call, and it
-  // is comparable in instructions to a whole-column decode). Every
-  // subsequent ranged read on the same view is O(length + spans), which is
-  // what turns a constant per-read cost into one proportional to what was
-  // asked for. A workload that opens a view, reads one small range and
-  // closes it will not see the win -- it pays the map build every time.
+  // touched) rather than O(length) point probes. The first ranged read on a
+  // view pays the position map's O(n) build, cached thereafter per view; a
+  // workload reading one small range per view will not see the amortised
+  // benefit.
+
   // One requested row's source index, paired with where in the request it
-  // belongs. Not std::pair<uint32_t, uint32_t>: libstdc++ 11 (the container's
-  // compiler, gcc 11) does not treat std::pair as trivially copyable even
-  // when both members are, so it fails raw_vector's static_assert there
-  // despite compiling fine against a newer libstdc++. A plain struct is
-  // trivially copyable on every compiler this project builds with, and
-  // named fields read better than .first/.second in the loops below.
+  // belongs. A plain struct rather than std::pair, since some compilers this
+  // project builds against do not treat std::pair as trivially copyable even
+  // when both members are, which fails raw_vector's static_assert.
   struct SourceRow {
     uint32_t source;
     uint32_t row;
   };
 
-  // Sorts `order`'s first `length` entries by .source in O(length), rather
-  // than the O(length log length) a comparison sort pays, without an array
-  // sized to rowCount_ either -- a naive counting sort keyed directly on the
-  // source index would need one entry per possible index, reproducing the
-  // exact "cost grows with the column, not with what was asked for" problem
-  // this project already found once in the position map. Four passes of an
-  // 8-bit digit cover any 32-bit source index with a 256-entry count table
-  // per pass: O(length) work, and a fixed, tiny table to clear regardless of
-  // length or rowCount_. A comparison sort was the third-largest cost the
-  // span path measured on it.
-  //
-  // Only the digits a source index can carry are swept. A source index is a
-  // row of this stream, so 524,288 rows need 19 bits and therefore three
-  // passes, not four; each pass skipped is a 256-entry table cleared and
-  // prefix-summed, which is fixed work a short range has too few rows to
-  // amortise. An odd pass count leaves the result in the scratch buffer, so
-  // it is copied back -- length words, against the pass it saved.
+  // Sorts `order`'s first `length` entries by .source in O(length) using an
+  // 8-bit-digit radix sort, rather than the O(length log length) a
+  // comparison sort pays or the O(rowCount_) an array sized to the source
+  // range would cost. Only the digits maxSource can carry are swept, so a
+  // narrower source range skips passes it does not need.
   static void radixSortBySource(
       velox::raw_vector<SourceRow>& order,
       uint32_t length,
@@ -926,16 +791,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     readPermutedSpanRanges({&one, 1}, length, output);
   }
 
-  // The span read, over a whole range list rather than one range.
-  //
-  // Everything the span path pays before it touches a section -- the sort, the
-  // grouping, the scratch -- is fixed per call, not per row, and a run's
-  // occurrences are just as likely to be shared between two ranges of one
-  // request as to sit inside one of them. Sorting the whole request at once
-  // therefore pays the fixed cost once and finds the longer blocks, where
-  // reading each range on its own pays it per range and re-splits every block
-  // a range boundary happens to fall in. `totalRows` is the sum of the
-  // lengths, which the caller has already computed to make this choice.
+  // The span read, over a whole range list rather than one range. Sorting the
+  // whole request at once amortises the fixed per-call cost and finds the
+  // longer runs, since a run's occurrences may be split across ranges;
+  // reading each range on its own would pay that cost per range. `totalRows`
+  // is the sum of the lengths, already computed by the caller.
   void readPermutedSpanRanges(
       std::span<const RowRange> ranges,
       uint32_t totalRows,
@@ -946,25 +806,14 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       std::fill(output, output + totalRows, constantBits_);
     }
 
-    // A run's occurrences within [offset, offset+length) are exactly a block
-    // of consecutive source indices, but they are not necessarily adjacent
-    // IN THE REQUEST: another run's rows can fall between two occurrences of
-    // this one. Merging only rows already adjacent in the request therefore
-    // finds a new "span" every time a different run interrupts, which on an
-    // interleaved arrival order is most rows -- close to one call per row
-    // rather than one per run. Sorting (source index, request-relative row)
-    // pairs by source index brings a run's scattered occurrences together,
-    // since they are a contiguous block of integers regardless of where in
-    // the request they fall; grouping the sorted order into consecutive-value
-    // runs then finds one span per key, not per interruption. Shared across
-    // every section below, since the position map -- and so this grouping --
-    // does not depend on which section is being read.
-    // std::vector, unlike velox::raw_vector, value-initialises every element
-    // it grows into on resize() even when the memory was already allocated by
-    // an earlier, larger call -- the same zero-fill this project already
-    // found and removed from decode's other scratch buffers. Every element
-    // here is overwritten by the loop directly below, so that fill was pure
-    // loss on any call whose length exceeds the largest one seen so far.
+    // A run's occurrences are a contiguous block of source indices, but not
+    // necessarily adjacent in the request, since another run's rows can fall
+    // between them. Sorting (source index, request-relative row) pairs by
+    // source index brings each run's occurrences together regardless of
+    // arrival order; this grouping is shared across every section below,
+    // since it depends only on the position map. Every element is
+    // overwritten by the loop directly below, so an uninitialised resize
+    // costs nothing here.
     thread_local velox::raw_vector<SourceRow> order;
     order.resize(totalRows);
     uint32_t at = 0;
@@ -1061,19 +910,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // Reads one section's values for a range already grouped into
-  // (source index, request-relative row) pairs sorted by source index, one
-  // bulk call per consecutive-value block -- one call per key touched,
-  // rather than one per row that survives interleaving. Each block's values
-  // come back in source order, not request order, so they are scattered into
-  // `scratch` at their recorded row rather than appended.
   // Reads a range too short for readPermutedSpan()'s sort to pay. Sections
-  // left in place are still read as one run each, and only permuted sections
-  // pay a probe per row, through a position map fetched once for the range.
-  // readOneRow() instead probes every section of every row and fetches the
-  // map and dispatches on each section's mapping per row.
-  // Kept out of line so the untransformed read path it branches from stays
-  // as small as it was.
+  // left in place are read as one run each, and only permuted sections pay a
+  // probe per row, through a position map fetched once for the range, rather
+  // than readOneRow()'s per-row map access and per-section dispatch. Kept out
+  // of line so the untransformed read path it branches from stays small.
   FOLLY_NOINLINE void readPermutedProbes(
       uint32_t offset,
       uint32_t length,
@@ -1137,6 +978,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  // Reads one section's values for a range already grouped into (source
+  // index, request-relative row) pairs sorted by source index, one bulk call
+  // per consecutive-value block. Each block's values come back in source
+  // order, not request order, so they are scattered into `scratch` at their
+  // recorded row rather than appended.
   template <typename SectionT>
   static void readPermutedSpanSection(
       const Section& section,
@@ -1147,17 +993,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       velox::raw_vector<uint8_t>& scratch) {
     auto* gathered = reinterpret_cast<SectionT*>(scratch.data());
     // The blocks are handed to the section as one ascending range list rather
-    // than read one at a time. Sorting by source has already made the list
-    // ascending, and that is what an encoding whose random access is a search
-    // needs to be told: an RLE section grouped by a key has one run per
-    // distinct key, so reading a block on its own costs a binary search over
-    // every run end in the section, and on a high-cardinality column nearly
-    // every block is one row. Given the list, the section walks its runs once
-    // for all of them. It also spares the per-block dispatch and the resize
-    // that used to run once per block.
-    //
-    // clear() and push_back keep the capacity without the value-initialisation
-    // resize() would do, which is the cost that mattered here.
+    // than read one at a time, since an encoding whose random access is a
+    // search (e.g. RLE) can then walk its runs once for all of them instead
+    // of a binary search per block.
     thread_local std::vector<RowRange> blocks;
     blocks.clear();
     uint32_t j = 0;
@@ -1199,23 +1037,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
 
   // Reads a permuted section at its own width, puts its rows back where they
   // belong, and accumulates them through the same kernel an untransformed
-  // section uses.
-  //
-  // The whole section is read because the permutation scatters across it: a
-  // row's value can sit anywhere. Reading it at its own width and through this
-  // kernel still beats the widened path, but the gather itself is not cheap:
-  // on a real column it was measured at half of all L1 read misses in this
-  // function, so this is where a transformed decode's memory traffic actually
-  // goes. A memset next to it (killed in a later change, see git history)
-  // mattered more to throughput than the gather itself, by evicting lines
-  // this loop was about to read -- proof that "not cheap" and "the top cost"
-  // are not the same question.
-  // Kept out of line for the same reason readRunsInBulk is: fusing the gather
-  // into this body grew it, and inlining the result into readPhysicalBlock
-  // cost the untransformed arm 5% even though that arm never calls this. The
-  // loss was layout in a widely included header, not work. Out of line, the
-  // callers keep their shape, and a function reached once per permuted section
-  // per block pays nothing for the call.
+  // section uses. The whole section is read because the permutation scatters
+  // across it, so a row's value can sit anywhere. Kept out of line so its
+  // code does not grow readPhysicalBlock's other, more common paths.
   template <typename SectionT>
   FOLLY_NOINLINE void permuteSection(
       const Section& section,
@@ -1233,14 +1057,9 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     auto* source = reinterpret_cast<SectionT*>(whole.data());
     section.view->read(0, this->rowCount_, source);
 
-    // Gathered straight into the output word rather than into a staging
-    // buffer the kernel then reads back. The buffer cost a write and a read of
-    // blockCount elements, which at a whole-column block is two more passes
-    // over memory that does not fit in L2, to hand the kernel a contiguous run
-    // it does not need: the gather is already one load per output element,
-    // and doing the mask and shift here rather than in the kernel adds nothing
-    // to that. The kernel still owns every contiguous case; this is the one
-    // caller that never had a contiguous source.
+    // Gathered straight into the output word rather than through a staging
+    // buffer, since the gather is already one load per output element and
+    // doing the mask and shift here adds nothing to that.
     const uint64_t mask = section.mask;
     const int shift = section.bitStart;
     const uint32_t* __restrict__ rows = positions.data() + blockStart;
@@ -1277,10 +1096,8 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
           subintsplit::PositionMapping::Permuted;
     };
 
-    // A section that seeds writes the whole word, so the clear is only needed
-    // where nothing will. readPhysical has always known this; this path did
-    // not, and paid a full-column store pass on every block to write zeros
-    // that the first section immediately overwrote.
+    // A section that seeds writes the whole word, so the clear below is only
+    // needed where nothing will.
     const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
     if (seedWithConstant) {
       std::fill_n(output, blockCount, constantBits_);
@@ -1291,15 +1108,6 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       const bool sectionSeeds = isFirst;
       isFirst = false;
       if (isPermuted(section)) {
-        // Moved, then accumulated at its own width. Widening this to 64 bits
-        // first and assembling the word by hand costs several times the memory
-        // traffic and gives up the kernel, which is where a transformed decode
-        // was losing to an untransformed one. That does not make the gather
-        // free: profiling a real column put it at half of all L1 read misses
-        // in permuteSection, and a stray memset allocated next to it was
-        // costing more than the gather itself by evicting the lines this loop
-        // was about to touch. Cheaper than the alternative is not the same
-        // claim as cheap.
         switch (section.storageBytes) {
           case 1:
             permuteSection<uint8_t>(
@@ -1374,14 +1182,11 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
   // read concurrently.
   static constexpr uint32_t kViewChunkSize = 1024;
 
-  // Source of viewId_ below. Shared by every view of this T on
-  // every thread, so the id space has no gaps for a reused address to fall
-  // into.
+  // Source of viewId_ below, shared across every view of this T so the id
+  // space has no gaps for a reused address to fall into.
   inline static std::atomic<uint64_t> nextViewId_{1};
-  // PositionCache's identity for this instance,
-  // assigned once at construction and never reused, unlike `this`. Declared
-  // first so it initializes right after the base class, matching the
-  // constructor's initializer-list order.
+  // Identifies this instance for PositionCache, assigned once at
+  // construction and never reused, unlike `this`.
   const uint64_t viewId_;
 
   // Per-section transform metadata from the header, indexed by wire position.

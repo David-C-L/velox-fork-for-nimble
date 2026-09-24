@@ -137,16 +137,11 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
           TypeTraits<T>::dataType);
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered:
-      // Mirrors SubIntSplitEncoding's own constraints: it splits a numeric word
-      // into bit ranges, so 32- and 64-bit numerics only. Both types are read
-      // by the same view, which undoes any transform the sections carry.
       if constexpr (
           isNumericType<physicalType>() &&
           (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
-        // A delta stream rebuilds each value from every step before it, so
-        // no section can be read at an index. It is decoded once instead, and
-        // indexed reads are served from that, which keeps the answer right
-        // at the cost of a full decode.
+        // A delta stream requires every prior value to reconstruct a given
+        // index, so it cannot be read positionally and must be materialized.
         if (subintsplit::isDeltaStream(
                 data,
                 EncodingPrefix::prefixSize(data, options.useVarintRowCount))) {

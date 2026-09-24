@@ -66,13 +66,9 @@ class EncodingView {
 
   /// Hands back dense ids for rows [offset, offset + length), and the table of
   /// values those ids stand for, when this encoding already holds its values
-  /// that way. Returns false when it does not, which is the default.
-  ///
-  /// A dictionary stores exactly this and a reader that wants to group rows by
-  /// value would otherwise rebuild it, hashing every row to recover ids the
-  /// encoding already had. The ids are dense but carry no order: a dictionary
-  /// orders its alphabet by first occurrence, so a caller that needs value
-  /// order must derive it from the table, which is small.
+  /// that way. Returns false when it does not, which is the default. Ids are
+  /// dense but carry no defined order; a caller needing value order must
+  /// derive it from the table.
   virtual bool denseRunIds(
       uint32_t /*offset*/,
       uint32_t /*length*/,
@@ -213,9 +209,8 @@ class TypedEncodingView : public EncodingView {
     readPhysical(offset, length, static_cast<physicalType*>(output));
   }
 
-  // Hands the whole range list to readPhysicalRanges, so a view that plans a
-  // scattered read across ranges can decode a dense stretch once instead of
-  // probing it row by row.
+  // Delegates to readPhysicalRanges so a view can decode across ranges in one
+  // pass instead of probing each row individually.
   uint32_t read(
       std::span<const RowRange> ranges,
       const std::function<void(uint32_t)>& /*setNull*/,
@@ -293,10 +288,8 @@ class TypedEncodingView : public EncodingView {
     }
   }
 
-  // Reads each range on its own, a single row through the point read and
-  // anything longer through the range read. Right for an encoding whose point
-  // read is about as cheap per row as its bulk decode, which is most of them;
-  // one where it is not overrides this to plan across the list.
+  // Default per-range read; an encoding whose point read is not cheap
+  // relative to its bulk decode should override this to plan across ranges.
   virtual void readPhysicalRanges(
       std::span<const RowRange> ranges,
       physicalType* output) const {

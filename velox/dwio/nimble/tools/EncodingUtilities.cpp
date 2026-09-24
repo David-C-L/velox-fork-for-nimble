@@ -95,10 +95,9 @@ extractEncodingProperties(
   std::unordered_map<EncodingPropertyType, EncodingProperty> properties{};
   extractCompressionType(
       encodingType, dataType, stream, useVarintRowCount, properties);
-  // `data` carries the node's own encoded bytes. Nothing needed them while the
-  // only consumers were printing labels, but recomputing what a node's
-  // selection was quoted means decoding that node, and the traversal is the
-  // only thing that knows where each node begins and ends.
+  // `data` carries the node's own encoded bytes: recomputing what a node's
+  // selection was quoted means decoding it, and the traversal is the only
+  // thing that knows where each node begins and ends.
   properties.insert(
       {EncodingPropertyType::EncodedSize,
        {.value = folly::to<std::string>(stream.size()), .data = stream}});
@@ -150,8 +149,8 @@ void traverseEncodings(
     case EncodingType::EliasFano:
     case EncodingType::SimdForBitpack:
 #ifndef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-    // SubIntSplit integration is disabled in non-experimental builds; treat
-    // it as having no nested encoding to traverse.
+    // Treated as having no nested encoding to traverse in non-experimental
+    // builds.
     case EncodingType::SubIntSplit:
 #endif
     // The wrapped encoding is carried verbatim rather than as a nested
@@ -449,14 +448,11 @@ void traverseEncodings(
           visitor);
       break;
     }
-    // SubIntSplit integration (re-enabled for
-    // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered: {
       // Walked by the parser the encoding and its view share, so an optional
-      // header block, like the row frame or the transform block, cannot
-      // desynchronise this walk from the stream.
+      // header block cannot desynchronise this walk from the stream.
       const auto sections = subintsplit::parseSections(stream, dataOffset);
       for (size_t s = 0; s < sections.size(); ++s) {
         traverseEncodings(
@@ -482,11 +478,9 @@ void traverseEncodings(
       break;
     }
     case EncodingType::FOR: {
-      // Layout after the common prefix: compressionType [1 byte], then
-      // frameSize, numFrames and firstFrameRows [varint each], then three
-      // self-describing nested metadata sub-streams each preceded by a varint
-      // size -- the per-frame bit widths, references and bit offsets -- and
-      // finally the packed payload, which is raw bits rather than an encoding.
+      // Layout after the common prefix: compressionType, frameSize, numFrames
+      // and firstFrameRows, then three nested metadata sub-streams (bit
+      // widths, references, bit offsets), then the raw packed payload.
       const char* pos = stream.data() + dataOffset;
       encoding::readChar(pos); // compressionType
       varint::readVarint32(&pos); // frameSize
@@ -527,22 +521,12 @@ void traverseEncodings(
       break;
     }
     case EncodingType::FrequencyPartition: {
-      // Layout after the common prefix: numPartitions [4 bytes], then the
-      // partition offsets and the partition sizes, each a nested stream
-      // preceded by a 4-byte size. After those come one dictionary and one key
-      // stream per non-empty tier, then the unencoded values, then the
-      // positional index.
-      //
-      // Only the first two are traversed, and the rest are deliberately not
-      // approximated. Which tiers are non-empty is carried inside the
-      // partition sizes stream, so reaching the tier streams means decoding
-      // that stream first, and decoding needs a memory pool this traversal
-      // does not have. Walking them blind is not an option either: the
-      // trailing index extension is not length-prefixed the way a nested
-      // stream is, so a walk cannot tell the last tier stream from the start
-      // of the index. Their bytes are still counted, in this node's own total.
-      // Giving traverseEncodings a pool-taking overload is what it would cost
-      // to go further.
+      // Only the leading partition-offsets and partition-sizes streams are
+      // traversed; the tier streams past them are deliberately not, since
+      // reaching them means decoding the partition sizes stream first, which
+      // needs a memory pool this traversal does not have, and their layout
+      // cannot otherwise be walked blind. Their bytes are still counted in
+      // this node's own total.
       const char* pos = stream.data() + dataOffset;
       encoding::readUint32(pos); // numPartitions
       const uint32_t partitionOffsetsSize = encoding::readUint32(pos);
@@ -569,9 +553,8 @@ void traverseEncodings(
       break;
     }
     case EncodingType::Huffman:
-      // Its alphabet, code lengths, checkpoints and bitstream are all written
-      // inline rather than as nested encodings, so there is nothing to
-      // traverse into.
+      // Written inline rather than as nested encodings, so there is nothing
+      // to traverse into.
       break;
   }
 }
@@ -623,10 +606,9 @@ std::string getEncodingTreeLabel(std::string_view stream) {
   std::string label =
       "#depth\tpath\tindex\tencoding\tdataType\tbytes\tcompression\n";
 
-  // The path of the node currently being visited, one entry per level. The
-  // traversal is depth-first and pre-order, so a node at level L is always a
-  // child of the most recent node at level L-1, and truncating to L before
-  // pushing this node's name leaves exactly its own ancestry behind.
+  // The path of the node currently being visited, one entry per level.
+  // Truncating to L before pushing this node's name leaves exactly its own
+  // ancestry behind, since the traversal is depth-first and pre-order.
   std::vector<std::string> path;
 
   traverseEncodings(
@@ -642,8 +624,7 @@ std::string getEncodingTreeLabel(std::string_view stream) {
         path.push_back(std::move(nestedEncodingName));
 
         std::string joined;
-        // Entry 0 is the root, whose name is empty, so the join starts at 1
-        // and a root with no children still reads as "/".
+        // Entry 0 is the root, whose name is empty, so the join starts at 1.
         for (size_t i = 1; i < path.size(); ++i) {
           joined += "/";
           joined += path[i];

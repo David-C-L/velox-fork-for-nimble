@@ -19,28 +19,22 @@
 #include <string_view>
 
 // How a benchmark target reaches the rows a read asks for, and whether it can
-// serve them from something built once.
-//
-// Kept apart from BenchCommon.h so that a driver, a target and a test can all
-// name these without pulling in the encodings.
+// serve them from something built once. Kept apart from BenchCommon.h so a
+// driver, a target and a test can all name these without pulling in the
+// encodings.
 
 namespace facebook::nimble::mlidc {
 
 /// The cost shape of a partial read.
 ///
-/// Every target answers this, so a driver asks rather than infers. A name says
-/// what an arm was called; this says what its reads cost, and the two have
-/// already disagreed: the point driver wrote emulated_point_read as a constant
-/// 1 for every arm including the view arms it was meant to separate, so the
-/// column had to be reconstructed from the arm's name afterwards.
+/// Every target answers this, so a driver asks rather than infers instead of
+/// relying on what an arm happens to be named.
 enum class ReadPath {
-  /// Reaching row i means traversing from row zero, so every probe replays the
-  /// stream from the start. This is what production reads through.
+  /// Reaching row i means traversing from row zero, as production reads do.
   kCursor,
   /// Row i is addressed directly, in time that does not depend on i.
   kIndexed,
-  /// Addressable at block granularity: a read costs the blocks it overlaps and
-  /// nothing else, whatever the column length is.
+  /// Addressable at block granularity: a read costs the blocks it overlaps.
   kBlock,
   /// Every read, however small, decompresses the whole payload first.
   kWholePayload,
@@ -64,8 +58,7 @@ inline std::string_view readPathName(ReadPath path) {
 /// Whether a one-row read costs one row.
 ///
 /// False for the paths that answer a point lookup by decoding more than the
-/// point, which is exactly what the point driver's emulated_point_read column
-/// is asking.
+/// point.
 inline bool servesPointReadDirectly(ReadPath path) {
   return path == ReadPath::kIndexed;
 }

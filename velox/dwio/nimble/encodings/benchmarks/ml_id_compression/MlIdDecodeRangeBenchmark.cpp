@@ -136,9 +136,8 @@ int runBenchmark() {
     }
   }
 
-  // One cell list for the whole run. Built before the encoder loop on
-  // purpose: a random offset drawn per encoder would compare encoders on
-  // different work, and the point of this sweep is the ratio between them.
+  // One cell list for the whole run, built before the encoder loop so a
+  // random offset per encoder does not compare them on different work.
   std::vector<Cell> cells;
   if (rangeSizes.empty()) {
     for (double a : aFracs) {

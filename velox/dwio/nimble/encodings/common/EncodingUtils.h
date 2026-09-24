@@ -28,8 +28,6 @@
 #include "velox/dwio/nimble/encodings/EliasFanoEncoding.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/ForEncoding.h"
-// FrequencyPartition integration (re-enabled for
-// NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 #include "velox/dwio/nimble/encodings/FrequencyPartitionEncoding.h"
 #endif
@@ -231,8 +229,6 @@ auto encodingTypeDispatchNonString(Encoding& encoding, F&& f) {
       NIMBLE_UNREACHABLE(
           "Huffman encoding only supports integral data types, got {}.",
           encoding.dataType());
-      // FOR and FrequencyPartition integration (re-enabled for
-      // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
     case EncodingType::FOR:
       if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {

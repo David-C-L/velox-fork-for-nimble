@@ -106,26 +106,12 @@ class DeltaEncoding final
   /// Size estimate for encoding selection, counted from the adjacent-pair
   /// statistics rather than assumed from the value range.
   ///
-  /// CHANGES SELECTION. This used to assume a single leading restatement and an
-  /// average step of range / (rowCount - 1) -- "the typical step for a column
-  /// whose values are roughly evenly spread across [min, max] in row order",
-  /// which is an assumption about row order that unsorted data does not meet.
-  /// Its own comment conceded that non-monotonic columns would be
-  /// underestimated; measured against real encodes the quote came out 3.3x
-  /// under at the median and 8.2x at the 90th percentile, because a column with
-  /// half its pairs descending restates half its rows at full width while being
-  /// priced for one restatement.
-  ///
-  /// Nothing is assumed now. computeDeltas puts a pair in the delta stream when
-  /// it does not descend and restates it when it does, so given the count of
-  /// non-decreasing pairs both stream lengths are known exactly, and the widest
-  /// rising step is what a fixed-width delta array must be sized to. Statistics
-  /// walks adjacent pairs for those three numbers in one pass, and caches them,
-  /// so a caller that asks for any of them pays for the walk once.
-  ///
-  /// The three nested streams are priced by the estimators selection would
-  /// apply to them rather than by a formula here, so this tracks their accuracy
-  /// instead of drifting from it.
+  /// computeDeltas puts a pair in the delta stream when it does not descend
+  /// and restates it when it does, so given the count of non-decreasing pairs
+  /// both stream lengths are known exactly, and the widest rising step is what
+  /// a fixed-width delta array must be sized to. The three nested streams are
+  /// priced by the estimators selection would apply to them rather than by a
+  /// formula here, so this tracks their accuracy instead of drifting from it.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,
@@ -135,7 +121,6 @@ class DeltaEncoding final
     }
 
     const auto& pairs = statistics.adjacentPairStats();
-    // One restatement always leads, and every descending pair adds another.
     const uint64_t deltaCount = pairs.nonDecreasingCount;
     const uint64_t restatementCount = rowCount - deltaCount;
 
@@ -149,15 +134,14 @@ class DeltaEncoding final
         TrivialEncoding<physicalType>::estimateSize(restatementCount),
         FixedBitWidthEncoding<physicalType>::estimateSize(
             restatementCount, statistics.min(), statistics.max(), options));
-    // A bool stream that is true exactly at the restatements. Sparse when
-    // restatements are rare, which is the case the encoding is for, and
-    // bit-packed otherwise.
+    // Sparse when restatements are rare, which is the case the encoding is
+    // for, and bit-packed otherwise.
     const uint64_t isRestatementsSize = std::min(
         SparseBoolEncoding::estimateSize(rowCount, restatementCount, options),
         EncodingPrefix::kFixedPrefixSize + 1 + velox::bits::nbytes(rowCount));
 
-    // Each nested sub-stream carries its own header, counted by the estimators
-    // above. Outer prefix(6) + two 4-byte relative offsets.
+    // Outer prefix plus two 4-byte relative offsets; nested headers are
+    // counted by the estimators above.
     constexpr uint64_t kOuterHeaderSize = EncodingPrefix::kFixedPrefixSize + 8;
     return kOuterHeaderSize + deltasSize + restatementsSize +
         isRestatementsSize;
@@ -350,13 +334,9 @@ void computeDeltas(
       }
     }
   } else {
-    // Every row writes its delta, its restatement and its flag, and only the
-    // cursor of the stream the row belongs to advances. Sized once up front
-    // instead of grown by appends, which copied each stream every time it
-    // doubled, and without a branch on the direction of each step, which a
-    // stream that rises and falls irregularly mispredicts. The restatements
-    // are sized for every row but written only up to their cursor, so the
-    // pages past it are never touched.
+    // Streams are sized once up front rather than grown by appends, and the
+    // restatements buffer is allocated for every row but written only up to
+    // its cursor, so pages past it are never touched.
     const size_t size = values.size();
     const size_t deltasStart = deltas->size();
     const size_t restatementsStart = restatements->size();

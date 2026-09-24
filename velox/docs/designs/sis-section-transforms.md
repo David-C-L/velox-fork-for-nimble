@@ -1,709 +1,157 @@
 # Reversible Section Transforms for SubIntSplit
 
-Formerly "Block-Local Reordering". The name no longer fits: blocking turned out
-to be what one family needs rather than what the design is, and confining it to
-that family is most of what makes the layer worth having.
-
-*2026-09-03*
-
-## Units
-
-Every figure carries **bits per element (b/e)**, the encoded size divided by the row count, and
-the same figure as a **percentage of that cell's own baseline**. Both are needed: baselines
-across the measured columns span 13 to 57 b/e, so a percentage alone hides how much data a
-change moves, and a bit count alone hides whether it is a large or small share of the column.
-
-A third column, **MB per 10M rows**, appears where absolute scale is the point. One bit per
-element is 1.25 MB per 10 million rows, so a 2 b/e saving on a billion-row column is about
-250 MB.
-
 ## Motivation
 
 SubIntSplit cuts an integer column into contiguous bit-range sections and gives each its own
-child encoding. Its measured gains come almost entirely from sections that land on
-slowly-varying bit ranges and compress under RLE or MainlyConstant. Row order is the one lever
-it has that the order-blind encoders do not: sorting an OSM spatial column gives SubIntSplit a
-uniform ~7 bits/element while Trivial, FixedBitWidth, Dictionary, Delta and FPE gain exactly
-0.00.
+child encoding. A section that compresses poorly when its rows are read in the column's row
+order can compress well once rows are reordered by the value of another section: sorting a
+column-like sub-part by a related key groups similar values together, which is exactly what
+slowly-varying-friendly child encodings such as RLE and MainlyConstant need.
 
-That raises the question this design answers. Can SubIntSplit capture some of that gain
-internally, by reordering rows inside a block after split selection, while still returning
-rows in their original order?
+Row order is therefore a lever SubIntSplit can pull without changing what each section stores,
+as long as the reorder is reversible and the original row order can still be recovered on read.
+This is why each SubIntSplit section can carry its own transform: a section is reordered only
+when doing so is cheaper than leaving it alone.
 
-An oracle study measured every plausible way of doing it: six transform families across twenty
-input orders, nine columns, three encoder inventories and two block sizes, with real encodes
-throughout and round-trip verification on every block. The full results are in
-`sis_reorder_results.md`. Three families survive, and this document specifies them and the
-extension point they share.
+The reorder has to be undoable independently of which sections chose it. Some sections in a
+block may be transformed and others left as-is, so the mechanism that recovers original row
+order cannot depend on every section agreeing to participate; it has to be reconstructable from
+a single, always-present source of truth. That is what motivates storing one section unpermuted
+as the sort key described below, rather than, say, storing an explicit permutation array
+alongside the block.
 
-## Summary of what the measurements support
+## The two current transforms
 
-Three families are worth building, and they are worth building in this order, because the
-order is by robustness rather than by headline size.
+Every other transform id that has existed in this design is retired; see below.
 
-| Rank | Family | Gain | Cost | Point access |
-|---|---|---|---|---|
-| 1 | **Value relabelling** | 6% on `Medicare1.NPI` as shipped, 9 to 11% on OSM under interleaved arrival, and it *grows* with a richer inventory | Gray costs 0.94% of encode; frequency and dense need a hash map, see below | **true O(1)**, rows never move |
-| 2 | **Key-derived permutation** | 28 to 32% on `Medicare1.NPI`, 17 to 22% on OSM `h3_r9`, under interleaved arrival | 1.7% encode, 0.51 ns/row bulk decode | **O(block) per probe** unless cached |
-| 3 | Closed-form permutation | 30% on XMark as shipped, near zero elsewhere, and it collapses to 1.02 b/e once delta exists | 2.8% of encode | true O(1) |
+### Key-derived permutation (transform id 1)
 
-Relabelling is placed first despite the smaller headline because it is the only one of the
-three that never moves a row. There is no permutation to invert, no rank to reconstruct and no
-key section to keep unpermuted, so point lookups are unaffected and the decoder change is a
-value mapping rather than an addressing change. It is also the family whose gain *rises* when
-delta and an entropy coder are added, where the block transforms fall away.
+One section in the block is designated the **key** section. Every other section that selects
+this transform is stably sorted by the key section's decoded value: rows with equal keys keep
+their relative order, which is what lets a reader reconstruct the same permutation deterministically
+from the key values alone.
 
-The key-derived permutation is the larger win where a column arrives interleaved, and is the
-one to reach for on scan-shaped workloads.
+The key section itself is always stored **unpermuted**, since it is what a reader uses to
+rebuild the mapping back to original row order; a permuted key section would have nothing to
+rebuild it from.
 
-The closed-form family is included only because it is nearly free to implement and is the
-cheapest possible special case; it should not be built before delta lands, since delta removes
-the structure it exploits.
+At encode time this means: pick a key section (typically the one whose value correlates with
+where the gains lie in the other sections), compute a stable sort of row indices by that
+section's values, then gather every other transformed section's values through that
+permutation before handing them to child-encoding selection. The key section's own bytes are
+never touched by the permutation.
 
-**Not worth building, on direct evidence:**
+At decode time, the process runs in reverse: the key section is decoded first, in its stored
+(unpermuted) order, and the same stable sort is recomputed over it to get back the permutation
+that was used at encode time. Any other section flagged as transformed is then decoded in its
+stored (sorted) order and gathered back through the inverse of that permutation to restore
+original row order.
 
-| Family | Verdict |
-|---|---|
-| Stored permutation index | Closed. +0.0000 b/e in all 176 measured cells, including near-sorted inputs |
-| Group reorder | Closed. Clears 0.01 b/e in 7 of 176 cells, never exceeds +0.21 |
-| BWT and BWT+MTF | Largest raw gains, but they need delta and an entropy coder absent, and BWT forfeits point access outright |
-| Bit-plane transposition | 17% on `Corporations.Id1`, but 24 to 434 ns/row to invert, and its gain there is a symptom of the split selector under-splitting |
+### Row frame (header flag bit 1)
 
-## Scope
+A row frame fits a line, `slope * row + base`, to the whole column and subtracts it from every
+value before the column is split into sections. Where the fit is a poor match for value drift,
+a step frame (a small number of flat segments rather than one line) is used instead. The frame
+is a property of the whole column, not of one section, and is recorded once in the header rather
+than per section.
 
-* Blocked only where a block is what makes a row reachable. The first version of this design
-  blocked everything that moved a row, on the assumption that moving rows is what puts a row out
-  of reach. That is wrong, and it was expensive: blocking a key-derived permutation at 4096 rows
-  took its gain on `Medicare1.NPI` from +5.99 b/e to +0.00, because a sort clusters far better
-  over a section than over 4096 rows, and it bought nothing in exchange.
+## Wire format
 
-  What decides it is whether undoing one row requires undoing the rows around it. The interface
-  states this as `positionMapping()`:
-
-  | | blocked? | how one row is read |
-  |---|---|---|
-  | `InPlace` (the three relabellings) | no | the value is undone where it stands |
-  | `Permuted` (key-derived) | no | one offset, from a map built off the key section |
-  | `Gathered` (bit-plane) | no | `width` computable offsets, reassembled by the transform |
-  | `Sequential` (Burrows-Wheeler, BWT+MTF) | **yes** | a chain through the block, no closed form |
-
-  A key-derived permutation sends each row to its rank in the sort of the key section, and the
-  key section reaches the reader in original order precisely so it can order the rest. So where
-  a row went is derivable without reading a single transformed value: a reader builds that map
-  once and then addresses any row through one indirection. Bit-plane is the same in kind but not
-  in shape -- a row's bits sit at `width` computable positions rather than one -- so it supplies
-  `gatherRow` instead of a map, with the reader providing the fetch and the transform providing
-  the arithmetic.
-
-  Only Burrows-Wheeler is left, and only because its inverse is a chain of lookups with no closed
-  form. Its block is 4096 rows, matching `kSubIntSplitChunkSize`, and the size is carried on the
-  wire so a later writer may choose another without breaking this reader. A zero block size means
-  nothing was blocked, which a reader must take as "the span is the whole column" rather than
-  defaulting to a chunk and inverting a whole-column permutation piecewise.
-
-  A blocked transform that still wants a dictionary derives it once from the whole section via
-  `prepareSection`, rather than storing one per block. Burrows-Wheeler with move-to-front is the
-  case that forced this: a per-block alphabet costs more than the transform saves, and a
-  section-wide alphabet is a superset of every block's, which is all move-to-front requires.
-  Move-to-front also declines a section whose alphabet exceeds a limit, since it scans that
-  alphabet per value and stores it outright, and past the limit it pays for neither.
-* Which section a key-derived permutation sorts by is searched, not fixed. Which section groups
-  the others is a property of the data, and guessing it wrong reports that the transform does not
-  pay when what did not pay was the guess.
-* Three families behind one extension point: value relabelling, which never moves a row; a
-  key-derived permutation, a stable sort of the block by another section the decoder has
-  already read; and closed-form permutations. None of them stores a per-row index.
-* Rows are always returned in their original order. No reader change is required.
-
-## Design
-
-### Wire format
-
-`SubIntSplitEncoding`'s header already reserves a byte after `splitCount`, documented as
-"future BitSplitOrder" and currently written as zero. It becomes a transform id:
+Encoding type 26 (`SubIntSplitReordered`) extends the SubIntSplit prefix with:
 
 ```
-[standard Encoding prefix]
-[1B]  splitCount
-[1B]  transformId          0 = none
-                           1 = key-derived permutation
-                           2 = value relabel, frequency
-                           3 = value relabel, dense
-                           4 = value relabel, Gray
-                           5 = closed-form permutation
-[1B]  transformParam       key section index, or the closed-form shape.
-                           Present only when transformId != 0, and only for
-                           the transforms that take one.
-[per-section codebook]     Only for the relabelling transforms that carry one;
-                           Gray carries none.
-[splitCount x 6B]  {bitStart, bitEnd, encodedSize}
-[section bytes...]
+[standard SubIntSplit prefix]
+[1B]  numSections
+[1B]  flags                 bit0 = delta
+                             bit1 = row frame present
+                             bit2 = transforms present
+[17B] row frame              present only if flags.bit1
+      [1B]  guard
+      [8B]  slope
+      [8B]  base
+[transform block]            present only if flags.bit2
+      [1B]  keySection       index of the section used as the sort key
+      [numSections x 1B]  transformId   per section, 0 = none
+      [per transformed section]
+          [4B]  codebookSize
+          [codebookSize x 8B]  codebook entries
+[numSections x 6B]  {bitStart, bitEnd, encodedSize}
+[section payloads...]
 ```
 
-`parseSubIntSplitSections` in `subintsplit/SectionAccumulator.h` is the single shared parser, so the
-change is made once, but both `SubIntSplitEncoding` and `SubIntSplitEncodingView` must honour
-it.
-
-The key section is stored **unpermuted**. It is what rebuilds the order, so it cannot itself
-be reordered. This holds for a composed transform too, which begins with the same permutation.
-
-### Compatibility
-
-**New reader, old data: safe.** Every stream written before this change carries zero in the
-reserved byte, which means no transform, so old data reads unchanged.
-
-**Old reader, new data: unsafe, and silently so.** The current parser reads the reserved byte
-and discards it:
-
-```cpp
-const uint8_t splitCount = encoding::read<uint8_t>(pos);
-encoding::read<uint8_t>(pos); // reserved order byte
-```
-
-Nothing validates it. An existing reader handed a stream with a non-zero transform id would
-decode the sections, skip the inverse, and return **transformed values as though they were the
-originals**: wrong data, no error, no signal. The extra header fields would also shift the
-section triples it expects.
-
-So the reserved byte alone is not a safe migration. The options, in order of preference:
-
-1. **Allocate a new `EncodingType`.** An old reader meets an encoding it does not know and
-   fails loudly in the factory, which is the correct behaviour for data it cannot decode. This
-   costs one enum value and is the recommended route.
-2. Reuse the reserved byte, and only where every reader is known to be upgraded first. Cheaper
-   on the wire, but it converts a version skew into silent corruption rather than an error.
-
-Whichever is chosen, a reader that meets an unknown transform id must fail rather than decode:
-an unrecognised transform produces wrong values, not degraded ones.
-
-### Relabelling may not need a format change at all
-
-Worth establishing before any wire change is made. Of the sections where dense or frequency
-relabelling is adopted, **59% had already chosen `Dictionary` and switched to
-`FixedBitWidth` after relabelling**, with a further 16 to 18% switching to `Varint`. That is
-close to what `DictionaryEncoding` already does: it stores an alphabet and per-row codes.
-
-The gain is therefore coming from how the *codes* are encoded, not from the relabelling being
-a new capability. It may be reachable by improving the encoding of a dictionary's index stream,
-or by letting nested selection consider dense-remap-then-bit-pack, neither of which touches the
-SubIntSplit header. Gray coding is the exception: it is a genuine value map, carries no
-codebook, and has no existing equivalent.
-
-### Encode
-
-In `SubIntSplitEncoding<T>::encode`, between section extraction and the `encodeNested` call:
-
-1. Once per block, build the permutation: a stable sort of row indices by the key section's
-   value. Ties keep original order, which is what makes the decoder's counting pass reproduce
-   it exactly.
-2. For each section other than the key, gather it through the permutation before handing it to
-   nested encoding selection.
-
-The loop is currently column-at-a-time and section-at-a-time. The permutation is a property of
-a block, so for this family the loop becomes block-outer and section-inner. Nothing else about
-encode changes; nested selection still sees the transformed section and chooses an encoding
-for what it actually has to encode.
-
-### Decode, bulk
-
-The permutation is shared by every section, so the existing accumulate loop is untouched. Rows
-are assembled in permuted order exactly as today, and the order is undone once on the finished
-values:
-
-```
-for each chunk:
-    accumulate all sections as now      // unchanged
-    gather the assembled values through the inverse permutation
-```
-
-One gather per block, not one per section.
-
-### Decode, point access
-
-This is the part that constrains where the layer should be enabled. Reading row *i* requires
-*i*'s rank in the stable sort, which depends on the key values of **every** row in the block.
-A single probe therefore needs the key section decoded and a rank computed over the block:
-O(block), roughly 15 microseconds for 1024 rows, against the view's 908 ns point lookup.
-
-Two mitigations, and the design should carry the first:
-
-* Cache the rank structure per block in the view, so probes landing in the same block pay it
-  once. A gather of many rows from one block then amortises it to near nothing; scattered
-  single-row probes across many blocks do not.
-* Fall back to `MaterializedEncodingView`, the escape hatch that already exists for
-  Zstd-compressed sections, when a section cannot be addressed directly.
-
-`readTypedAt` in `SubIntSplitEncodingView` must consult the cache rather than assume O(1)
-addressing.
-
-## Implementation structure
-
-The point of specifying this is that three families are being built and more may follow, so
-the extension point matters as much as the first implementation.
-
-### Files
-
-All new code lives in a SubIntSplit-scoped directory, so no other nimble encoding is touched
-by code it does not use:
-
-```
-velox/dwio/nimble/encodings/subintsplit/
-    SectionTransform.h          the interface and the transform id registry
-    ValueRelabelTransform.h     frequency, dense and Gray relabelling
-    KeyDerivedTransform.h       the stable sort by another section
-    ClosedFormTransform.h       stride and transpose
-    tests/SectionTransformTests.cpp
-```
-
-Names describe the concept. Per `CODING_STYLE.md` nothing here is named `*Utils`, `*Helpers`
-or `*Common`, since those names attract unrelated functions and lose cohesion.
-
-### The interface
-
-One abstract transform, one file per family, so a family can be added without modifying an
-existing one:
-
-```cpp
-/// Rewrites one SubIntSplit section within a block, reversibly.
-class SectionTransform {
- public:
-  virtual ~SectionTransform() = default;
-
-  /// Identifies the transform on the wire. Stable across releases.
-  virtual TransformId id() const = 0;
-
-  /// Rewrites `values` in place for encoding. `context` carries the block's
-  /// already-decoded key section, for transforms that need one.
-  virtual void apply(std::span<uint64_t> values, const TransformContext& context) = 0;
-
-  /// Restores the original values. Must be exact for every input.
-  virtual void invert(std::span<uint64_t> values, const TransformContext& context) = 0;
-
-  /// Restoration cost in bits, so section selection can charge for it.
-  virtual size_t restorationBits(std::span<const uint64_t> values, int width) const = 0;
-
-  /// Whether a single row can be read without reconstructing the block.
-  virtual bool supportsPointAccess() const = 0;
-};
-```
-
-`supportsPointAccess` is on the interface rather than implied, because it is the property that
-decides whether a transform may be selected for a point-lookup-shaped read, and it differs
-across the three families being built.
-
-Method bodies go in the corresponding `.cpp`; per the style guide only trivial one-liners stay
-in a header. Every public method carries a `///` comment; private members use `//`.
-
-### Transform ids and forward compatibility
-
-`transformId` is a dense enum, appended to and never renumbered, since it is on the wire.
-
-A reader that meets an unknown `transformId` **must fail cleanly rather than decode**, because
-an unrecognised transform silently produces wrong values rather than an obvious error:
-
-```cpp
-VELOX_CHECK_LT(
-    transformId, kTransformIdCount, "Unsupported SubIntSplit transform id: {}", transformId);
-```
-
-Runtime information goes at the end of the message, after the static description, per the
-style guide. `transformId == 0` means no transform, which is what every stream written before
-this change already contains, so old data reads unchanged.
-
-### Selection
-
-A transform is chosen per section, and only when it pays for itself: a section takes
-`max(0, gain - restorationBits)` and otherwise stays untransformed. Charging every section for
-a transform only some of them want is not a small mistake; on XMark the same transform reads
-+1.07 b/e when sections may decline it and −1.44 b/e when they may not.
-
-Selection must also respect the read shape. A transform whose `supportsPointAccess()` is false
-should not be selected when the column is expected to serve point lookups, which is the hook
-the `Encoding::Options` already carries policy for.
-
-### Testing
-
-Tests go in `encodings/subintsplit/tests/`, next to the code, following the grouped-test
-conventions in the nimble CMakeLists:
-
-* Round-trip every transform over a matrix of block sizes, section widths and data shapes
-  including constant, low-cardinality, monotone and random. The oracle harness already does
-  this and reports zero failures across roughly 2.4 million rows.
-* A key-derived permutation keyed on the section it sorted by must be the identity.
-* A section used as a key must round-trip while stored unpermuted.
-* An unknown transform id must throw, not misdecode.
-* Point-lookup latency with and without the rank cache, against the 908 ns view baseline.
-
-## What the built layer measures
-
-Measured at 524288 rows per column. The full tables are in
-`MetaNimbleProject/sis_transform_results.md`.
-
-**The layer's worth is a property of how a column arrived, not of the column.**
-On the order a file stores, five of eight columns gain under 1%. On an
-interleaved arrival order the same layer on the same rows recovers 20 to 42%.
-
-| column | shipped | best interleaved |
-|---|---|---|
-| `osm_h3_r9` | +3.70% | +35.65% |
-| `publicbi_npi` | +22.19% | +42.29% |
-| `snowflake` | +0.59% | +10.33% |
-| `xmark_prepost` | +38.01% (BWT) | +30.65% (key-derived) |
-
-A stored file is usually the arrival order already sorted, so measuring only
-what the file holds tests the layer on the input with least left to recover.
-This is why the benchmark carries an arrival-order axis rather than reading
-each column as shipped.
-
-The two families respond to arrival order in opposite directions. Key-derived
-recovers *structured* disorder: it gains most where rows arrived interleaved
-from ordered writers, because the interleave leaves the groupings intact and a
-sort on the right section puts them back. Random shuffling is a different case,
-and a worse one -- `osm_h3_r9` gives +8.47% shuffled against +35.65% merged --
-because shuffling destroys the groupings rather than interleaving them.
-Burrows-Wheeler is the reverse: worth +38.01% on `xmark` as stored and nothing
-at all once interleaved, since the repeated context it exploits is exactly what
-interleaving destroys.
-
-What each costs a reader follows the position mapping, not the gain:
-
-| | compression | point lookup |
-|---|---|---|
-| key-derived, `publicbi_npi` | +22.19% | 199 ns against 38.6 ns |
-| bit-plane, `xmark` | +14.72% | 784 ns against 557 ns |
-| Burrows-Wheeler, `xmark` | +38.01% | 174054 ns against 557 ns |
-
-On two OSM columns key-derived probes came back faster than the untransformed
-baseline, because permuting improved locality for the section it sorted on.
-
-## Where the gains are, by column
-
-The gains are not spread evenly, and the columns they favour are not the ones this encoding
-was built for.
-
-| Column | Best realistic arm | Baseline b/e | Gain b/e | Gain % | MB/10M rows | Family |
-|---|---|---|---|---|---|---|
-| `Medicare1.NPI` | interleaved | 20.7 | +6.2 | 30% | 7.8 | key-derived |
-| OSM `h3_r9`, coarse | interleaved | 16.7 | +3.7 | 22% | 4.6 | key-derived |
-| OSM `h3_r9`, coarse | sorted by a sibling | 11.2 | +0.9 | 8% | 1.1 | key-derived |
-| OSM fine, `mergekey` | interleaved by a carried key | 49.4 to 58.1 | +4.4 to +5.2 | 7.5 to 10.6% | 5.5 to 6.5 | key-derived |
-| OSM fine | any other realistic arm | 26 to 45 | under +0.5 | under 1% | under 0.6 | any |
-| `snowflake` | shipped | 48.1 | +1.4 | 2.9% | 1.7 | bit-plane |
-| `snowflake` | `mergekey=3` | 44.5 | **+3.1** | **7.0%** | 3.9 | key-derived then bit-plane |
-| `snowflake` | `mergeirr=8` | 57.0 | **+2.7** | **4.8%** | 3.4 | key-derived then bit-plane |
-
-**Fine-resolution spatial columns and Snowflake are the weak cases.** On `s2_l30`, `h3_r15`
-and `morton_2x32` no family clears 1% on any arm except `mergekey`, where a key carried in the
-value gives the permutation something to group by. That is consistent with the earlier finding
-that the low bits of a fine space-filling-curve position are incompressible noise: there is no
-structure for a reordering to expose, at any resolution the curve is fine enough to be
-near-unique. The coarse `h3_r9` behaves completely differently, at 8 to 22%.
-
-Snowflake resists every *single* transform: at most +1.4 b/e (2.9%) from bit-plane
-transposition on its shipped order, falling to +0.33 b/e (0.8%) once an entropy coder is
-available, and under +0.15 b/e (0.3%) from the key-derived permutation. Its one substantial
-result comes from composition, below, and that one does survive an entropy coder.
-
-## Do transforms stack?
-
-Measured, by composing the key-derived permutation with a per-section transform and scoring the
-result as its own candidate. Across 52 cells the composition delivers a **median of 85% of the
-sum of its parts, with a lower quartile of 48%**. They overlap rather than add.
-
-More importantly, composition is often **worse than the better component alone**:
-
-| Column, arm, inventory | Key-derived alone | Second alone | Composed |
-|---|---|---|---|
-| `osm_s2_l30_sorted`, `mergeirr=8`, entropy | +6.16 | +0.00 | **+0.05** |
-| `publicbi_npi`, `mergeirr=8`, base | +6.28 | +0.00 | **+0.30** |
-| `osm_h3_r9`, `mergekey=3`, base | +5.84 | +0.21 | **+2.92** |
-
-Permuting rows and then rewriting the section's values can destroy the structure the
-permutation just created, and a greedy chain finds that out only after it has committed.
-
-Genuine synergy does exist, and it is where Snowflake's only real result lives:
-
-All figures bits per element, with the composed result also as a share of that cell's baseline.
-
-| Column, arm, inventory | Baseline | Key-derived | Second | Composed | Sum | Composed % | MB/10M |
-|---|---|---|---|---|---|---|---|
-| `snowflake`, `mergeirr=8`, base | 56.96 | +0.13 | +0.06 | **+2.71** | +0.19 | **4.8%** | 3.4 |
-| `snowflake`, `mergeirr=8`, entropy | 51.52 | +0.13 | +0.05 | **+2.55** | +0.18 | **4.9%** | 3.2 |
-| `snowflake`, `mergekey=3`, base | 44.52 | +0.11 | +1.77 | **+3.11** | +1.88 | **7.0%** | 3.9 |
-
-This is the one place Snowflake gains anything worth having, and it holds under an entropy
-coder, which the single bit-plane transform does not.
-
-There the permutation groups equal values together and only a bit-oriented transform can
-monetise the result: neither alone sees it.
-
-**The design consequence is concrete.** A composed transform must be evaluated as its own
-candidate with its own measured size. The selector must not chain transforms greedily, and
-must not assume additivity in a cost model, because both would be wrong more often than right.
-That is why `SectionTransform` takes the section and returns a rewritten section rather than
-offering a `compose` operation: composition is a candidate, not an operator.
-
-## Costs
-
-Measured, on 1024-row blocks.
-
-**Value relabelling.** Gray coding costs 1.4 ns/row to apply, 0.94% of the encoding-selection
-pass, and stores no codebook at all. Frequency and dense relabelling measure 103 and 64 ns/row
-in the reference implementation, which is 50 to 80% of encode, but that is a linear lookup per
-value; a hash map makes both comparable to Gray. Decode is a codebook lookup per value, 2.2 to
-3.3 ns/row, and rows never move so point access is unaffected.
-
-**Key-derived permutation.**
-
-| Step | Cost | Paid |
-|---|---|---|
-| build the permutation | 14.61 ns/row | once per block, at encode |
-| apply it | 0.52 ns/row | once per section, at encode |
-| invert it | 0.51 ns/row | once per block, at decode |
-
-* **Encode: about 1.7%.** Amortised over a 7-section split, 2.60 ns/row/section against roughly
-  153 ns/row/section for the encoding-selection pass that follows. Building the permutation per
-  section instead of per block costs 18.3% and is the implementation to avoid.
-* **Bulk decode: 8 to 23% slower.** One 0.51 ns/row gather against SubIntSplit's own 2.2 to 6.2
-  ns/row.
-* **Point access: O(block) per probe** unless the rank cache hits.
-* **Split selection: roughly 5 to 8x**, estimated from the components rather than measured end
-  to end, if the DP is made key-aware by permuting the sampled values once per candidate key.
-
-## When to enable it
-
-The gain depends almost entirely on how the column arrives, so that is the thing to test
-before enabling anything.
-
-| Arrival order | Cheap-family gain, surviving delta and entropy |
-|---|---|
-| interleaved by a field the value carries | 28 to 32% on `Medicare1.NPI`, 17 to 22% on OSM `h3_r9` |
-| sorted by a correlated sibling column | 8% on OSM `h3_r9` |
-| the column's own natural order | 6% on `Medicare1.NPI`, under 2% on Snowflake and XMark |
-| already sorted by its own value | nothing |
-
-The layer suits columns written by several shards or partitions and read by scans, and does
-not suit columns that already arrive in a good order or are read by scattered point lookups.
-
-## What this does not address, and matters more
-
-Split selection is the larger lever. Choosing boundaries against real encoded bytes rather than
-the DP's cost model is worth **1 to 9 bits per element with no transform at all**, positive in
-34 of 36 measured cells, and it needs no format change. On OSM and Snowflake, once boundaries
-are chosen that well, the best transform adds +0.00 and +0.73 b/e respectively and turns
-negative once an entropy coder is available: there the transform and the split are substitutes,
-and most of what a naive measurement credits to reordering is the transform compensating for a
-misplaced boundary.
-
-The two are complements only on the PublicBI columns, where the transform still adds +4.7 to
-+9.2 b/e on top of an oracle split and survives an entropy coder.
-
-**Sequencing follows from that.** Close the cost-model gap first, then delta and an entropy
-coder, then re-run the oracle. This layer is worth building for interleaved arrivals regardless,
-because its gain there survives both, but its value on the designed ID schemes largely does not.
-
-## Implementation plan
-
-Staged, with a gate at the end of each stage, because two of the stages need no format change
-and one of them may remove the need for part of the layer. Building the transform first would
-be building the smaller lever against a baseline that is about to move.
-
-### Stage 0. Close the cost-model gap in split selection
-
-No format change. No new encoding. The largest measured number in the whole study.
-
-**What the gap is.** The DP in `subintsplit/SplitSelector.h` costs every candidate bit range with
-`bestCostBits`, and that estimate is wrong in four separate ways:
-
-```cpp
-const SegmentMetrics metrics = collector.compute(segValues, requiredFlags);
-const double perSampleCost = costFn(metrics, numSamples, bitWidth, bestEnc);
-const double fullCost = perSampleCost * fullCount / numSamples;
-```
-
-1. `bestCostBits` is an **analytic formula over summary metrics**, cardinality, run count,
-   min and max, rather than an encode. It predicts a size, it does not measure one.
-2. It scores **seven flat encodings and omits Delta and Huffman entirely**, neither of which
-   appears in its `consider` list. Under production nested selection Delta wins 24,133 sections
-   and Huffman 33,761, so ranges where those win are mispriced by construction.
-3. **Dictionary is priced without its nested index encoding.** With flat scoring Dictionary
-   never wins a single section; with real nested selection it wins 47,608. The model is costing
-   Dictionary as though its codes were stored raw.
-4. `perSampleCost * fullCount / numSamples` **extrapolates linearly from a sample**, which is
-   wrong for RLE, whose run structure changes with length, and for Dictionary, whose alphabet
-   does not grow linearly with rows.
-
-**How large it is, separated from per-block adaptivity.** An earlier measurement compared the
-production split against a per-block oracle, which conflated the model's error with something a
-cost-model fix cannot reach: a split covers a stream, not a block, so per-block boundaries are
-not expressible. Re-measured with a single oracle split chosen across all blocks, the two
-separate cleanly and the per-block part is small:
-
-| Dataset, arm, inventory | Production split | One-split oracle | Cost-model gap | Per-block extra |
-|---|---|---|---|---|
-| `snowflake`, shipped, base | 47.62 | 43.52 | **+4.10 b/e (8.6%)** | +1.06 |
-| `snowflake`, `mergeirr=8`, base | 57.98 | 49.49 | **+8.48 b/e (14.6%)** | +0.17 |
-| `osm_s2_l30`, shipped, base | 45.78 | 41.71 | **+4.06 b/e (8.9%)** | +0.15 |
-| `osm_h3_r9`, shipped, base | 13.49 | 11.98 | **+1.51 b/e (11.2%)** | +0.28 |
-| `osm_h3_r9`, shipped, entropy | 12.05 | 11.44 | +0.61 b/e (5.1%) | +0.41 |
-
-The cost-model gap runs +0.19 to +8.61 b/e and the per-block remainder +0.00 to +1.06, so
-almost all of it is reachable by a single, stream-wide split chosen better.
-
-**Most of this work already exists on `nimble-880-migration`.** That branch's `bestCostBits`
-considers fourteen candidates against seven here, adding Delta, Huffman, PFOR, FOR, DeltaBlock
-and FrequencyPartition, and corrects the MainlyConstant, Dictionary and Delta biases:
-
-| Commit | What |
-|---|---|
-| `a96b8a08f` | cost models for FOR and Delta |
-| `cf93566da` | cost models for Huffman and DeltaBlock |
-| `665409bcf` | corrects SIS cost-model bias for MainlyConstant, Dictionary and Delta |
-| `23afc685f` | corrects the Delta restatement charge and packed-delta rounding |
-| `1beaab46b`, `db951ac40`, `410f2ff74` | FrequencyPartition cost model and index sizing |
-
-**What is missing is validation through the drivers, not the code.** Those commits touch only
-`subintsplit/CostModel.h` and `SubIntSplitCostModelsTest.cpp`, which are unit tests over the
-cost functions themselves. No results directory references that branch, and although
-`MlIdCostModelOracleBenchmark` exists there it does not appear to have been run against it. A
-unit test can confirm a formula returns the number its author intended; it cannot show that the
-DP now picks better boundaries, which is the thing that matters.
-
-So stage 0 is: merge that branch forward, then run `MlIdCostModelOracleBenchmark` for top-1
-accuracy, Spearman correlation and plan-level regret against a true-bytes oracle, and
-`MlIdReorderOracleBenchmark` for the end-to-end split quality, and see how much of the gap
-below it actually closes. The remaining known weakness after that is the linear extrapolation
-`perSampleCost * fullCount / numSamples`, which none of those commits addresses.
-
-**Gate.** Re-run `MlIdReorderOracleBenchmark`. On OSM and Snowflake the best transform adds
-+0.00 and +0.73 b/e once boundaries are good, so if this stage lands most of its available
-gain, the reordering layer's value on those columns is already spoken for and only the PublicBI
-case justifies going further.
-
-### What the layer is worth after stage 0
-
-Measured, by scoring the best transform on top of a single stream-wide split chosen against
-real bytes, which is the ceiling stage 0 aims at. Across 36 cells stage 0 takes a median
-+3.85 b/e and the layer keeps a median +1.66 b/e, but the median hides the shape of it, which
-is what decides the scope.
-
-| Column | Stage 0 takes | Layer keeps after | Layer % |
-|---|---|---|---|
-| OSM `s2_l30`, all arms | +3.78 to +4.38 b/e | **+0.00** | 0.0% |
-| OSM `h3_r9`, all arms | +0.19 to +2.15 b/e | +0.00 to +0.26 | 0 to 2.2% |
-| `snowflake`, shipped | +4.10 b/e | +1.54, and +0.00 under entropy | 0 to 3.5% |
-| `snowflake`, `mergeirr=8` | +8.48 b/e | +3.08, +1.75 under entropy | 4.0 to 6.2% |
-| `xmark_prepost_full`, shipped | +7.55 b/e | +4.65, +1.44 under entropy | 12 to 26% |
-| `publicbi_id1`, all arms | +1.22 to +5.47 b/e | **+4.68 to +6.88** | 28 to 37% |
-| `publicbi_npi`, all arms | −0.01 to +7.78 b/e | **+8.01 to +9.62** | 27 to 64% |
-
-**On the designed ID schemes the layer is essentially gone.** OSM `s2_l30` keeps exactly +0.00
-on every arm and inventory; `h3_r9` keeps at most +0.26 b/e. Snowflake keeps +1.5 to +3.1 b/e
-on some arms and exactly +0.00 on shipped-with-entropy. Fixing the cost model captures what the
-transform was capturing, which is the substitution effect measured earlier, now quantified
-against the realistic one-split ceiling rather than a per-block one.
-
-**On the arbitrary BI columns it survives intact and sometimes grows.** `Medicare1.NPI` keeps
-+8.01 to +9.62 b/e, 27 to 64% of the post-stage-0 size, and on its irregular-merge arm stage 0
-buys nothing at all (−0.01) while the layer buys +8.79 b/e. `Corporations.Id1` keeps +4.68 to
-+6.88 b/e. Both *increase* under an entropy coder rather than shrinking.
-
-**So the scope after stage 0 is PublicBI-shaped columns, plus XMark.** That is a narrower and
-more honest case than the one this design opened with, and it should be stated to anyone
-deciding whether to build it: if the target columns are Snowflake- or OSM-shaped, stage 0 is
-the whole project.
-
-One caveat in the layer's favour. The one-split oracle is a ceiling stage 0 will not fully
-reach, so wherever stage 0 falls short the layer retains more than the table shows.
-
-### Stage 1. Check whether relabelling needs a wire change at all
-
-No format change until the answer is known.
-
-Of the sections where dense or frequency relabelling is adopted, 59% had already chosen
-`Dictionary` and switched to `FixedBitWidth` afterwards. That is close to what
-`DictionaryEncoding` already does. Try reaching the same gain by improving how a dictionary's
-index stream is encoded, or by letting nested selection consider dense-remap-then-bit-pack.
-
-**Gate.** If the `Medicare1.NPI` gain of +2.05 b/e (6.0%) is reachable this way, the whole
-relabelling family needs no transform id, no codebook in the header and no decoder change.
-Only Gray coding would remain genuinely new, and it stores nothing.
-
-### Stage 2. The transform framework and the key-derived permutation
-
-The first stage that touches the format.
-
-1. `SectionTransform` and the transform id registry in `encodings/subintsplit/`, with the
-   identity transform only, so the plumbing lands before any behaviour does.
-2. **Allocate a new `EncodingType`** rather than reusing the reserved header byte. The current
-   parser reads that byte and discards it without validation, so an old reader given new data
-   would skip the inverse and return transformed values as originals: wrong data, silently. A
-   new encoding type makes an old reader fail in the factory instead.
-3. `KeyDerivedTransform`: build the permutation once per block, gather per section, hold the
-   key section unpermuted.
-4. Encode-side selection: score each section with and without, keep it only where it pays,
-   using real encoded sizes rather than an estimate.
-5. Decode: undo the order once on the assembled values in the chunk loop, not once per section.
-6. `SubIntSplitEncodingView`: a per-block rank cache, since a single probe otherwise costs a
-   counting pass over the block.
-
-**Gate.** Shadow mode first: encode both ways, compare sizes and assert the round trip, ship
-neither. Only enable once the shadow numbers reproduce the harness on real data.
-
-### Stage 3. Selection policy and the cost of looking
-
-Trying every candidate key multiplies split selection by roughly the section count, 5 to 8x, so
-the encoder needs a reason to look before it pays that.
-
-A cheap gate on the existing sample: if no section is a plausible key, meaning none has low
-enough cardinality to group by, or if grouping by the best candidate does not reduce run counts
-in the other sections, skip the whole family. The sampler in `subintsplit/Sampler.h` already
-produces what this needs.
-
-Selection must also respect the read shape, since the key-derived permutation is O(block) per
-point probe. A column expected to serve point lookups should not get it.
-
-### Stage 4. Composition, only as explicit candidates
-
-Composed transforms are worth having: they are where Snowflake's only substantial result lives,
-+2.71 b/e (4.8%) on an irregular merge, surviving an entropy coder. But composition delivers a
-median 85% of the sum of its parts and is frequently worse than the better component alone, as
-low as +0.05 b/e where the permutation alone gives +6.16.
-
-So a composed transform is enumerated and measured as its own candidate. The selector must not
-chain greedily and must not estimate a composition as a sum of its parts.
-
-### Stage 5. Re-evaluate after delta and an entropy coder
-
-The prior reports identify these as SubIntSplit's real gap against OpenZL, and they change what
-every transform is worth: delta competes with the block transforms and compounds with the
-key-derived permutation. Re-running the harness afterwards is one command and decides whether
-anything beyond stage 2 is still justified.
-
-### What would make this not worth doing
-
-Stated up front so the gates mean something.
-
-* Stage 0 recovers most of its 1 to 9 b/e and the target columns are OSM or Snowflake shaped.
-  The transform adds +0.00 to +0.73 b/e there once boundaries are good.
-* The target columns arrive already well ordered. In their own natural order these columns give
-  0.1 to 2.0 b/e, against 3.7 to 6.2 b/e when interleaved.
-* The workload is point lookups rather than scans. The key-derived permutation is O(block) per
-  probe.
-* Stage 1 shows relabelling is reachable through `Dictionary`, and relabelling was the only
-  family wanted.
-
-## Alternatives rejected
-
-* **Storing the permutation index.** The obvious design, and it never pays: +0.0000 b/e in all
-  176 measured cells across twenty input orders, including inputs within sixteen positions of
-  sorted where the index is at its most compressible. Sorting a section and storing where each
-  row came from is entropy coding with worse random access.
-* **Reordering groups rather than rows**, to shrink the index. Clears 0.01 b/e in 7 of 176.
-* **BWT and BWT+MTF.** The largest raw gains in the study, up to 48% on XMark, but they fall to
-  a fifth of that once delta and an entropy coder exist, and a BWT section cannot be read at one
-  row without rebuilding the block.
-* **Bit-plane transposition.** Keeps row addressing and gives 17% on `Corporations.Id1`, but
-  costs 24 to 434 ns/row to invert. Its gain there is also a symptom rather than a win: `Id1`
-  gets a single 64-bit section for a column using about 20 bits, so the transform is
-  compensating for the split selector under-splitting.
+Field-by-field:
+
+* `numSections` and the trailing `{bitStart, bitEnd, encodedSize}` array are the ordinary
+  SubIntSplit section table; nothing about them changes when transforms are in use.
+* `flags` is checked before anything else in the header is parsed, since it determines whether
+  the row-frame and transform blocks are present at all. A stream with `flags == 0` (delta off,
+  no row frame, no transforms) parses identically to a plain SubIntSplit stream past the prefix.
+* The row frame, when present, is fixed-size (17 bytes) regardless of column width, since
+  `slope` and `base` are stored as 8-byte values and adjusted for the column's actual type on
+  read; the guard byte lets a reader sanity-check the frame before applying it.
+* The transform block's `transformId` array is one byte per section, including the key section
+  itself (which always reads back as `0`, since it is never transformed) and any section that
+  chose no transform (also `0`).
+* The codebook that follows a transformed section exists so a future value-remapping transform
+  can attach an alphabet without a further wire change; `codebookSize` of `0` for the key-derived
+  permutation is what makes it a no-op for that transform today.
+
+Two things this format deliberately does not have:
+
+* No separate "transform block size" field. A reader that knows `numSections` and each
+  section's `transformId` and codebook size can compute the block's length by walking it, so a
+  redundant size field was dropped along with the transforms that needed it (see below).
+* No per-transform block state carried alongside the header. Retired transforms needed extra
+  bookkeeping of this kind; the two current transforms do not, so none is reserved for it.
+
+## How reads address rows
+
+A read that needs row *r*'s value in a permuted section cannot index directly into that
+section's storage, because the section holds rows in sorted-by-key order, not original order.
+The reader instead rebuilds a **position map** from the key section's decoded values (the same
+stable sort used at encode time), and resolves the probe through it: one indirection from
+original row number to the row's position within the section.
+
+Because building the position map requires decoding the key section, the whole permuted column
+is decoded once per block and the decode is cached in the view rather than recomputed for every
+probe. A single point access pays for the decode and the map; repeated point or range access
+into the same block reuses both.
+
+This gives the transform two different cost profiles depending on the access pattern:
+
+* **Bulk / sequential decode** never needs the position map at all. Rows are assembled in their
+  stored (sorted-by-key) order exactly like an untransformed block, and the whole assembled
+  block is gathered through the inverse permutation once at the end. The per-row cost of the
+  transform is a single gather, independent of how many sections were transformed.
+* **Point / scattered access** pays for decoding the key section and building the position map
+  the first time a block is touched, then one indirection through that map per probe
+  afterwards. This is why the position map is cached rather than treated as a temporary: without
+  the cache, every probe into a fresh row of an already-visited block would redo the same
+  key-section decode and sort.
+
+A reader that cannot cache across probes (for example, because it is only ever asked for one
+row from a block) still gets a correct answer, just without the amortization; correctness never
+depends on the cache being present.
+
+## How selection decides
+
+For each section, split selection prices the section twice: once with the section's data left
+in original row order, and once with it passed through the section's transform. Whichever
+priced encoding is cheaper is what gets selected; a section that does not benefit from being
+reordered is simply not transformed, regardless of whether other sections in the same block are.
+
+Auto-selection only prices the key-derived permutation transform against the untransformed
+alternative. The row frame is not decided this way: it is applied when a slope/step fit exists
+and is judged beneficial for the column as a whole, ahead of section splitting, rather than
+priced per section. The retired transforms below are never priced, since selection no longer
+knows about them.
+
+## Retired transforms
+
+Transform ids 2 to 4 (value relabelling variants), 5 to 6 (Burrows-Wheeler-style transforms),
+and 7 (bit-plane transform) have been retired. Current readers reject these transform ids
+outright rather than attempting to decode them. They were dropped because selection never
+priced them out as cheaper than the alternatives it already had, and because they imposed a
+poor point-access cost: transforms in the Burrows-Wheeler family, in particular, require more
+than one indirection (extra decode work per probe) to resolve a single row, unlike the
+key-derived permutation's single indirection through its position map.

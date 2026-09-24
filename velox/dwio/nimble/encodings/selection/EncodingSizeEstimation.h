@@ -85,13 +85,11 @@ struct EncodingSizeEstimation {
         "Unable to estimate size for type {}.", folly::demangle(typeid(T)));
   }
 
-  /// A size estimateSize never quotes below for `encodingType`, for the
-  /// encodings whose estimate counts the stream's distinct values, where the
-  /// bound can be had without counting them: MainlyConstant, Dictionary and
-  /// FrequencyPartition on an integer stream whose range is too wide to count
-  /// in a table. nullopt otherwise. Counting a near-unique stream's distinct
-  /// values is most of what selecting its encoding costs, and a bound is enough
-  /// to show that none of the three can win there.
+  /// A size estimateSize never quotes below for `encodingType`, for encodings
+  /// whose estimate counts the stream's distinct values but where a bound can
+  /// be had without counting them (MainlyConstant, Dictionary,
+  /// FrequencyPartition on a too-wide-to-table integer stream). nullopt
+  /// otherwise.
   static std::optional<uint64_t> estimateSizeLowerBound(
       const EncodingType encodingType,
       std::span<const physicalType> values,
@@ -158,12 +156,10 @@ struct EncodingSizeEstimation {
   }
 
  private:
-  // MainlyConstantEncodingBase::estimateSize for numbers, with the common value
-  // unknown. With D distinct values the common one occurs at most
-  // rowCount - (D - 1) times, so at least D - 1 rows are uncommon; and
-  // whichever value is common, the others span at least the smaller of max -
-  // (second smallest) and (second largest) - min. Both prices grow with those
-  // two quantities, so priced at them they bound the estimate from below.
+  // Lower bound for MainlyConstantEncodingBase::estimateSize with the common
+  // value unknown: with D distinct values, at least D - 1 rows are uncommon,
+  // and they span at least the smaller of max - (second smallest) and
+  // (second largest) - min.
   static std::optional<uint64_t> mainlyConstantSizeLowerBound(
       std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,
@@ -198,12 +194,9 @@ struct EncodingSizeEstimation {
     return outerEncodingSize + otherValuesSize + isCommonEncodingSize;
   }
 
-  // Prices RLE's run-lengths stream over the lengths themselves, with the
-  // encodings nested selection picks for it on real data. RLE's own estimate
-  // uses one FixedBitWidth over [minRepeat, maxRepeat], which on the snowflake
-  // [4..11] section quoted about 183 KB for lengths the writer stored in 22 KB
-  // as MainlyConstant, and lost the section to FOR. That flat price stays a
-  // candidate, so this never quotes above it.
+  // Prices RLE's run-lengths stream with the encodings nested selection would
+  // pick for it, rather than only the flat FixedBitWidth RLE's own estimate
+  // uses; that flat price stays a candidate, so this never quotes above it.
   static uint64_t estimateRunLengthsSize(
       const Statistics<physicalType>& statistics,
       const Encoding::Options& options) {
@@ -299,16 +292,13 @@ struct EncodingSizeEstimation {
         return BlockBitPackingEncoding<physicalType>::estimateSize(
             statistics, options.blockBitPackingBlockSize);
       }
-      // SubIntSplit integration (re-enabled for
-      // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
       case EncodingType::SubIntSplit: {
         if constexpr (
             isNumericType<physicalType>() &&
             (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {
-          // No values to plan a split over, so the estimate is the
+          // No values to plan a split over, so this falls back to the
           // FixedBitWidth bound the encoder's whole-value floor guarantees.
-          // The values overload below is what selection reaches.
           return SubIntSplitEncoding<T>::estimateSize(
               entryCount, {}, statistics, options);
         } else {
@@ -316,8 +306,6 @@ struct EncodingSizeEstimation {
         }
       }
 #endif
-      // Delta/FOR integration (re-enabled for
-      // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
       case EncodingType::Delta: {
         if constexpr (isIntegralType<physicalType>()) {
@@ -335,8 +323,6 @@ struct EncodingSizeEstimation {
           return std::nullopt;
         }
       }
-      // FrequencyPartition integration (re-enabled for
-      // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
       case EncodingType::FrequencyPartition: {
         if constexpr (isIntegralType<physicalType>()) {
           // Options carry the index type, which is a large part of what a
@@ -399,10 +385,8 @@ struct EncodingSizeEstimation {
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
       case EncodingType::FOR: {
         // Measured over the values rather than inferred from statistics: a
-        // frame's local range is a property of the values in position and does
-        // not follow from any summary of them. The statistics-only overload
-        // still exists for callers holding no values, and is deliberately
-        // conservative there.
+        // frame's local range is a property of the values in position, not
+        // of any summary of them.
         if constexpr (isIntegralType<physicalType>()) {
           return ForEncoding<physicalType>::estimateSize(values, options);
         } else {
@@ -412,8 +396,7 @@ struct EncodingSizeEstimation {
       case EncodingType::SubIntSplit: {
         // Planned over the values, for the same reason FOR is: where the bit
         // fields of a value sit, and how each behaves down the stream, is not
-        // in any summary of the values. The statistics-only overload falls
-        // back to the FixedBitWidth bound.
+        // in any summary of the values.
         if constexpr (
             isNumericType<physicalType>() &&
             (sizeof(physicalType) == 4 || sizeof(physicalType) == 8)) {

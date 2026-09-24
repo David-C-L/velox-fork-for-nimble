@@ -27,15 +27,12 @@
 // The order a column arrives in, as an axis of the benchmark.
 //
 // A reordering transform recovers structure that the arrival order scattered,
-// so measuring one only against the order a file happens to be stored in tests
-// it on the input where it has least to do. A column shipped in timestamp
-// order is already grouped; the same column as it actually arrived, interleaved
-// from many writers, is not.
+// so measuring one only against the order a file happens to be stored in
+// tests it on the input where it has least to do.
 //
-// Every arm here reorders the *input*, before any encoding. The comparison the
-// ablation draws is always within one arm -- no transform against transform, on
-// the same rows in the same order -- never across arms, which would only be
-// measuring that sorted data compresses well.
+// Every arm here reorders the *input*, before any encoding. The comparison
+// the ablation draws is always within one arm, never across arms, which
+// would only be measuring that sorted data compresses well.
 namespace facebook::nimble::mlidc {
 
 // One arrival order. `param` is the arm's argument where it takes one.
@@ -73,11 +70,9 @@ std::vector<uint32_t> stableOrderBy(size_t count, KeyFn key) {
 
 } // namespace detail
 
-/// Builds the row order for `order` over `values`.
-///
-/// `keyOf` supplies the field an arm partitions by, for the arms that need
-/// one. Returns the identity for an unrecognised arm rather than failing, so a
-/// driver that does not know an arm still runs the reference case.
+/// Builds the row order for `order` over `values`. `keyOf` supplies the field
+/// an arm partitions by, for the arms that need one. Returns the identity for
+/// an unrecognised arm rather than failing.
 inline std::vector<uint32_t> buildInputOrder(
     const InputOrder& order,
     const std::vector<uint64_t>& values,
@@ -103,14 +98,10 @@ inline std::vector<uint32_t> buildInputOrder(
   if (order.kind == "mergeirr") {
     // An irregular merge: k monotone runs consumed in random order, so the
     // stride between consecutive rows of one run varies. Each run is a
-    // contiguous range of the SORTED order, which for distinct values is a
-    // contiguous range of value magnitude -- so a row's own value (its
-    // high-order bits) does say which run it came from. That is what lets
-    // the key-derived family key on it: the split finds those bits as their
-    // own section, sorts by them, and gathers each run back together.
-    // Measured up to +42% on real columns under this arm. What would deny
-    // the family a key is a run boundary orthogonal to value magnitude --
-    // mergekey's writer partition below, not this.
+    // contiguous range of the SORTED order, so a row's own value (its
+    // high-order bits) does say which run it came from, which is what lets
+    // the key-derived family key on it. A run boundary orthogonal to value
+    // magnitude (mergekey's writer partition below) would deny it that key.
     const int runs = std::max(1, order.param);
     const auto sorted = detail::stableOrderBy(
         count, [&values](uint32_t i) { return values[i]; });
@@ -139,13 +130,10 @@ inline std::vector<uint32_t> buildInputOrder(
   }
   if (order.kind == "mergekey") {
     // The realistic multi-writer case: rows are partitioned by a field the
-    // value already carries, each partition is ordered, and the partitions are
-    // interleaved at irregular rates. A Snowflake id looks exactly like this,
-    // with its worker and datacenter bits as the partition key.
-    //
-    // Because the key is in the data, the permutation that undoes the
-    // interleave is derivable from a section the decoder has already read,
-    // which is what the key-derived family needs and what mergeirr denies it.
+    // value already carries, each partition is ordered, and the partitions
+    // are interleaved at irregular rates. Because the key is in the data,
+    // the permutation that undoes the interleave is derivable from a
+    // section the decoder has already read, which mergeirr denies it.
     std::vector<uint32_t> byKey(count);
     std::iota(byKey.begin(), byKey.end(), 0u);
     std::stable_sort(byKey.begin(), byKey.end(), [&](uint32_t a, uint32_t b) {

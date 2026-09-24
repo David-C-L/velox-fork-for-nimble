@@ -154,15 +154,9 @@ class MainlyConstantEncodingBase
       const uint64_t commonValueSize = sizeof(physicalType);
       // The other-values child holds every value except the common one, so it
       // is priced over the range of those values rather than over the whole
-      // stream's. The distinction is the point of the encoding: MainlyConstant
-      // is chosen precisely when one value dominates, and that dominant value
-      // is very often an out-of-band sentinel -- a zero, or a max-int null
-      // marker -- sitting at one end of the range. Including it stretched
-      // min..max across a gap that no value in the child ever occupies, and the
-      // resulting bit width was charged to every uncommon row.
-      //
-      // uniqueCounts is already built, and this walks it rather than the rows,
-      // so the cost is one pass over the distinct values.
+      // stream's: the common value is often an out-of-band sentinel at one
+      // end of the range, and including it would inflate the bit width
+      // charged to every uncommon row.
       physicalType uncommonMin{};
       physicalType uncommonMax{};
       bool hasUncommonValue{false};
@@ -180,11 +174,10 @@ class MainlyConstantEncodingBase
         uncommonMax = std::max(uncommonMax, uniqueCount.first);
       }
 
-      // Trivial is added alongside FixedBitWidth because a child whose values
-      // span the full width of the type gains nothing from bit packing and
-      // pays a header for it. Dictionary and nested ALP are still missing:
-      // both need a Statistics over the uncommon values, which cannot be
-      // derived from the parent's and would cost a pass over the rows.
+      // Trivial is considered alongside FixedBitWidth because a child whose
+      // values span the full width of the type gains nothing from bit
+      // packing. Dictionary and nested ALP would need a Statistics over the
+      // uncommon values, which isn't available here.
       const uint64_t otherValuesSize = hasUncommonValue
           ? std::min(
                 TrivialEncoding<physicalType>::estimateSize(uncommonCount),

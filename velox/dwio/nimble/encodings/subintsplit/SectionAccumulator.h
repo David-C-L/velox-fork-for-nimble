@@ -29,11 +29,8 @@
 namespace facebook::nimble::subintsplit {
 
 /// Output elements combined per chunk when decoding, unless the caller asks
-/// for another size. The output slice (kDecodeChunkSize * sizeof(PhysicalT))
-/// and the scratch buffer (kDecodeChunkSize * storageBytes) together fit in L2
-/// across every section of a chunk:
-///   uint64 output + uint64 scratch: 4096 * 8 * 2 = 64 KB
-///   uint64 output + uint8  scratch: 4096 * 8 + 4096 * 1 = 36 KB
+/// for another size. Sized so the output slice and scratch buffer together
+/// fit in L2 across every section of a chunk.
 inline constexpr uint32_t kDecodeChunkSize = 4096;
 
 namespace detail {

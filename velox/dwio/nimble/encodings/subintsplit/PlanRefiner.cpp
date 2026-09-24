@@ -36,7 +36,7 @@ namespace facebook::nimble::subintsplit {
 namespace {
 
 // How far one refinement step moves a boundary, and how many improving steps
-// refinement takes before stopping. Measured refinements converged within 21.
+// refinement takes before stopping.
 constexpr int kMaxShift{3};
 constexpr int kMaxMoves{64};
 
@@ -44,17 +44,15 @@ constexpr double kInfinity{std::numeric_limits<double>::infinity()};
 
 using Ranges = std::vector<std::pair<int, int>>;
 
-// One bit range of the sample, priced as section selection would price it:
-// the encoding selection picks and that encoding's estimated size, in bits for
-// the sample. Infinite when no candidate could be estimated.
+// One bit range of the sample, priced as section selection would price it.
+// Infinite when no candidate could be estimated.
 struct RangePrice {
   double sizeBits{kInfinity};
   EncodingType encoding{EncodingType::Trivial};
 };
 
-// Prices bit ranges of one sample, caching each range. Plans in a shortlist and
-// the neighbours refinement tries share most of their ranges, so the cache is
-// what keeps the estimators to the handful of ranges actually in play.
+// Prices bit ranges of one sample, caching each range, since shortlisted
+// plans and refinement's neighbours share most of their ranges.
 class RangePricer {
  public:
   RangePricer(std::vector<uint64_t> samples, const Encoding::Options& options)
@@ -94,12 +92,10 @@ class RangePricer {
   }
 
  private:
-  // Narrows the range to the storage type the writer encodes it as and runs
-  // ManualEncodingSelectionPolicy::select's comparison over the candidates a
-  // SubIntSplit section is offered: estimate times effective read factor, plus
-  // the decode term when section selection prices decode, bounded on size by
-  // subIntSplitMaxSizeRegression. Kept in step with that function by hand; a
-  // divergence prices a section selection will not choose.
+  // Narrows the range to its storage type and mirrors
+  // ManualEncodingSelectionPolicy::select's candidate comparison. Kept in
+  // step with that function by hand; a divergence prices a plan section
+  // selection would not actually choose.
   template <typename Storage>
   RangePrice priceNarrowed(int bitStart, uint64_t mask) {
     std::vector<Storage> narrowed(samples_.size());
@@ -210,8 +206,8 @@ class PlanSearch {
         cuts_{cuts},
         selectorConfig_{selectorConfig} {}
 
-  // Size, split penalties and decode at `weight`, as the split DP weighs a
-  // plan, but from the estimators rather than the cost models.
+  // Prices size, split penalties and decode at `weight` from the estimators
+  // rather than the cost models the split DP uses.
   PlanPrice price(const Ranges& ranges, double weight) {
     PlanPrice total{
         selectorConfig_.splitPenalty * static_cast<double>(ranges.size() - 1),
@@ -235,8 +231,8 @@ class PlanSearch {
     return total;
   }
 
-  // The cheapest shortlisted plan at `weight`, refined by first-improvement
-  // hill climbing over boundary shifts, merges and splits.
+  // Refines the cheapest shortlisted plan by first-improvement hill climbing
+  // over boundary shifts, merges and splits.
   Ranges search(const std::vector<Ranges>& shortlist, double weight) {
     Ranges best;
     double bestBits = kInfinity;
@@ -292,10 +288,9 @@ class PlanSearch {
       merged.erase(merged.begin() + i + 1);
       result.push_back(std::move(merged));
     }
-    // Splits dominate refinement's cost, so when bit-flip boundaries are known
-    // they are the only places a segment is split. They also keep refinement
-    // from following estimates the real bytes do not bear out, which splitting
-    // anywhere did on one measured column.
+    // When bit-flip boundaries are known, restrict splits to them; splitting
+    // dominates refinement's cost and unrestricted splits can chase estimates
+    // the real bytes do not bear out.
     for (size_t i = 0; i < plan.size(); ++i) {
       for (int position = plan[i].first + 1; position <= plan[i].second;
            ++position) {
@@ -346,8 +341,8 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
       ranges.emplace_back(segment.bitStart, segment.bitEnd);
       nextBit = segment.bitStart == nextBit ? segment.bitEnd + 1 : -1;
     }
-    // Only plans that tile [0, kBits) exactly; anything else would price and
-    // then encode a column with bits missing or repeated.
+    // Only plans tiling [0, kBits) exactly are valid; anything else would
+    // leave bits missing or repeated.
     if (!ranges.empty() && nextBit == kBits) {
       candidates.push_back(std::move(ranges));
     }
@@ -361,8 +356,8 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
   if (chosen.empty()) {
     return {};
   }
-  // Bounded on size exactly as the split DP bounds its weighted plan: against
-  // the plan the same search finds when decode counts for nothing.
+  // Bounded on size as the split DP bounds its weighted plan, against the
+  // plan the same search finds when decode counts for nothing.
   if (weight != 0.0) {
     Ranges sizeOnly = search.search(candidates, 0.0);
     if (!sizeOnly.empty() &&

@@ -112,9 +112,7 @@ int runBenchmark() {
                     << tree << "\n";
         }
         // The same tree again, one node per line and keyed by path. Emitted
-        // beside the readable form rather than instead of it: the two have
-        // different readers, and a script keying on path cannot misread this
-        // one the way a positional parse of the form above has twice.
+        // beside the readable form since the two have different readers.
         auto nodes = target->describeTree();
         if (!nodes.empty()) {
           std::cout << "  --- " << enc.name << " encoding nodes ---\n" << nodes;

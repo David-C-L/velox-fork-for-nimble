@@ -40,12 +40,9 @@
 namespace facebook::nimble::mlidc {
 
 /// Compresses `count` elements with OpenZL's select_numeric graph, appending
-/// the frame to `out`. Returns the frame's size.
-///
-/// Shared by the whole-column arm and the block arms so that openzl/block-K
-/// differs from openzl/auto in the block size and nothing else. A second copy
-/// of this setup would let the two drift, and the block-size axis would then be
-/// measuring a graph difference as well.
+/// the frame to `out`. Returns the frame's size. Shared by the whole-column
+/// arm and the block arms so openzl/block-K differs from openzl/auto only
+/// in block size, not in graph setup.
 template <typename T>
 size_t openzlCompressNumeric(const T* src, size_t count, std::string& out) {
   openzl::Compressor compressor;
@@ -125,12 +122,10 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
         std::string_view{compressed_.data(), compressed_.size()}, n, dst);
   }
 
-  // OpenZL has no addressable interior, so a partial read is served the only
-  // way a block codec can: decompress the whole column, then copy out the rows
-  // that were asked for. This is the cost a reader actually pays, and it is
-  // the comparison the decode drivers exist to make. It is not a limitation
-  // being worked around; reporting it as unsupported would simply leave the
-  // comparison unmeasured.
+  // OpenZL has no addressable interior, so a partial read decompresses the
+  // whole column, then copies out the rows that were asked for. This is the
+  // cost a reader actually pays, and the comparison the decode drivers exist
+  // to make.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
     decompressAll();
     std::copy_n(scratch_.data() + begin, count, dst);
@@ -149,10 +144,8 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
     return compressed_.size();
   }
 
-  // The frame plus the scratch buffer a partial read decompresses into. That
-  // scratch is a whole decoded column and it is kept between reads, so an arm
-  // that has served one range is holding the column uncompressed even though
-  // it recomputes it on the next call.
+  // The frame plus the scratch buffer a partial read decompresses into,
+  // which holds a whole decoded column kept between reads.
   size_t residentBytes() const override {
     return compressed_.size() + scratch_.capacity() * sizeof(T);
   }
@@ -162,16 +155,10 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
     return ReadPath::kWholePayload;
   }
 
-  // Report the codec graph OpenZL chose for this column.
-  //
-  // The compression driver prints this beside SubIntSplit's section tree when
-  // --mlidc_dump_encoding is set, which is what makes the two comparable: the
-  // section tree says how SubIntSplit split the word, and this says what the
-  // black box did instead. Without it a study can observe only that OpenZL
-  // won, never what it did differently.
-  //
-  // Reflection decompresses the frame to rebuild the graph, so this is only
-  // ever called outside a timed region.
+  // Reports the codec graph OpenZL chose for this column, alongside
+  // SubIntSplit's section tree, so a study can see what the black box did
+  // rather than only that it won. Reflection decompresses the frame to
+  // rebuild the graph, so this is only ever called outside a timed region.
   std::string describe() override {
     if (compressed_.empty()) {
       return {};
@@ -228,8 +215,7 @@ class OpenZLBenchTarget : public NimbleBenchTargetBase<T> {
   }
 
  private:
-  // Owns a reflection context so a frame walk cannot leak one on an early
-  // return.
+  // Owns a reflection context so a frame walk cannot leak on early return.
   class ReflectionContext {
    public:
     ReflectionContext() : rctx_(ZL_ReflectionCtx_create()) {}

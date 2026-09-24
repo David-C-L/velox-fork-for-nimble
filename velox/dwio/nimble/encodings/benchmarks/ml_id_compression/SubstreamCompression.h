@@ -157,20 +157,11 @@ class BenchEncodingSelectionPolicy
     // std::nullopt.
     //
     // The candidate list comes from nestedEncodingReadFactors, the same
-    // function ManualEncodingSelectionPolicy::createImpl uses, and both
-    // parentEncodingType and the nested identifier are forwarded to it rather
-    // than discarded. The identifier was dropped here until the index streams
-    // became role-scoped, at which point dropping it would have offered the
-    // writer an encoding this policy withheld -- the same divergence the note
-    // below describes, in the other direction and just as quiet. Discarding
-    // it is what made this policy differ from the writer: the augmented list a
-    // SubIntSplit section gets is keyed on the parent type, so dropping the
-    // parent silently offered a section eight encodings where the writer offers
-    // fifteen, and every SubIntSplit figure this suite produced described an
-    // encoder nothing ships. Forwarding it also removes the parent encoding
-    // from the candidates, which is where the hand-rolled SubIntSplit erase
-    // this used to do has gone -- for a SubIntSplit parent the generic rule
-    // removes exactly what the erase did.
+    // function ManualEncodingSelectionPolicy::createImpl uses, with both
+    // parentEncodingType and the nested identifier forwarded to it rather than
+    // discarded: the augmented candidate list a SubIntSplit section gets is
+    // keyed on the parent type, and forwarding it also removes the parent
+    // encoding from the candidates, matching what the writer does.
     if (realNestedSelection_) {
       auto readFactors = nimble::nestedEncodingReadFactors(
           nimble::ManualEncodingSelectionPolicyFactory::
@@ -179,15 +170,9 @@ class BenchEncodingSelectionPolicy
           nestedEncodingIdentifier);
       // Withdraws the named encodings from what a section may be encoded as.
       // Empty, the default, leaves the writer's candidate list untouched.
-      //
-      // This is the list a section's encoding is chosen from. Withdrawing an
-      // encoding from the split planner alone moves only where the boundaries
-      // fall, and leaves the section encoded exactly as before, which is why
-      // the planner-side gate on its own reports that a withdrawal changed
-      // nothing.
-      //
-      // Matching is by substring of toString(), so a name that prefixes
-      // another withdraws both: "Delta" takes DeltaBlock with it.
+      // Withdrawing from the split planner alone moves only where boundaries
+      // fall; matching is by substring of toString(), so "Delta" also
+      // withdraws DeltaBlock.
       if (!FLAGS_mlidc_sis_withdraw_nested_encodings.empty()) {
         const std::string& withdrawn =
             FLAGS_mlidc_sis_withdraw_nested_encodings;

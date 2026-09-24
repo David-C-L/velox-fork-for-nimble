@@ -18,16 +18,11 @@
 // A whole-column linear predictor of a value from its row number, removed
 // before SubIntSplit plans its sections and added back on every read.
 //
-// A packed ID that holds a per-row counter next to a field that tracks the same
-// counter -- a pre-order rank beside a post-order rank, a tuple number beside a
-// derived offset -- has most of its information in how far each value sits
-// from a line through the rows. Bit-range sections cannot see that line: a
-// section reads a fixed range of bits, and the tracking field's distance from
-// the counter lives in carries that cross whichever boundaries the planner
-// picks. Subtracting slope * row + base from the whole word first leaves only
-// that distance, which sections do encode well, and it costs a read one
-// multiply-add per row with no dependence on neighbouring rows, so point and
-// range reads keep their cost.
+// A bit-range section cannot see a packed ID's per-row counter, since the
+// counter's carries cross whichever bit boundaries the planner picks.
+// Subtracting slope * row + base first leaves only the residual distance
+// from that line, which sections do encode well, at the cost of one
+// multiply-add per row with no dependence on neighbouring rows.
 
 #include <algorithm>
 #include <array>
@@ -37,11 +32,10 @@
 
 namespace facebook::nimble::subintsplit {
 
-/// The predictor subtracted from every value of a SubIntSplit stream before its
-/// sections were planned. value = residual + slope * row + base, in the
-/// physical type's modular arithmetic, where row is the value's position in
-/// the stream. Inactive, the default, means the stream stores values as they
-/// are.
+/// The predictor subtracted from every value of a SubIntSplit stream before
+/// its sections were planned: value = residual + slope * row + base, in the
+/// physical type's modular arithmetic. Inactive (the default) means the
+/// stream stores values as they are.
 struct RowFrame {
   /// Amount the predictor grows per row.
   uint64_t slope{0};
@@ -81,20 +75,16 @@ inline void addRowFrame(
 
 /// The frame's prediction for one row.
 template <typename PhysicalType>
-inline PhysicalType rowFramePrediction(
-    const RowFrame& frame,
-    uint64_t row) {
+inline PhysicalType rowFramePrediction(const RowFrame& frame, uint64_t row) {
   return static_cast<PhysicalType>(frame.slope * row + frame.base);
 }
 
-
 /// Rows between the two values a growth sample compares.
 inline constexpr uint32_t kRowFrameStride = 1'024;
-/// A second stride the fitted slope must also hold over. Sampling at one
-/// stride cannot see what a column does between samples, so a field that
-/// wraps with a period dividing that stride -- a counter masked to 10 bits
-/// beside one advancing every 64 rows -- aliases to a slope it does not have.
-/// A stride sharing no large factor with the first breaks the alias.
+/// A second stride the fitted slope must also hold over, sharing no large
+/// factor with the first: sampling at one stride alone cannot see what a
+/// column does between samples, so a field whose period divides that stride
+/// can alias to a slope it does not have.
 inline constexpr uint32_t kRowFrameCheckStride = 1'000;
 /// Fewest growth samples a frame is fitted on. Below this a median of strides
 /// says too little about the column to be worth a planner pass.
@@ -107,22 +97,16 @@ inline constexpr double kRowFrameMinAgreement = 0.9;
 /// does not follow a line through its rows.
 ///
 /// The slope is read off the low `width` bits for the widest width at which
-/// nearly every stride grows by the same whole multiple of the stride, checked
-/// again at a second stride to rule out aliasing. Low bits rather than the
-/// whole word, because a packed ID usually keeps a field above its counters
-/// that moves independently of the row, like a tree depth, and that field
-/// decides the whole word's growth while carrying none of the line. The widest
-/// agreeing width, because every counter below it adds its own term to the
-/// slope. Sorted columns with uneven gaps, hashes and timestamps all fail the
-/// agreement test at every width, which keeps the planner pass this costs off
-/// the columns that could not use it.
+/// nearly every stride grows by the same whole multiple, checked again at a
+/// second stride to rule out aliasing. Low bits rather than the whole word,
+/// since a packed ID usually keeps a field above its counters that moves
+/// independently of the row.
 ///
-/// The base is the most negative residual of those low bits, so that the
-/// fields below `width` stay non-negative and do not borrow from the fields
-/// above them.
+/// The base is the most negative residual of those low bits, so the fields
+/// below `width` stay non-negative and do not borrow from the fields above
+/// them.
 template <typename PhysicalType>
-RowFrame fitRowFrame(
-    std::span<const PhysicalType> values) {
+RowFrame fitRowFrame(std::span<const PhysicalType> values) {
   const int kBits = static_cast<int>(sizeof(PhysicalType) * 8);
   const uint64_t numStrides =
       values.size() < 2 ? 0 : (values.size() - 1) / kRowFrameStride;
@@ -204,21 +188,13 @@ inline constexpr double kStepFrameMinShare = 0.25;
 /// Fits a row frame whose slope is the non-zero step that adjacent rows most
 /// often take, or returns an inactive one when no step is common enough.
 ///
-/// fitRowFrame asks whether a column follows one line across the
-/// stream. This asks whether it follows many short lines of the same slope,
-/// broken wherever something else in the value moves. A UUIDv7's high half is
-/// the case: its 12-bit counter counts up by one within a millisecond and
-/// restarts at random in the next, so 57% of adjacent rows step by exactly one
-/// while no 1,024-row stride grows by a consistent amount. Subtracting
-/// slope * row turns each such stretch into repeats of one value, which
-/// sections store as runs. The base is zero: the frame is kept on encoded
-/// bytes, not on a borrow-free residual, so there is nothing for it to protect.
-///
-/// Needs as many rows as fitRowFrame, so the two are offered the
-/// same columns.
+/// Unlike fitRowFrame, which asks whether a column follows one line across
+/// the whole stream, this asks whether it follows many short lines of the
+/// same slope, broken wherever something else in the value moves. The base
+/// is zero, since the frame is kept on encoded bytes and there is no
+/// borrow-free residual to protect.
 template <typename PhysicalType>
-RowFrame fitStepFrame(
-    std::span<const PhysicalType> values) {
+RowFrame fitStepFrame(std::span<const PhysicalType> values) {
   if (values.size() < 2 ||
       (values.size() - 1) / kRowFrameStride < kRowFrameMinStrides) {
     return {};

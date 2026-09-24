@@ -22,7 +22,7 @@
 
 namespace facebook::nimble::subintsplit {
 
-/// Mask selecting the low `width` bits, all ones from 64 up.
+/// Mask selecting the low `width` bits.
 constexpr uint64_t widthMask(int width) noexcept {
   return width >= 64 ? ~uint64_t{0} : ((uint64_t{1} << width) - 1);
 }
@@ -99,17 +99,12 @@ struct SectionPlan {
   /// nested encoding selection makes the final choice at encode time.
   EncodingType encoding{EncodingType::Trivial};
 
-  /// Estimated total bits to store this section across the full stream. Under
-  /// a decode weight this is the weighted figure the planner minimised.
+  /// Total bits to store this section, weighted by decode cost if requested.
   double cost{0.0};
-  /// Estimated size alone, in bits for the full stream. Equal to `cost` at the
-  /// default decode weight, and the two separate exactly when a caller has
-  /// asked decode to count for something.
+  /// Estimated size alone, in bits; equals `cost` unless decode was weighted.
   double sizeCostBits{0.0};
-  /// Estimated nanoseconds per row this section costs to decode, under the
-  /// access pattern the plan was selected for. Reported whatever the weight
-  /// is, so a caller can see what a size-only plan costs to read without
-  /// having to change the plan to find out.
+  /// Estimated decode cost in nanoseconds per row, reported regardless of
+  /// whether decode was weighted into `cost`.
   double decodeNanosPerRow{0.0};
 
   int width() const noexcept {

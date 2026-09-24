@@ -25,37 +25,21 @@
 
 #include "velox/dwio/nimble/common/Exceptions.h"
 
-// Reversible rewrites of one SubIntSplit section within one block.
-//
-// SubIntSplit splits a column into contiguous bit-range sections and gives each
-// its own encoding. A section that compresses poorly in row order may compress
-// well in some other arrangement, and the arrangement can be undone at read
-// time, so the reader still returns the original rows in their original order.
-//
-// What separates the families is how that undoing works, because it decides
-// both the bytes stored and whether a single row can still be read on its own:
-//
-//   * A key-derived permutation sorts the section by another section the
-//     decoder has already read, so nothing is stored, but recovering one row's
-//     position needs that row's rank, which depends on the whole section.
-//   * A row frame subtracts a fitted line from whole values before the column
-//     is split, and is recorded by a header flag rather than per section.
+// Reversible rewrites of one SubIntSplit section within one block. How a
+// transform undoes itself decides both the bytes stored and whether a single
+// row can be read without reconstructing the section.
 namespace facebook::nimble::subintsplit {
 
 /// Identifies a transform on the wire. Dense, appended to, never renumbered:
 /// these values are persisted, and a reader that cannot recognise one must
-/// fail rather than decode, since an unrecognised transform yields wrong
-/// values rather than obviously broken ones.
+/// fail rather than decode.
 enum class TransformId : uint8_t {
-  /// No transform. Every stream written before this existed carries zero here,
-  /// so old data reads unchanged.
+  /// No transform.
   None = 0,
   /// Stable sort of the section by another section's value.
   KeyDerived = 1,
-  // 2 to 7 are retired: the frequency, dense and Gray relabellings (2, 3, 4),
-  // the Burrows-Wheeler pair (5, 6) and the bit-plane transposition (7).
-  // Left as a gap rather than reused, so transformForRaw rejects them as a
-  // reader should reject a transform it cannot invert.
+  // 2 to 7 are retired ids, left as a gap rather than reused so
+  // transformForRaw rejects them.
   /// Subtracts a fitted line, slope * row + base, from every whole value
   /// before the column is split. Recorded by the stream's row-frame header
   /// flag rather than in the per-section id array, so transformForRaw rejects
@@ -65,27 +49,19 @@ enum class TransformId : uint8_t {
 
 /// How a transform relates an original row to where its value ended up.
 enum class PositionMapping : uint8_t {
-  /// Values are rewritten where they stand. A row is read without knowing
-  /// anything about its neighbours.
+  /// Values are rewritten where they stand.
   InPlace,
-  /// Rows move, but where a row went is derivable without reading the
-  /// transformed data: from the key section, which is stored in original
-  /// order. A reader builds that map once and then addresses any row through
-  /// it, so the transform can span the whole section and a probe still costs
-  /// one indirection.
+  /// Rows move, but where a row went is derivable from the key section
+  /// (stored in original order) without reading the transformed data.
   Permuted,
 };
 
 /// Returns the name of a transform id, for logging and test failures.
 std::string toString(TransformId id);
 
-/// Bookkeeping for undoing a key-derived permutation: which run each row's
-/// key falls in, the value each run stands for, that run's rank among the
-/// sorted distinct keys, and where each rank's rows start once the block is
-/// arranged in that order. A block's key section produces exactly one of
-/// these; every section keyed on it shares the same one rather than each
-/// rebuilding it, when the caller chooses to share it (see
-/// TransformContext::keyRunIds and friends below).
+/// Bookkeeping for undoing a key-derived permutation. A block's key section
+/// produces exactly one of these, and every section keyed on it may share it
+/// rather than each rebuilding it (see TransformContext::keyRunIds).
 struct KeyRunState {
   /// Run id of each row's key, in original row order.
   std::vector<uint32_t> runOfRow;
@@ -98,16 +74,11 @@ struct KeyRunState {
   std::vector<uint32_t> runStart;
 };
 
-/// Fills `out` with the KeyRunState for `keys`. Reused by
-/// KeyDerivedTransform::invert when the caller has not already supplied one
-/// through TransformContext, and by any caller that shares one KeyRunState
-/// across several sections keyed on the same block.
+/// Fills `out` with the KeyRunState for `keys`.
 void buildKeyRunState(std::span<const uint64_t> keys, KeyRunState& out);
 
 /// Scratch KeyDerivedTransform::invert reuses across calls instead of
-/// allocating fresh buffers each time. `local` holds a KeyRunState built here
-/// when the caller did not supply one; `cursor` and `rows` are always needed,
-/// since the merge that undoes the permutation mutates them.
+/// allocating fresh buffers each time.
 struct KeyDerivedScratch {
   /// Run bookkeeping built here when TransformContext did not supply one.
   KeyRunState local;
@@ -120,6 +91,8 @@ struct KeyDerivedScratch {
 };
 
 /// Everything a transform needs about the block beyond the section itself.
+/// The keyRun* and keyOrder spans are optional caches: empty means the
+/// transform must derive them from keySection itself.
 struct TransformContext {
   /// The section this transform is keyed on, already decoded and in original
   /// row order. Empty for transforms that do not use one.
@@ -130,43 +103,27 @@ struct TransformContext {
   /// Column row of the first value, for transforms whose inverse depends on
   /// where a row sits rather than only on its value.
   uint64_t firstRow{0};
-  /// Dense run ids for the key section, one per row, where the encoding
-  /// holding that section already had them. Empty otherwise, and a transform
-  /// that wants them must then derive them from keySection itself.
-  ///
-  /// These carry no order: whoever supplies them decides how they are numbered,
-  /// so a transform needing the key's value order takes it from keyRunValues.
+  /// Dense run ids for the key section, one per row; a transform needing the
+  /// key's value order takes it from keyRunValues instead.
   std::span<const uint32_t> keyRunIds;
   /// The value each run id stands for. As many entries as there are runs.
   std::span<const uint64_t> keyRunValues;
-  /// The permutation that stably sorts keySection, one row index per row,
-  /// where the caller has already built it. Empty otherwise, and a transform
-  /// that wants it must then derive it from keySection itself.
-  ///
-  /// Supplied because it is a property of the key alone: an encoder trying one
-  /// candidate key across several sections would otherwise rebuild the same
-  /// permutation once per section.
+  /// The permutation that stably sorts keySection, one row index per row.
   std::span<const uint32_t> keyOrder;
-  /// Sorted rank of each run, indexed by run id: entry r is where
-  /// keyRunValues[r] sits among the distinct keys in ascending order. Empty
-  /// unless the caller already has it, the same condition as keyRunIds.
+  /// Sorted rank of each run, indexed by run id, ascending among the
+  /// distinct keys.
   std::span<const uint32_t> keyRunSortedRank;
-  /// Prefix-sum run starts in sorted-rank order: the run whose sorted rank is
-  /// r begins at keyRunStart[r], and has keyRunValues.size() + 1 entries.
-  /// Empty unless the caller already has it, the same condition as
-  /// keyRunIds.
+  /// Prefix-sum run starts in sorted-rank order; runValues.size() + 1
+  /// entries.
   std::span<const uint32_t> keyRunStart;
-  /// Reusable scratch KeyDerivedTransform::invert may use instead of
-  /// allocating its own buffers every call. Null means allocate locally, so
-  /// omitting it is always correct, just slower. Non-owning: the caller
-  /// decides the buffers' lifetime.
+  /// Reusable scratch for KeyDerivedTransform::invert. Null means allocate
+  /// locally; non-owning otherwise.
   KeyDerivedScratch* keyDerivedScratch = nullptr;
 };
 
 /// The permutation that stably sorts `key`, ties keeping their original row
-/// order. Exposed so that a caller holding one key across several sections can
-/// build it once and hand it back through TransformContext::keyOrder, rather
-/// than each section's transform rebuilding the same one.
+/// order. Exposed so a caller sharing one key across several sections can
+/// build it once and pass it back through TransformContext::keyOrder.
 std::vector<uint32_t> buildKeyOrder(std::span<const uint64_t> key);
 
 /// State a transform produces at encode and needs back at decode. The row
@@ -192,24 +149,19 @@ class SectionTransform {
       const TransformContext& context,
       TransformState& state) const = 0;
 
-  /// Restores the original values in place. Must reproduce the input to
-  /// `apply` exactly, for every input.
+  /// Restores the original values in place; must exactly reproduce `apply`'s
+  /// input.
   virtual void invert(
       std::span<uint64_t> values,
       const TransformContext& context,
       const TransformState& state) const = 0;
 
-  /// How this transform relates an original row to where its value was stored,
-  /// which decides how a reader addresses a single row.
+  /// Decides how a reader addresses a single row.
   virtual PositionMapping positionMapping() const = 0;
 
   /// Fills `positions[i]` with the offset the value of original row i was
-  /// stored at.
-  ///
-  /// Defined only where positionMapping() is Permuted; that is what Permuted
-  /// means. A reader builds this once and then reads any row through it, which
-  /// is why such a transform costs a probe an indirection rather than a
-  /// reconstruction. Throws otherwise.
+  /// stored at. Defined only where positionMapping() is Permuted; throws
+  /// otherwise.
   virtual void positionMap(
       const TransformContext& context,
       const TransformState& state,
@@ -225,8 +177,7 @@ class SectionTransform {
   }
 
   /// Whether this transform applies to whole values before the column is
-  /// split, with TransformContext::width the column's type width, rather than
-  /// to one section. The encoder admits such a transform only there.
+  /// split rather than to one section.
   virtual bool transformsWholeValue() const {
     return false;
   }
@@ -239,13 +190,9 @@ const SectionTransform* transformFor(TransformId id);
 
 /// Returns the transform for a raw wire byte, validating it first.
 inline const SectionTransform* transformForRaw(uint8_t rawId) {
-  // A file-format check rather than an internal one: the byte came off the
-  // wire, and a reader that cannot recognise it must refuse the data rather
-  // than decode without the inverse and hand back wrong values.
-  // Retired ids are rejected here alongside ids past the end. Catching them as
-  // a file error rather than letting transformFor fall through to an internal
-  // one keeps the diagnosis pointing at the data, which is where the problem
-  // is.
+  // File-format check: the byte came off the wire, so an unrecognised id
+  // (including retired ones) must be reported as a file error, not fall
+  // through to transformFor's internal check.
   NIMBLE_CHECK_FILE(
       rawId <= static_cast<uint8_t>(TransformId::KeyDerived),
       fmt::format("Unsupported SubIntSplit transform id: {}", rawId));

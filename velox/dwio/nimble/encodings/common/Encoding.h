@@ -138,68 +138,48 @@ class Encoding {
     uint8_t frequencyPartitionIndex = 0;
 
     /// When true, TierTagArray builds a per-tier `resolvedValues` vector at
-    /// decode construction, mapping rank directly to the decoded value, and
-    /// point/range/bulk decode read from it instead of chasing
-    /// `dictionary[indices[rank]]`. Removes two dependent loads (the indices
-    /// lookup and the dictionary lookup it feeds) from the hot path at the
-    /// cost of holding both the original indices/dictionary tables and the
-    /// resolved values in memory at once: the resolved table is |T| bytes per
-    /// row versus 4 bytes per row for indices, so for T wider than uint32_t
-    /// this roughly doubles the tier's decoded-value footprint. Payload bytes
-    /// are unaffected either way -- this table is rebuilt at decode
-    /// construction and never serialised. Default false since the memory
-    /// cost is real even when the format does not change.
+    /// decode construction so point/range/bulk decode read the decoded value
+    /// directly instead of chasing `dictionary[indices[rank]]`. Trades extra
+    /// resident memory (up to |T| bytes per row versus 4 for indices) for
+    /// fewer dependent loads on the hot path.
     bool frequencyPartitionResolveTierValues = true;
 
     /// Reversible transform applied to SubIntSplit's sections, as a
-    /// subintsplit::TransformId. Zero, the default, applies none and writes
-    /// the stream in the original format. The section named by
-    /// subIntSplitKeySection is always left untransformed, since a key-derived
-    /// permutation is rebuilt from it at read time.
+    /// subintsplit::TransformId. Zero, the default, applies none. The
+    /// section named by subIntSplitKeySection is always left untransformed,
+    /// since a key-derived permutation is rebuilt from it at read time.
     uint8_t subIntSplitTransform = 0;
 
     /// Lets the encoder choose per section whether to apply the key-derived
     /// transform, pricing it against the untransformed encoding and keeping
-    /// the cheaper. Ignores subIntSplitTransform, which names a
-    /// single transform for every section, and is exclusive with
-    /// subIntSplitForceApply, which asks the encoder to obey rather than
-    /// choose. Costs one trial encode per candidate per section, so it buys
-    /// compression with encode time.
+    /// the cheaper. Ignores subIntSplitTransform and is exclusive with
+    /// subIntSplitForceApply. Costs one trial encode per candidate per
+    /// section.
     bool subIntSplitAutoTransform = false;
 
     /// Executor SubIntSplit encodes its sections on concurrently. Null, the
     /// default, encodes them one after another on the calling thread. Only
     /// encodes that search no transform spread their sections, since a
     /// transform search compares each section's encodes against a bound the
-    /// others move. The bytes are the same either way: each section is encoded
-    /// exactly as it would be alone and written in section order.
+    /// others move.
     folly::Executor* subIntSplitSectionExecutor = nullptr;
 
     /// Section whose values order a key-derived permutation, and which is
-    /// therefore stored unpermuted. 0xFF, the default, means the encoder tries
-    /// every section and keeps the one that encodes smallest: which section
-    /// groups the others is a property of the data, so fixing it reports that
-    /// the transform did not pay when what did not pay was the guess.
+    /// therefore stored unpermuted. 0xFF, the default, means the encoder
+    /// tries every section and keeps the one that encodes smallest.
     uint8_t subIntSplitKeySection = 0xFF;
 
-    /// Encodings SubIntSplit may cost a section against when choosing splits.
-    /// Empty, the default, means every encoding, which is production
-    /// behaviour. A restricted set holds the inventory fixed so that the
-    /// effect of the cost models can be measured on its own, and does not
-    /// change the format: it only narrows what the selector considers.
+    /// Encodings SubIntSplit may cost a section against when choosing
+    /// splits. Empty, the default, means every encoding. A restricted set
+    /// only narrows what the selector considers; it does not change the
+    /// format.
     std::unordered_set<EncodingType> subIntSplitAllowedEncodings;
 
     /// Test-only: skips the opt-in cost comparison that keeps a SubIntSplit
     /// transform only where it encodes smaller, and applies
-    /// subIntSplitTransform to every eligible section regardless. A test that
-    /// pins a transform id without this can pass while never actually
-    /// exercising the transform, because selection is free to decide it does
-    /// not pay on synthetic data
-    /// -- which is exactly what happened to this encoding's own test suite.
-    /// Requires subIntSplitTransform to name a real transform and
-    /// subIntSplitKeySection to be a valid section (not 0xFF), so this can
-    /// neither force nothing nor search for a key and force at the same time.
-    /// Never set outside tests: production always wants the cost comparison.
+    /// subIntSplitTransform to every eligible section regardless. Requires
+    /// subIntSplitTransform to name a real transform and subIntSplitKeySection
+    /// to be a valid section. Never set outside tests.
     bool subIntSplitForceApply = false;
 
     /// Block size for BlockBitPacking encoding. Determines how many rows
@@ -222,300 +202,148 @@ class Encoding {
     bool fixedBitWidthUseExactBits{false};
 
     /// Whether SubIntSplit's split planner may cost a bit range as Huffman.
-    /// False by default, which is a deliberate change from how the planner
-    /// scored ranges before.
-    ///
-    /// Huffman was never reachable as a section encoding: sections are chosen
-    /// from the default read factors, which do not include it, and the only
-    /// place it is offered to them is a SubIntSplit-specific block in
-    /// ManualEncodingSelectionPolicy::createImpl that a section's policy does
-    /// not always come from. It was nonetheless priced into where the splits
-    /// fall, because the planner minimises over per-range costs and Huffman's
-    /// was among them. So an encoding nothing could select was steering the
-    /// planner toward boundaries nothing would read well, which is not a
-    /// trade-off anyone chose and does not show up in a diff.
-    ///
-    /// Withdrawing it was measured across five columns: one paid 15.7% in
-    /// size and returned 3.78x its bulk decode, one held its size to three
-    /// decimals and returned 2.04x, and three did not move on any axis.
-    /// Encode fell 43%, since costing Huffman is the most expensive model in
-    /// the grid. Set true to price the old behaviour again.
-    ///
-    /// If a future column pays size for this the way that first one did, the
-    /// answer is more likely a cheap entropy term in the cost models than
-    /// restoring an encoding no section can use: what Huffman's cost was
-    /// really contributing is a signal that a bit range has low entropy, and
-    /// nothing else in the inventory says that.
+    /// False by default: no section encoding can actually select Huffman, so
+    /// pricing it only steers split boundaries toward an encoding nothing
+    /// will use. Set true to price it anyway.
     bool subIntSplitAllowHuffman{false};
 
     /// Allows the SubIntSplit split planner to cost segments as DeltaBlock.
-    /// False by default, matching subIntSplitAllowHuffman above and for the
-    /// same three reasons.
-    ///
-    /// Decode: DeltaBlock reconstructs values with a serial prefix sum that
-    /// does not vectorize, and withholding it returned 85.95 against 73.94
-    /// Meps on the columns measured. Its per-block baselines, which are what
-    /// justify the format, do no work on a contiguous scan.
-    ///
-    /// Size: withholding it also improved compression, to 40.46 bits per
-    /// element from 41.49. Both axes moving the same way is unusual enough to
-    /// state plainly -- this was not a trade.
-    ///
-    /// Encode: deltaBlockCostBits walks the sample values rather than pricing
-    /// from statistics, so it costs a pass per grid cell. That is the property
-    /// that made Huffman worth withdrawing from the grid, and it is measured
-    /// separately here rather than assumed from the parallel.
-    ///
-    /// This flag and the absence of DeltaBlock from the SubIntSplit nested
-    /// candidate list in nestedEncodingReadFactors are one decision, not two:
-    /// the planner and section selection have to agree, or the DP places
-    /// boundaries around an encoding selection cannot then use. They are
-    /// separate fields only because that function is handed no options.
-    ///
-    /// The evidence has a known limit. It was gathered on bulk and point
-    /// access, neither of which can see what a per-block baseline is for,
-    /// which is reaching row i without replaying the stream before it. So
-    /// DeltaBlock loses on the access patterns measured so far and its
-    /// advantage is unmeasured, not absent; a gather or low-selectivity
-    /// workload is what would change this answer. Set true to price the old
-    /// behaviour again.
+    /// False by default: DeltaBlock's serial prefix-sum decode does not
+    /// vectorize and its per-block baselines pay off only for random access,
+    /// not the contiguous scans this was measured on, while its cost model
+    /// is expensive to evaluate per grid cell. Must stay in sync with
+    /// whether DeltaBlock appears in the SubIntSplit nested candidate list
+    /// in nestedEncodingReadFactors, since the planner and section selection
+    /// need to agree on what is available.
     bool subIntSplitAllowDeltaBlock{false};
 
     /// How much a SubIntSplit section's decode cost counts against its
     /// encoded size when the split planner chooses boundaries and encodings.
-    ///
-    /// Zero, the default, is size-only selection and reproduces the previous
-    /// behaviour exactly: the decode term is multiplied by this and added, so
-    /// at zero every boundary and every encoding is the one that was picked
-    /// before. Nothing about selection changes until a caller asks for it.
-    ///
-    /// The unit is bytes per row of encoded size per nanosecond per row of
-    /// decode, so 1.0 says "a nanosecond per row of decode is worth a byte per
-    /// row of size" and the useful range is roughly 0 to 1. It is an exchange
-    /// rate a caller picks, not a measurement.
-    ///
-    /// What it buys is the case section attribution kept finding and the size
-    /// models could not see: on twitter-snowflake, two FrequencyPartition
-    /// sections held 4.3% of the encoded bytes and cost 27% of bulk decode,
-    /// because section decode times add rather than max. A four-bit section
-    /// dragged the whole column and selection had no way to know.
-    ///
-    /// See subintsplit/DecodeCost.h for where the per-encoding rates come from
-    /// and how well each is supported.
+    /// Zero, the default, is size-only selection. The unit is bytes of
+    /// encoded size per nanosecond per row of decode; a caller picks this as
+    /// an exchange rate, not a measurement. See subintsplit/DecodeCost.h for
+    /// where the per-encoding rates come from.
     double subIntSplitDecodeWeight{0.0};
 
     /// The read shape section decode is costed for when
     /// subIntSplitDecodeWeight is non-zero: 0 bulk, 1 point, 2 gather, 3
-    /// range. Matches
-    /// subintsplit::DecodeAccessPattern, and is a plain integer here
-    /// for the same reason subIntSplitTransform is -- this header cannot see
-    /// that enum.
-    ///
-    /// It matters because the encodings do not rank the same way on each.
-    /// FrequencyPartition with a TierTagArray index is competitive on bulk and
-    /// 36x worse than FixedBitWidth on a random probe; RLE's bulk cost is its
-    /// run count while its probe cost is a search. Weighting decode without
-    /// naming the pattern would optimise for whichever one the rates happened
-    /// to be fitted on.
+    /// range. Matches subintsplit::DecodeAccessPattern as a plain integer,
+    /// since this header cannot see that enum. Encodings do not rank the
+    /// same way on every access pattern, so weighting decode without naming
+    /// the pattern would optimise for whichever one the rates were fitted
+    /// on.
     uint8_t subIntSplitDecodeAccessPattern{0};
 
-    /// The reader section decode is costed for when subIntSplitDecodeWeight is
-    /// non-zero. Matches subintsplit::DecodeReadPath: 0 the cursor
+    /// The reader section decode is costed for when subIntSplitDecodeWeight
+    /// is non-zero. Matches subintsplit::DecodeReadPath: 0 the cursor
     /// (SubIntSplitEncoding::materialize) and 1 the view
-    /// (SubIntSplitEncodingView), both with construction amortised; 2 and 3 the
-    /// same readers paying each section's construction on every read.
-    ///
-    /// Choose by how streams are read. A section that falls back to a
-    /// materializing view costs almost nothing to read once opened and nearly
-    /// everything to open, and building a FrequencyPartition section costs
-    /// about 25 ns per row on either reader, so pricing opens for a reader that
-    /// amortises them buys faster opens with slower reads.
+    /// (SubIntSplitEncodingView), both with construction amortised; 2 and 3
+    /// the same readers paying each section's construction on every read.
+    /// Choose by how streams are actually read: pricing opens for a reader
+    /// that amortises them buys faster opens at the cost of slower reads.
     uint8_t subIntSplitDecodeReadPath{0};
 
     /// Whether these options are the ones a SubIntSplit section is being
-    /// encoded with, rather than a column's own options.
-    ///
-    /// Set only by sectionEncodingOptions, and read only by encoding
-    /// selection, which uses it to decide whether subIntSplitDecodeWeight
-    /// applies. Without it the weight would either reach every stream in the
-    /// file or reach no section at all: the split planner's cost models and
-    /// the candidate list a section's encoding is actually chosen from are
-    /// different code with no shared configuration, and only the second of
-    /// them decides what a section is finally encoded as. Withdrawing an
-    /// encoding from the planner alone was measured to leave the section
-    /// encoded exactly as before.
-    ///
-    /// It marks the whole subtree below a section, not just its top encoding,
-    /// so a nested stream inside a section -- a FrequencyPartition tag stream,
-    /// say -- is priced on decode as well. That is deliberate: a tag stream
-    /// read once per row is exactly the cost that made FrequencyPartition
-    /// sections dear.
+    /// encoded with, rather than a column's own options. Set only by
+    /// sectionEncodingOptions and read only by encoding selection, to decide
+    /// whether subIntSplitDecodeWeight applies; without it the weight would
+    /// reach either every stream in the file or none. Marks the whole
+    /// subtree below a section, so a nested stream (e.g. a FrequencyPartition
+    /// tag stream) is priced on decode too.
     bool subIntSplitSectionSelection{false};
 
     /// The most encoded size, as a fraction, that decode weighting may give
     /// up against what size-only selection would have chosen for the same
-    /// column.
-    ///
-    /// subIntSplitDecodeWeight prices decode in bytes and adds it to a size in
-    /// bytes, so the objective has no floor: raise the weight far enough and
-    /// an uncompressed column scores as a win, which is what ipv4 did at
-    /// weight 0.25 when it abandoned the split for a single Trivial<Uint32>
-    /// section at 32 bits per element. A weight cannot express the bound,
-    /// because both of its terms are unbounded and in the same units.
-    ///
-    /// So the bound is stated here instead, and enforced wherever a
-    /// decode-weighted choice is made: the split planner, the transform key
-    /// search, and a section's encoding selection. Each compares the plan it
-    /// chose against the plan size alone would have chosen at the same point,
-    /// and takes the size-only one when the weighted one costs more than this
-    /// fraction extra.
-    ///
-    /// Inert at the default decode weight of zero, where the two plans are
-    /// the same plan. It is a constraint, not an exchange rate: sweeping it
-    /// traces the compression/decode frontier in a unit that means the same
-    /// thing on every column, which a weight does not.
+    /// column. subIntSplitDecodeWeight has no floor on its own -- raising it
+    /// far enough can make an uncompressed encoding score as a win -- so this
+    /// bound is enforced separately wherever a decode-weighted choice is
+    /// made: the split planner, the transform key search, and a section's
+    /// encoding selection. Inert at the default decode weight of zero.
     double subIntSplitMaxSizeRegression{0.05};
 
-    /// Chooses split boundaries with the hybrid planner instead of trusting the
-    /// split DP's argmin.
-    ///
-    /// The DP prices ranges with cost models that, measured against whole-
-    /// column encodes, name the cheapest encoding for a range about a fifth of
-    /// the time. The hybrid planner keeps the DP as a cheap shortlister: it
-    /// takes subintsplit::kHybridShortlist cheapest plans, plus plans cut only
-    /// at the bit-flip profile's gradient boundaries and the DP's own plan,
-    /// re-prices only the ranges those plans use with the estimators section
-    /// selection itself uses, on subintsplit::kHybridRescoreSamples rows, and
-    /// then refines the winner by moving, merging and splitting boundaries
-    /// under the same pricing. Decode weighting and
-    /// subIntSplitMaxSizeRegression apply to the re-priced plans.
-    ///
-    /// Off by default. On seven ID columns it stored every column in no more
-    /// bytes than the DP's plan and up to 18% fewer, for roughly twice the
+    /// Chooses split boundaries with the hybrid planner instead of trusting
+    /// the split DP's argmin. The DP's cost models often misprice a range
+    /// relative to a whole-column encode, so the hybrid planner uses the DP
+    /// only as a cheap shortlister, re-prices a small set of candidate plans
+    /// with the same estimators section selection uses, and then locally
+    /// refines the winner. Decode weighting and subIntSplitMaxSizeRegression
+    /// apply to the re-priced plans. Off by default; costs roughly twice the
     /// planning time.
     bool subIntSplitHybridPlanner{false};
 
     /// How top-level selection admits SubIntSplit, as a
     /// subintsplit::SubIntSplitAdmission value. 0 (the default) keeps
-    /// SubIntSplitEncoding::estimateSize competing with the other candidates.
-    /// 1 offers SubIntSplit as a candidate exactly when the bit-flip profile's
-    /// gradient gate admits the stream and withholds it otherwise; 2 also
-    /// requires the active-bit entropy guard (see
-    /// subintsplit/TopLevelPolicy.h). Under 1 and 2 an admitted stream still
-    /// has to win the ordinary size comparison, unless
-    /// subIntSplitAdmissionForces says otherwise.
+    /// SubIntSplitEncoding::estimateSize competing with the other
+    /// candidates. 1 offers SubIntSplit as a candidate only when the
+    /// bit-flip profile's gradient gate admits the stream; 2 also requires
+    /// the active-bit entropy guard (see subintsplit/TopLevelPolicy.h).
+    /// Under 1 and 2 an admitted stream still has to win the ordinary size
+    /// comparison, unless subIntSplitAdmissionForces says otherwise.
     uint8_t subIntSplitAdmission{0};
 
-    /// Whether a bit-flip admission decides on its own, rather than deciding
-    /// only which candidates compete. True makes an admitted stream
-    /// SubIntSplit without a size comparison, which is what the admission
-    /// modes did before they were turned into a candidacy gate; it is kept for
-    /// the ablation that separates the gate's predictions from what selection
-    /// does with them. Read only when subIntSplitAdmission is not 0.
+    /// Whether a bit-flip admission decides on its own, rather than only
+    /// which candidates compete. True makes an admitted stream SubIntSplit
+    /// without a size comparison; kept for ablations that separate the
+    /// gate's predictions from what selection does with them. Read only
+    /// when subIntSplitAdmission is not 0.
     bool subIntSplitAdmissionForces{false};
 
     /// Consecutive pairs the admission profile is computed over, taken at a
-    /// fixed stride across the stream. 0 uses the statistics' own profile over
-    /// every pair. Only read when subIntSplitAdmission is not 0.
-    ///
-    /// The default samples, because the gate is meant to be cheap enough to
-    /// run before anything expensive and a whole-stream profile is not: on a
-    /// 524'288-row uint64 column it costs 9.97 ms against 228 us at this cap,
-    /// and over the 42 evaluation columns the two profiles admit exactly the
-    /// same streams.
+    /// fixed stride across the stream. 0 uses the statistics' own profile
+    /// over every pair. Only read when subIntSplitAdmission is not 0. The
+    /// default samples so the gate stays cheap enough to run before
+    /// anything expensive.
     uint32_t subIntSplitAdmissionProfilePairs{1'024};
 
-    /// Whether selection may choose SubIntSplit for a nested stream: an RLE's
-    /// run values, a Dictionary's alphabet, a FrequencyPartition tier. True
-    /// keeps the writer's candidate list. False leaves SubIntSplit to
-    /// top-level selection only, so an encoding's size can be told apart from
-    /// that of the SubIntSplit streams nested in it; on bing_quadkey RLE
-    /// stores 22.83 bits per value only because its run values are
-    /// SubIntSplit. A SubIntSplit section never chooses SubIntSplit whatever
-    /// this says.
+    /// Whether selection may choose SubIntSplit for a nested stream: an
+    /// RLE's run values, a Dictionary's alphabet, a FrequencyPartition tier.
+    /// True keeps the writer's candidate list; false restricts SubIntSplit
+    /// to top-level selection, so a nested encoding's own size can be told
+    /// apart from the SubIntSplit streams nested in it. A SubIntSplit
+    /// section never chooses SubIntSplit whatever this says.
     bool subIntSplitInNestedStreams{true};
 
-    /// Whether SubIntSplit may subtract a fitted slope * row + base from every
-    /// value before planning its sections (see subintsplit/RowFrame.h). A line
-    /// frame is fitted only where nearly every 1'024-row stride of the column's
-    /// low bits grows by the same multiple of the stride, and kept only where
-    /// the planner prices the residuals below the values. Failing that, a step
-    /// frame takes the adjacent step more than a quarter of rows share, and is
-    /// kept only where its residuals, as one whole-value section, encode
-    /// smaller than the plan. A read pays one multiply-add per row.
-    ///
-    /// On by default. On the XMark pre/post ID column it took the hybrid plan
-    /// from 9.35 to 5.14 bits per value; none of the other five paper columns
-    /// fit a frame, so their streams are unchanged.
+    /// Whether SubIntSplit may subtract a fitted slope * row + base (a line
+    /// frame) or a per-step baseline (a step frame) from every value before
+    /// planning its sections (see subintsplit/RowFrame.h). Either frame is
+    /// kept only where the planner prices the residuals below the plain
+    /// values; a read pays one multiply-add per row. On by default.
     bool subIntSplitRowFrame{true};
 
     /// Whether the streams this selection writes are handed to a substream
-    /// compressor once they are encoded. Set by the selection policy from the
-    /// CompressionOptions it was built with, so that a size estimate can tell
+    /// compressor once they are encoded. Set by the selection policy from
+    /// the CompressionOptions it was built with, so a size estimate can tell
     /// the two worlds apart; a caller does not set it.
     bool substreamCompression{false};
 
     /// Whether SubIntSplit's estimate declines to price a split at all when
     /// substreamCompression says the stream will be compressed afterwards,
-    /// answering FixedBitWidth's bound instead so the split loses.
-    ///
-    /// The estimate ranks candidates on uncompressed bytes, and under a
-    /// compressor those are not the bytes on disk. The two rankings disagree
-    /// most where a split's uncompressed win is largest, because a large
-    /// uncompressed win means redundancy a general-purpose compressor also
-    /// finds: on XMark's nested prepost stream the split stores 92% fewer
-    /// uncompressed bytes than its rival and 59% more OpenZL-compressed ones,
-    /// and Snowflake's nested streams lose 9% to 12% the same way. Over the
-    /// nine sweep columns' nested cells the unguarded estimate is 20.5%
-    /// smaller uncompressed and 2.6% smaller under OpenZL, but the OpenZL
-    /// figure is eight cells worse against five better.
-    ///
-    /// This is a stop-gap for a defect in what the estimate prices, not a
-    /// claim that a split never pays under a compressor: it gives up the five
-    /// cells that do win, worth that 2.6%. Pricing compressed bytes -- by
-    /// compressing a bounded sample of the values with the configured codec
-    /// and scaling the rivals' estimates by the ratio, which the measurements
-    /// above say would keep those five -- is what removes the need for it.
-    ///
-    /// Uncompressed selection never reads this: substreamCompression is false
-    /// there.
+    /// answering FixedBitWidth's bound instead so the split loses. The
+    /// estimate ranks candidates on uncompressed bytes, which disagrees with
+    /// ranking under a general-purpose compressor most where a split's
+    /// uncompressed win is largest. This is a stop-gap for that mismatch,
+    /// not a claim that a split never pays under a compressor; pricing
+    /// compressed bytes directly would remove the need for it. Uncompressed
+    /// selection never reads this field.
     bool subIntSplitEstimateCompressionGuard{true};
 
     /// Whether selection may rule SubIntSplit out from the bit-flip gradient
     /// gate rather than by planning a split (see
-    /// SubIntSplitEncoding::estimateSizeLowerBound).
-    ///
-    /// Off, because measuring it says it does not pay. Over the 60-column
-    /// corpus the screen fires on five columns and saves 36.8 ms of the
-    /// 1.16 s selection spends on them -- 3% -- because the corpus is 49
-    /// positives to 11 negatives and the columns a split does win on still
-    /// pay the DP. It costs one of those positives, a Corporations funding
-    /// column the gate rejects. And the bound it supplies is a prediction
-    /// rather than a proof: on a 300'000-row uniform-random column the gate
-    /// rejects, the split DP still prices a split 2% below FixedBitWidth, so
-    /// taking the bound can withhold a candidate that would have won by that
-    /// much, which is more than EncodingSelectionPolicy's candidateCannotWin
-    /// screen promises its callers.
-    ///
-    /// On for a writer that expects mostly negatives, where skipping a 7.2 ms
-    /// DP per column is what the gate is for.
+    /// SubIntSplitEncoding::estimateSizeLowerBound). Off by default: the
+    /// gate's bound is a prediction rather than a proof, so it can withhold
+    /// a candidate that would have won, and measured savings from skipping
+    /// the DP are small. On for a writer that expects mostly negatives and
+    /// wants to skip the DP on them.
     bool subIntSplitEstimateBitFlipScreen{false};
 
-    /// Rows a stream's costly candidates are first priced on, before selection
-    /// decides whether to price them on the whole stream. Zero, the default,
-    /// prices every candidate on every row.
-    ///
-    /// MainlyConstant, Dictionary, RLE, FrequencyPartition and Huffman price a
-    /// stream from its distinct values or its runs, and on a long near-unique
-    /// stream that costs more than every other estimate together while they
-    /// lose to plain bit packing. With this set, and the stream longer than
-    /// twice it, every candidate is priced on this many rows drawn in
-    /// contiguous blocks, and each costly one goes on to be priced on the
-    /// whole stream only where its sample cost is within
-    /// selectionScreenMargin of the cheapest sample cost. Everything priced on
-    /// the whole stream is chosen between exactly as it would be without the
-    /// screen, so the choice can change only where a candidate that loses the
-    /// sample by more than the margin would have won the stream.
+    /// Rows a stream's costly candidates are first priced on, before
+    /// selection decides whether to price them on the whole stream. Zero,
+    /// the default, prices every candidate on every row. MainlyConstant,
+    /// Dictionary, RLE, FrequencyPartition and Huffman price from distinct
+    /// values or runs, which is expensive on a long near-unique stream that
+    /// loses to plain bit packing anyway; with this set, a costly candidate
+    /// is only priced on the whole stream if its sample cost is within
+    /// selectionScreenMargin of the cheapest.
     uint32_t selectionScreenRows{0};
 
     /// How far a costly candidate's sample cost may exceed the cheapest before
@@ -530,19 +358,13 @@ class Encoding {
 
     /// EXPERIMENTATION: Lets SubIntSplit zigzag-delta the stream before
     /// splitting it into bit ranges, keeping whichever form encodes smaller.
-    ///
-    /// A monotone counter's low bits are maximally random viewed absolutely
-    /// but nearly constant viewed as deltas, so no per-bit-range encoding can
-    /// compress them while the delta form is trivial. This mirrors OpenZL,
-    /// where ZL_NODE_DELTA_INT feeds a downstream graph rather than acting as
-    /// a leaf codec. The zigzag step keeps decreasing runs from wrapping to
-    /// huge unsigned values.
-    ///
-    /// Delta-encoded streams can only be read sequentially from row 0: skip()
-    /// decodes every skipped row, so point and range reads cost a scan from
-    /// the start, and the EncodingView reads them through a full decode. The
-    /// delta form carries no row frame and no section transforms. Do not
-    /// enable for production until restatement points are added.
+    /// A monotone counter's low bits are nearly random viewed absolutely but
+    /// nearly constant viewed as deltas, so this can compress cases no
+    /// per-bit-range encoding can. Delta-encoded streams can only be read
+    /// sequentially from row 0: skip() decodes every skipped row, point and
+    /// range reads cost a full scan, and the delta form carries no row frame
+    /// or section transforms. Do not enable for production until restatement
+    /// points are added.
     bool subIntSplitDeltaPreTransform{false};
 
     /// Output elements SubIntSplit combines per pass when decoding.
@@ -578,8 +400,7 @@ class Encoding {
     ///
     /// Raising it prunes candidate boundaries, which shrinks the cost grid
     /// quadratically -- the cheapest way to speed up planning, paid for in
-    /// split quality. Negative selects the default, which here is 0.0, no
-    /// pruning; upstream's threshold is subintsplit::kBoundaryPruneThreshold.
+    /// split quality. Negative selects the default of 0.0 (no pruning).
     double subIntSplitBoundaryPruneThreshold{-1.0};
 
     /// Hard ceiling on SubIntSplit's candidate split boundaries.
@@ -607,38 +428,31 @@ class Encoding {
     /// EXPERIMENTATION: Trims the bit planes constant across SubIntSplit's
     /// planner sample before the split DP, storing each constant edge as one
     /// Constant section and scoring the grid over the varying planes alone.
-    ///
-    /// Off by default. Planning is a small share of encode at production row
-    /// counts, and trimming can move the plan, so it changes encoded output.
-    /// Ignored for an edge narrower than the minimum section width, and when
-    /// subIntSplitAllowedEncodings excludes Constant.
+    /// Off by default: trimming can move the plan and thus changes encoded
+    /// output. Ignored for an edge narrower than the minimum section width,
+    /// or when subIntSplitAllowedEncodings excludes Constant.
     bool subIntSplitTrimConstantPlanes{false};
 
     /// Folds SubIntSplit's Constant sections into one pre-shifted word when a
     /// stream is opened, so the decode loop never materialises them. Decode
     /// only: encoded output is unchanged. Applies to streams without section
-    /// transforms. On by default: cursor bulk decode 1.5-3% faster (geomean
-    /// over 9 columns, up to 22%), no axis measurably slower.
+    /// transforms. On by default.
     bool subIntSplitFoldConstantSections{true};
 
     /// Decodes a SubIntSplit stream whose one remaining section holds each
-    /// value verbatim straight into the caller's buffer, skipping the scratch
-    /// copy and the mask-and-shift pass. Decode only. On by default: cursor
-    /// bulk decode 7-9% faster (geomean over 9 columns, up to 25%).
+    /// value verbatim straight into the caller's buffer, skipping the
+    /// scratch copy and the mask-and-shift pass. Decode only. On by default.
     bool subIntSplitPassThrough{true};
 
-    /// Decodes SubIntSplit a block at a time on the readWithVisitor slow path,
-    /// instead of one value per section per call. Decode only; applies to
-    /// streams with no transform, row frame or delta. Off until measured on a
-    /// workload that reaches the slow path.
+    /// Decodes SubIntSplit a block at a time on the readWithVisitor slow
+    /// path, instead of one value per section per call. Decode only;
+    /// applies to streams with no transform, row frame or delta. Off until
+    /// measured on a workload that reaches the slow path.
     bool subIntSplitVisitorBlockBuffer{false};
 
     /// Prices a Huffman tree deeper than HuffmanEncoding::kMaxCodeBits at its
     /// Shannon bound instead of declining it. encode() length-limits such a
-    /// tree, so it is encodable; declining it reproduces the selection made
-    /// before length limiting. On by default; changes encoded output where
-    /// Huffman then wins, which on the evaluation columns is one cell,
-    /// 0.29% smaller.
+    /// tree, so it remains encodable. On by default.
     bool huffmanPriceLengthLimited{true};
 
     /// Per-column decoding statistics for timing decompression.
@@ -795,22 +609,18 @@ class Encoding {
     NIMBLE_UNREACHABLE("materializeIndices on non-dictionary encoding");
   }
 
-  /// Whether reads leave a decoded span resident that later reads are served
-  /// from, so that the first read after construction carries a cost the ones
-  /// after it do not.
-  ///
-  /// A benchmark needs this to attribute that first cost. Where it is true the
-  /// arm has a one-time build even though nothing about its interface says so,
-  /// and a curve that ignored it would charge the build to whichever read
-  /// happened to come first, or hide it in warmup entirely.
+  /// Whether reads leave a decoded span resident that later reads are
+  /// served from, so the first read after construction carries a one-time
+  /// build cost the ones after it do not. A benchmark needs this to
+  /// attribute that first cost correctly rather than to whichever read
+  /// happens to come first.
   virtual bool retainsDecodeCache() const {
     return false;
   }
 
-  /// Drops the retained decoded span, so the next read rebuilds it.
-  ///
-  /// Paired with retainsDecodeCache() this is what lets a measurement separate
-  /// the first read's cost from the rest. A no-op where there is no cache.
+  /// Drops the retained decoded span, so the next read rebuilds it. Paired
+  /// with retainsDecodeCache() to let a measurement separate the first
+  /// read's cost from the rest. A no-op where there is no cache.
   virtual void dropDecodeCache() {}
 
   // A string for debugging/iteration that gives details about *this.

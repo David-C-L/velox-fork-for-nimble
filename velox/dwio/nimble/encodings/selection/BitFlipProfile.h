@@ -28,9 +28,8 @@
 #include <immintrin.h>
 #endif
 
-// Bit-flip-probability statistics for integral value streams. Shared between
-// Statistics<T> (outer, per-column selection) and SubIntSplit's standalone
-// evidence-gathering estimator, so the per-bit XOR-and-popcount pass is
+// Bit-flip-probability statistics for integral value streams, shared between
+// Statistics<T> and SubIntSplit so the per-bit XOR-and-popcount pass is
 // implemented exactly once.
 
 namespace facebook::nimble {
@@ -40,16 +39,10 @@ inline constexpr int kMaxBitWidth = 64;
 
 /// Per-bit-position flip-probability profile of an integral value stream.
 /// `flipProbability[i]` is P(bit i differs between two consecutive sampled
-/// values), estimated by XOR-count-and-divide. `variance` is the variance of
-/// `flipProbability` across `numBits` positions; `gradient[i]` is
-/// |flipProbability[i] - flipProbability[i - 1]| (gradient[0] == 0). Only
-/// the first `numBits` entries of each array are meaningful; the remainder
-/// are zero-filled. `numPairs` is how many pairs the probabilities were taken
-/// from, which is what says how much of a small gradient is sampling noise.
-/// `varyingBits` has bit i set when bit i is not the same in
-/// every value of the stream, whatever pairs the probabilities were taken
-/// from, so a bit that flips too rarely to show up in a sample still counts as
-/// varying; it is zero when the caller asked for it to be skipped.
+/// values); `variance` and `gradient` summarise it across `numBits`
+/// positions. `numPairs` bounds how much of a small gradient is noise.
+/// `varyingBits` has bit i set when bit i is not constant across the whole
+/// stream, and is zero when the caller asked for it to be skipped.
 struct BitFlipProfile {
   std::array<double, kMaxBitWidth> flipProbability{};
   double variance{0.0};
@@ -59,10 +52,8 @@ struct BitFlipProfile {
   size_t numPairs{0};
 };
 
-/// Whether `BitFlipProfile::varyingBits` is worth what it costs to fill.
-/// Filling it reads every value in the stream, which on a 524'288-row uint64
-/// column is 4 MB of traffic and dominates a capped profile; the gradient gate
-/// never reads it, so a caller that only runs the gradient gate should skip it.
+/// Whether `BitFlipProfile::varyingBits` is worth what it costs to fill: a
+/// full-stream read that dominates a capped profile's cost.
 enum class BitFlipVaryingBits {
   /// Leaves `BitFlipProfile::varyingBits` zero and reads only the sampled
   /// pairs.
@@ -74,14 +65,9 @@ enum class BitFlipVaryingBits {
 namespace detail {
 
 // Adds each word of `flipWords` to a bank of 64 per-bit-position counters:
-// `counts[b]` gains one for every word with bit b set.
-//
-// Counted with a bit-sliced adder rather than by visiting set bits. Four
-// planes hold, between them, one four-digit binary counter per bit position,
-// so a word is absorbed by four carry-propagating steps of two bitwise ops
-// each with no memory traffic, and `counts` is touched only when a counter
-// overflows sixteen. The planes are independent across bit positions, which is
-// what lets the loop below run four words at a time in a 256-bit vector.
+// `counts[b]` gains one for every word with bit b set. Counted with a
+// bit-sliced adder, whose planes are independent across bit positions and let
+// the loop below vectorise, rather than by visiting set bits.
 inline void spillPlane(
     uint64_t plane,
     uint64_t weight,
@@ -92,9 +78,8 @@ inline void spillPlane(
   }
 }
 
-// Scalar reference for accumulateFlipCounts, and the fallback where the build
-// has no AVX2. Kept callable on its own so a test can hold the vectorised path
-// against it.
+// Scalar reference for accumulateFlipCounts, and the fallback without AVX2.
+// Kept callable on its own so a test can check the vectorised path against it.
 inline void accumulateFlipCountsScalar(
     std::span<const uint64_t> flipWords,
     std::array<uint64_t, kMaxBitWidth>& counts) {
@@ -129,9 +114,8 @@ inline void accumulateFlipCounts(
     accumulateFlipCountsScalar(flipWords, counts);
     return;
   }
-  // One independent four-plane counter per 64-bit lane, so four words are
-  // absorbed per iteration and the four partial counters are merged at the
-  // end by spilling every lane's planes separately.
+  // One independent four-plane counter per 64-bit lane; the four partial
+  // counters are merged at the end by spilling each lane's planes.
   __m256i ones = _mm256_setzero_si256();
   __m256i twos = _mm256_setzero_si256();
   __m256i fours = _mm256_setzero_si256();
@@ -174,9 +158,8 @@ inline void accumulateFlipCounts(
 }
 
 // Bits that are not the same in every value of `values`. Four independent
-// accumulator pairs so that the loop is not a chain of dependent ANDs and ORs
-// and the compiler can widen it; this pass reads the whole stream and is
-// memory-bound on a column of any size.
+// accumulator pairs avoid a chain of dependent ANDs and ORs so the compiler
+// can widen the loop.
 template <typename T>
 uint64_t varyingBitsOf(std::span<const T> values) {
   using UnsignedT = std::make_unsigned_t<T>;
@@ -210,12 +193,9 @@ uint64_t varyingBitsOf(std::span<const T> values) {
 } // namespace detail
 
 /// Computes the bit-flip profile of `values` over at most `maxPairs`
-/// consecutive pairs, or over every pair when `maxPairs` is 0. A capped
-/// profile takes pairs (i, i + 1) at a fixed stride across the whole stream,
-/// so adjacency, which is what a flip measures, is kept while the counting
-/// cost falls to O(maxPairs). `varyingBits` costs a pass over every value and
-/// is filled only when `varyingBits` asks for it. Returns a zero profile when
-/// `values` has fewer than two elements.
+/// consecutive pairs (every pair when `maxPairs` is 0), taken at a fixed
+/// stride to keep adjacency while bounding the counting cost. Returns a zero
+/// profile when `values` has fewer than two elements.
 template <typename T>
 BitFlipProfile computeBitFlipProfile(
     std::span<const T> values,
@@ -240,8 +220,8 @@ BitFlipProfile computeBitFlipProfile(
       ? 1
       : (totalPairs + maxPairs - 1) / maxPairs;
 
-  // The XORs are materialised a chunk at a time so that the bit-sliced counter
-  // below runs over contiguous words whatever stride the pairs were taken at.
+  // XORs are materialised a chunk at a time so the bit-sliced counter runs
+  // over contiguous words whatever stride the pairs were taken at.
   constexpr size_t kChunkWords = 256;
   std::array<uint64_t, kChunkWords> flipWords{};
   std::array<uint64_t, kMaxBitWidth> flipCounts{};

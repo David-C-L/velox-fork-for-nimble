@@ -44,16 +44,9 @@ class DictionaryEncodingView final : public TypedEncodingView<T> {
         options);
     NIMBLE_CHECK_NOT_NULL(indices_);
 
-    // Resolve the alphabet once. A range read otherwise asks the alphabet for
-    // one value per row, and each of those is a virtual call that unpacks bits
-    // to reach a table small enough to have been held outright: on a column
-    // whose dictionary holds a few hundred entries, that resolution was a
-    // third of the decode.
-    //
-    // Only worth holding while the alphabet is small against the rows it
-    // serves, which is the case a dictionary is chosen for. A larger one keeps
-    // resolving per value rather than paying to materialise something that
-    // will not be reused.
+    // Resolving the alphabet once avoids a virtual call per row later, but is
+    // only worth it while the alphabet is small relative to the rows it
+    // serves, which is the case a dictionary is chosen for.
     const auto alphabetRows = alphabet_->rowCount();
     if (alphabetRows > 0 && alphabetRows <= kResolvedAlphabetLimit &&
         alphabetRows < this->rowCount_) {
@@ -62,10 +55,8 @@ class DictionaryEncodingView final : public TypedEncodingView<T> {
     }
   }
 
-  // The indices are already the dense ids a caller grouping rows by value
-  // would otherwise rebuild, and the alphabet is already decoded, so both are
-  // handed over rather than derived again. Declined when the alphabet was too
-  // large to hold, since then there is nothing to hand over.
+  // Hands over the indices and resolved alphabet directly; declines when the
+  // alphabet was not resolved (too large relative to row count).
   bool denseRunIds(
       uint32_t offset,
       uint32_t length,

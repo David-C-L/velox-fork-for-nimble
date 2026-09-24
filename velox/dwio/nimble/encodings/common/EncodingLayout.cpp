@@ -225,18 +225,12 @@ EncodingLayout EncodingLayoutCapture::capture(
     }
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered: {
-      // SubIntSplit decomposes its input into per-section bit-range
-      // sub-streams. Capture each section's nested encoding as a child, and
+      // Capture each SubIntSplit section's nested encoding as a child, and
       // preserve the recovered bit boundaries in the encoding config so the
       // same split layout can be replayed (see
-      // ReplayedEncodingSelectionPolicy).
-      //
-      // Walked by the shared parser rather than by a header walk written here.
-      // This used to have its own, which read the byte after splitCount as
-      // reserved; that byte now says whether a transform block follows, so on
-      // a reordered stream a local walk would take the section headers from
-      // the wrong offset and capture nonsense. A third reader of this header
-      // is exactly what the shared one exists to prevent.
+      // ReplayedEncodingSelectionPolicy). Walked by the shared parser rather
+      // than a local header walk, to avoid a second reader disagreeing with it
+      // on section offsets.
       subintsplit::RowFrame rowFrame;
       const auto sections =
           subintsplit::parseSections(encoding, prefixSize, nullptr, &rowFrame);
@@ -253,9 +247,9 @@ EncodingLayout EncodingLayoutCapture::capture(
         boundaryPlans.push_back(segment);
       }
 
-      // The captured type is the one the stream carries. Reporting a reordered
-      // stream as plain SubIntSplit would describe a layout that decodes to
-      // different values than the stream it came from.
+      // The captured type is the one the stream carries: reporting it as
+      // plain SubIntSplit would describe a layout that decodes to different
+      // values than the stream it came from.
       auto config = subintsplit::makePreserveSplitConfig(boundaryPlans);
       if (rowFrame.active()) {
         config.emplace(

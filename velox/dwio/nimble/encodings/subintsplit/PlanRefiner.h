@@ -23,16 +23,14 @@
 
 namespace facebook::nimble::subintsplit {
 
-/// How many of the split DP's cheapest plans the hybrid planner re-prices,
-/// and separately how many bit-flip-restricted plans.
+/// Number of cheapest split-DP plans the hybrid planner re-prices.
 inline constexpr uint32_t kHybridShortlist{8};
 
-/// Rows sampled to re-price the hybrid planner's shortlisted ranges. Only the
-/// ranges in shortlisted plans and refinement moves are priced at this size,
-/// which is what keeps a larger sample affordable.
+/// Sample size used to re-price shortlisted ranges; only those ranges are
+/// priced at this size, keeping a larger sample affordable.
 inline constexpr uint32_t kHybridRescoreSamples{16'384};
 
-/// A split plan the hybrid planner settled on, with the re-priced totals it
+/// A split plan chosen by the hybrid planner, with the re-priced totals it
 /// was chosen on, both in bits for the full stream.
 struct RefinedPlan {
   std::vector<SectionPlan> sections;
@@ -43,27 +41,22 @@ struct RefinedPlan {
 };
 
 /// The hybrid split planner's second stage: re-prices shortlisted plans with
-/// the estimators section selection uses, on a larger sample than the split DP
-/// costs with, and refines the cheapest by moving, merging and splitting
-/// boundaries under the same pricing.
+/// the estimators section selection uses, on a larger sample than the split
+/// DP costs with, then refines the cheapest by moving, merging and splitting
+/// boundaries under the same pricing. Pricing only the ranges a shortlist and
+/// its refinement touch keeps the accurate estimators affordable.
 ///
-/// The split DP's cost models are cheap and inaccurate; the estimators are
-/// accurate and too expensive to run on every range at a sample large enough to
-/// trust. Pricing only the ranges a shortlist and its refinement touch is what
-/// makes the accurate pricing affordable.
-///
-/// Defined in subintsplit/PlanRefiner.cpp for uint32_t and uint64_t, the
-/// physical types SubIntSplit splits. The estimators live in
-/// selection/EncodingSizeEstimation.h, which includes SubIntSplitEncoding.h, so
-/// no header on SubIntSplit's own include path can reach them.
+/// Defined in PlanRefiner.cpp for uint32_t and uint64_t only, since the
+/// estimators it calls live behind SubIntSplitEncoding.h and are unreachable
+/// from any header on SubIntSplit's own include path.
 class SubIntSplitPlanRefiner {
  public:
-  /// Returns the cheapest plan found, or an empty plan if no shortlisted plan
-  /// could be priced. `cuts`, when non-empty, marks bit positions refinement
-  /// may split a segment at; empty allows every interior bit. Decode weighting
-  /// and Options::subIntSplitMaxSizeRegression apply as they do in the DP:
-  /// when the weighted plan's size exceeds the size-only plan's by more than
-  /// the cap, the size-only plan is returned.
+  /// Returns the cheapest plan found, or an empty plan if none could be
+  /// priced. `cuts`, when non-empty, restricts refinement's split points to
+  /// those positions. Decode weighting and
+  /// Options::subIntSplitMaxSizeRegression apply as in the DP: if the
+  /// weighted plan's size exceeds the size-only plan's by more than the cap,
+  /// the size-only plan is returned instead.
   template <typename PhysicalType>
   static RefinedPlan refine(
       std::span<const PhysicalType> values,

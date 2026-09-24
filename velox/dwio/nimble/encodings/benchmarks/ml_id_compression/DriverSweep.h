@@ -46,9 +46,7 @@ namespace facebook::nimble::mlidc {
 
 /// Overrides the upstream SubIntSplit switches named in `features`, a
 /// comma-separated list where a name sets its switch on and no-<name> sets it
-/// off, so one driver run can measure each against the library default. Throws
-/// on a name it does not know, rather than measuring a run that silently left
-/// the feature off.
+/// off. Throws on a name it does not know.
 inline void applyUpstreamFeatures(
     std::string_view features,
     Encoding::Options& options) {
@@ -120,14 +118,12 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
   context.cacheState = cacheState;
   context.rows = rows;
   context.encoders = buildDefaultEncoders<T>();
-  // Zstd as an arm in its own right rather than as a sub-stream codec, in
-  // fixed-size blocks. Needs no OpenZL, so every driver gets it.
+  // Zstd as an arm in its own right, in fixed-size blocks; needs no OpenZL.
   for (auto& entry : buildZstdBlockEncoders<T>()) {
     context.encoders.push_back(std::move(entry));
   }
-  // The same blocks, kept once decoded. Wrapping a block arm rather than
-  // zstd/whole is what makes the laziness real: with a whole-payload inner,
-  // decoding "one block" would decompress the entire column.
+  // The same blocks, kept once decoded, so decoding "one block" does not
+  // decompress the entire column the way a whole-payload inner would.
   for (auto& entry : buildZstdBlockEncoders<T>()) {
     if (entry.variant == "block-" + std::to_string(kLazyBlockElementCount)) {
       context.encoders.push_back(
@@ -135,10 +131,8 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
               std::move(entry), kLazyBlockElementCount));
     }
   }
-  // Zstd over the whole column, and the same bytes read through a buffer
-  // decoded once on the first access. The pair is the amortisation question
-  // asked of a blackbox codec: what a reader pays per probe while it holds only
-  // the compressed column, against what it pays once it has decoded it.
+  // Zstd over the whole column, and the same bytes materialized once on
+  // first access: the amortisation question for a blackbox codec.
   context.encoders.push_back(buildZstdWholeEncoder<T>());
   context.encoders.push_back(
       withMaterializedAccess<T>(buildZstdWholeEncoder<T>()));
@@ -146,23 +140,17 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
     // Serves partial reads by decompressing the whole column, which is the
     // comparison the decode drivers exist to make.
     context.encoders.push_back(buildOpenZLEncoder<T>());
-    // The same frame, decompressed once and then served from memory. Without
-    // it openzl/auto is the only way this study lets a blackbox codec answer a
-    // probe, and it reports 7.5e-05 Mprobes/s on snowflake for a reason that is
-    // about deployment rather than about the codec.
+    // The same frame, decompressed once and then served from memory, since
+    // otherwise a blackbox codec has only one way to answer a probe.
     context.encoders.push_back(
         withMaterializedAccess<T>(buildOpenZLEncoder<T>()));
-    // The same codec deployed the way a columnar format deploys one. Against
-    // openzl/auto these separate the codec from the granularity it is shipped
-    // at, which is what makes "just use smaller blocks" a measured answer
-    // rather than an argued one.
+    // The same codec deployed the way a columnar format deploys one,
+    // separating the codec from the granularity it is shipped at.
     for (auto& entry : buildOpenZLBlockEncoders<T>()) {
       context.encoders.push_back(std::move(entry));
     }
-    // The third regime on the frontier. openzl/auto+materialize holds a whole
-    // decoded column to answer a probe in tens of nanoseconds; this holds only
-    // the blocks a workload actually reached, and the gap between the two on
-    // the resident axis is what the time axis alone could not show.
+    // Holds only the blocks a workload actually reached, unlike
+    // openzl/auto+materialize which holds the whole decoded column.
     for (auto& entry : buildOpenZLBlockEncoders<T>()) {
       if (entry.variant == "block-" + std::to_string(kLazyBlockElementCount)) {
         context.encoders.push_back(
@@ -171,10 +159,8 @@ makeSweepContext(bool withOpenZL, CacheState cacheState, uint32_t rows) {
       }
     }
   }
-  // Applied last so it can select an OpenZL entry too. Mirrors
-  // --mlidc_datasets: comma-separated names matched against the same name
-  // written to the CSV's encoding column, empty meaning all, and an unknown
-  // name is an error rather than a silent empty result.
+  // Applied last so it can select an OpenZL entry too. Comma-separated names
+  // matched against the CSV's encoding column; an unknown name is an error.
   if (!FLAGS_mlidc_encoders.empty()) {
     std::vector<EncoderEntry<T>> filtered;
     std::stringstream names(FLAGS_mlidc_encoders);
@@ -264,10 +250,8 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
     const std::string& dataset) {
   facebook::nimble::Encoding::Options options;
   // Withdraws FrequencyPartition from the encodings the split planner may
-  // cost a section against, leaving every other candidate in place. False,
-  // the default, is production behaviour. Withdrawing an encoding moves the
-  // boundaries the DP picks and not merely the encoding named for a
-  // section, because a section's cost is what the DP minimises over.
+  // cost a section against. This moves the boundaries the DP picks, not just
+  // which encoding a section names, since the DP minimises over section cost.
   if (FLAGS_mlidc_sis_withdraw_frequency_partition) {
     options.subIntSplitAllowedEncodings = {
         facebook::nimble::EncodingType::Trivial,
@@ -287,8 +271,8 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
     };
   }
   // Zero by default, so every driver's selection is unchanged unless the flag
-  // is set. Set here alongside the assembly switches for the same reason: it
-  // reaches every arm without threading an argument through every factory.
+  // is set; reaches every arm without threading an argument through each
+  // factory.
   options.subIntSplitDecodeWeight = FLAGS_mlidc_sis_decode_weight;
   options.subIntSplitDecodeAccessPattern =
       static_cast<uint8_t>(FLAGS_mlidc_sis_decode_access_pattern);
@@ -304,9 +288,8 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   options.subIntSplitEstimateBitFlipScreen =
       FLAGS_mlidc_sis_estimate_bitflip_screen;
   applyUpstreamFeatures(FLAGS_mlidc_sis_upstream_features, options);
-  // Which arm is being built is known here and nowhere below it, so the encode
-  // cache reads it from here rather than every encode signature growing an
-  // argument it would only pass through.
+  // Which arm is being built is known here, so the encode cache reads it from
+  // here rather than threading it through every encode signature.
   setCacheContext(encoder.name);
   try {
     auto target = encoder.factory(data, options);
@@ -392,12 +375,9 @@ inline void setTimingColumns(
   csv.set("time_min_ns", result.time.min_ns);
 }
 
-/// Adds the columns that carry a target's read path and the two halves of its
-/// cost, so a view arm reports what building its access structure cost and what
-/// a read cost once it was built.
-///
-/// Appended to a driver's column list rather than written into each of them, so
-/// that a driver cannot pick up one of the four and miss the rest.
+/// Adds the columns that carry a target's read path and the two halves of
+/// its cost: what building the access structure cost, and what a read cost
+/// once it was built.
 inline void appendAccessColumns(std::vector<std::string>& columns) {
   columns.push_back("read_path");
   columns.push_back("builds_access_structure");
@@ -426,9 +406,8 @@ MeasureResult measureAccessStructureBuild(
     target.discardAccessStructure();
     target.buildAccessStructure();
   });
-  // Left built on purpose: the per-read measurement that follows is the one
-  // that excludes construction, and it must not find the structure discarded by
-  // the last iteration above.
+  // Left built on purpose: the per-read measurement that follows excludes
+  // construction and must not find the structure discarded.
   target.buildAccessStructure();
   return result;
 }

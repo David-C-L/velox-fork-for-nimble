@@ -122,9 +122,7 @@ inline bool isDeltaStream(std::string_view data, uint32_t dataOffset) {
 /// Per-section transform metadata, as the header carries it.
 ///
 /// A section is transformed only where it pays for itself, so the ids are per
-/// section rather than one for the stream: charging every section for a
-/// transform only some of them want measured far worse than letting each
-/// decline.
+/// section rather than one for the stream, letting each section decline.
 struct TransformInfo {
   /// Index of the section the key-derived permutation sorts by. That section
   /// is stored unpermuted, since it is what rebuilds the order. kNoKeySection
@@ -194,11 +192,9 @@ inline std::vector<StoredSection> parseSections(
     RowFrame* rowFrame = nullptr,
     uint8_t* flags = nullptr) {
   const char* pos = data.data() + dataOffset;
-  // Every field below comes off the wire, so a corrupt or truncated stream
-  // reaches here as arbitrary bytes. Without these checks a bad length walks
-  // pos past the buffer, a bad entry count resizes a vector by up to 4 billion
-  // elements, and a bad bit range shifts by a negative width. Reads are cheap
-  // relative to a decode and this runs once per stream, not per row.
+  // Every field below comes off the wire as arbitrary bytes; without these
+  // checks a bad length walks pos past the buffer, a bad entry count resizes
+  // a vector by billions of elements, or a bad bit range shifts negatively.
   const char* const streamEnd = data.data() + data.size();
   auto requireBytes = [&](size_t bytes) {
     NIMBLE_CHECK(

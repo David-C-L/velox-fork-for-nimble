@@ -28,25 +28,21 @@
 // (see BitFlipProfile.h). The gradient gate, optionally with the active-bit
 // entropy guard, is what ManualEncodingSelectionPolicy::select() admits
 // SubIntSplit by when Encoding::Options::subIntSplitAdmission asks for it;
-// the default admission is still SubIntSplitEncoding::estimateSize. See
-// benchmarks/ml_id_compression/MlIdAdmissionBenchmark.cpp for how the modes
-// compare against ground truth, and subintsplit/Estimator.h for how they're
-// used to gate a real cost estimate.
+// the default admission is still SubIntSplitEncoding::estimateSize.
 
 namespace facebook::nimble::subintsplit {
 
 struct TopLevelPolicyConfig {
   // The variance gate predicts "worth costing SubIntSplit" when
-  // BitFlipProfile::variance exceeds this threshold. A stream with uniform
-  // flip probability across all bit positions (e.g. uniform-random, or a
-  // single homogeneous distribution) has variance close to 0; concatenated
-  // bit-fields with different statistical behavior push it up.
+  // BitFlipProfile::variance exceeds this threshold: a stream with uniform
+  // flip probability has variance close to 0, while concatenated bit-fields
+  // with different statistical behavior push it up.
   double varianceGateThreshold{0.01};
 
   // Gradient boundaries are bit positions where the discrete derivative of
-  // the flip-probability curve spikes above (mean + multiplier * stddev) of
-  // the gradient array itself -- an adaptive threshold, since the absolute
-  // scale of the gradient varies a lot by dataset.
+  // the flip-probability curve spikes above an adaptive threshold (mean +
+  // multiplier * stddev of the gradient array itself), since the gradient's
+  // absolute scale varies a lot by column.
   double gradientStdDevMultiplier{2.0};
 
   // The gradient gate predicts "worth costing SubIntSplit" when at least
@@ -55,12 +51,9 @@ struct TopLevelPolicyConfig {
   int minGradientBoundaries{1};
 
   // The gradient gate also requires the largest gradient value in the
-  // profile to reach at least this absolute magnitude. The adaptive
-  // threshold above is relative to each column's own gradient noise floor,
-  // so a nearly flat profile (uniform or constant-like) can still produce a
-  // handful of "boundaries" that exceed its own tiny mean + multiplier *
-  // stddev without any of them being a meaningful spike; this floor rejects
-  // that case.
+  // profile to reach at least this absolute magnitude, since the adaptive
+  // threshold above is relative to each column's own noise floor and a
+  // nearly flat profile can otherwise still produce spurious "boundaries".
   double minGradientMagnitude{0.005};
 
   // The entropy guard rejects a stream whose non-constant bits flip, on
@@ -69,19 +62,10 @@ struct TopLevelPolicyConfig {
   // has nothing left for a split to exploit once its constant bits are
   // dropped, which FixedBitWidth already does. Varying bits come from the
   // whole stream (BitFlipProfile::varyingBits), so a sampled profile does not
-  // drop slow fields and inflate the mean.
-  //
-  // 0.8 was read off 39 columns before the ground truth counted pure
-  // baselines, and on the 42 columns since it rejects six streams a split
-  // does win on -- an NPI, two Corporations id columns, an IPv4 id, a
-  // quadkey and a species id -- for recall 0.82 against the gradient guard's
-  // 0.97. Leaving one dataset family out picks 0.99 or 1.0 in every fold, so
-  // 0.99 is the highest value the data supports: it holds precision at 1.00
-  // for recall 0.95, where the gradient guard alone trades one false
-  // positive for one more true positive. Now that admission decides
-  // candidacy rather than the encoding, that false positive costs a size
-  // estimate and nothing else, so kBitFlip is the better of the two modes and
-  // this guard exists for the ablation that shows why.
+  // drop slow fields and inflate the mean. Since admission only decides
+  // candidacy rather than the encoding, a false positive here only costs a
+  // size estimate, so the threshold is set loose; this guard exists mainly
+  // for the ablation that justifies preferring kBitFlip over kBitFlipEntropy.
   double maxActiveFlipEntropy{0.99};
 };
 
@@ -128,12 +112,8 @@ inline bool bitFlipVarianceGate(
 }
 
 // Returns candidate split points derived from spikes in `profile`'s
-// gradient: a split point `s` means "a segment may start or end at bit
-// index `s`" (so a segment's bit range is [boundaries[i], boundaries[i+1] -
-// 1]). Sorted, deduped, always including 0 and `profile.numBits` (the
-// implicit outer edges of the full bit range) -- empty `profile.numBits`
-// yields just those two edges. Currently consumed only by
-// bitFlipGradientGate() below.
+// gradient, sorted and deduped, always including 0 and `profile.numBits` as
+// the outer edges of the full bit range.
 inline std::vector<int> bitFlipGradientBoundaries(
     const BitFlipProfile& profile,
     const TopLevelPolicyConfig& config) {
@@ -173,11 +153,8 @@ inline std::vector<int> bitFlipGradientBoundaries(
   return boundaries;
 }
 
-// Predicts whether `profile` indicates a stream worth costing SubIntSplit
-// against its rivals, using the gradient-boundary signal instead of
-// variance: requires at least `config.minGradientBoundaries` interior
-// boundaries (see bitFlipGradientBoundaries()) whose largest gradient value
-// also reaches `config.minGradientMagnitude`.
+// Predicts whether `profile` is worth costing SubIntSplit against its
+// rivals, using the gradient-boundary signal instead of variance.
 inline bool bitFlipGradientGate(
     const BitFlipProfile& profile,
     const TopLevelPolicyConfig& config) {

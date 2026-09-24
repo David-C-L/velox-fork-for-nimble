@@ -634,13 +634,10 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
 
   /// Size estimate with the run-lengths stream priced by the caller.
   ///
-  /// The writer hands run lengths to nested selection, which on real data
-  /// picks MainlyConstant or FrequencyPartition for them. This header cannot
-  /// price those (MainlyConstantEncoding.h includes it), so the overload above
-  /// falls back to one FixedBitWidth over [minRepeat, maxRepeat], where a
-  /// single long run sets the width charged to every length. Callers that can
-  /// see the nested encodings, such as EncodingSizeEstimation, pass the better
-  /// price.
+  /// This header cannot see the nested encodings nested selection actually
+  /// picks for run lengths (MainlyConstantEncoding.h includes this one), so
+  /// the overload above falls back to a single FixedBitWidth. Callers that can
+  /// see those encodings should pass the better price here instead.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,
@@ -675,32 +672,19 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
       return DictionaryEncoding<std::string_view>::estimateSize(
           runCount, statistics, options);
     } else {
-      // Priced over the run values themselves, which statistics already holds,
-      // rather than over the parent's statistics. The two differ in the way
-      // that decides the pick: the parent's uniqueCounts describe how often
-      // each value occurs in the *input*, where a long run makes a value look
-      // common, while in the run values stream every run contributes exactly
-      // one entry. A stream of few long runs is high-cardinality once
-      // collapsed, and a stream of many short alternating runs is a small
-      // repeating alphabet -- neither is visible from the parent.
+      // Priced from the input's own statistics rather than by rebuilding
+      // statistics over the collapsed run values: the parent's distinct count
+      // and min/max already bound Dictionary's price after collapsing, since
+      // collapsing runs never introduces a new distinct value. Trivial and
+      // Dictionary are considered in addition to FixedBitWidth because they
+      // are what wins when the collapsed cardinality is at either extreme;
+      // RLE and Constant cannot apply, since adjacent run values differ by
+      // construction.
       //
-      // min/max survive the collapse, so the previous FixedBitWidth quote was
-      // not wrong; it was just the only candidate. Trivial and Dictionary are
-      // added because they are what wins when the collapsed cardinality is at
-      // either extreme. RLE and Constant are not: adjacent run values differ by
-      // construction, so neither can apply to more than a single run.
-      //
-      // Collapsing runs keeps every distinct value too, so for integers, whose
-      // Dictionary price reads only the distinct count and min/max, the input's
-      // statistics give the same quote as statistics over the run values. Using
-      // them skips copying the run values and counting their distinct values a
-      // second time, which on a near-unique stream is as costly as the first.
-      //
-      // Dictionary's price only grows with the distinct count, so priced at a
-      // lower bound on that count it is a lower bound on itself. Where even
-      // that does not beat the plain encodings, Dictionary cannot be the
-      // cheapest and the distinct values are never counted: the quote is the
-      // one counting them would have given.
+      // Dictionary's price only grows with distinct count, so pricing it at a
+      // lower bound on that count gives a lower bound on itself: where even
+      // that does not beat the plain encodings, the real distinct values never
+      // need to be counted.
       if constexpr (!isFloatingPointType<T>()) {
         const uint64_t plainSize = std::min(
             TrivialEncoding<physicalType>::estimateSize(runCount),
@@ -730,10 +714,9 @@ class RLEEncoding final : public internal::RLEEncodingBase<T, RLEEncoding<T>> {
           TrivialEncoding<physicalType>::estimateSize(runCount),
           FixedBitWidthEncoding<physicalType>::estimateSize(
               runCount, runValuesStatistics, options));
-      // Guarded because uniqueCounts is optional: Statistics declines to build
-      // it above a cardinality cap, and DictionaryEncoding::estimateSize reads
-      // it unconditionally. Absent means the alphabet is too large for a
-      // Dictionary to win anyway, so skipping it costs nothing.
+      // Guarded because uniqueCounts is optional and DictionaryEncoding reads
+      // it unconditionally; absent means the alphabet is too large for
+      // Dictionary to win anyway.
       if (runValuesStatistics.uniqueCounts().has_value()) {
         bestSize = std::min(
             bestSize,

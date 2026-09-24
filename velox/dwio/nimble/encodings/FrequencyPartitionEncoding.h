@@ -77,10 +77,8 @@
 //   3 bytes: padding
 //   4 bytes: tagStreamByteCount
 //   [tagStreamByteCount]: nested encoding of the tag per row (tag = tier
-//                         index 0..numTiers-1, or numTiers for fallback).
-//                         The constructor decodes it once and repacks it
-//                         LSB-first at tagBits per row, which is the form
-//                         every read works from.
+//                         index 0..numTiers-1, or numTiers for fallback);
+//                         decoded and repacked LSB-first for reads.
 //
 // Index payload layout (EliasFano):
 //   For each non-empty tier (same order as above):
@@ -110,16 +108,10 @@ class FrequencyPartitionEncoding
 
   static constexpr uint8_t kFormatVersion = 1;
 
-  // Multiplier applied to the undiscounted TierTagArray tag-stream estimate
-  // in estimateSize() to approximate the size after nested encoding
-  // selection (which, empirically, usually picks Huffman over the tag
-  // stream's skewed tier distribution). 1.0 disables the discount, pricing
-  // the raw packed width -- the safer default, since an optimistic estimate
-  // over-selects FrequencyPartition while a pessimistic one merely
-  // under-selects it. Kept as a named constant so the discount can be
-  // measured independently of the base fix; see
-  // subintsplit/CostModel.h's matching kFrequencyPartitionNestedIndexDiscount,
-  // which must be updated together with this one.
+  // Discount for TierTagArray's tag-stream estimate in estimateSize(). 1.0
+  // (no discount) is the safer default: an optimistic estimate over-selects
+  // FrequencyPartition. Must stay in sync with subintsplit/CostModel.h's
+  // copy of this constant.
   static constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
   static constexpr uint32_t kRankSampleStride = 256;
   // Upper bound on tiers: one per entry of the key-bit table
@@ -142,12 +134,9 @@ class FrequencyPartitionEncoding
   template <typename DecoderVisitor>
   void readWithVisitor(DecoderVisitor& visitor, ReadWithVisitorParams& params);
 
-  /// In-memory size, in bytes, of TierTagArray's decode-time index: the
-  /// flattened rank-sample table, the forward-scan cursor, and (when
-  /// Options::frequencyPartitionResolveTierValues was set) each tier's
-  /// resolved-value table. Zero for any other index type. All of this is
-  /// rebuilt every time a TierTagArray column is decoded and never
-  /// serialised, so it is a load-time memory cost, not a payload cost.
+  /// In-memory size, in bytes, of TierTagArray's decode-time index. Zero
+  /// for any other index type. Rebuilt on every decode, so this is a
+  /// load-time memory cost, not a payload cost.
   size_t tagRankIndexBytes() const {
     size_t total = tierRankSamples_.size() * sizeof(uint32_t);
     total += cursorPos_.size() * sizeof(uint32_t);
@@ -167,33 +156,10 @@ class FrequencyPartitionEncoding
       const Encoding::Options& options = {});
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
-  /// Size estimate for encoding selection, priced from the frequency
-  /// distribution the encoder will actually partition.
-  ///
-  /// CHANGES SELECTION. This used to read consecutiveRepeatCount over rowCount
-  /// as a proxy for how much of the column lands in the cheapest tier. Run
-  /// length is not frequency concentration, and the two coincide only on sorted
-  /// data: a column of ten thousand distinct values each appearing in a run of
-  /// ten has a repeat fraction of 0.9, and the proxy read that as 90% of rows
-  /// earning one-bit keys, when in truth almost every one of those values ranks
-  /// far outside the two-value first tier and pays a sixteen-bit key plus its
-  /// share of a ten-thousand-entry dictionary. Measured against real encodes,
-  /// the quote came out 6.5x under at the median and 13.5x at the 90th
-  /// percentile, which made this the largest single source of SubIntSplit
-  /// sections being handed to an encoding that then inflated them.
-  ///
-  /// Nothing here is a proxy any more. encode() sorts the distinct values by
-  /// frequency and fills tiers of fixed capacity in that order, so given the
-  /// counts the tier every value lands in is determined, and so is the number
-  /// of rows and dictionary entries each tier carries. Statistics already holds
-  /// those counts. The nested streams are then priced by the same estimators
-  /// selection would apply to them rather than by a formula of our own, so this
-  /// tracks their accuracy instead of drifting from it.
-  ///
-  /// Returns the whole column at full width when the counts are unavailable.
-  /// That is what encode() charges when no value earns a short key, and it is
-  /// the honest answer for an estimator with no distribution to read: guessing
-  /// from something else is what this is replacing.
+  /// Size estimate for encoding selection: mirrors encode()'s tier
+  /// assignment and prices each tier's nested streams with the same
+  /// estimators selection would apply to them. Returns the whole column at
+  /// full width when per-value counts are unavailable.
   static uint64_t estimateSize(
       uint64_t rowCount,
       const Statistics<physicalType>& statistics,
@@ -222,9 +188,8 @@ class FrequencyPartitionEncoding
     }
 
     const uint64_t uniqueCount = uniqueCounts->size();
-    // Only the values that reach a tier need ranking. Everything past the last
-    // tier's capacity is unencoded at full width whatever its frequency, so the
-    // tail is never ranked.
+    // Values past the last tier's capacity are unencoded at full width
+    // regardless of frequency, so only the ranked prefix needs sorting.
     const auto ranked =
         static_cast<size_t>(std::min<uint64_t>(uniqueCount, totalCapacity));
     std::vector<uint64_t> counts;
@@ -233,13 +198,8 @@ class FrequencyPartitionEncoding
       counts.push_back(unique.second);
     }
 
-    // A tier needs the sum of its counts, never their order, so tiers are
-    // split off with partitions rather than by sorting. Where the capacity
-    // table reaches past the cardinality, as it does for 64-bit values, sorting
-    // was a full sort of one count per distinct value. The counts of every
-    // tier that ends before the last one are split from the rest first, in one
-    // pass over all of them, and the narrower tiers are then split within that
-    // prefix.
+    // A tier needs only the sum of its counts, not their order, so tiers are
+    // split off with nth_element partitioning rather than a full sort.
     size_t innerTiersEnd = 0;
     {
       uint64_t tierStart = 0;
@@ -296,9 +256,9 @@ class FrequencyPartitionEncoding
       }
       ++nonEmptyTiers;
 
-      // The tier's dictionary and its key stream, each a nested encoding with
-      // its own 4-byte length prefix. Keys index into the dictionary, so their
-      // width follows the tier's occupancy rather than its nominal key bits.
+      // The tier's dictionary and key stream; keys index into the
+      // dictionary, so their width follows tier occupancy, not nominal
+      // key bits.
       const uint64_t dictSize = std::min(
           TrivialEncoding<physicalType>::estimateSize(dictEntries),
           FixedBitWidthEncoding<physicalType>::estimateSize(
@@ -328,35 +288,23 @@ class FrequencyPartitionEncoding
 
     // The positional index, without which materialize() would hand back rows
     // in tier order and desync a SubIntSplit section from its siblings.
-    // Priced per the actual index type in options.frequencyPartitionIndex,
-    // rather than always as PerTierBitmaps: TierTagArray -- the mode
-    // SubIntSplitEncoding forces (see SubIntSplitEncoding::
-    // sectionEncodingOptions) -- is packed very differently from a bitmap and
-    // was badly over-priced by the bitmap formula.
+    // Priced per the actual index type rather than always as PerTierBitmaps,
+    // since each index type is packed differently.
     const auto indexType =
         static_cast<FreqPartIndexType>(options.frequencyPartitionIndex);
     if (indexType != FreqPartIndexType::NoIndex && nonEmptyTiers > 0) {
       payloadSize += 1 + 1 + 4; // formatVersion + indexType + payload length
       switch (indexType) {
         case FreqPartIndexType::PerTierBitmaps: {
-          // One N-bit bitmap per active tier (4-byte bitmapByteCount prefix +
-          // numValues bits rounded to a 64-bit word).
+          // One N-bit bitmap per active tier, rounded to a 64-bit word.
           const uint64_t bitmapWords = (rowCount + 63) / 64;
           payloadSize +=
               static_cast<uint64_t>(nonEmptyTiers) * (4 + bitmapWords * 8);
           break;
         }
         case FreqPartIndexType::TierTagArray: {
-          // tagBits(1) + padding(3) + tagStreamByteCount(4) header, then the
-          // tag stream. The stream goes through nested selection at encode
-          // time (FrequencyPartitionEncoding::encode), so its real size is
-          // usually smaller than this: this prices the undiscounted
-          // FixedBitWidth packing of one tagBits-wide tag per row, the same
-          // way the dictionary/key streams above are priced against
-          // TrivialEncoding/FixedBitWidthEncoding::estimateSize.
-          // kFrequencyPartitionNestedIndexDiscount (1.0 = no discount, i.e.
-          // this pessimistic estimate) is where a nested-selection discount
-          // would be applied if one is adopted later.
+          // Prices the undiscounted FixedBitWidth packing of one tagBits-wide
+          // tag per row; the real (nested-selected) stream is usually smaller.
           payloadSize += 8;
           payloadSize += static_cast<uint64_t>(std::llround(
               static_cast<double>(FixedBitWidthEncoding<uint32_t>::estimateSize(
@@ -368,9 +316,8 @@ class FrequencyPartitionEncoding
           break;
         }
         case FreqPartIndexType::EliasFano: {
-          // No dedicated EliasFano estimator yet: reuse the PerTierBitmaps
-          // formula. EliasFano is packed differently and this over-states
-          // it, the same way it over-stated TierTagArray before this fix.
+          // No dedicated EliasFano estimator yet: reuses the PerTierBitmaps
+          // formula, which over-states its actual (denser) packing.
           const uint64_t bitmapWords = (rowCount + 63) / 64;
           payloadSize +=
               static_cast<uint64_t>(nonEmptyTiers) * (4 + bitmapWords * 8);
@@ -384,13 +331,10 @@ class FrequencyPartitionEncoding
     return outerSize + payloadSize;
   }
 
-  /// A size estimateSize never quotes below, for a stream of `rowCount` rows
-  /// holding at least `distinctLowerBound` distinct values, computed without
-  /// their counts. Every term of estimateSize grows with the distinct count and
-  /// with each tier's rows, so this prices the tiers that many distinct values
-  /// fill with every tier holding one row per entry, and no fallback rows.
-  /// Lets selection rule this encoding out of a near-unique stream without
-  /// counting the stream's distinct values.
+  /// A lower bound on estimateSize's result for `rowCount` rows holding at
+  /// least `distinctLowerBound` distinct values but no known counts. Lets
+  /// selection rule this encoding out for a near-unique stream without
+  /// counting its distinct values.
   static uint64_t estimateSizeLowerBound(
       uint64_t rowCount,
       uint64_t distinctLowerBound,
@@ -482,11 +426,9 @@ class FrequencyPartitionEncoding
     uint32_t startRow; // NoIndex only: offset in encoded stream
     uint32_t size; // NoIndex only: count in encoded stream
 
-    // Optional, opt-in (Options::frequencyPartitionResolveTierValues): rank
-    // resolved directly to a value, i.e. resolvedValues[rank] ==
-    // dictionary[indices[rank]]. Populated once at decode construction so
-    // TierTagArray's point/range/bulk decode can skip the indices lookup and
-    // the dictionary lookup it feeds. Empty when the option is off.
+    // Opt-in (Options::frequencyPartitionResolveTierValues) rank -> value
+    // table, i.e. resolvedValues[rank] == dictionary[indices[rank]], letting
+    // decode skip the indices/dictionary chain. Empty when the option is off.
     Vector<T> resolvedValues;
 
     // Index fields — populated based on indexType_:
@@ -680,38 +622,13 @@ class FrequencyPartitionEncoding
   }
 
   // Counts positions in [begin, end) whose unpacked tag equals `target`,
-  // using word-parallel (SWAR) comparison instead of one unpack per position.
-  //
-  // Each 64-bit word is assembled at the bit offset of position `j` and
-  // treated as `fieldsPerWord = 64 / tagBits` packed fields. `target` is
-  // broadcast into every field and XORed against the word, so a matching
-  // field becomes all-zero and a mismatching field is nonzero. An OR-fold
-  // (repeatedly OR-ing each field's bits down into its own low bit, one bit
-  // of shift at a time) turns "field is nonzero" into a single bit per
-  // field with no cross-field interaction, then a popcount over the
-  // complemented low bits counts the matches in one instruction sequence.
-  // The OR-fold is deliberately single-bit-step rather than the doubling
-  // 1,2,4,... step sequence a byte-parallel "any zero byte" trick normally
-  // uses: doubling can fold in a bit from the *next* field once the
-  // cumulative shift reaches tagBits, silently corrupting the match/no-match
-  // result for that field. Single-bit steps keep every folded-in bit inside
-  // the field it started in.
-  //
-  // A word-sized load starting at bit offset `bitOff` can need up to
-  // bitOff + 64 bits -- up to 127, i.e. 16 bytes, not 8 -- so an unaligned
-  // window is assembled from two 8-byte loads (`lo`, `hi`) and spliced with
-  // a shift-and-or; reading only 8 bytes here would zero-fill the top
-  // fields instead of supplying their real bits, understating a mismatch
-  // (and overstating a match against tag 0) for however many fields the
-  // load was short. (Both mistakes were caught by fuzzing this function
-  // against the scalar loop before this landed -- the had-zero-field
-  // subtraction trick and the doubling OR-fold both look right and are
-  // both wrong for this use.)
-  //
-  // Falls back to the scalar unpack for: the head/tail of the range (whatever
-  // does not fill a whole word), and any word for which the two-word load
-  // would read past the end of tagArray_. tagBits <= 8 is required (same
-  // precondition as unpackTagAt); it always holds here since tagBits is
+  // using word-parallel (SWAR) comparison instead of one unpack per
+  // position: `target` is broadcast into each of a word's packed fields and
+  // XORed against it, a single-bit-step OR-fold reduces each field to one
+  // bit (a doubling step would leak a bit across fields), and popcount
+  // counts the matches. Falls back to the scalar unpack for the head/tail
+  // of the range and any word whose two-word load would read past the end
+  // of tagArray_. Requires tagBits <= 8, which always holds since tagBits is
   // ceilLog2(numTiers + 1) and numTiers <= kMaxTiers.
   uint32_t countEqualTag(uint32_t begin, uint32_t end, uint8_t target) const {
     if (begin >= end) {
@@ -771,17 +688,10 @@ class FrequencyPartitionEncoding
   }
 
   // Count elements with tag == tierIdx strictly before position `pos`.
-  // Uses tierRankSamples_ and tagArray_. tierIdx == tiers_.size() is
-  // fallback: tag values >= tiers_.size() (a range predicate, not a single
-  // value), so that bucket is counted with the scalar loop rather than the
-  // equality-only SWAR path.
-  //
-  // Reuses the per-tier scan cursor (cursorPos_/cursorRank_/cursorValid_)
-  // when the cursor sits between the nearest sample and `pos`, so a
-  // caller visiting positions in ascending order (as gather probes do,
-  // and as materializeImpl's seeding step does across consecutive tiers of
-  // the same range) rescans only the gap since its last call instead of
-  // replaying from the sample every time.
+  // tierIdx == tiers_.size() is the fallback bucket (a range predicate, not
+  // a single tag value), so it uses the scalar loop instead of the SWAR
+  // path. Reuses the per-tier scan cursor when it sits between the nearest
+  // sample and `pos`, so ascending-order callers rescan only the gap.
   uint32_t tierRankAtForTag(uint32_t tierIdx, uint32_t pos) const {
     const uint32_t sampleIdx = pos / kRankSampleStride;
     const uint32_t sampleStart = sampleIdx * kRankSampleStride;
@@ -820,10 +730,9 @@ class FrequencyPartitionEncoding
   template <FreqPartIndexType I>
   T decodeAtOriginalIndexImpl(uint32_t u) const;
 
-  // Reads the value at `rank` within `tier`: resolvedValues[rank] when the
-  // opt-in Options::frequencyPartitionResolveTierValues table was built
-  // (skipping the indices lookup and the dictionary lookup it feeds), else
-  // the ordinary dictionary[indices[rank]] chain.
+  // Reads the value at `rank` within `tier`, using the resolvedValues table
+  // when built (Options::frequencyPartitionResolveTierValues) to skip the
+  // indices/dictionary chain.
   static T tierValueAtRank(const TierInfo& tier, uint32_t rank) {
     if (!tier.resolvedValues.empty()) {
       return tier.resolvedValues[rank];
@@ -862,27 +771,18 @@ class FrequencyPartitionEncoding
   Vector<uint8_t> tagArray_;
   // Flattened [numBuckets x numSamplesPerBucket] table: tierRankSamples_
   // [t * numRankSamplesPerBucket_ + si] = count of tag==t in positions
-  // [0, si*kRankSampleStride). Index tiers_.size() is used for the fallback
-  // bucket. Held as one contiguous allocation instead of a vector of vectors
-  // so a lookup costs one pointer chase (into this buffer) rather than two
-  // (into the outer vector, then into the per-tier inner vector).
+  // [0, si*kRankSampleStride). Index tiers_.size() is the fallback bucket.
+  // Held as one contiguous allocation so a lookup costs one pointer chase
+  // instead of two.
   std::vector<uint32_t> tierRankSamples_;
   uint32_t numRankSamplesPerBucket_{0};
 
-  // Forward-scan cursor for tierRankAtForTag, keyed the same way as
-  // tierRankSamples_ (index tiers_.size() is the fallback bucket).
+  // Forward-scan cursor for tierRankAtForTag, keyed like tierRankSamples_:
   // cursorPos_[t]/cursorRank_[t] record the position and rank of the most
-  // recent tierRankAtForTag(t, ...) call, so a later call at a position ahead
-  // of the cursor can resume scanning from there instead of from the nearest
-  // sample. Gather probes visit rows in ascending original-row order (see
-  // readWithVisitor), which is exactly the access pattern this rewards.
-  //
-  // Declared mutable because tierRankAtForTag is const: it is a cache of
-  // already-computed ranks, not part of the encoding's decoded value. This is
-  // safe without synchronization because a decoded Encoding is always owned
-  // through a single std::unique_ptr (see EncodingFactory) and never shared
-  // across threads -- the same assumption the existing currentOriginalPos_ /
-  // currentTier_ streaming cursors already rely on.
+  // recent call for tier t, so a later call ahead of the cursor resumes
+  // from there instead of from the nearest sample. Declared mutable as a
+  // cache of already-computed ranks; safe without synchronization since a
+  // decoded Encoding is never shared across threads.
   mutable std::vector<uint32_t> cursorPos_;
   mutable std::vector<uint32_t> cursorRank_;
   mutable std::vector<bool> cursorValid_;
@@ -914,8 +814,8 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
       fallbackWordPrefix_{this->pool_},
       tagBits_(0),
       tagArray_{this->pool_} {
-  // Not kPrefixSize: encode() writes a varint row count when asked, which is
-  // a prefix of a different length. dataOffset() is that length.
+  // Not kPrefixSize: encode() may write a varint row count, a differently
+  // sized prefix that dataOffset() accounts for.
   const auto* pos = data.data() + this->dataOffset();
   const uint32_t numPartitions = encoding::readUint32(pos);
   const EncodingFactory encodingFactory(options);
@@ -1129,11 +1029,9 @@ FrequencyPartitionEncoding<T>::FrequencyPartitionEncoding(
             tiers_[t].tierCount = counts[t];
           }
 
-          // Opt-in (Options::frequencyPartitionResolveTierValues): resolve
-          // indices[rank] -> dictionary index into a direct rank -> value
-          // table, so decode can skip both loads at read time. Memory, not
-          // format, cost: held alongside the existing indices/dictionary
-          // tables, not instead of them.
+          // Opt-in (Options::frequencyPartitionResolveTierValues): a direct
+          // rank -> value table, held alongside indices/dictionary rather
+          // than replacing them, so decode can skip that lookup chain.
           if (options.frequencyPartitionResolveTierValues) {
             for (auto& tier : tiers_) {
               tier.resolvedValues.resize(tier.indices.size());
@@ -1311,18 +1209,10 @@ T FrequencyPartitionEncoding<T>::decodeAtOriginalIndexImpl(uint32_t u) const {
 // ---------------------------------------------------------------------------
 
 // Walks [start, start + count) once, carrying a per-tier cursor instead of
-// ranking every row.
-//
-// Each tier's key stream is written in ascending original-row order: encode()
-// fills tierRows by scanning rows 0..N-1 forward, then emits that tier's keys
-// in that order. So over a forward scan the rank of a row within its tier is
-// just how many rows of that tier have already been seen, and the rank query
-// the point path needs per row collapses to one increment. The ranks are still
-// paid once per tier at `start`, which is what lets a ranged read begin
-// anywhere without replaying the stream before it.
-//
-// decodeAtOriginalIndexImpl is deliberately left alone: it remains the point
-// path, where there is no previous row to carry a cursor from.
+// ranking every row: since each tier's key stream is written in ascending
+// original-row order, a per-row rank query collapses to one increment.
+// Ranks are still paid once per tier at `start`, letting a ranged read
+// begin anywhere. decodeAtOriginalIndexImpl remains the point path.
 template <typename T>
 template <FreqPartIndexType I>
 void FrequencyPartitionEncoding<T>::materializeImpl(
@@ -1332,11 +1222,9 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
   const uint32_t numTiers = static_cast<uint32_t>(tiers_.size());
   NIMBLE_CHECK(numTiers <= kMaxTiers, "tier count exceeds cursor capacity");
 
-  // Seeding the cursors costs one rank per tier, while carrying them saves one
-  // rank per row, so the walk only pays for itself once the run is longer than
-  // the tier count. Below that -- a single-row materialize being the case that
-  // matters, since that is how a point read arrives here -- rank the one tier
-  // the row actually lands in and skip the seeding entirely.
+  // Seeding the cursors costs one rank per tier, so this pays off only once
+  // the run is longer than the tier count; below that, rank just the row's
+  // own tier and skip seeding.
   if (count <= kSequentialThreshold) {
     for (uint32_t i = 0; i < count; ++i) {
       dst[i] = decodeAtOriginalIndexImpl<I>(start + i);
@@ -1372,16 +1260,10 @@ void FrequencyPartitionEncoding<T>::materializeImpl(
     }
   }
 
-  // Software prefetch was tried here (issuing a prefetch for row
-  // i + kDistance's indices/resolvedValues slot once its cheap,
-  // non-dependent tag was known, ahead of consuming row i's own dependent
-  // chain) and measured as a net regression: -43% on bulk (144 -> 81
-  // Melem/s) and -35 to -46% on range at B=64/512/4096, large enough to
-  // erase tierValueAtRank's own gain. The per-row cost of the extra
-  // unpackTagAt call and branch outweighed any latency it hid -- this walk's
-  // working set (tier5's dictionary/indices, ~3.7-7.4MB) fits the LLC, so it
-  // is not DRAM-latency-bound the way the hypothesis assumed. Do not
-  // reintroduce without re-measuring against this baseline.
+  // Software prefetching a future row's indices/resolvedValues slot was
+  // tried here and measured as a net regression, since the walk's working
+  // set fits the LLC and is not DRAM-latency-bound. Do not reintroduce
+  // without re-measuring.
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t u = start + i;
 
@@ -1576,11 +1458,9 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
   const uint32_t valueCount = static_cast<uint32_t>(values.size());
 
   // Narrow values are counted in a table rather than hashed one row at a
-  // time. The map is still what the tiers are ranked from, because the sort
-  // below is not stable and so reads its tie order from the map's iteration
-  // order; inserting the distinct values in the order they first occur, which
-  // is the order counting them in the map would have inserted them, rebuilds
-  // exactly that map.
+  // time. The map is still what tiers are ranked from, since the sort below
+  // is unstable and reads tie order from the map's insertion order; the
+  // distinct values are inserted in first-occurrence order to reproduce it.
   constexpr bool kCountsInTable = std::is_integral_v<physicalType> &&
       !std::is_same_v<physicalType, bool> && sizeof(physicalType) <= 2;
   constexpr size_t kTableSize =
@@ -1667,9 +1547,9 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     tierAssignments.push_back(std::move(tier));
   }
 
-  // Each assigned value's tier and its key within the tier, looked up once per
-  // row to place the row and its key together. Values reaching no tier are
-  // absent from the map, or marked unassigned in the table.
+  // Each assigned value's tier and key, looked up once per row. Values
+  // reaching no tier are absent from the map, or marked unassigned in the
+  // table.
   struct Assignment {
     uint32_t tier;
     uint32_t key;
@@ -1696,10 +1576,10 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
   }
 
   // Assign rows to tiers. Every tier's row count is already known from the
-  // frequencies its dictionary was ranked by, so the outputs are sized up front
-  // and each row is written at its tier's cursor without a branch on the tier:
-  // on a section whose values alternate between tiers that branch was
-  // unpredictable, and appending grew each output as it went.
+  // frequencies its dictionary was ranked by, so outputs are sized up front
+  // and each row is written at its tier's cursor rather than appended,
+  // avoiding a branch-per-row that would be unpredictable for values that
+  // alternate tiers.
   const auto numAssignedTiers = static_cast<uint32_t>(tierAssignments.size());
   std::vector<uint32_t> tierSizes(numAssignedTiers + 1, 0);
   {
@@ -1717,9 +1597,8 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
   std::vector<std::vector<uint32_t>> tierRows(numAssignedTiers + 1);
   std::vector<Vector<uint32_t>> tierKeys;
   tierKeys.reserve(numAssignedTiers);
-  // Rows and keys are written through these, one slot per tier plus the
-  // fallback. The fallback has no keys, so its key slot is a scratch word that
-  // its cursor is masked away from.
+  // One slot per tier plus fallback; the fallback has no keys, so its key
+  // slot is a scratch word its cursor is masked away from.
   std::array<uint32_t*, 8> rowOutputs{};
   std::array<uint32_t*, 8> keyOutputs{};
   std::array<uint32_t, 8> keyCursorMasks{};
@@ -1736,8 +1615,8 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     }
   }
 
-  // The tier tag of every row, which is all the TierTagArray index stores, is
-  // the tier each row is placed in, so it is written in the same pass.
+  // The tier tag of every row is written in the same pass, since it is
+  // exactly the tier each row is placed in.
   const bool tagRows = indexType == FreqPartIndexType::TierTagArray;
   Vector<uint32_t> tagValues(pool);
   if (tagRows) {
@@ -1861,15 +1740,11 @@ std::string_view FrequencyPartitionEncoding<T>::encode(
     // (fallback).
     const uint8_t tagBits = ceilLog2WithMinOne(numTiers + 1);
 
-    // The tag stream goes through nested selection rather than being packed at
-    // a fixed tagBits width. Tags are the tier a row landed in, so their
-    // distribution is the tier distribution, which is skewed by construction:
-    // tiers exist because some values are far more frequent than others. A
-    // fixed-width packing spends ceilLog2(numTiers + 1) bits on every row and
-    // cannot use that skew. The constructor decodes this stream once and
-    // repacks it to the fixed width, so whatever it costs to decode is paid
-    // per encoding rather than per read. The tags were written when the rows
-    // were placed.
+    // The tag stream goes through nested selection rather than a fixed
+    // tagBits-wide packing, since the tier distribution it reflects is
+    // skewed by construction and a fixed width cannot exploit that. The
+    // constructor decodes and repacks it once, paying that cost per
+    // encoding rather than per read.
     const std::string_view serializedTags =
         selection.template encodeNested<uint32_t>(
             EncodingIdentifiers::FrequencyPartition::TierTags,

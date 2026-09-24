@@ -33,42 +33,29 @@
 #include "velox/dwio/nimble/encodings/subintsplit/SectionMetrics.h"
 
 // DP-based bit-range split selector for SubIntSplitEncoding.
-// Evaluates a grid of bit ranges [l..r] on a sample of uint64_t values,
-// runs dynamic programming over bit positions 0..kBits to find the minimum-cost
-// partition, and returns a list of SectionPlan entries.
 
 namespace facebook::nimble::subintsplit {
 
 struct SelectorConfig {
   int minSectionWidth{1};
   double splitPenalty{10.0}; // extra bits charged per additional split boundary
-  // Whether segments may be costed as Huffman. Withdrawing it moves the
-  // boundaries the DP picks, not merely the encoding it names for a segment,
-  // since a segment's cost is what the DP minimises over.
+  // Withdrawing this moves the boundaries the DP picks, not merely the
+  // encoding it names for a segment, since cost is what the DP minimises over.
   bool allowHuffman{true};
-  // Whether segments may be costed as DeltaBlock. Same blast radius as
-  // allowHuffman above: withdrawing it moves the boundaries the DP picks, not
-  // only the encoding named for a segment. See
-  // Encoding::Options::subIntSplitAllowDeltaBlock, which is what production
-  // sets this from and which defaults the other way.
+  // Same effect as allowHuffman: withdrawing it moves the boundaries the DP
+  // picks, not only the segment encoding.
   bool allowDeltaBlock{true};
-  // How much a segment's decode cost counts against its size, and for which
-  // read shape. Zero is the default and reproduces size-only selection
-  // exactly -- see DecodeCostWeighting. Raising it lets the DP decline an
-  // encoding that stores a section well and reads it badly, which is what
-  // section attribution kept showing and the size models could not express.
+  // Weight of a segment's decode cost against its size. Zero reproduces
+  // size-only selection exactly (see DecodeCostWeighting).
   DecodeCostWeighting decodeWeighting{};
 
-  /// Trims the bit planes constant across the whole sample before scoring, so
-  /// they become one Constant section at each edge and the grid is scored
-  /// over the varying planes alone. Off by default: planning is already a
-  /// small share of encode at production row counts, and trimming changes the
-  /// plan. Ignored for an edge narrower than minSectionWidth, and when the
-  /// allowed encodings exclude Constant.
+  /// Trims bit planes constant across the whole sample into a single
+  /// Constant section at each edge before scoring. Off by default because
+  /// trimming changes the plan. Ignored below minSectionWidth or when
+  /// Constant is disallowed.
   bool trimConstantPlanes{false};
-  /// Relative change in a bit plane's set rate below which a position is not
-  /// considered as a split boundary. 0.0 considers every position. See
-  /// kBoundaryPruneThreshold for the value upstream chose.
+  /// Relative set-rate change below which a position is not considered a
+  /// split boundary. 0.0 considers every position.
   double boundaryPruneThreshold{0.0};
   /// Ceiling on candidate boundaries, the strongest by set-rate change kept.
   /// 0 is unlimited.
@@ -88,9 +75,7 @@ struct SelectorConfig {
   size_t streamRowCount{0};
 };
 
-/// Upstream's default set-rate threshold for boundary pruning: it drops a
-/// position only when its two adjacent bit planes are set at within 0.1% the
-/// same rate.
+/// Default set-rate threshold for boundary pruning.
 constexpr double kBoundaryPruneThreshold = 0.001;
 
 /// Extra bits the DP charges each section after the first.
@@ -215,41 +200,20 @@ class BitRangeExtractor {
   int bitEnd_;
 };
 
-// Counts, for every bit range [bitStart, bitEnd] of a sample, the metrics that
-// need no pass over the range's extracted values: the frequencies of its
-// distinct values, its runs, and its bit-width histogram. The split grid visits
-// 2,080 ranges of a 64-bit sample, and scanning, partitioning and histogramming
-// each one separately was most of what planning a split cost. Here each metric
-// is prepared once per left edge, or once per sample, and read per range.
-//
-// Frequencies. Two samples are equal on [bitStart, bitEnd] exactly when they
-// agree on those bits. Reverse each sample's bits from bitStart up, so that
-// bitStart is the most significant, and sort: samples equal on a range are then
-// contiguous, and adjacent sorted keys fall in different groups for the range
-// exactly when their common prefix is shorter than its width. So the groups at
-// every width follow from one sorted order and the prefix length of each
-// adjacent pair, and the multiset of group sizes is the multiset of
-// frequencies a hash map would count. Widening the range can only add group
-// boundaries, so they are added incrementally as bitEnd rises. Moving the left
-// edge up one bit drops the leading bit of every key, which leaves two sorted
-// halves to merge rather than a sort to redo.
-//
-// Runs. Adjacent rows differ on a range exactly when their XOR has a set bit in
-// it, that is, when the XOR's lowest set bit at or above bitStart lies within
-// the width. One histogram of that position per left edge gives the run count
-// at every width.
-//
-// Bit widths. A value's bit width is at least k exactly when the range holds a
-// set bit at relative position k - 1 or above. Counting, once per sample, the
-// samples with a set bit anywhere in [low, high] for every bit pair turns the
-// histogram of any range into ten table reads.
+// Counts, for every bit range [bitStart, bitEnd] of a sample, the metrics
+// that need no pass over the range's extracted values (value frequencies,
+// runs, bit-width histogram), each prepared once per left edge or per sample
+// and read per range rather than recomputed for every one of the grid's
+// ranges. Frequencies come from one sort of the reversed, bit-shifted
+// samples, since samples equal on a range are then contiguous and group
+// boundaries follow from adjacent-pair prefix lengths.
 class BitRangeCounter {
  public:
   explicit BitRangeCounter(const std::vector<uint64_t>& samples)
       : samples_{samples} {
     const size_t numSamples = samples_.size();
-    // setBitCounts_[high * 64 + low]: samples whose highest set bit at or below
-    // `high` is at or above `low`.
+    // setBitCounts_[high * 64 + low]: samples whose highest set bit at or
+    // below `high` is at or above `low`.
     setBitCounts_.assign(64 * 64, 0);
     std::array<uint32_t, 65> widthCounts{};
     for (int high = 0; high < 64; ++high) {
@@ -397,9 +361,7 @@ class BitRangeCounter {
   }
 
   // Position of the first bit at or after `from` that is set in the group
-  // starts, or clear when `wantClear`. The sentinel at numSamples bounds the
-  // search for a set bit; a search for a clear bit returns numSamples when
-  // there is none before it.
+  // starts, or clear when `wantClear`.
   size_t findBit(size_t from, bool wantClear) const noexcept {
     const size_t numSamples = samples_.size();
     size_t word = from / 64;
@@ -473,48 +435,23 @@ class BitRangeCounter {
 struct SelectorResult {
   std::vector<SectionPlan> sections;
   double totalCost{0.0};
-  // The plan's estimated size alone, in bits: what the sections store, with
-  // no split penalty and no decode term. It is therefore below totalCost even
-  // at the default decode weight, by exactly the penalty the DP charges per
-  // boundary, and the two answer different questions -- what the plan costs
-  // the DP, and what the plan costs the file.
+  // Estimated size alone, in bits: what the sections store, with no split
+  // penalty and no decode term. Answers what the plan costs the file, as
+  // opposed to totalCost, what it costs the DP.
   double totalSizeBits{0.0};
-  // The plan's estimated decode cost, composed over its sections by
-  // combineSectionDecodeNanos: nanoseconds per row for bulk and range,
-  // nanoseconds per probe for point and gather. Includes the per-section
-  // assembly term, so it prices the plan and not merely its sections.
+  // Estimated decode cost composed over sections by
+  // combineSectionDecodeNanos, including the per-section assembly term.
   double totalDecodeNanosPerRow{0.0};
 };
 
-// Run the DP split selector on `samples` (uint64_t values drawn from a
-// physical-type stream of `kBits` width).
-//
-// `fullCount` is the total element count of the *full* stream; cost model
-// scores are scaled from the sample size to the full stream so the DP
-// produces estimates in the right units.
-//
-// `costFn` scores a single segment: given (metrics, numValues, fullCount,
-// bitWidth, segValues), return a SectionCost carrying the per-sample weighted
-// cost in bits, the per-sample size in bits, and the decode nanoseconds per
-// row of the encoding it chose. It returns all three rather than the minimum
-// alone because the DP minimises the weighted figure while the caller has to
-// be able to report the other two, and the only place all three are known is
-// the comparison that picked the winner.
-//
-// `fullCount` reaches the cost models as well as scaling their result. A model
-// needs it to tell a sample apart from the stream it came from: the count of
-// distinct values in a sample is a lower bound on the stream's and nothing
-// more, and without knowing how much larger the stream is there is no way to
-// say how much of one the sample saw.
-//
-// buildSectionCostGrid costs the bit ranges [l..r] of `samples` that `layout`
-// admits, scaled to `fullCount` rows, as a row-major sz*sz grid indexed
-// l * sz + r; selectSplitsImpl runs the DP over it. `samples` must be
-// non-empty and `sz` in [1, 64] for the grid. An unrestricted layout scores
-// every cell. Otherwise the whole range [0, sz) is always scored, so the DP
-// keeps a fallback, the constant edges of a trimmed range are free Constant
-// cells, and every other cell must lie inside the varying range and start and
-// end on candidate boundaries.
+// Runs the DP split selector on `samples` (uint64_t values drawn from a
+// physical-type stream of `kBits` width). `fullCount` scales cost model
+// scores from the sample size to the full stream's. `costFn` scores a single
+// segment and returns weighted cost, size, and decode cost together, since
+// the DP minimises the weighted figure while callers need to report the
+// other two. buildSectionCostGrid costs the bit ranges [l..r] that `layout`
+// admits as a row-major sz*sz grid indexed l * sz + r; selectSplitsImpl runs
+// the DP over it. `samples` must be non-empty and `sz` in [1, 64].
 template <typename CostFn>
 inline std::vector<SectionCost> buildSectionCostGrid(
     const std::vector<uint64_t>& samples,
@@ -552,16 +489,10 @@ inline std::vector<SectionCost> buildSectionCostGrid(
   MetricCollector collector;
   BitRangeExtractor extractor(samples);
   const size_t numSamples = samples.size();
-  // BitRangeCounter cannot describe a capped count. Capping freezes the
-  // running maximum at whichever element crossed the cap, which is a property
-  // of the order the values arrived in, and sorting discards that order by
-  // design. It never has to here: capping needs more distinct values than a
-  // sample this size can hold.
-  //
-  // This is a fallback and not an assertion, deliberately. A caller sampling
-  // more than the cap is not doing anything wrong, and this hands them the
-  // counting path they get today rather than failing on them. Please do not
-  // tighten it into a check on the grounds that it reads like one.
+  // BitRangeCounter cannot describe a capped count, since capping depends on
+  // arrival order and this path sorts. Falls back to the uncapped counting
+  // path rather than asserting, since a caller sampling more than the cap is
+  // not doing anything wrong.
   const bool rangeCounts = numSamples <= MetricCollector::kUniqueCountCap;
   std::optional<BitRangeCounter> counter;
   if (rangeCounts) {
@@ -753,16 +684,14 @@ inline SelectorResult selectSplitsImpl(
       sized);
 }
 
-// Selects splits costing segments against `allowed` only. An empty set costs
-// every encoding, so a caller can pass one through unconditionally.
-// The per-range cost function the split DP minimises, over `allowed` only.
-// Holds a reference to `allowed`, which must outlive it.
 /// Whether a section may be encoded as Constant under `allowed`, where an
 /// empty set allows everything.
 inline bool allowsConstant(const AllowedEncodings& allowed) {
   return allowed.empty() || allowed.contains(EncodingType::Constant);
 }
 
+// The per-range cost function the split DP minimises, over `allowed` only.
+// Holds a reference to `allowed`, which must outlive it.
 inline auto restrictedSectionCostFn(
     const AllowedEncodings& allowed,
     const SelectorConfig& cfg) {
@@ -788,6 +717,8 @@ inline auto restrictedSectionCostFn(
   };
 }
 
+// Selects splits costing segments against `allowed` only. An empty set costs
+// every encoding, so a caller can pass one through unconditionally.
 inline SelectorResult selectSplitsRestricted(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -821,16 +752,9 @@ inline std::vector<SectionCost> buildRestrictedCostGrid(
       restrictedSectionCostFn(allowed, cfg));
 }
 
-// Selects splits over the full encoding inventory.
-//
-// Forwards to selectSplitsRestricted with an empty allowed set rather than
-// calling bestCostBits, which hardcodes both gates. Calling bestCostBits here
-// dropped cfg.allowHuffman on the floor: a caller that withdrew Huffman still
-// got splits planned with Huffman priced, silently, while the same caller
-// going through selectSplitsRestricted got what it asked for.
-// cfg.allowDeltaBlock would be lost the same way, which is why it is threaded
-// through the same path rather than given its own. The default config allows
-// both, so this changes nothing for a caller that never set either field.
+// Selects splits over the full encoding inventory. Forwards to
+// selectSplitsRestricted with an empty allowed set so that cfg.allowHuffman
+// and cfg.allowDeltaBlock are still respected.
 inline SelectorResult selectSplits(
     const std::vector<uint64_t>& samples,
     int kBits,
@@ -841,15 +765,10 @@ inline SelectorResult selectSplits(
 }
 
 // The k cheapest segmentations of [0, sz) over `grid`, cheapest first, under
-// the same split penalty and minimum segment width as the DP.
-//
-// The DP keeps one predecessor per position and trusts its argmin. Keeping k
-// is what lets a planner hand a shortlist to a more accurate and more expensive
-// scorer instead: measured against whole-column encodes, the grid's costs name
-// the cheapest encoding for a range about a fifth of the time. When `cuts` is
-// non-empty a range may only start and end at positions it marks, which is how
-// bit-flip gradient boundaries nominate plans without constraining the DP.
-// Each segment carries its grid cell's encoding and costs.
+// the same split penalty and minimum segment width as the DP. Lets a planner
+// hand a shortlist to a more accurate, more expensive scorer instead of
+// trusting the DP's single argmin. When `cuts` is non-empty a range may only
+// start and end at positions it marks.
 inline std::vector<std::vector<SectionPlan>> kBestSplits(
     const std::vector<SectionCost>& grid,
     int sz,
@@ -923,11 +842,10 @@ inline std::vector<std::vector<SectionPlan>> kBestSplits(
   return plans;
 }
 
-// Shortlists split plans for the hybrid planner from one costing of the grid:
-// the k cheapest plans, then the k cheapest cut only at `cuts`. Plans may
-// repeat across the two lists; callers that re-price them cache by range.
-// Takes a grid the caller already costed, so the same sample is not costed
-// twice when the caller priced it for another decision first.
+// Shortlists split plans for the hybrid planner from one costing of the
+// grid: the k cheapest plans, then the k cheapest cut only at `cuts`. Plans
+// may repeat across the two lists; callers that re-price them cache by
+// range.
 inline std::vector<std::vector<SectionPlan>> shortlistSplitsOverGrid(
     const std::vector<SectionCost>& grid,
     int sz,

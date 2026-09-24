@@ -40,13 +40,11 @@
 // Per-segment cost models for SubIntSplitEncoding's DP selector.
 //
 // Each function estimates the compressed size in bits for encoding numValues
-// items from a bit-range sub-stream of logical width bitWidth. The models
-// correspond to nimble's present encodings and are derived from the same
-// assumptions used in EncodingSizeEstimation.h (common prefix 6 bytes, nested
-// encoding overhead, etc.).
+// items from a bit-range sub-stream of logical width bitWidth, following the
+// same assumptions as EncodingSizeEstimation.h.
 //
 // Deliberately avoids HLL cardinality estimation, entropy, and frame-residual
-// tracking — the simplified SectionMetrics provides enough signal for the DP
+// tracking; the simplified SectionMetrics provides enough signal for the DP
 // to make directionally correct split decisions.
 
 namespace facebook::nimble::subintsplit {
@@ -74,29 +72,11 @@ inline MetricFlags allCostModelRequiredFlags() noexcept {
 }
 
 /// Estimated number of distinct values in the *stream* a segment was sampled
-/// from, rather than the number the sample happened to contain.
-///
-/// The sample's distinct count is a lower bound on the stream's and nothing
-/// more, and the cost models were reading it as the answer. That is harmless
-/// while the sample holds every value the stream does, and badly wrong as soon
-/// as it cannot: past MetricCollector::kUniqueCountCap the count stops dead at
-/// the cap, so a segment holding a million distinct values reports 16385
-/// however many it really has.
-///
-/// Chao's estimator recovers the count from the repetition the sample saw. A
-/// value seen exactly once suggests others like it went unseen; a value seen
-/// exactly twice says the sample is beginning to saturate. It needs no
-/// assumption about the distribution's shape and it degrades correctly at both
-/// ends: with no singletons it returns the observed count, which is right when
-/// the sample held the whole alphabet, and it grows without bound as the sample
-/// approaches all-distinct, which is the case where the stream's cardinality
-/// genuinely cannot be inferred from the sample.
-///
-/// Clamped to what the segment can hold, which is what makes that unbounded end
-/// safe. A `bitWidth`-bit segment has at most 2^bitWidth distinct values and a
-/// stream of `fullCount` rows has at most `fullCount` of them, so an
-/// all-distinct sample lands on the smaller bound -- "as many as there could
-/// be", which is the honest reading of a sample that saw no repetition at all.
+/// from, rather than the number the sample happened to contain: the sample's
+/// count is only a lower bound and saturates hard at
+/// MetricCollector::kUniqueCountCap. Chao's estimator recovers a better count
+/// from singleton/doubleton frequencies, clamped to at most 2^bitWidth
+/// distinct values and at most `fullCount` rows.
 inline double estimatedStreamUniqueCount(
     const SectionMetrics& m,
     size_t numValues,
@@ -108,9 +88,7 @@ inline double estimatedStreamUniqueCount(
       ? rows
       : std::min(static_cast<double>(uint64_t{1} << bitWidth), rows);
 
-  // The sample is the stream, so there is nothing to extrapolate -- except
-  // where capping truncated the count, which is the one case where even a full
-  // scan does not know its own answer and the estimator still has work to do.
+  // A full scan needs no extrapolation unless capping truncated the count.
   if (numValues >= fullCount && !m.uniqueCountCapped) {
     return std::min(observed, capacity);
   }
@@ -137,7 +115,6 @@ inline double trivialCostBits(
 }
 
 // FixedBitWidth: bit-pack using observed range, rounded to byte boundary.
-// Required: MinMax
 inline double fixedBitWidthCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -163,7 +140,6 @@ inline double fixedBitWidthCostBits(
 }
 
 // Constant: zero cost when all values are equal, infinity otherwise.
-// Required: MinMax
 inline double constantCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -181,14 +157,10 @@ inline double constantCostBits(
 }
 
 // MainlyConstant: store one dominant value, a SparseBool mask marking the
-// exception rows, and the exception values as a FixedBitWidth child. Effective
-// when one value dominates the segment (say >=50%).
-// Delegates the otherValues and isCommon sub-costs directly to
-// FixedBitWidthEncoding::estimateSize / SparseBoolEncoding::estimateSize --
-// the same calls MainlyConstantEncoding::estimateSize itself makes (see
-// MainlyConstantEncoding.h) -- instead of a separate hand-rolled formula, so
-// the two estimators cannot drift apart.
-// Required: DominantValue, MinMax
+// exception rows, and the exception values as a FixedBitWidth child.
+// Delegates the otherValues and isCommon sub-costs to the same estimators
+// MainlyConstantEncoding::estimateSize itself calls, so the two cannot drift
+// apart.
 inline double mainlyConstantCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -237,29 +209,12 @@ inline double mainlyConstantCostBits(
       static_cast<double>(isCommonBytes) * 8.0;
 }
 
-// Dictionary: unique value table + bit-packed indices.
-// Delegates both nested streams directly to the same estimators
-// DictionaryEncoding::estimateSize uses (see DictionaryEncoding.h): the
-// indices stream via FixedBitWidthEncoding<uint32_t>::estimateSize(rowCount,
-// 0, uniqueCount-1), and the alphabet via
-// min(TrivialEncoding, FixedBitWidthEncoding)::estimateSize(uniqueCount, min,
-// max). Only the numeric path is modeled; SIS operates on raw uint64_t
-// bit-range slices, never strings.
-// The index width comes from the stream's estimated distinct count, not the
-// sample's. An index has to address every value in the alphabet the encoder
-// will actually build, and that alphabet belongs to the stream: sizing it from
-// the sample charged 16 bits per index for a segment whose real alphabet needs
-// 24, which made a wide high-cardinality segment look like a bargain and cost
-// the planner its splits.
-//
-// The alphabet term is still sized from the sample, which is wrong in the same
-// way and is deliberately left alone here. It is a fixed cost, and the selector
-// scales a model's whole result by fullCount/numValues, so a corrected alphabet
-// would be multiplied by the sampling ratio and swing Dictionary from far too
-// cheap to far too expensive. Two errors currently cancel there. Separating
-// fixed from per-value cost is what makes that term fixable, and it is a
-// different change from this one.
-// Required: UniqueCount, MinMax
+// Dictionary: unique value table + bit-packed indices. Delegates both nested
+// streams to the same estimators DictionaryEncoding::estimateSize uses. The
+// index width uses the stream's estimated distinct count, not the sample's,
+// since the index must address every value the encoder actually builds; the
+// alphabet term stays sized from the sample, a fixed cost that the selector
+// already scales by fullCount/numValues.
 inline double dictionaryCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -312,7 +267,6 @@ inline double dictionaryCostBits(
 }
 
 // RLE: run values + bit-packed run lengths.
-// Required: RunStats, MinMax
 inline double
 rleCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   if (numValues == 0 || m.avgRunLength <= 0.0) {
@@ -330,7 +284,6 @@ rleCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
 }
 
 // Varint: variable-length integer storage. Only useful for ≥32-bit sections.
-// Required: MinMax (max value determines byte width)
 inline double varintCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -367,7 +320,6 @@ inline double varintCostBits(
 }
 
 // SimdForBitpack: SIMD-friendly bit-packing of the observed [min, max] range.
-// Required: MinMax
 inline double simdForBitpackCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -398,12 +350,10 @@ inline double simdForBitpackCostBits(
   return static_cast<double>(bytes) * 8.0;
 }
 
-// PFOR: bit-packed "base" region sized to cover ~90% of values (by observed
-// bit width), plus exception side-channels (positions + residual values) for
-// the remainder. Mirrors PFOREncoding<T>::selectBaseBitWidth /
-// PFOREncoding<T>::estimateSize, but operates on `m.bitWidthBuckets` directly
-// instead of constructing a real Statistics<T>.
-// Required: BitWidthHistogram
+// PFOR: bit-packed "base" region sized to cover ~90% of values, plus
+// exception side-channels (positions + residual values) for the remainder.
+// Mirrors PFOREncoding<T>::selectBaseBitWidth / estimateSize, operating on
+// `m.bitWidthBuckets` instead of a real Statistics<T>.
 inline double
 pforCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   if (numValues == 0) {
@@ -441,9 +391,7 @@ pforCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   const double baseValuesBits =
       static_cast<double>(baseBitWidth) * static_cast<double>(numValues);
 
-  // Exception side-channels are nested encodings; approximate as Trivial
-  // sub-encodings (prefix(6) + 1 + raw values), as PFOREncoding::estimateSize
-  // does.
+  // Exception side-channels are nested encodings, approximated as Trivial.
   constexpr double kNestedHeaderBits = 7.0 * 8.0;
   const double positionsBits = numExceptions == 0
       ? 0.0
@@ -456,12 +404,9 @@ pforCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   return headerBits + baseValuesBits + positionsBits + valuesBits;
 }
 
-// BlockBitPacking: per-block bit-packing with local baselines/widths.
-// Calls the encoding's own estimateSize directly on the raw sample (always
-// instantiated at uint64_t, regardless of `bitWidth` -- this overestimates
-// per-block metadata for narrower sections, but keeps the DP directionally
-// correct without per-width sample copies).
-// Required: none beyond `segValues` itself.
+// BlockBitPacking: per-block bit-packing with local baselines/widths. Calls
+// the encoding's own estimateSize on the raw sample, always at uint64_t
+// regardless of `bitWidth`, to avoid per-width sample copies.
 inline double blockBitPackingCostBits(
     const std::vector<uint64_t>& segValues,
     size_t numValues,
@@ -478,13 +423,9 @@ inline double blockBitPackingCostBits(
 }
 
 // Huffman: canonical Huffman coding over the observed value alphabet.
-// Delegates to HuffmanEncoding<uint64_t>::estimateSize directly (rather than
-// approximating from SectionMetrics) since the exact per-symbol code length
-// depends on the full frequency distribution, which SectionMetrics does not
-// retain. Only evaluated when the segment's cardinality is low enough for
-// Huffman to apply (see the `bestCostBits` guard below), keeping the
-// Statistics<uint64_t>::create() cost bounded.
-// Required: none beyond `segValues` itself.
+// Delegates to HuffmanEncoding<uint64_t>::estimateSize since the exact
+// per-symbol code length depends on the full frequency distribution, which
+// SectionMetrics does not retain.
 inline double huffmanCostBits(
     const std::vector<uint64_t>& segValues,
     size_t numValues) noexcept {
@@ -502,14 +443,11 @@ inline double huffmanCostBits(
 }
 
 // DeltaBlock: fixed-size blocks, each storing a base value plus bit-packed
-// non-decreasing deltas from that base. Delegates directly to
-// DeltaBlockEncoding<uint64_t>::estimateSize on the raw sample, mirroring
-// blockBitPackingCostBits -- DeltaBlockEncoding's own estimator is already
-// exact (it walks real block boundaries), so approximating from
-// SectionMetrics would only lose precision. Returns infinity for any block
-// containing a decrease, matching DeltaBlockEncoding's non-decreasing-only
-// design.
-// Required: none beyond `segValues` itself.
+// non-decreasing deltas from that base. Delegates to
+// DeltaBlockEncoding<uint64_t>::estimateSize on the raw sample rather than
+// approximating from SectionMetrics, since that estimator already walks real
+// block boundaries exactly. Returns infinity for any block containing a
+// decrease.
 inline double deltaBlockCostBits(
     const std::vector<uint64_t>& segValues,
     size_t numValues,
@@ -527,10 +465,8 @@ inline double deltaBlockCostBits(
 }
 
 // Delta: positive-delta encoding with restatements for non-monotonic steps.
-// Infinity unless at least 90% of consecutive steps are non-decreasing
-// (matches DeltaEncoding's positive-delta-only design — frequent decreases
-// force expensive restatements).
-// Required: DeltaStats
+// Infinity unless at least 90% of consecutive steps are non-decreasing, since
+// frequent decreases force expensive restatements.
 inline double deltaCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -545,11 +481,9 @@ inline double deltaCostBits(
     return std::numeric_limits<double>::infinity();
   }
 
-  // Sized to the largest kept (non-decreasing) delta, not the average: a
-  // fixed-width packed array must cover every value it stores, and a
-  // right-skewed delta distribution makes the average a severe
-  // underestimate of the width actually required (see SectionMetrics::
-  // maxDelta). Matches FixedBitWidthEncoding's own exact-bits sizing.
+  // Sized to the largest kept delta, not the average: a fixed-width packed
+  // array must cover every value it stores, and a right-skewed delta
+  // distribution makes the average a severe underestimate.
   const uint8_t deltaBitWidth = m.maxDelta == 0
       ? uint8_t{0}
       : static_cast<uint8_t>(std::bit_width(m.maxDelta));
@@ -559,9 +493,7 @@ inline double deltaCostBits(
   const double numRestatements =
       std::max(1.0, restatementFraction * static_cast<double>(numValues));
 
-  // Three nested sub-encodings (deltas, restatements, isRestatements), each
-  // with its own ~7-byte header, plus the outer prefix(6) + two 4-byte
-  // relative offsets.
+  // Three nested sub-encodings, each with its own ~7-byte header.
   constexpr double kNestedHeaderBits = 7.0 * 8.0;
   constexpr double kOuterHeaderBits = (6.0 + 4.0 + 4.0) * 8.0;
 
@@ -569,11 +501,9 @@ inline double deltaCostBits(
       static_cast<double>(numValues) * static_cast<double>(deltaBitWidth);
   const double restatementsBits = kNestedHeaderBits +
       numRestatements * static_cast<double>(storageWidthBits(bitWidth));
-  // isRestatements is a bool stream that is true only at restatement
-  // positions -- nested-encoded, so delegate to SparseBoolEncoding's own
-  // estimator (as the MainlyConstant/Dictionary fixes above do) instead of
-  // charging a flat 1 bit/value, which drastically overestimates when
-  // restatements are rare (the common case for mostly-monotonic data).
+  // isRestatements is true only at restatement positions, so delegate to
+  // SparseBoolEncoding's estimator rather than charging a flat 1 bit/value,
+  // which overestimates when restatements are rare.
   const double isRestatementsBits =
       static_cast<double>(SparseBoolEncoding::estimateSize(
           static_cast<uint64_t>(numValues),
@@ -586,10 +516,8 @@ inline double deltaCostBits(
 
 // FOR (Frame of Reference): fixed-size frames, each bit-packed against a
 // local minimum (reference). The local bit width is estimated from the
-// average step size scaled to the frame size -- a random-walk heuristic
-// where the local range over a frame of `kForFrameSize` steps grows roughly
-// with avgAbsDelta -- capped by the segment's overall range.
-// Required: MinMax, DeltaStats
+// average step size scaled to the frame size, capped by the segment's
+// overall range.
 inline double
 forCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   if (numValues == 0) {
@@ -612,8 +540,7 @@ forCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   // prefix(6) + compressionType(1) + frameSize(4) + numFrames(4) +
   // enableBitOffsets(1)
   constexpr double kOuterHeaderBits = (6.0 + 1.0 + 4.0 + 4.0 + 1.0) * 8.0;
-  // Per-frame metadata streams (bitWidths, references, bitOffsets), each a
-  // nested encoding with its own ~7-byte header.
+  // Per-frame metadata streams are nested encodings with ~7-byte headers.
   constexpr double kNestedHeaderBits = 7.0 * 8.0;
   const double bitWidthsBits =
       kNestedHeaderBits + static_cast<double>(numFrames) * 8.0;
@@ -628,22 +555,15 @@ forCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
       packedBits;
 }
 
-// Multiplier applied to the undiscounted TierTagArray index estimate below to
-// approximate the size after nested encoding selection (which, empirically,
-// usually picks Huffman over the tag stream's skewed tier distribution). 1.0
-// disables the discount, pricing the raw packed width -- the safer default,
-// since an optimistic estimate over-selects FrequencyPartition while a
-// pessimistic one merely under-selects it. Kept as a named constant so the
-// discount can be measured independently of the base fix; must be kept in
-// sync with FrequencyPartitionEncoding.h's matching
-// kFrequencyPartitionNestedIndexDiscount -- the two estimators price the same
-// wire format on different paths.
+// Multiplier applied to the undiscounted TierTagArray index estimate below.
+// 1.0 disables the discount and prices the raw packed width, the safer
+// default since an optimistic estimate over-selects FrequencyPartition while
+// a pessimistic one merely under-selects it. Must be kept in sync with
+// FrequencyPartitionEncoding.h's matching constant.
 constexpr double kFrequencyPartitionNestedIndexDiscount = 1.0;
 
 // Bits needed to distinguish `x` outcomes, minimum 1. Selection-time twin of
-// FrequencyPartitionEncoding's private, encode-time ceilLog2WithMinOne: kept
-// separate because that one is a class-private helper with no encoding
-// instance available here to call it on.
+// FrequencyPartitionEncoding's private, encode-time ceilLog2WithMinOne.
 inline uint8_t ceilLog2WithMinOne(uint32_t x) noexcept {
   if (x <= 1u) {
     return 1u;
@@ -652,14 +572,9 @@ inline uint8_t ceilLog2WithMinOne(uint32_t x) noexcept {
 }
 
 // Number of PerTierBitmaps tiers FrequencyPartitionEncoding::encode would
-// create for `uniqueCount` distinct values, mirroring its tier-capacity table
-// (FrequencyPartitionEncoding.h: keyBitOptions = {1,2,4,8,16,32} bits with
-// capacities 2/4/16/256/65280/~4.29B). Each tier created needs its own N-bit
-// bitmap in the index payload (FrequencyPartitionEncoding.h's "Index payload
-// layout (PerTierBitmaps)"), so this directly drives indexBits below.
-// Assuming a fixed 2 tiers regardless of uniqueCount -- rather than the 3-5
-// tiers typical for a segment near the 1024-unique cap -- was the single
-// largest source of FPE's cost underestimate.
+// create for `uniqueCount` distinct values, mirroring its tier-capacity
+// table. Each tier created needs its own N-bit bitmap in the index payload,
+// so this directly drives indexBits below.
 inline uint32_t frequencyPartitionNumTiers(uint64_t uniqueCount) noexcept {
   constexpr uint64_t kCapacities[] = {2, 4, 16, 256, 65280, 4294901760ull};
   uint64_t assigned = 0;
@@ -676,11 +591,9 @@ inline uint32_t frequencyPartitionNumTiers(uint64_t uniqueCount) noexcept {
 
 // FrequencyPartition: tier-based dictionary encoding where the top-K
 // most-frequent values are stored with narrow (1/2-bit) keys. Requires an
-// indexed mode (PerTierBitmaps) that preserves original row order; without an
-// index, materialize() would desync sibling SubIntSplit segments.
-// Returns infinity when the unique count is unknown, capped, or > 1024
-// (FPE's overhead dominates for high-cardinality segments).
-// Required: UniqueCount, FrequencyTiers (topKCoverage populated)
+// indexed mode that preserves original row order, since without one
+// materialize() would desync sibling SubIntSplit segments. Returns infinity
+// when the unique count is unknown, capped, or > 1024.
 inline double frequencyPartitionCostBits(
     const SectionMetrics& m,
     size_t numValues,
@@ -692,8 +605,7 @@ inline double frequencyPartitionCostBits(
 
   const double n = static_cast<double>(numValues);
 
-  // Tier 0 (1-bit keys, capacity 2): top-2 most frequent values.
-  // Tier 1 (2-bit keys, capacity 4): next tier up to top-8 (proxy).
+  // Tier 0: top-2 values at 1-bit keys. Tier 1: next tier at 2-bit keys.
   // Remainder: fallback at full storage width.
   const double tier0Coverage = m.topKCoverage[1]; // top-2 values → 1-bit keys
   const double tier1Coverage =
@@ -703,27 +615,20 @@ inline double frequencyPartitionCostBits(
   const double keyCostBits = tier0Coverage * n * 1.0 + tier1Coverage * n * 2.0 +
       fallbackCoverage * n * static_cast<double>(storageWidthBits(bitWidth));
 
-  // TierTagArray index: SubIntSplitEncoding::sectionEncodingOptions forces
-  // frequencyPartitionIndex to TierTagArray for every section (see
-  // SubIntSplitEncoding.h), so that -- not PerTierBitmaps -- is the index a
-  // FrequencyPartition candidate here would actually pay for. Priced as an
-  // 8-byte header (tagBits + padding + tagStreamByteCount) plus the
-  // undiscounted packed width of one tagBits-wide tag per row, mirroring
-  // FrequencyPartitionEncoding::estimateSize's TierTagArray case; see
-  // kFrequencyPartitionNestedIndexDiscount above for the nested-selection
-  // discount this omits by default.
+  // SubIntSplitEncoding::sectionEncodingOptions forces frequencyPartitionIndex
+  // to TierTagArray for every section, so that (not PerTierBitmaps) is the
+  // index a candidate here pays for.
   const uint32_t numTiers = frequencyPartitionNumTiers(m.uniqueCount);
   const uint8_t tagBits = ceilLog2WithMinOne(numTiers + 1);
   const double indexHeaderBits = 8.0 * 8.0;
   const double indexBits = indexHeaderBits +
       static_cast<double>(tagBits) * n * kFrequencyPartitionNestedIndexDiscount;
 
-  // One dictionary + one key stream per active tier, each a nested
-  // sub-encoding with a ~7-byte header.
+  // One dictionary + one key stream per active tier.
   const double kTierOverheadBits =
       static_cast<double>(numTiers) * 2.0 * 7.0 * 8.0;
 
-  // Outer prefix + numPartitions + nested partitionOffsets/partitionSizes.
+  // Outer prefix + numPartitions + partitionOffsets/partitionSizes.
   constexpr double kOuterHeaderBits = (6.0 + 4.0 + 4.0 + 4.0 + 2.0 * 7.0) * 8.0;
 
   return kOuterHeaderBits + keyCostBits + indexBits + kTierOverheadBits;
@@ -734,25 +639,17 @@ inline double frequencyPartitionCostBits(
 /// experiment holds the inventory fixed while something else varies.
 using AllowedEncodings = std::unordered_set<EncodingType>;
 
-/// Evaluates the cost models for `allowed` and returns the minimum cost in
-/// bits, setting `bestEncoding` to the winner. An empty `allowed` considers
-/// every encoding.
-///
-/// This is the single dispatch point over the cost models. Anything wanting a
-/// subset calls it with a set rather than copying the dispatch, because a copy
-/// silently goes stale when an encoding or a signature changes here.
 /// What one segment costs, priced on both axes at once.
 ///
-/// `weightedBits` is what the split DP minimises. It is `sizeBits` plus the
-/// caller's weighted decode term, and at the default weight of zero the decode
-/// term is exactly zero, so `weightedBits == sizeBits` bit for bit and every
-/// boundary the planner picks is the one it picked before.
+/// `weightedBits` is what the split DP minimises: `sizeBits` plus the
+/// caller's weighted decode term. At the default weight of zero the decode
+/// term is exactly zero, so `weightedBits == sizeBits` and every boundary the
+/// planner picks is the one it picked before.
 ///
 /// `sizeBits` and `decodeNanosPerRow` are carried alongside rather than
-/// recovered afterwards, so that a caller can report what a plan costs on each
-/// axis separately. Recomputing them from the winning encoding is not the same
-/// thing: the winner under a weight is not the winner under no weight, and the
-/// only place both are known is where the comparison was made.
+/// recovered afterwards, since the winner under a weight is not the winner
+/// under no weight, and the only place both are known is where the
+/// comparison was made.
 struct SectionCost {
   double weightedBits{std::numeric_limits<double>::infinity()};
   double sizeBits{std::numeric_limits<double>::infinity()};
@@ -763,11 +660,11 @@ struct SectionCost {
   bool trimmedEdge{false};
 };
 
-/// Prices `allowed` on size and decode together and returns the cheapest under
-/// `weighting`. An empty `allowed` considers every encoding.
+/// Prices `allowed` on size and decode together and returns the cheapest
+/// under `weighting`. An empty `allowed` considers every encoding.
 ///
-/// This is the single dispatch point over the cost models. Anything wanting a
-/// subset calls it with a set rather than copying the dispatch, because a copy
+/// This is the single dispatch point over the cost models: anything wanting a
+/// subset calls it with a set rather than copying the dispatch, since a copy
 /// silently goes stale when an encoding or a signature changes here.
 inline SectionCost bestSectionCost(
     const SectionMetrics& m,
@@ -784,9 +681,8 @@ inline SectionCost bestSectionCost(
     if (!allowed.empty() && allowed.count(type) == 0) {
       return;
     }
-    // An unrepresentable candidate never won before and must not start
-    // winning now: an infinite size times a zero weight is a NaN, and a NaN
-    // loses every comparison silently rather than visibly.
+    // An infinite size times a zero weight is a NaN, which would lose every
+    // comparison silently rather than visibly.
     if (!std::isfinite(sizeBits)) {
       return;
     }
@@ -812,17 +708,11 @@ inline SectionCost bestSectionCost(
       EncodingType::MainlyConstant);
   consider(rleCostBits(m, numValues, bitWidth), EncodingType::RLE);
   consider(varintCostBits(m, numValues, bitWidth), EncodingType::Varint);
-  // Dictionary only where the stream's alphabet is small enough against the
-  // stream's rows for indices to beat values.
-  //
-  // Both sides of that test used to be sample quantities, and the capped case
-  // inverted it outright: `uniqueCountCapped ||` admitted a segment *because*
-  // its cardinality had proved too large to count, which is the one condition
-  // under which Dictionary certainly does not pay. Past
-  // MetricCollector::kUniqueCountCap every wide segment took that branch and
-  // was then priced on a 16385-value alphabet, so the widest and least
-  // compressible ranges came out cheapest and the planner stopped splitting
-  // them. It grew worse with more evidence, which is how it was found.
+  // Dictionary only where the stream's estimated alphabet is small enough
+  // against the stream's rows for indices to beat values. Must use the
+  // stream-level estimate, not the sample's raw count: a capped sample would
+  // otherwise look small enough to admit Dictionary regardless of the
+  // stream's true cardinality.
   const double streamUniques =
       estimatedStreamUniqueCount(m, numValues, bitWidth, fullCount);
   if (m.uniqueCount > 0 &&
@@ -847,17 +737,14 @@ inline SectionCost bestSectionCost(
         EncodingType::FrequencyPartition);
   }
   // Huffman is only viable within its supported alphabet size; skip the
-  // Statistics<uint64_t>::create() call entirely otherwise. Costing it is the
-  // most expensive model here, so a caller that has withdrawn Huffman skips
-  // the work as well as the candidate.
+  // Statistics<uint64_t>::create() call entirely otherwise, since it is the
+  // most expensive model here.
   if (allowHuffman && m.uniqueCount > 0 && !m.uniqueCountCapped &&
       m.uniqueCount <= HuffmanEncoding<uint64_t>::kMaxSymbols) {
     consider(huffmanCostBits(segValues, numValues), EncodingType::Huffman);
   }
-  // DeltaBlock is gated for the same reason as Huffman above: costing it walks
-  // segValues rather than reading the metrics, so a caller that has withdrawn
-  // it skips a pass over the sample per grid cell as well as the candidate.
-  // See Encoding::Options::subIntSplitAllowDeltaBlock.
+  // Gated like Huffman above: costing DeltaBlock walks segValues rather than
+  // reading the metrics, so a withdrawn candidate also skips that pass.
   if (allowDeltaBlock) {
     consider(
         deltaBlockCostBits(segValues, numValues), EncodingType::DeltaBlock);

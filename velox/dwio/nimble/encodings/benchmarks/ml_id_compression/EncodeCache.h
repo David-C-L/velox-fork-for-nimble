@@ -35,24 +35,17 @@
 /// On-disk cache of encoded payloads, so a target is encoded once and every
 /// later driver loads the bytes instead of re-encoding them.
 ///
-/// Every driver encodes its own targets, so a sweep pays each encode once per
-/// driver. At 2M rows a SubIntSplit encode runs ~1.1s plain and ~5.2s with the
-/// transform layer, which puts encoding well above the measurements it exists
-/// to set up.
-///
 /// A wrong hit is worse than no cache: every number downstream would be wrong
 /// and mutually consistent, which is the hardest kind of error to notice. So
-/// the key errs toward missing. Anything not provably irrelevant is folded in,
-/// and a spurious miss costs only the encode that would have happened anyway.
+/// the key errs toward missing: anything not provably irrelevant is folded in,
+/// and a spurious miss just costs the encode that would have happened anyway.
 namespace facebook::nimble::mlidc {
 
 /// 128 bits, as two independent FNV-1a streams with different bases and a
 /// mixing step on the second.
 ///
 /// Written out rather than taken from a library so the digest cannot change
-/// underneath the cache: a different digest reshuffles every key at once. That
-/// failure is a cache that misses everything, which is slow rather than wrong,
-/// but it is still worth not having.
+/// underneath the cache and reshuffle every key at once.
 struct Digest128 {
   uint64_t a{0xcbf29ce484222325ULL};
   uint64_t b{0x9ae16a3b2f90404fULL};
@@ -88,10 +81,8 @@ struct Digest128 {
 
 /// Whether a flag can change the encoded bytes.
 ///
-/// The listed flags change what is measured and never what is encoded.
-/// Everything else is folded into the key, so a flag added later is included by
-/// default: forgetting to classify one costs a miss, not a wrong hit. That is
-/// the only direction this decision is allowed to fail in.
+/// Everything not listed here is folded into the key by default, so a flag
+/// added later without being classified costs a miss, never a wrong hit.
 inline bool flagAffectsEncoding(const std::string& name) {
   static const char* kMeasurementOnly[] = {
       "mlidc_iters",
@@ -151,16 +142,11 @@ inline std::vector<std::filesystem::path> encoderSources() {
 
 /// Fingerprint of the encoder build.
 ///
-/// The git commit is necessary but not sufficient, because uncommitted patches
-/// are measured routinely. Hashing this executable would be sufficient, but it
-/// is also too much: each driver is a different executable, so it would key
-/// every driver separately and defeat the point of the cache, which is that a
-/// target encoded by one driver is reused by the next.
-///
-/// So the fingerprint is the encoder's *sources* -- shared by every driver, and
-/// covering the encodings themselves, the arm definitions, and the layout of
-/// Encoding::Options alike. A source hash is only sound while the binary
-/// actually matches the sources, which cacheIsStale() below is what enforces.
+/// Hashing the executable would key every driver separately and defeat the
+/// point of the cache, since each driver is a different binary. So the
+/// fingerprint hashes the encoder's *sources* instead, shared across drivers;
+/// it is sound only while the binary matches them, which cacheIsStale()
+/// enforces.
 inline const std::string& buildFingerprint() {
   static const std::string kFingerprint = [] {
     Digest128 d;
@@ -194,13 +180,9 @@ inline const std::string& buildFingerprint() {
 
 /// Whether this binary predates the sources the fingerprint was taken from.
 ///
-/// This is what makes a source hash safe. If a source is newer than the
-/// running executable, the binary holds an older encoder than the key claims,
-/// and anything it stored would later be served to a correctly built binary as
-/// if it matched. The cache turns itself off instead, loudly: three separate
-/// times in this project a checkout without a rebuild produced a binary
-/// answering for code it did not contain, and a cache would make that silent
-/// and persistent rather than merely wrong once.
+/// If a source is newer than the running executable, the binary holds an
+/// older encoder than the key claims, so the cache turns itself off loudly
+/// rather than silently serving stale results.
 inline bool cacheIsStale() {
   static const bool kStale = [] {
     std::error_code ec;
@@ -274,10 +256,9 @@ inline void clearCacheContext() {
 
 // The arm identity used for the cache key.
 //
-// realNestedSelection and the option fields an arm sets are folded in
-// explicitly even though the build fingerprint already covers them by covering
-// the arm's own code. They are cheap, and a reader should not have to
-// reconstruct that argument in order to trust the key.
+// realNestedSelection and option fields are folded in explicitly so a reader
+// does not have to reconstruct them from the build fingerprint to trust the
+// key.
 inline std::string cacheArmIdentity(
     const Encoding::Options& options,
     bool realNestedSelection) {
@@ -292,40 +273,30 @@ inline std::string cacheArmIdentity(
   id += "|d" + std::to_string(options.subIntSplitAllowDeltaBlock ? 1 : 0);
   id += "|n" + std::to_string(options.subIntSplitInNestedStreams ? 1 : 0);
   // A restricted inventory changes which encodings the planner may pick, so
-  // it changes the bytes. Without this the withdrawn and unrestricted arms
-  // share one cache entry, and the withdrawal would appear to change
-  // nothing at all.
+  // it must be in the key or withdrawn and unrestricted arms would collide.
   id += "|q" +
       std::to_string(options.subIntSplitAllowedEncodings.empty() ? 0 : 1);
   // The decode weight and its access pattern change which encodings the split
-  // planner picks, so they change the bytes and have to be in the key. A
-  // sweep over weights that shared one cache entry would report one plan's
-  // size for every weight, and would look like a weight that changes nothing.
+  // planner picks, so they must be in the key.
   id += "|w" + std::to_string(options.subIntSplitDecodeWeight);
   id += "|p" +
       std::to_string(static_cast<int>(options.subIntSplitDecodeAccessPattern));
-  // The read path selects which rate table prices decode, so it moves plans
-  // exactly as the access pattern does.
+  // The read path selects which rate table prices decode.
   id += "|rp" +
       std::to_string(static_cast<int>(options.subIntSplitDecodeReadPath));
   // The size bound decides whether the weighted plan or the size-only one is
-  // written, so it changes the bytes for the same reason the weight does.
+  // written.
   id += "|r" + std::to_string(options.subIntSplitMaxSizeRegression);
-  // Admission decides whether nested streams may pick SubIntSplit, so it can
-  // move the bytes of any arm.
+  // Admission decides whether nested streams may pick SubIntSplit.
   id += "|adm" + std::to_string(static_cast<int>(options.subIntSplitAdmission));
-  // Whether an admitted stream still has to win on size changes which encoding
-  // is written wherever the gate and the size comparison disagree. Only the
-  // forcing case is in the id, so entries cached before this option existed
-  // stay addressable.
+  // Whether an admitted stream still has to win on size changes which
+  // encoding is written, so it must be in the key.
   if (options.subIntSplitAdmissionForces) {
     id += "|admf";
   }
   id += "|v" + std::to_string(options.useVarintRowCount ? 1 : 0);
-  // deltaZigzagAnchorStride is deliberately absent: it does not exist on this
-  // branch, and an option that no encoding here reads cannot change the bytes.
-  // The build fingerprint covers it regardless, so re-adding it alongside the
-  // encoding is optional rather than required.
+  // deltaZigzagAnchorStride is deliberately absent: no encoding here reads it,
+  // and the build fingerprint covers it if that ever changes.
   return id;
 }
 
@@ -340,10 +311,8 @@ inline std::string cacheDir() {
 
 /// Builds the key for one encode.
 ///
-/// The input values are hashed rather than the flags that produced them. A
-/// dataset name, arrival order, row count and seed matter only because they
-/// decide these bytes, and hashing the bytes themselves cannot be wrong about a
-/// flag nobody thought to include.
+/// The input values are hashed rather than the flags that produced them, so
+/// hashing cannot be wrong about a flag nobody thought to include.
 template <typename T>
 std::string encodeCacheKey(
     const T* values,
@@ -371,10 +340,8 @@ inline std::string entryPath(const std::string& dir, const std::string& key) {
 
 /// Loads a cached payload, or returns false.
 ///
-/// The header repeats what the key already covers so that a hit is checked
-/// rather than trusted. A key collision, a truncated file or an entry written
-/// by a different arm then shows up as a miss and a warning, instead of as
-/// another target's bytes.
+/// The header repeats what the key already covers, so a hit is checked rather
+/// than trusted: a mismatch shows up as a miss and a warning, not wrong bytes.
 inline bool loadCached(
     const std::string& key,
     const std::string& arm,

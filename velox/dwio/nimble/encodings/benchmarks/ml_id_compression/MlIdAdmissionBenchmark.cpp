@@ -14,16 +14,12 @@
  * limitations under the License.
  */
 
-// Measures the SubIntSplit admission heuristic against what splitting actually
-// buys. The heuristic is what the writer's top-level selection runs before any
-// sampling or planning: SubIntSplitEncoding::estimateSize (90% of the
-// FixedBitWidth estimate, excluded when the value range spans more than three
-// quarters of the type) weighed by its read factor against every other
-// default candidate. Per dataset this driver records whether that heuristic
-// admits the stream and picks SubIntSplit, what it costs, and, as ground
-// truth, the bytes of every encoder in --mlidc_encoders, so a column is a
-// positive when the smallest SubIntSplit arm beats the smallest arm of any
-// other nimble family by more than 1%.
+// Measures the SubIntSplit admission heuristic against what splitting
+// actually buys: SubIntSplitEncoding::estimateSize weighed by its read
+// factor against every other default candidate. Per dataset this records
+// whether the heuristic admits the stream and picks SubIntSplit, what it
+// costs, and, as ground truth, the bytes of every encoder in
+// --mlidc_encoders.
 //
 // Per column (rows = min(524288, lines); int64 when the column has negatives):
 //   nimble_ml_id_admission_benchmark --mlidc_file=<col.txt>
@@ -34,15 +30,12 @@
 // then tabulate the confusion matrix over all columns' CSVs.
 //
 // Each column also gets one row_kind=admission row per bit-flip admission
-// mode (bitflip and bitflip_entropy, which gate candidacy and leave the size
-// comparison to pick, plus bitflip_forced and bitflip_entropy_forced, which
-// select an admitted stream outright) and profile pair cap in
-// --admission_profile_pairs: the gate's decision, what computing the profile
-// and gating costs (decision_ns), and what select() costs and picks with that
-// Encoding::Options::subIntSplitAdmission (select_ns, policy_encoding).
-// --admission_skip_encoders drops the ground-truth encodes, for reruns that
-// take ground truth from an earlier sweep at the same commit.
-// Run without --mlidc_encode_cache_dir, so encode_ns times a real encode.
+// mode and profile pair cap in --admission_profile_pairs: the gate's
+// decision, what computing the profile and gating costs (decision_ns), and
+// what select() costs and picks under that mode (select_ns,
+// policy_encoding). --admission_skip_encoders drops the ground-truth
+// encodes. Run without --mlidc_encode_cache_dir, so encode_ns times a real
+// encode.
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
@@ -98,8 +91,8 @@ int64_t median(std::vector<int64_t> samples) {
   return samples[samples.size() / 2];
 }
 
-// The profile count before per-bit counts moved to 8-bit lanes, timed to show
-// what that change is worth.
+// Bit-by-bit flip counting, timed for comparison against a lane-based
+// implementation.
 template <typename T>
 std::array<uint64_t, 64> countFlipsBitByBit(std::span<const T> values) {
   std::array<uint64_t, 64> counts{};
@@ -169,11 +162,8 @@ int runBenchmark() {
   CsvResultWriter csv(csvPath, csvColumns);
 
   // The compressor the ground-truth encoder rows below are written under, so
-  // that a size estimate which prices compressed bytes differently is asked
-  // about the same world the arms are measured in. Uncompressed by default,
-  // which is what --mlidc_substream_compression defaults to; the writer's own
-  // default is a compressor, and passing that here would have selection price
-  // for compressed bytes against arms encoded without one.
+  // a size estimate prices the same world the arms are measured in.
+  // Uncompressed by default, unlike the writer's own default.
   CompressionOptions policyCompressionOptions;
   policyCompressionOptions.compressionType =
       parseCompressionType(FLAGS_mlidc_substream_compression);
@@ -193,8 +183,7 @@ int runBenchmark() {
         reinterpret_cast<const physicalType*>(data.data()), data.size()};
 
     // What the writer pays before it has decided anything: statistics, then
-    // the policy's comparison of closed-form estimates. Statistics are timed
-    // apart because every candidate shares them.
+    // the policy's comparison of closed-form estimates.
     std::vector<int64_t> statisticsNanos;
     std::vector<int64_t> heuristicNanos;
     std::vector<int64_t> estimateNanos;
@@ -222,11 +211,9 @@ int runBenchmark() {
     }
     const bool estimateAdmits = sisEstimate.has_value();
 
-    // What the rule the sampled plan replaced would have said: 0.90 times
-    // FixedBitWidth's estimate over the whole value range, plus a header for
-    // four sections, withheld once that range passed three quarters of the
-    // type width. Recomputed here rather than kept in the encoding, so that
-    // the change has something to be scored against on these columns.
+    // What the rule the sampled plan replaced would have said. Recomputed
+    // here rather than kept in the encoding, so it has something to be
+    // scored against on these columns.
     std::optional<uint64_t> legacyEstimate;
     {
       const auto statistics = Statistics<physicalType>::create(values);
@@ -285,10 +272,8 @@ int runBenchmark() {
 
     using nimble::subintsplit::SubIntSplitAdmission;
     const nimble::subintsplit::TopLevelPolicyConfig admissionConfig;
-    // The designs a column's admission can be decided by, each named for what
-    // decides it: the size estimate alone, the estimate with the gradient gate
-    // screening the split DP out, the gate deciding candidacy with the
-    // estimate pricing what it admits, and the gate deciding outright.
+    // The designs a column's admission can be decided by, each named for
+    // what decides it.
     struct AdmissionArm {
       std::string_view name;
       SubIntSplitAdmission mode;
@@ -391,9 +376,8 @@ int runBenchmark() {
       csv.flush();
       continue;
     }
-    // Ground truth. Encode time is wall time of the arm's factory, which is
-    // the full selection plus encode for a SubIntSplit arm; run without an
-    // encode cache so it is not a cache read.
+    // Ground truth. Encode time is wall time of the arm's factory; run
+    // without an encode cache so it is not a cache read.
     for (const auto& encoder : context.encoders) {
       const auto start = Clock::now();
       auto target =

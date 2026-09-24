@@ -36,23 +36,17 @@
 // Addressable block compression
 // ---------------------------------------------------------------------------
 // OuterCompressedTarget (BenchCommon.h) wraps a whole encoded column in one
-// block codec, which is why every read there decompresses everything. That is
-// one end of a spectrum, not the only way a block codec can be deployed: a
-// columnar format ships a codec in fixed-size blocks and decompresses only the
-// blocks a read overlaps.
-//
-// This file is that addressable sibling. The two together are the comparison
-// the skip-access claim rests on: whole-payload compression makes read cost a
-// function of column size, block compression makes it a function of block size,
-// and the block-size axis here is what answers "just use smaller blocks".
+// block codec, so every read there decompresses everything. This file is the
+// addressable sibling: a columnar format ships a codec in fixed-size blocks
+// and decompresses only the blocks a read overlaps, making read cost a
+// function of block size rather than column size.
 
 namespace facebook::nimble::mlidc {
 
 /// Compresses and decompresses one fixed-size block of elements.
 ///
-/// Exists so the block layout, addressing and accounting below are written once
-/// and every codec plugs into them, rather than each codec growing its own copy
-/// of the indexing that the correctness of the whole measurement depends on.
+/// Exists so the block layout, addressing and accounting are written once and
+/// every codec plugs into them, rather than each growing its own indexing.
 template <typename T>
 class BlockCodec {
  public:
@@ -60,8 +54,7 @@ class BlockCodec {
 
   /// Compresses `count` elements at `src`, appending the codec's bytes to
   /// `out`. Returns false when the codec declined the block, having appended
-  /// nothing, in which case the caller stores the block verbatim. Zstd declines
-  /// incompressible data, which a block of random IDs routinely is.
+  /// nothing, in which case the caller stores the block verbatim.
   virtual bool
   compressBlock(const T* src, uint32_t count, std::string& out) = 0;
 
@@ -72,8 +65,7 @@ class BlockCodec {
 };
 
 /// BlockCodec backed by nimble's own compressor registry, so Zstd here is the
-/// same Zstd the encodings use for their sub-streams and no second wiring can
-/// drift from it.
+/// same Zstd the encodings use for their sub-streams.
 template <typename T>
 class NimbleBlockCodec : public BlockCodec<T> {
  public:
@@ -114,8 +106,7 @@ class NimbleBlockCodec : public BlockCodec<T> {
         buffer->size());
     // nimble's compressor interface hands back an owned buffer rather than
     // writing into a caller-supplied one, so a block always costs one extra
-    // copy here. It is charged to every arm this codec serves, and it is small
-    // beside the decompression it follows.
+    // copy here.
     std::memcpy(dst, buffer->template as<char>(), expected);
   }
 
@@ -128,11 +119,9 @@ class NimbleBlockCodec : public BlockCodec<T> {
 /// serves a read by decompressing only the blocks that read overlaps.
 ///
 /// A read of `count` elements starting at `begin` decompresses exactly the
-/// blocks in [begin / K, (begin + count - 1) / K], which is
-/// floor((begin + count - 1) / K) - floor(begin / K) + 1 blocks and never more.
-/// A point read therefore costs one block whatever the column length is, and
-/// that independence from column length is the property the whole arm exists to
-/// demonstrate.
+/// blocks in [begin / K, (begin + count - 1) / K]. A point read therefore
+/// costs one block whatever the column length is, which is the property this
+/// arm exists to demonstrate.
 template <typename T>
 class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
  public:
@@ -176,8 +165,7 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
            .compressed = compressed});
     }
     // metadataBytes() charges a 32-bit start offset per block, so a payload
-    // that could not be addressed by one would be under-reporting its own
-    // stored size.
+    // that could not be addressed by one would under-report its stored size.
     NIMBLE_CHECK(
         payload_.size() <= std::numeric_limits<uint32_t>::max(),
         "Block payload too large for a 32-bit block directory: {} bytes",
@@ -196,12 +184,9 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
 
   void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
       override {
-    // The scratch block is reused across the ranges of one gather, because a
-    // reader serving a gather holds one decompressed block at a time and two
-    // ranges landing in the same block cost one decompression. It is dropped
-    // at both ends of the call so nothing is cached between calls: a reader
-    // holding only compressed blocks pays for the first block of every new
-    // read, which is what the point and range drivers measure.
+    // The scratch block is reused across the ranges of one gather, since two
+    // ranges landing in the same block should cost one decompression. It is
+    // dropped at both ends of the call so nothing is cached between calls.
     cachedBlock_ = kNoBlock;
     for (const auto& range : ranges) {
       readRange(range.startRow, range.numRows(), dst);
@@ -211,35 +196,30 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   }
 
   /// Stored bytes: the compressed blocks plus the block directory, since a
-  /// reader cannot address a block without the directory and a compression
-  /// number that omitted it would be describing an unreadable file.
+  /// reader cannot address a block without the directory.
   size_t payloadSize() const override {
     return payload_.size() + metadataBytes();
   }
 
-  /// Bytes the block directory would occupy on disk: a 32-bit start offset and
-  /// a stored-form byte per block, one terminating offset, and a header giving
-  /// the element count and the block size.
-  ///
-  /// Computed rather than serialised. Nothing here reads a block by parsing
-  /// bytes, so materialising the directory would only be to measure it.
+  /// Bytes the block directory would occupy on disk: a 32-bit start offset
+  /// and a stored-form byte per block, one terminating offset, and a header
+  /// giving the element count and the block size. Computed rather than
+  /// serialised, since nothing here reads a block by parsing bytes.
   size_t metadataBytes() const {
     return blocks_.size() * (sizeof(uint32_t) + 1) + sizeof(uint32_t) +
         2 * sizeof(uint32_t);
   }
 
   /// The compressed blocks, the block directory, and the one scratch block a
-  /// partial read decompresses into. A block arm holds its column compressed
-  /// and one block uncompressed, which is the footprint the block-size axis is
-  /// really trading against.
+  /// partial read decompresses into: a block arm holds its column compressed
+  /// and one block uncompressed.
   size_t residentBytes() const override {
     return payload_.size() + blocks_.size() * sizeof(BlockEntry) +
         scratch_.capacity() * sizeof(T);
   }
 
-  /// Blocks decompressed since the last encode. Instrumentation for the tests
-  /// that pin the "a read decompresses only what it overlaps" property; never
-  /// read on a timed path.
+  /// Blocks decompressed since the last encode. Instrumentation for tests
+  /// pinning the "a read decompresses only what it overlaps" property.
   size_t numBlockDecodes() const {
     return numBlockDecodes_;
   }
@@ -248,10 +228,9 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
     return blocks_.size();
   }
 
-  /// Block-addressable, except when the whole column landed in one block: then
-  /// a read costs the payload however the arm was configured. Derived from the
-  /// encoded shape rather than declared, so a single-block arm cannot claim an
-  /// addressability it does not have.
+  /// Block-addressable, except when the whole column landed in one block.
+  /// Derived from the encoded shape rather than declared, so a single-block
+  /// arm cannot claim an addressability it does not have.
   ReadPath readPath() const override {
     return blocks_.size() <= 1 ? ReadPath::kWholePayload : ReadPath::kBlock;
   }
@@ -278,7 +257,7 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   }
 
  private:
-  // One block's slice of payload_ and how it was stored.
+  // A block's slice of payload_ and how it was stored.
   struct BlockEntry {
     size_t offset;
     size_t size;
@@ -293,7 +272,7 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
         (static_cast<size_t>(count) + blockSize - 1) / blockSize);
   }
 
-  // Serves one contiguous range, touching only the blocks it overlaps.
+  // Serves one range, touching only the blocks it overlaps.
   void readRange(uint32_t begin, uint32_t count, T* dst) {
     if (count == 0) {
       return;
@@ -316,14 +295,14 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
 
       if (from == blockBegin && to == blockBegin + elements) {
         // The range covers the block, so decode straight into the caller's
-        // buffer. This is the bulk-scan path and it costs no extra copy.
+        // buffer: the bulk-scan path, with no extra copy.
         decodeBlock(block, out);
         continue;
       }
       if (cachedBlock_ != block) {
-        // The block's own element count, not blockSize_: the final block is
-        // short, and a whole-column arm sets blockSize_ to a bound rather than
-        // a length, where resizing to it would ask for 4 billion elements.
+        // The block's own element count, not blockSize_: a whole-column arm
+        // sets blockSize_ to a bound, where resizing to it would ask for 4
+        // billion elements.
         scratch_.resize(elements);
         decodeBlock(block, scratch_.data());
         cachedBlock_ = block;
@@ -358,19 +337,15 @@ class BlockCompressedTarget : public NimbleBenchTargetBase<T> {
   size_t numBlockDecodes_{0};
 };
 
-/// Block sizes swept, in elements. At 8 bytes per element they are 8 KB
-/// (vector scale), 512 KB and 2 MB (row-group scale), which brackets what a
-/// columnar format actually ships.
+/// Block sizes swept, in elements: brackets vector scale and row-group scale.
 inline constexpr std::array<uint32_t, 3> kBlockElementCounts{
     1024,
     65'536,
     262'144};
 
-/// Builds one arm for a codec at one block size.
-///
-/// `codecName` becomes the arm's prefix, so the codec and the block size are
-/// both readable off the CSV's encoding column and neither can collide with
-/// openzl/auto. No commas: the --mlidc_encoders filter splits its list on them.
+/// Builds one arm for a codec at one block size. `codecName` becomes the
+/// arm's prefix, so the codec and block size are both readable off the CSV's
+/// encoding column. No commas: --mlidc_encoders splits its list on them.
 template <typename T>
 EncoderEntry<T> makeBlockCodecEntry(
     std::string codecName,
@@ -382,9 +357,8 @@ EncoderEntry<T> makeBlockCodecEntry(
   entry.name = codecName + "/" + variant;
   entry.family = std::move(family);
   entry.variant = variant;
-  // A block is addressable, so a skip costs nothing, but reaching a row inside
-  // one still decompresses the whole block: neither a fast skip nor random
-  // access in the sense the other arms use those words.
+  // A block is addressable, so a skip costs nothing, but reaching a row
+  // inside one still decompresses the whole block.
   entry.isSequential = false;
   entry.fastSkip = false;
   entry.randomAccess = false;
@@ -398,9 +372,8 @@ EncoderEntry<T> makeBlockCodecEntry(
   return entry;
 }
 
-/// The Zstd arms. Zstd is named in the paper as a plotted baseline and had no
-/// arm of its own; it appeared only as a sub-stream codec inside other
-/// encodings, which measures something else entirely.
+/// The Zstd arms: a plotted baseline that previously appeared only as a
+/// sub-stream codec inside other encodings.
 template <typename T>
 std::vector<EncoderEntry<T>> buildZstdBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
@@ -416,15 +389,11 @@ std::vector<EncoderEntry<T>> buildZstdBlockEncoders() {
   return entries;
 }
 
-/// Zstd over the whole column in one block: what a reader pays when it holds a
-/// compressed column and no block directory.
-///
-/// The block arms answer a probe from one block. This one has to decompress
-/// everything, which is the same read shape as openzl/auto, and it is the arm
-/// the materialise-on-first-access decorator has something to prove against.
-/// Expressed as a single block rather than as a target of its own so that the
-/// codec, the size accounting and the indexing stay the ones the block arms
-/// already use.
+/// Zstd over the whole column in one block: what a reader pays when it holds
+/// a compressed column and no block directory. This is the arm the
+/// materialise-on-first-access decorator has something to prove against.
+/// Expressed as a single block rather than as a target of its own so the
+/// codec, size accounting and indexing stay the ones the block arms use.
 template <typename T>
 EncoderEntry<T> buildZstdWholeEncoder() {
   auto entry = makeBlockCodecEntry<T>(
@@ -446,26 +415,21 @@ EncoderEntry<T> buildZstdWholeEncoder() {
 
 /// Keeps the blocks it has decoded, and only those.
 ///
-/// MaterializingTarget decodes the entire column on the first access, which
-/// makes a fair comparison against a view impossible: the view materialises
-/// only the sections that lack a real one and serves the rest from the
-/// compressed representation, so the two answer the same reads while holding
-/// very different amounts of memory. Decoding both in full would just be bulk
-/// decode, which is already measured. This is the middle case, and it is the
-/// one a reader actually deploys: materialise at the granularity the format is
-/// addressable at, and let a workload decide how much of the column ends up
-/// resident.
+/// MaterializingTarget decodes the entire column on first access, which makes
+/// a fair comparison against a view impossible since a view materialises only
+/// the sections that lack one. This is the middle case a reader actually
+/// deploys: materialise at the granularity the format is addressable at, and
+/// let a workload decide how much of the column ends up resident.
 ///
-/// Wraps a block target rather than a whole-payload one on purpose. With a
+/// Wraps a block target rather than a whole-payload one on purpose: with a
 /// whole-payload inner, decoding "one block" would decompress the entire
 /// column and the laziness would be fictitious.
 template <typename T>
 class BlockLazyTarget : public NimbleBenchTargetBase<T> {
  public:
-  /// Takes an inner block target the entry's factory has already encoded, the
-  /// column length, and the block size that inner target was built with. The
-  /// two block sizes must agree, or a "decode one block" here would span two
-  /// of the inner target's.
+  /// Takes an inner block target the entry's factory has already encoded,
+  /// the column length, and the block size that inner target was built with.
+  /// The two block sizes must agree.
   BlockLazyTarget(
       std::unique_ptr<NimbleBenchTargetBase<T>> inner,
       uint32_t rowCount,
@@ -481,12 +445,9 @@ class BlockLazyTarget : public NimbleBenchTargetBase<T> {
     resetCache();
   }
 
-  /// Reads every row, bypassing the cache.
-  ///
-  /// A bulk read must not turn into full materialisation by a side door: if it
-  /// populated the cache, one scan would leave the whole column resident and
-  /// this arm would silently become the +materialize arm it exists to be
-  /// distinguished from.
+  /// Reads every row, bypassing the cache: if it populated the cache, one
+  /// scan would leave the whole column resident and this arm would silently
+  /// become the +materialize arm it exists to be distinguished from.
   void materializeAll(T* dst, uint32_t n) override {
     inner_->materializeAll(dst, n);
   }
@@ -509,19 +470,14 @@ class BlockLazyTarget : public NimbleBenchTargetBase<T> {
     return blockCount() <= 1 ? ReadPath::kWholePayload : ReadPath::kBlock;
   }
 
-  /// False, and deliberately. There is no one-time build to amortise here --
-  /// the cost is spread across the reads that happen to miss, and it depends
-  /// on which rows a workload touches rather than on the column. The story
-  /// this arm tells is resident_bytes rising along the ops axis, not a build
-  /// cost paid up front.
+  /// False, deliberately: there is no one-time build to amortise here, since
+  /// the cost is spread across the reads that happen to miss.
   bool buildsAccessStructure() const override {
     return false;
   }
 
-  /// Drops every cached block, so the next read decodes again. The drivers
-  /// call this inside the timed region that measures a read starting from
-  /// nothing, and a cache that survived it would make that region measure a
-  /// copy.
+  /// Drops every cached block, so the next read decodes again. Called inside
+  /// the timed region that measures a read starting from nothing.
   void discardAccessStructure() override {
     resetCache();
   }
@@ -530,19 +486,16 @@ class BlockLazyTarget : public NimbleBenchTargetBase<T> {
     return inner_->payloadSize();
   }
 
-  /// The compressed column plus exactly the blocks a workload has decoded.
-  ///
-  /// This is the axis the arm exists for: it starts at the inner target's
-  /// footprint and rises towards full materialisation only as far as the reads
-  /// actually reach.
+  /// The compressed column plus exactly the blocks a workload has decoded:
+  /// starts at the inner target's footprint and rises towards full
+  /// materialisation only as far as the reads actually reach.
   size_t residentBytes() const override {
     return inner_->residentBytes() + cachedBytes_ +
         cache_.capacity() * sizeof(std::vector<T>);
   }
 
-  /// Blocks decoded since the last reset. Instrumentation for the tests that
-  /// pin "a k-probe workload touches min(k, blocks) blocks"; never read on a
-  /// timed path.
+  /// Blocks decoded since the last reset. Instrumentation for tests pinning
+  /// "a k-probe workload touches min(k, blocks) blocks".
   size_t numBlockMaterializations() const {
     return numBlockMaterializations_;
   }
@@ -631,11 +584,10 @@ class BlockLazyTarget : public NimbleBenchTargetBase<T> {
   size_t numBlockMaterializations_{0};
 };
 
-/// Wraps a block arm so it keeps the blocks it decodes.
-///
-/// Composed like withMaterializedAccess so the pair encodes to the same bytes
-/// and differs only in what a read leaves behind. blockSize must be the one
-/// the wrapped entry was built with.
+/// Wraps a block arm so it keeps the blocks it decodes. Composed like
+/// withMaterializedAccess so the pair encodes to the same bytes and differs
+/// only in what a read leaves behind. blockSize must match the wrapped
+/// entry's.
 template <typename T>
 EncoderEntry<T> withBlockLazyMaterialization(
     EncoderEntry<T> entry,
@@ -657,9 +609,8 @@ EncoderEntry<T> withBlockLazyMaterialization(
   return entry;
 }
 
-/// The block size the lazy arms are built at, taken from kBlockElementCounts
-/// as the middle one: 512 KB at eight bytes per element, which is row-group
-/// scale rather than vector scale.
+/// The block size the lazy arms are built at: the middle entry of
+/// kBlockElementCounts, row-group scale rather than vector scale.
 inline constexpr uint32_t kLazyBlockElementCount = 65'536;
 
 } // namespace facebook::nimble::mlidc
