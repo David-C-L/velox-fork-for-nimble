@@ -605,7 +605,7 @@ struct OracleSegment {
 };
 
 struct OracleDpResult {
-  std::vector<OracleSegment> segments;
+  std::vector<OracleSegment> sections;
   size_t totalBytes{0};
 };
 
