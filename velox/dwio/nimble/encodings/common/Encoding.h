@@ -172,6 +172,11 @@ class Encoding {
     /// until restatement points are added.
     bool subIntSplitDeltaPreTransform{false};
 
+    /// Prices a Huffman tree deeper than HuffmanEncoding::kMaxCodeBits at its
+    /// Shannon bound instead of declining it. encode() length-limits such a
+    /// tree, so it remains encodable. On by default.
+    bool huffmanPriceLengthLimited{true};
+
     /// Per-column decoding statistics for timing decompression.
     velox::dwio::common::DecodingStats* decodingStats = nullptr;
 
