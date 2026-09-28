@@ -81,6 +81,7 @@ DECLARE_bool(mlidc_sis_estimate_compression_guard);
 DECLARE_bool(mlidc_sis_estimate_bitflip_screen);
 DECLARE_string(mlidc_outer_compression);
 DECLARE_int32(mlidc_block_codec_iters);
+DECLARE_string(mlidc_block_sizes);
 DECLARE_string(mlidc_datasets);
 DECLARE_string(mlidc_encoders);
 DECLARE_double(mlidc_sis_decode_weight);

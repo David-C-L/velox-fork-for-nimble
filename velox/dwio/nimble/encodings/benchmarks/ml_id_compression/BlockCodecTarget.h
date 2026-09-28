@@ -346,6 +346,27 @@ inline constexpr std::array<uint32_t, 3> kBlockElementCounts{
     65'536,
     262'144};
 
+/// The block sizes the block arms are built at, from --mlidc_block_sizes. Its
+/// default is kBlockElementCounts, so the default arm set is unchanged.
+inline std::vector<uint32_t> blockElementCounts() {
+  std::vector<uint32_t> sizes;
+  std::stringstream list(FLAGS_mlidc_block_sizes);
+  std::string item;
+  while (std::getline(list, item, ',')) {
+    if (item.empty()) {
+      continue;
+    }
+    const unsigned long size = std::stoul(item);
+    NIMBLE_CHECK(
+        size > 0 && size <= std::numeric_limits<uint32_t>::max(),
+        "--mlidc_block_sizes entry out of range: {}",
+        item);
+    sizes.push_back(static_cast<uint32_t>(size));
+  }
+  NIMBLE_CHECK(!sizes.empty(), "--mlidc_block_sizes is empty");
+  return sizes;
+}
+
 /// Builds one arm for a codec at one block size. `codecName` becomes the
 /// arm's prefix, so the codec and block size are both readable off the CSV's
 /// encoding column. No commas: --mlidc_encoders splits its list on them.
@@ -382,8 +403,9 @@ EncoderEntry<T> makeBlockCodecEntry(
 template <typename T>
 std::vector<EncoderEntry<T>> buildZstdBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
-  entries.reserve(kBlockElementCounts.size());
-  for (const uint32_t blockSize : kBlockElementCounts) {
+  const auto blockSizes = blockElementCounts();
+  entries.reserve(blockSizes.size());
+  for (const uint32_t blockSize : blockSizes) {
     entries.push_back(
         makeBlockCodecEntry<T>(
             "zstd", "Zstd", blockSize, []() -> std::unique_ptr<BlockCodec<T>> {

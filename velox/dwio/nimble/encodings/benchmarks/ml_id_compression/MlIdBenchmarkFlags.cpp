@@ -171,6 +171,12 @@ DEFINE_string(
     "emitted to the CSV's encoding column, e.g. SIS/key_derived+view. Empty "
     "runs every encoder. Lets one arm's decode be profiled without the "
     "encode and decode cost of the other thirty in the same run.");
+DEFINE_string(
+    mlidc_block_sizes,
+    "1024,65536,262144",
+    "Comma-separated block sizes, in elements, of the zstd/block-K and "
+    "openzl/block-K arms. The default is kBlockElementCounts. The lazy block "
+    "arms exist only when the list includes kLazyBlockElementCount (65536).");
 DEFINE_int32(
     mlidc_block_codec_iters,
     1,

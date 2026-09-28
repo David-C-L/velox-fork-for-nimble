@@ -94,8 +94,9 @@ class OpenZLBlockCodec : public BlockCodec<T> {
 template <typename T>
 std::vector<EncoderEntry<T>> buildOpenZLBlockEncoders() {
   std::vector<EncoderEntry<T>> entries;
-  entries.reserve(kBlockElementCounts.size());
-  for (const uint32_t blockSize : kBlockElementCounts) {
+  const auto blockSizes = blockElementCounts();
+  entries.reserve(blockSizes.size());
+  for (const uint32_t blockSize : blockSizes) {
     entries.push_back(
         makeBlockCodecEntry<T>(
             "openzl",
