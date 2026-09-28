@@ -1036,6 +1036,7 @@ int runBenchmark() {
       "is_oracle_pick",
       "plan_type",
       "plan_segment_count",
+      "plan_boundaries",
       "plan_total_sample_bytes",
       "oracle_cell_sum_bytes",
       "full_column_vs_cell_sum",
@@ -1119,6 +1120,7 @@ int runBenchmark() {
     csv.set("seed", static_cast<int64_t>(seed));
     csv.set("plan_type", "writer_reproduction");
     csv.set("plan_segment_count", static_cast<int64_t>(writerPlan.size()));
+    csv.set("plan_boundaries", serializeSplitBoundaries(writerPlan));
     csv.set("full_column_rows", static_cast<int64_t>(data.size()));
     if (recomputeBytes.has_value()) {
       csv.set(
@@ -1864,6 +1866,9 @@ int runBenchmark() {
         csv.set("sample_size", static_cast<int64_t>(sampleSize));
         csv.set("plan_type", planType + "_summary");
         csv.set("plan_segment_count", static_cast<int64_t>(segments.size()));
+        // Inclusive bit ranges in the preserve-mode form, so a plan can be
+        // pinned elsewhere (--mlidc_sis_pinned_boundaries) as written here.
+        csv.set("plan_boundaries", serializeSplitBoundaries(segments));
         csv.set(
             "plan_total_sample_bytes", static_cast<int64_t>(planSampleBytes));
         // The sum over this plan's ranges of the smallest bytes any single
@@ -1924,7 +1929,8 @@ int runBenchmark() {
         csv.endRow();
 
         std::cout << "  " << planType << ": " << segments.size()
-                  << " segments, sample_bytes=" << planSampleBytes
+                  << " segments [" << serializeSplitBoundaries(segments)
+                  << "], sample_bytes=" << planSampleBytes
                   << ", regret=" << regretBytes << ", full_column_bytes=";
         if (fullColumnBytes.has_value()) {
           std::cout << fullColumnBytes.value() << " ("
