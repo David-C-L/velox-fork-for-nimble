@@ -90,6 +90,7 @@ DECLARE_int32(mlidc_sis_decode_read_path);
 DECLARE_int32(mlidc_sis_admission);
 DECLARE_bool(mlidc_sis_admission_forces);
 DECLARE_double(mlidc_sis_max_size_regression);
+DECLARE_double(mlidc_sis_split_penalty);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);

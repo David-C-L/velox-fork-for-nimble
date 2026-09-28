@@ -146,6 +146,12 @@ DEFINE_bool(
     "may rule SubIntSplit out from the bit-flip gradient gate rather than by "
     "planning a split.");
 DEFINE_double(
+    mlidc_sis_split_penalty,
+    10.0,
+    "subintsplit::SelectorConfig::splitPenalty: extra bits the split DP "
+    "charges per section boundary. The default is the library's. The cost "
+    "model oracle driver applies it to its own selector config too.");
+DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,
     "subintsplit::TuningConfig::maxSizeRegression: the most encoded size, "

@@ -761,6 +761,7 @@ std::vector<SectionPlan> writerDerivedPlan(
   auto writerCfg = defaultSelectorConfig();
   writerCfg.allowHuffman = columnTuning.selector.allowHuffman;
   writerCfg.allowDeltaBlock = columnTuning.selector.allowDeltaBlock;
+  writerCfg.splitPenalty = columnTuning.selector.splitPenalty;
   return selectSplitsRestricted(
              writerSample,
              kBits,
@@ -881,6 +882,7 @@ int runBenchmark() {
   TuningConfig columnTuning;
   columnTuning.selector.allowHuffman = FLAGS_allow_huffman;
   columnTuning.selector.allowDeltaBlock = FLAGS_allow_delta_block;
+  columnTuning.selector.splitPenalty = FLAGS_mlidc_sis_split_penalty;
   const facebook::nimble::Encoding::Options sectionOptions =
       sectionEncodingOptions(columnOptions, columnTuning);
 
@@ -992,6 +994,7 @@ int runBenchmark() {
   SelectorConfig selectorCfg = defaultSelectorConfig();
   selectorCfg.allowHuffman = FLAGS_allow_huffman;
   selectorCfg.allowDeltaBlock = FLAGS_allow_delta_block;
+  selectorCfg.splitPenalty = FLAGS_mlidc_sis_split_penalty;
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
 
   for (const auto& ds : datasets) {

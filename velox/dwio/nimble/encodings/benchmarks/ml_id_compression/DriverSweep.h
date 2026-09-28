@@ -267,6 +267,12 @@ void writeValidationFailureRow(
   csv.endRow();
 }
 
+/// Applies the split planner's ablation flags. Their defaults leave the
+/// tuning as the library builds it.
+inline void applyPlannerFlags(subintsplit::TuningConfig& tuning) {
+  tuning.selector.splitPenalty = FLAGS_mlidc_sis_split_penalty;
+}
+
 /// Encodes data with one encoder, or returns nullptr after writing a skip row.
 ///
 /// An encoder that cannot represent a dataset throws from its factory, which is
@@ -318,6 +324,7 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   };
   tuning.maxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
   tuning.rowFrame = FLAGS_mlidc_sis_row_frame;
+  applyPlannerFlags(tuning);
   // Admission and the estimate guards decide whether a stream picks
   // SubIntSplit at all, so they stay on the options selection reads.
   options.subIntSplit.admission =
