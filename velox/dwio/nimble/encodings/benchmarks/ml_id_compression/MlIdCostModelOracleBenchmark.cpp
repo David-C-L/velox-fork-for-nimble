@@ -233,6 +233,14 @@ DEFINE_string(
     "the column in order. Cost grows linearly in sample size and the whole-"
     "column entry dominates a sweep, so narrow --mlidc_datasets before asking "
     "for it.");
+DEFINE_string(
+    forced_sections,
+    "",
+    "Comma-separated section counts k. For each k, the oracle DP is rerun "
+    "with exactly k sections, under the cell-minimum and the selection-"
+    "realistic objectives, and each plan is encoded through the pinned-plan "
+    "path as plan types oracle_dp_k<k> and oracle_dp_selection_k<k>. A k no "
+    "plan reaches is reported as a skipped row. Empty disables.");
 DEFINE_bool(
     nested_selection,
     true,
@@ -677,6 +685,77 @@ OracleDpResult oracleDp(
         {start, idx - 1, cellEncoding(cell), cellBytes(cell)});
     // Reported unscaled, so the number stays a count of bytes the oracle
     // actually measured rather than a projection of them.
+    result.totalBytes += cellBytes(cell);
+    idx = start;
+  }
+  std::reverse(result.sections.begin(), result.sections.end());
+  return result;
+}
+
+// oracleDp constrained to exactly `k` sections: best[i][j] covers bits
+// [0, i) with j sections. The split penalty is then a constant (k - 1) times
+// the penalty, so it does not move the plan; it is charged for comparability.
+// Returns an empty result when no k-section plan exists.
+OracleDpResult oracleDpForcedK(
+    const std::vector<std::vector<OracleCell>>& grid,
+    int sz,
+    int k,
+    double costScale,
+    double splitPenaltyBytes,
+    OracleObjective objective) {
+  OracleDpResult result;
+  if (k < 1 || k > sz) {
+    return result;
+  }
+  const auto cellBytes = [objective](const OracleCell& cell) {
+    switch (objective) {
+      case OracleObjective::kCellMinimum:
+        return cell.bestBytes;
+      case OracleObjective::kSelectionRealistic:
+        return cell.selectionBytes;
+      case OracleObjective::kSelectionEstimate:
+        return cell.selectionEstimateBytes;
+    }
+    return cell.bestBytes;
+  };
+  const auto cellEncoding = [objective](const OracleCell& cell) {
+    return objective == OracleObjective::kCellMinimum ? cell.bestEncoding
+                                                      : cell.selectionEncoding;
+  };
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  std::vector<std::vector<double>> dp(
+      sz + 1, std::vector<double>(k + 1, kInf));
+  std::vector<std::vector<int>> prev(sz + 1, std::vector<int>(k + 1, -1));
+  dp[0][0] = 0.0;
+  for (int i = 1; i <= sz; ++i) {
+    for (int j = 1; j <= std::min(i, k); ++j) {
+      for (int start = j - 1; start < i; ++start) {
+        if (!std::isfinite(dp[start][j - 1])) {
+          continue;
+        }
+        const auto& cell = grid[start][i - 1];
+        if (cellBytes(cell) == std::numeric_limits<size_t>::max()) {
+          continue;
+        }
+        const double splitCost = (start == 0) ? 0.0 : splitPenaltyBytes;
+        const double candidate = dp[start][j - 1] +
+            static_cast<double>(cellBytes(cell)) * costScale + splitCost;
+        if (candidate < dp[i][j]) {
+          dp[i][j] = candidate;
+          prev[i][j] = start;
+        }
+      }
+    }
+  }
+  if (!std::isfinite(dp[sz][k])) {
+    return result;
+  }
+  int idx = sz;
+  for (int j = k; j > 0; --j) {
+    const int start = prev[idx][j];
+    const auto& cell = grid[start][idx - 1];
+    result.sections.push_back(
+        {start, idx - 1, cellEncoding(cell), cellBytes(cell)});
     result.totalBytes += cellBytes(cell);
     idx = start;
   }
@@ -1879,6 +1958,43 @@ int runBenchmark() {
           "estimator_dp found no plan: {}",
           ds.name);
       scorePlan("estimator_dp", toSegmentPlans(estimatorDp.sections));
+
+      // Fixed section counts, each plan encoded through the pinned-plan path.
+      // An empty plan would fall back to the writer's own, so a k with no
+      // plan is written as a skipped row instead.
+      for (const size_t k : parseSampleSizes(FLAGS_forced_sections)) {
+        for (const auto& [prefix, objective] :
+             {std::pair{"oracle_dp_k", OracleObjective::kCellMinimum},
+              std::pair{
+                  "oracle_dp_selection_k",
+                  OracleObjective::kSelectionRealistic}}) {
+          const std::string planType = prefix + std::to_string(k);
+          const OracleDpResult forced = oracleDpForcedK(
+              oracleGrid,
+              kBits,
+              static_cast<int>(k),
+              fullCostScale,
+              splitPenaltyBytes,
+              objective);
+          if (forced.sections.empty()) {
+            csv.beginRow();
+            csv.set("driver", "bench_costmodel_oracle");
+            csv.set("dtype", elemTypeName<Elem>());
+            csv.set("dataset", ds.name);
+            csv.set("N", static_cast<int64_t>(n));
+            csv.set("seed", static_cast<int64_t>(seed));
+            csv.set("sample_size", static_cast<int64_t>(sampleSize));
+            csv.set("plan_type", planType + "_summary");
+            csv.set("plan_segment_count", int64_t{0});
+            csv.set("split_penalty_bits", selectorCfg.splitPenalty);
+            csv.set("skipped", int64_t{1});
+            csv.endRow();
+            std::cout << "  " << planType << ": no plan\n";
+            continue;
+          }
+          scorePlan(planType, toSegmentPlans(forced.sections));
+        }
+      }
 
       // The hybrid planner: shortlist cheaply at this sample, then re-score
       // only the shortlisted ranges with selection's estimators on a larger
