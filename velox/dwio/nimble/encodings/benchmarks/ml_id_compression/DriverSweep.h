@@ -267,10 +267,16 @@ void writeValidationFailureRow(
   csv.endRow();
 }
 
-/// Applies the split planner's ablation flags. Their defaults leave the
-/// tuning as the library builds it.
+/// Applies the split planner's ablation flags, --mlidc_sis_split_penalty and
+/// --mlidc_sis_planner_samples. Their defaults leave the tuning as the library
+/// builds it.
 inline void applyPlannerFlags(subintsplit::TuningConfig& tuning) {
   tuning.selector.splitPenalty = FLAGS_mlidc_sis_split_penalty;
+  // Negative keeps the library default; 0 is the sampler's whole column.
+  if (FLAGS_mlidc_sis_planner_samples >= 0) {
+    tuning.sampler.maxSamples =
+        static_cast<size_t>(FLAGS_mlidc_sis_planner_samples);
+  }
 }
 
 /// Encodes data with one encoder, or returns nullptr after writing a skip row.

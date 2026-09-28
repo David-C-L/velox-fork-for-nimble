@@ -151,6 +151,12 @@ DEFINE_double(
     "subintsplit::SelectorConfig::splitPenalty: extra bits the split DP "
     "charges per section boundary. The default is the library's. The cost "
     "model oracle driver applies it to its own selector config too.");
+DEFINE_int64(
+    mlidc_sis_planner_samples,
+    -1,
+    "subintsplit::TuningConfig::sampler.maxSamples: values the split planner "
+    "samples. -1 keeps the library default (2048); 0 samples the whole column. "
+    "SubIntSplitEncoding::estimateSize keeps its own 512-value sample.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,
