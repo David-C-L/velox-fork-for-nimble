@@ -950,7 +950,9 @@ TEST_F(EncodingSizeEstimationTest, fixedBitWidthRefinementCountsSlopBytes) {
   EXPECT_EQ(refined.value(), plain.value() + 7);
 }
 
-TEST_F(EncodingSizeEstimationTest, mainlyConstantRefinementPricesUncommonRange) {
+TEST_F(
+    EncodingSizeEstimationTest,
+    mainlyConstantRefinementPricesUncommonRange) {
   // The common value is a sentinel at the top of the range, so pricing the
   // other values over the whole stream's range charges each of them 32 bits,
   // while their own range needs 10.

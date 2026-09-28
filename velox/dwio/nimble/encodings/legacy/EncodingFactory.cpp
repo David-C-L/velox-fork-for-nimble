@@ -338,8 +338,8 @@ std::unique_ptr<Encoding> EncodingFactory::create(
       // the base factory on this object also preserves the decoding options.
       return ::facebook::nimble::EncodingFactory::create(
           memoryPool, data, std::move(stringBufferFactory));
-    // FOR and FrequencyPartition integration (re-enabled for
-    // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
+      // FOR and FrequencyPartition integration (re-enabled for
+      // NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS; was commented out by #636):
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
     case EncodingType::FOR: {
       RETURN_ENCODING_BY_INTEGRAL_TYPE(

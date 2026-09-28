@@ -762,10 +762,8 @@ TEST_F(ForEncodingTest, roundTripsMixedBitWidthFrames) {
   // slice leaves such a frame unaligned, where the bit-stream decode can only
   // assemble values of up to 56 bits. uint64_t frames here therefore stay at
   // 32 bits or less.
-  check.template operator()<uint64_t>(
-      {1, 32, 2, 16, 4, 8, 0, 16, 1, 2, 4, 32});
+  check.template operator()<uint64_t>({1, 32, 2, 16, 4, 8, 0, 16, 1, 2, 4, 32});
 }
-
 
 // Test random access by reading subsets
 TEST_F(ForEncodingTest, randomAccess) {

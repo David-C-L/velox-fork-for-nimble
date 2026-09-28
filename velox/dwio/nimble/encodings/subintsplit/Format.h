@@ -235,13 +235,11 @@ inline std::vector<StoredSection> parseSections(
   const auto header = readStreamHeader(pos);
   const uint8_t numSections = header.numSections;
   NIMBLE_CHECK_FILE(
-      numSections > 0,
-      "SubIntSplit stream must contain at least one section.");
+      numSections > 0, "SubIntSplit stream must contain at least one section.");
   // A section covers at least one bit of a value, so there can be no more
   // sections than bits.
   NIMBLE_CHECK_FILE(
-      numSections <= valueBits,
-      "SubIntSplit stream has too many sections.");
+      numSections <= valueBits, "SubIntSplit stream has too many sections.");
   NIMBLE_CHECK_FILE(
       (header.flags & ~kKnownFlags) == 0,
       "SubIntSplit stream has unsupported flags.");
