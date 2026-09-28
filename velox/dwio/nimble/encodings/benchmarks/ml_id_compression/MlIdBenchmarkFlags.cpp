@@ -157,6 +157,17 @@ DEFINE_int64(
     "subintsplit::TuningConfig::sampler.maxSamples: values the split planner "
     "samples. -1 keeps the library default (2048); 0 samples the whole column. "
     "SubIntSplitEncoding::estimateSize keeps its own 512-value sample.");
+DEFINE_string(
+    mlidc_sis_pinned_boundaries,
+    "",
+    "Adds an SIS/pinned arm: SIS/realNested with its split plan pinned "
+    "through preserve mode to these inclusive bit ranges, e.g. "
+    "\"0-3;4-11;12-63\" (the oracle driver's plan_boundaries column). Empty "
+    "adds no arm.");
+DEFINE_string(
+    mlidc_sis_pinned_label,
+    "pinned",
+    "The variant column of the SIS/pinned arm, naming the pinned plan.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,

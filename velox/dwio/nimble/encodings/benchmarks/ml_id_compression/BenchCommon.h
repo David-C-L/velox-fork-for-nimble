@@ -46,6 +46,8 @@
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
+#include "velox/dwio/nimble/encodings/common/EncodingLayout.h"
+#include "velox/dwio/nimble/encodings/subintsplit/SplitBoundaries.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/AccessStructure.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/CachePolicy.h"
 #include "velox/dwio/nimble/encodings/benchmarks/ml_id_compression/EncodeCache.h"
@@ -92,6 +94,8 @@ DECLARE_bool(mlidc_sis_admission_forces);
 DECLARE_double(mlidc_sis_max_size_regression);
 DECLARE_double(mlidc_sis_split_penalty);
 DECLARE_int64(mlidc_sis_planner_samples);
+DECLARE_string(mlidc_sis_pinned_boundaries);
+DECLARE_string(mlidc_sis_pinned_label);
 DECLARE_bool(mlidc_dump_encoding);
 DECLARE_string(mlidc_encode_cache_dir);
 DECLARE_bool(mlidc_allow_delta_block);
@@ -166,20 +170,30 @@ class NimbleBenchTarget {
 
   NimbleBenchTarget() : pool_(makeTargetPool()) {}
 
-  // Encode data.  Destroys any previously encoded state.
+  // Encode data.  Destroys any previously encoded state. A non-empty
+  // `encodingConfig` reaches the top-level selection, which is how a
+  // SubIntSplit plan is pinned (preserve mode).
   void encode(
       const Vector<T>& data,
       const Encoding::Options& options,
       const subintsplit::TuningConfig& tuning,
-      bool realNestedSelection = false) {
+      bool realNestedSelection = false,
+      const EncodingLayout::Config& encodingConfig = {}) {
     Buffer buf{*pool_};
     constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
     // The key hashes every input value and two fingerprints, so it is built
     // only where a cache will read it.
     const bool caching = !cacheDir().empty();
-    const auto armId = caching
+    auto armId = caching
         ? cacheArmIdentity(options, tuning, realNestedSelection)
         : std::string{};
+    if (caching && !encodingConfig.values().empty()) {
+      for (const auto& [key, value] : std::map<std::string, std::string>(
+               encodingConfig.values().begin(),
+               encodingConfig.values().end())) {
+        armId += "|cfg:" + key + "=" + value;
+      }
+    }
     const auto key = caching
         ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
         : std::string{};
@@ -194,7 +208,8 @@ class NimbleBenchTarget {
               parseCompressionType(FLAGS_mlidc_substream_compression),
               options,
               tuning,
-              realNestedSelection));
+              realNestedSelection,
+              encodingConfig));
       if (caching) {
         storeCached(key, armId, kType, encoded_);
       }
@@ -1932,6 +1947,36 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
       auto impl =
           std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
       impl->target.encode(data, opts, tuning, /*realNestedSelection=*/true);
+      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+    };
+    encoders.push_back(std::move(entry));
+  }
+
+  // SIS/realNested pinned to a given plan through preserve mode, as the cost
+  // model oracle driver's encodeColumn pins one. Only present when
+  // --mlidc_sis_pinned_boundaries is set; the plan is named by the variant.
+  if (!FLAGS_mlidc_sis_pinned_boundaries.empty()) {
+    EncoderEntry<T> entry;
+    entry.name = "SIS/pinned";
+    entry.family = "SubIntSplit";
+    entry.variant = FLAGS_mlidc_sis_pinned_label;
+    entry.inventory = "full";
+    entry.isSequential = false;
+    entry.fastSkip = false;
+    entry.randomAccess = false;
+    entry.factory = [](const Vector<T>& data,
+                       const Encoding::Options& opts,
+                       const subintsplit::TuningConfig& tuning) {
+      auto impl =
+          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+      const EncodingLayout::Config config{{
+          {std::string(subintsplit::kSplitModeConfigKey),
+           std::string(subintsplit::kSplitModePreserve)},
+          {std::string(subintsplit::kSplitBoundariesConfigKey),
+           FLAGS_mlidc_sis_pinned_boundaries},
+      }};
+      impl->target.encode(
+          data, opts, tuning, /*realNestedSelection=*/true, config);
       return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
     };
     encoders.push_back(std::move(entry));
