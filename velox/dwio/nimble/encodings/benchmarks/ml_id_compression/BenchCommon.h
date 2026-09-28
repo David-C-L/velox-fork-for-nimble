@@ -163,6 +163,19 @@ std::unique_ptr<EncodingT> makeDecoder(
   }
 }
 
+// Extends an encode cache arm identity by a top-level encoding config, sorted
+// so the identity does not depend on hash order. An empty config leaves the
+// identity as it was.
+inline std::string withConfigIdentity(
+    std::string armId,
+    const EncodingLayout::Config& encodingConfig) {
+  for (const auto& [key, value] : std::map<std::string, std::string>(
+           encodingConfig.values().begin(), encodingConfig.values().end())) {
+    armId += "|cfg:" + key + "=" + value;
+  }
+  return armId;
+}
+
 template <typename EncodingT>
 class NimbleBenchTarget {
  public:
@@ -184,16 +197,11 @@ class NimbleBenchTarget {
     // The key hashes every input value and two fingerprints, so it is built
     // only where a cache will read it.
     const bool caching = !cacheDir().empty();
-    auto armId = caching
-        ? cacheArmIdentity(options, tuning, realNestedSelection)
+    const auto armId = caching
+        ? withConfigIdentity(
+              cacheArmIdentity(options, tuning, realNestedSelection),
+              encodingConfig)
         : std::string{};
-    if (caching && !encodingConfig.values().empty()) {
-      for (const auto& [key, value] : std::map<std::string, std::string>(
-               encodingConfig.values().begin(),
-               encodingConfig.values().end())) {
-        armId += "|cfg:" + key + "=" + value;
-      }
-    }
     const auto key = caching
         ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
         : std::string{};
@@ -519,13 +527,16 @@ class NimbleViewBenchTargetImpl
       const Vector<T>& data,
       const Encoding::Options& opts,
       const subintsplit::TuningConfig& tuning,
-      bool realNestedSelection) {
+      bool realNestedSelection,
+      const EncodingLayout::Config& encodingConfig = {}) {
     Buffer buf{*pool_};
     constexpr auto kType = test::EncodingTypeTraits<EncodingT>::encodingType;
     // Keyed only where a cache will read the key; see NimbleBenchTarget.
     const bool caching = !cacheDir().empty();
     const auto armId = caching
-        ? cacheArmIdentity(opts, tuning, realNestedSelection)
+        ? withConfigIdentity(
+              cacheArmIdentity(opts, tuning, realNestedSelection),
+              encodingConfig)
         : std::string{};
     const auto key = caching
         ? encodeCacheKey<T>(data.data(), data.size(), armId, kType)
@@ -538,7 +549,8 @@ class NimbleViewBenchTargetImpl
               parseCompressionType(FLAGS_mlidc_substream_compression),
               opts,
               tuning,
-              realNestedSelection));
+              realNestedSelection,
+              encodingConfig));
       if (caching) {
         storeCached(key, armId, kType, encoded_);
       }
@@ -1952,34 +1964,44 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
     encoders.push_back(std::move(entry));
   }
 
-  // SIS/realNested pinned to a given plan through preserve mode, as the cost
-  // model oracle driver's encodeColumn pins one. Only present when
-  // --mlidc_sis_pinned_boundaries is set; the plan is named by the variant.
+  // SIS/realNested and its view pinned to a given plan through preserve mode,
+  // as the cost model oracle driver's encodeColumn pins one. Only present when
+  // --mlidc_sis_pinned_boundaries is set; the variant names the plan.
   if (!FLAGS_mlidc_sis_pinned_boundaries.empty()) {
-    EncoderEntry<T> entry;
-    entry.name = "SIS/pinned";
-    entry.family = "SubIntSplit";
-    entry.variant = FLAGS_mlidc_sis_pinned_label;
-    entry.inventory = "full";
-    entry.isSequential = false;
-    entry.fastSkip = false;
-    entry.randomAccess = false;
-    entry.factory = [](const Vector<T>& data,
-                       const Encoding::Options& opts,
-                       const subintsplit::TuningConfig& tuning) {
-      auto impl =
-          std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
-      const EncodingLayout::Config config{{
-          {std::string(subintsplit::kSplitModeConfigKey),
-           std::string(subintsplit::kSplitModePreserve)},
-          {std::string(subintsplit::kSplitBoundariesConfigKey),
-           FLAGS_mlidc_sis_pinned_boundaries},
-      }};
-      impl->target.encode(
-          data, opts, tuning, /*realNestedSelection=*/true, config);
-      return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
-    };
-    encoders.push_back(std::move(entry));
+    for (const bool view : {false, true}) {
+      EncoderEntry<T> entry;
+      entry.name = view ? "SIS/pinned+view" : "SIS/pinned";
+      entry.family = "SubIntSplit";
+      entry.variant = FLAGS_mlidc_sis_pinned_label + (view ? "_view" : "");
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = view;
+      entry.randomAccess = view;
+      entry.factory = [view](
+                          const Vector<T>& data,
+                          const Encoding::Options& opts,
+                          const subintsplit::TuningConfig& tuning) {
+        const EncodingLayout::Config config{{
+            {std::string(subintsplit::kSplitModeConfigKey),
+             std::string(subintsplit::kSplitModePreserve)},
+            {std::string(subintsplit::kSplitBoundariesConfigKey),
+             FLAGS_mlidc_sis_pinned_boundaries},
+        }};
+        if (view) {
+          auto impl = std::make_unique<
+              NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+          impl->encodeWith(
+              data, opts, tuning, /*realNestedSelection=*/true, config);
+          return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+        }
+        auto impl =
+            std::make_unique<NimbleBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->target.encode(
+            data, opts, tuning, /*realNestedSelection=*/true, config);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
   }
 
   {
