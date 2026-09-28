@@ -318,9 +318,8 @@ const SectionTransform* transformFor(TransformId id) {
     case TransformId::KeyDerived:
       return &kKeyDerived;
   }
-  NIMBLE_UNREACHABLE(
-      fmt::format(
-          "Unsupported SubIntSplit transform id: {}", static_cast<int>(id)));
+  NIMBLE_UNREACHABLE(fmt::format(
+      "Unsupported SubIntSplit transform id: {}", static_cast<int>(id)));
 }
 
 } // namespace facebook::nimble::subintsplit
