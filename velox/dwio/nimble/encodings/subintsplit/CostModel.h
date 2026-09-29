@@ -395,11 +395,21 @@ inline uint64_t plainStreamBytesV2(
 /// range, which collapsing runs preserves. One pass over `segValues` finds the
 /// run lengths, the same order of work as the BlockBitPacking model. Falls
 /// back to the V1 model when the values are not supplied.
+///
+/// `sampleBlockSize` is the block size of the block-stratified sample
+/// `segValues` was drawn with, or 0 when it is contiguous (a full scan, or
+/// stride sampling). Two adjacent sample blocks come from rows blockStride
+/// apart, so the pair at a block join is not a run boundary of the stream.
+/// Counting it adds one run per block, about avgRunLength / blockSize
+/// relative to the stream's runs (+9% at 12-row runs and 128-row blocks,
+/// +50% at 64-row runs). Only transitions inside a block count as runs; a
+/// join still ends a run for the shortest and longest run.
 inline double rleCostBitsV2(
     const SectionMetrics& m,
     size_t numValues,
     int bitWidth,
-    const std::vector<uint64_t>& segValues) {
+    const std::vector<uint64_t>& segValues,
+    size_t sampleBlockSize = 0) {
   if (numValues == 0 || m.avgRunLength <= 0.0) {
     return 0.0;
   }
@@ -411,14 +421,17 @@ inline double rleCostBitsV2(
   uint64_t shortest = std::numeric_limits<uint64_t>::max();
   uint64_t longest = 0;
   for (size_t i = 1; i < numValues; ++i) {
-    if (segValues[i] == segValues[i - 1]) {
+    const bool blockJoin = sampleBlockSize > 0 && i % sampleBlockSize == 0;
+    if (!blockJoin && segValues[i] == segValues[i - 1]) {
       ++run;
       continue;
     }
     shortest = std::min(shortest, run);
     longest = std::max(longest, run);
     run = 1;
-    ++runs;
+    if (!blockJoin) {
+      ++runs;
+    }
   }
   shortest = std::min(shortest, run);
   longest = std::max(longest, run);
@@ -864,7 +877,8 @@ inline SectionCost bestSectionCost(
     bool allowDeltaBlock,
     const DecodeCostWeighting& weighting,
     const AllowedEncodings& excluded = {},
-    bool costModelV2 = false) noexcept {
+    bool costModelV2 = false,
+    size_t sampleBlockSize = 0) noexcept {
   SectionCost best;
   auto consider = [&](double sizeBits, EncodingType type) noexcept {
     if (!allowed.empty() && allowed.count(type) == 0) {
@@ -899,8 +913,15 @@ inline SectionCost bestSectionCost(
       mainlyConstantCostBits(m, numValues, bitWidth),
       EncodingType::MainlyConstant);
   consider(
-      costModelV2 ? rleCostBitsV2(m, numValues, bitWidth, segValues)
-                  : rleCostBits(m, numValues, bitWidth),
+      costModelV2
+          ? rleCostBitsV2(
+                m,
+                numValues,
+                bitWidth,
+                segValues,
+                // A sample of the whole stream is contiguous.
+                numValues < fullCount ? sampleBlockSize : 0)
+          : rleCostBits(m, numValues, bitWidth),
       EncodingType::RLE);
   consider(varintCostBits(m, numValues, bitWidth), EncodingType::Varint);
   // Dictionary only where the stream's estimated alphabet is small enough
@@ -964,7 +985,8 @@ inline double bestCostBitsRestricted(
     bool allowHuffman,
     bool allowDeltaBlock,
     EncodingType& bestEncoding,
-    bool costModelV2 = false) noexcept {
+    bool costModelV2 = false,
+    size_t sampleBlockSize = 0) noexcept {
   const SectionCost cost = bestSectionCost(
       m,
       numValues,
@@ -976,7 +998,8 @@ inline double bestCostBitsRestricted(
       allowDeltaBlock,
       DecodeCostWeighting{},
       /*excluded=*/{},
-      costModelV2);
+      costModelV2,
+      sampleBlockSize);
   bestEncoding = cost.encoding;
   return cost.weightedBits;
 }

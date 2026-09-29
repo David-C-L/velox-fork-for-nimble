@@ -96,6 +96,11 @@ struct SelectorConfig {
   /// estimate consistent between sample and full scan). Off by default, which
   /// leaves every plan unchanged. Evaluation only for now.
   bool costModelV2{false};
+  /// Block size of the block-stratified sample the grid is costed on, or 0
+  /// for a contiguous one. Read only by costModelV2's RLE model, which must
+  /// not count a join between two sample blocks as a run. Set by the entry
+  /// points that draw the sample.
+  size_t sampleBlockSize{0};
 };
 
 /// Extra bits the DP charges each section after the first.
@@ -720,7 +725,8 @@ inline auto restrictedSectionCostFn(
           allowDeltaBlock = cfg.allowDeltaBlock,
           weighting = cfg.decodeWeighting,
           excluded = cfg.excludedEncodings,
-          costModelV2 = cfg.costModelV2](
+          costModelV2 = cfg.costModelV2,
+          sampleBlockSize = cfg.sampleBlockSize](
              const SectionMetrics& m,
              size_t numValues,
              size_t streamCount,
@@ -737,7 +743,8 @@ inline auto restrictedSectionCostFn(
         allowDeltaBlock,
         weighting,
         excluded,
-        costModelV2);
+        costModelV2,
+        sampleBlockSize);
   };
 }
 

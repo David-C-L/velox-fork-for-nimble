@@ -1595,6 +1595,7 @@ subintsplit::SelectorConfig SubIntSplitEncoding<T>::plannerSelectorConfig(
     size_t rowCount) {
   auto selectorConfig = tuning.selector;
   selectorConfig.streamRowCount = rowCount;
+  selectorConfig.sampleBlockSize = tuning.sampler.blockSize;
   // The cost models cover encodings that nestedEncodingReadFactors offers a
   // section but that EncodingSizeEstimation may not price. select() skips an
   // encoding it cannot price, so a section is never given one, and a plan
@@ -1689,6 +1690,7 @@ std::optional<uint64_t> SubIntSplitEncoding<T>::estimateSize(
   // disk, and selection is comparing bytes here.
   auto selectorConfig = plannerSelectorConfig(tuning, rowCount);
   selectorConfig.decodeWeighting = subintsplit::DecodeCostWeighting{};
+  selectorConfig.sampleBlockSize = estimatorSamplerConfig().blockSize;
   const auto planBytes =
       [&](const std::vector<uint64_t>& planSamples) -> std::optional<uint64_t> {
     const auto plan = subintsplit::selectSplitsRestricted(

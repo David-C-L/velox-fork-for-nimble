@@ -842,6 +842,7 @@ std::vector<SectionPlan> writerDerivedPlan(
   writerCfg.allowDeltaBlock = columnTuning.selector.allowDeltaBlock;
   writerCfg.splitPenalty = columnTuning.selector.splitPenalty;
   writerCfg.costModelV2 = columnTuning.selector.costModelV2;
+  writerCfg.sampleBlockSize = defaultSamplerConfig().blockSize;
   return selectSplitsRestricted(
              writerSample,
              kBits,
@@ -1078,6 +1079,7 @@ int runBenchmark() {
   selectorCfg.allowDeltaBlock = FLAGS_allow_delta_block;
   selectorCfg.splitPenalty = FLAGS_mlidc_sis_split_penalty;
   selectorCfg.costModelV2 = FLAGS_mlidc_sis_cost_model_v2;
+  selectorCfg.sampleBlockSize = samplerCfg.blockSize;
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
 
   for (const auto& ds : datasets) {
@@ -1292,7 +1294,8 @@ int runBenchmark() {
               FLAGS_allow_huffman,
               FLAGS_allow_delta_block,
               modelBestEnc,
-              selectorCfg.costModelV2);
+              selectorCfg.costModelV2,
+              selectorCfg.sampleBlockSize);
           costModelNanos += static_cast<uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - costModelStart)
@@ -1344,7 +1347,12 @@ int runBenchmark() {
                 break;
               case EncodingType::RLE:
                 bits = costModelV2
-                    ? rleCostBitsV2(metrics, sampleSize, width, sectionU64)
+                    ? rleCostBitsV2(
+                          metrics,
+                          sampleSize,
+                          width,
+                          sectionU64,
+                          sampleSize < n ? selectorCfg.sampleBlockSize : 0)
                     : rleCostBits(metrics, sampleSize, width);
                 break;
               case EncodingType::Varint:
