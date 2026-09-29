@@ -91,6 +91,11 @@ struct SelectorConfig {
   /// Rows in the full stream, which decodeCostBitsPerValue is scaled by. Set
   /// by the entry points that are handed the row count.
   size_t streamRowCount{0};
+  /// Prices RLE and Dictionary with the V2 cost models in CostModel.h (nested
+  /// streams at the widths and options a section writes, and a distinct-count
+  /// estimate consistent between sample and full scan). Off by default, which
+  /// leaves every plan unchanged. Evaluation only for now.
+  bool costModelV2{false};
 };
 
 /// Extra bits the DP charges each section after the first.
@@ -714,7 +719,8 @@ inline auto restrictedSectionCostFn(
           allowHuffman = cfg.allowHuffman,
           allowDeltaBlock = cfg.allowDeltaBlock,
           weighting = cfg.decodeWeighting,
-          excluded = cfg.excludedEncodings](
+          excluded = cfg.excludedEncodings,
+          costModelV2 = cfg.costModelV2](
              const SectionMetrics& m,
              size_t numValues,
              size_t streamCount,
@@ -730,7 +736,8 @@ inline auto restrictedSectionCostFn(
         allowHuffman,
         allowDeltaBlock,
         weighting,
-        excluded);
+        excluded,
+        costModelV2);
   };
 }
 

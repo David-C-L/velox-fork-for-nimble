@@ -87,6 +87,7 @@ if(NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS)
     PRIVATE
       SubIntSplitEncodingTest.cpp
       SubIntSplitCostModelsTest.cpp
+      SubIntSplitCostModelV2Test.cpp
       SubIntSplitEncodingViewTest.cpp
       SubIntSplitTopLevelPolicyTest.cpp
       SubIntSplitSelectorTest.cpp

@@ -295,6 +295,180 @@ rleCostBits(const SectionMetrics& m, size_t numValues, int bitWidth) noexcept {
   return headerBits + runValuesBits + runLengthsBits;
 }
 
+// ---------------------------------------------------------------------------
+// Cost model V2 (opt-in, SelectorConfig::costModelV2).
+//
+// The V1 RLE and Dictionary models above price nested streams differently
+// from how a section writes them: RLE stores run values at full storage width
+// with 16-bit run lengths, and both call the nested estimators with
+// Encoding::Options{}, which rounds bit widths up to a byte while a section
+// packs at its exact width (sectionEncodingOptions in SubIntSplitEncoding.h).
+// V2 prices RLE's two nested streams and Dictionary's indices and alphabet
+// with the estimators and options the section encode uses, and extrapolates
+// distinct counts with an estimator that agrees with a full scan. Off by
+// default, where the planner's output is unchanged.
+// ---------------------------------------------------------------------------
+
+/// The options a section's nested streams are written with: exact bit widths
+/// and the refined estimators, as sectionEncodingOptions sets them.
+inline Encoding::Options sectionEstimateOptionsV2() {
+  Encoding::Options options;
+  options.fixedBitWidthUseExactBits = true;
+  options.sectionEstimatorRefinements = true;
+  return options;
+}
+
+/// V2 distinct count of the stream a segment was sampled from. Shlosser's
+/// estimator (Haas et al., VLDB 1995) over the rows the frequencies were
+/// counted on, with frequencies above two lumped at three since SectionMetrics
+/// keeps only singletons and doubletons. It tends to the observed count as the
+/// counted rows approach the stream, so a full scan, a large sample and a
+/// capped count all price a stream on one curve, where V1 switches from Chao1
+/// to the raw count at full scan. Near-unique block samples extrapolate to
+/// about the stream's row count instead of Chao1's f1^2 / 2f2 lower bound.
+inline double estimatedStreamUniqueCountV2(
+    const SectionMetrics& m,
+    size_t numValues,
+    int bitWidth,
+    size_t fullCount) noexcept {
+  const double observed = static_cast<double>(m.uniqueCount);
+  const double rows = static_cast<double>(std::max<size_t>(fullCount, 1));
+  const double capacity = bitWidth >= 63
+      ? rows
+      : std::min(static_cast<double>(uint64_t{1} << bitWidth), rows);
+  const double counted =
+      static_cast<double>(m.countedRows > 0 ? m.countedRows : numValues);
+  if (counted >= rows || observed <= 0.0) {
+    return std::min(observed, capacity);
+  }
+  const double q = counted / rows;
+  const auto f1 = static_cast<double>(m.singletonCount);
+  const auto f2 = static_cast<double>(m.doubletonCount);
+  const double rest = std::max(0.0, observed - f1 - f2);
+  const double restRows = std::max(0.0, counted - f1 - 2.0 * f2);
+  const double p = 1.0 - q;
+  const double numerator = p * f1 + p * p * f2 + p * p * p * rest;
+  const double denominator =
+      q * f1 + 2.0 * q * p * f2 + q * p * p * restRows;
+  const double estimate =
+      denominator > 0.0 ? observed + f1 * numerator / denominator : observed;
+  return std::clamp(estimate, observed, std::max(observed, capacity));
+}
+
+/// Bytes of a section-width stream of `count` values in [minValue, maxValue]
+/// stored as the cheaper of Trivial and exact-width FixedBitWidth, at the
+/// storage type a `bitWidth`-bit section is narrowed to.
+inline uint64_t plainStreamBytesV2(
+    uint64_t count,
+    uint64_t minValue,
+    uint64_t maxValue,
+    int bitWidth) {
+  const Encoding::Options options = sectionEstimateOptionsV2();
+  switch (storageWidthBits(bitWidth)) {
+    case 8:
+      return std::min(
+          TrivialEncoding<uint8_t>::estimateSize(count),
+          FixedBitWidthEncoding<uint8_t>::estimateSize(
+              count, minValue, maxValue, options));
+    case 16:
+      return std::min(
+          TrivialEncoding<uint16_t>::estimateSize(count),
+          FixedBitWidthEncoding<uint16_t>::estimateSize(
+              count, minValue, maxValue, options));
+    case 32:
+      return std::min(
+          TrivialEncoding<uint32_t>::estimateSize(count),
+          FixedBitWidthEncoding<uint32_t>::estimateSize(
+              count, minValue, maxValue, options));
+    default:
+      return std::min(
+          TrivialEncoding<uint64_t>::estimateSize(count),
+          FixedBitWidthEncoding<uint64_t>::estimateSize(
+              count, minValue, maxValue, options));
+  }
+}
+
+/// V2 RLE: RLEEncoding's layout, prefix + run-lengths size + two nested
+/// streams. Run lengths are priced as exact-width FixedBitWidth<uint32_t> over
+/// [shortest, longest] run, as RLEEncoding::estimateSize does; run values as
+/// the cheaper of Trivial and exact-width FixedBitWidth over the segment's
+/// range, which collapsing runs preserves. One pass over `segValues` finds the
+/// run lengths, the same order of work as the BlockBitPacking model. Falls
+/// back to the V1 model when the values are not supplied.
+inline double rleCostBitsV2(
+    const SectionMetrics& m,
+    size_t numValues,
+    int bitWidth,
+    const std::vector<uint64_t>& segValues) {
+  if (numValues == 0 || m.avgRunLength <= 0.0) {
+    return 0.0;
+  }
+  if (segValues.size() < numValues) {
+    return rleCostBits(m, numValues, bitWidth);
+  }
+  uint64_t runs = 1;
+  uint64_t run = 1;
+  uint64_t shortest = std::numeric_limits<uint64_t>::max();
+  uint64_t longest = 0;
+  for (size_t i = 1; i < numValues; ++i) {
+    if (segValues[i] == segValues[i - 1]) {
+      ++run;
+      continue;
+    }
+    shortest = std::min(shortest, run);
+    longest = std::max(longest, run);
+    run = 1;
+    ++runs;
+  }
+  shortest = std::min(shortest, run);
+  longest = std::max(longest, run);
+
+  const uint64_t runLengthsBytes =
+      FixedBitWidthEncoding<uint32_t>::estimateSize(
+          runs, shortest, longest, sectionEstimateOptionsV2());
+  const uint64_t runValuesBytes =
+      plainStreamBytesV2(runs, m.min, m.max, bitWidth);
+  // prefix(6) + runLengthsSize(4), as RLEEncoding::estimateSize.
+  constexpr double kOuterBytes = 6.0 + 4.0;
+  return (kOuterBytes + static_cast<double>(runLengthsBytes) +
+          static_cast<double>(runValuesBytes)) *
+      8.0;
+}
+
+/// V2 Dictionary: indices at the exact width of the stream's estimated
+/// distinct count, and an alphabet of that many entries. The alphabet is
+/// written once per stream, so it is charged here at numValues / fullCount of
+/// its stream size: the selector scales every cell by fullCount / numValues,
+/// which restores it to one stream alphabet, where V1 scaled a sample-sized
+/// (and at large samples, capped) alphabet up with the rows.
+inline double dictionaryCostBitsV2(
+    const SectionMetrics& m,
+    size_t numValues,
+    size_t fullCount,
+    int bitWidth) {
+  if (m.uniqueCount == 0 || numValues == 0) {
+    return 0.0;
+  }
+  const double estimate = std::max(
+      1.0, estimatedStreamUniqueCountV2(m, numValues, bitWidth, fullCount));
+  const auto streamUniques = static_cast<uint64_t>(std::llround(estimate));
+  const uint64_t indicesBytes = FixedBitWidthEncoding<uint32_t>::estimateSize(
+      numValues,
+      /*minValue=*/0,
+      streamUniques - 1,
+      sectionEstimateOptionsV2());
+  const uint64_t alphabetBytes =
+      plainStreamBytesV2(streamUniques, m.min, m.max, bitWidth);
+  const double alphabetShare = fullCount > numValues
+      ? static_cast<double>(numValues) / static_cast<double>(fullCount)
+      : 1.0;
+  // Outer: prefix(6) + alphabetSize(4), matching DictionaryEncoding's layout.
+  constexpr double kOuterBytes = 6.0 + 4.0;
+  return (kOuterBytes + static_cast<double>(indicesBytes) +
+          static_cast<double>(alphabetBytes) * alphabetShare) *
+      8.0;
+}
+
 // Varint: variable-length integer storage. Only useful for ≥32-bit sections.
 inline double varintCostBits(
     const SectionMetrics& m,
@@ -689,7 +863,8 @@ inline SectionCost bestSectionCost(
     bool allowHuffman,
     bool allowDeltaBlock,
     const DecodeCostWeighting& weighting,
-    const AllowedEncodings& excluded = {}) noexcept {
+    const AllowedEncodings& excluded = {},
+    bool costModelV2 = false) noexcept {
   SectionCost best;
   auto consider = [&](double sizeBits, EncodingType type) noexcept {
     if (!allowed.empty() && allowed.count(type) == 0) {
@@ -723,19 +898,24 @@ inline SectionCost bestSectionCost(
   consider(
       mainlyConstantCostBits(m, numValues, bitWidth),
       EncodingType::MainlyConstant);
-  consider(rleCostBits(m, numValues, bitWidth), EncodingType::RLE);
+  consider(
+      costModelV2 ? rleCostBitsV2(m, numValues, bitWidth, segValues)
+                  : rleCostBits(m, numValues, bitWidth),
+      EncodingType::RLE);
   consider(varintCostBits(m, numValues, bitWidth), EncodingType::Varint);
   // Dictionary only where the stream's estimated alphabet is small enough
   // against the stream's rows for indices to beat values. Must use the
   // stream-level estimate, not the sample's raw count: a capped sample would
   // otherwise look small enough to admit Dictionary regardless of the
   // stream's true cardinality.
-  const double streamUniques =
-      estimatedStreamUniqueCount(m, numValues, bitWidth, fullCount);
+  const double streamUniques = costModelV2
+      ? estimatedStreamUniqueCountV2(m, numValues, bitWidth, fullCount)
+      : estimatedStreamUniqueCount(m, numValues, bitWidth, fullCount);
   if (m.uniqueCount > 0 &&
       streamUniques < static_cast<double>(fullCount) / 2.0) {
     consider(
-        dictionaryCostBits(m, numValues, fullCount, bitWidth),
+        costModelV2 ? dictionaryCostBitsV2(m, numValues, fullCount, bitWidth)
+                    : dictionaryCostBits(m, numValues, fullCount, bitWidth),
         EncodingType::Dictionary);
   }
   consider(
@@ -783,7 +963,8 @@ inline double bestCostBitsRestricted(
     const AllowedEncodings& allowed,
     bool allowHuffman,
     bool allowDeltaBlock,
-    EncodingType& bestEncoding) noexcept {
+    EncodingType& bestEncoding,
+    bool costModelV2 = false) noexcept {
   const SectionCost cost = bestSectionCost(
       m,
       numValues,
@@ -793,7 +974,9 @@ inline double bestCostBitsRestricted(
       allowed,
       allowHuffman,
       allowDeltaBlock,
-      DecodeCostWeighting{});
+      DecodeCostWeighting{},
+      /*excluded=*/{},
+      costModelV2);
   bestEncoding = cost.encoding;
   return cost.weightedBits;
 }
