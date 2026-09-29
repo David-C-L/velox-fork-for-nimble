@@ -841,6 +841,7 @@ std::vector<SectionPlan> writerDerivedPlan(
   writerCfg.allowHuffman = columnTuning.selector.allowHuffman;
   writerCfg.allowDeltaBlock = columnTuning.selector.allowDeltaBlock;
   writerCfg.splitPenalty = columnTuning.selector.splitPenalty;
+  writerCfg.costModelV2 = columnTuning.selector.costModelV2;
   return selectSplitsRestricted(
              writerSample,
              kBits,
@@ -962,6 +963,7 @@ int runBenchmark() {
   columnTuning.selector.allowHuffman = FLAGS_allow_huffman;
   columnTuning.selector.allowDeltaBlock = FLAGS_allow_delta_block;
   columnTuning.selector.splitPenalty = FLAGS_mlidc_sis_split_penalty;
+  columnTuning.selector.costModelV2 = FLAGS_mlidc_sis_cost_model_v2;
   const facebook::nimble::Encoding::Options sectionOptions =
       sectionEncodingOptions(columnOptions, columnTuning);
 
@@ -1075,6 +1077,7 @@ int runBenchmark() {
   selectorCfg.allowHuffman = FLAGS_allow_huffman;
   selectorCfg.allowDeltaBlock = FLAGS_allow_delta_block;
   selectorCfg.splitPenalty = FLAGS_mlidc_sis_split_penalty;
+  selectorCfg.costModelV2 = FLAGS_mlidc_sis_cost_model_v2;
   const MetricFlags requiredFlags = allCostModelRequiredFlags();
 
   for (const auto& ds : datasets) {
@@ -1288,7 +1291,8 @@ int runBenchmark() {
               allowed,
               FLAGS_allow_huffman,
               FLAGS_allow_delta_block,
-              modelBestEnc);
+              modelBestEnc,
+              selectorCfg.costModelV2);
           costModelNanos += static_cast<uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - costModelStart)
@@ -1304,9 +1308,12 @@ int runBenchmark() {
           // them a gated-out Dictionary would report the lowest est_bits in the
           // row while is_model_pick stayed zero, which reads as a bug in the
           // driver rather than as the model declining to offer it.
+          const bool costModelV2 = selectorCfg.costModelV2;
+          const double streamUniques = costModelV2
+              ? estimatedStreamUniqueCountV2(metrics, sampleSize, width, n)
+              : estimatedStreamUniqueCount(metrics, sampleSize, width, n);
           const bool dictionaryViable = metrics.uniqueCount > 0 &&
-              estimatedStreamUniqueCount(metrics, sampleSize, width, n) <
-                  static_cast<double>(n) / 2.0;
+              streamUniques < static_cast<double>(n) / 2.0;
           const bool frequencyPartitionViable = metrics.uniqueCount > 0 &&
               !metrics.uniqueCountCapped && metrics.uniqueCount <= 1024;
           const bool huffmanViable = FLAGS_allow_huffman &&
@@ -1330,12 +1337,15 @@ int runBenchmark() {
                 bits = mainlyConstantCostBits(metrics, sampleSize, width);
                 break;
               case EncodingType::Dictionary:
-                bits = dictionaryViable
-                    ? dictionaryCostBits(metrics, sampleSize, n, width)
-                    : kUnavailable;
+                bits = !dictionaryViable ? kUnavailable
+                    : costModelV2
+                    ? dictionaryCostBitsV2(metrics, sampleSize, n, width)
+                    : dictionaryCostBits(metrics, sampleSize, n, width);
                 break;
               case EncodingType::RLE:
-                bits = rleCostBits(metrics, sampleSize, width);
+                bits = costModelV2
+                    ? rleCostBitsV2(metrics, sampleSize, width, sectionU64)
+                    : rleCostBits(metrics, sampleSize, width);
                 break;
               case EncodingType::Varint:
                 bits = varintCostBits(metrics, sampleSize, width);

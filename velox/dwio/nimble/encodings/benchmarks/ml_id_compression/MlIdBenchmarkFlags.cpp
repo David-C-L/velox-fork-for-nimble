@@ -168,6 +168,14 @@ DEFINE_string(
     mlidc_sis_pinned_label,
     "pinned",
     "The variant column of the SIS/pinned arm, naming the pinned plan.");
+DEFINE_bool(
+    mlidc_sis_cost_model_v2,
+    false,
+    "subintsplit::SelectorConfig::costModelV2: prices RLE and Dictionary "
+    "sections with the V2 cost models (nested streams at the widths a section "
+    "writes, distinct counts consistent between sample and full scan). Off, "
+    "the default, leaves every plan as the library builds it. The cost model "
+    "oracle driver applies it to its own selector config and estimates too.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,
