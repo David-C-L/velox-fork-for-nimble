@@ -129,3 +129,25 @@ ACCESS_CACHE_STATES="hot cold-payload"
 # The encode driver ignores this by design -- it would otherwise time the load
 # it was supposed to be timing an encode for. See METHODOLOGY.md.
 SWEEP_ENCODE_CACHE_DIR="${SWEEP_ENCODE_CACHE_DIR:-}"
+
+# --- columns ----------------------------------------------------------------
+# One line per column: name|path under the Datasets root|full row count. A
+# launcher runs a column at its full length or at the leading SWEEP_ROWS rows.
+# Bit-field structured columns first, then the unstructured controls.
+SWEEP_COLUMNS_STRUCTURED="snowflake|TwitterSnowflake/csv/tweet_id_full.txt|10000000
+xmark_prepost_full|XMark/csv/prepost_id_full.txt|32298988
+osm_h3_r9_fileorder|OSM/csv/h3_r9_fileorder.txt|10000000
+osm_s2_l30_fileorder|OSM/csv/s2_l30_fileorder.txt|10000000
+bing_quadkey|BingTiles/csv/quadkey_fileorder_full.txt|9869460
+uuidv7_hi|UUIDv7/csv/uuidv7_hi_10M.txt|10000000
+instagram|Instagram/instagram_id_full.txt|1536841"
+SWEEP_COLUMNS_UNSTRUCTURED="publicbi_npi|PublicBI/Medicare1/csv/NPI_full.txt|17290144
+publicbi_id1|PublicBI/Corporations/csv/Id1.txt|739754
+uuidv7_lo|UUIDv7/csv/uuidv7_lo_10M.txt|10000000
+publicbi_drug_cost|PublicBI_controls_20260929/Medicare1_TOTAL_DRUG_COST_cents_full.txt|17290144
+publicbi_day_supply|PublicBI_controls_20260929/Medicare1_TOTAL_DAY_SUPPLY_full.txt|17290144
+publicbi_bene_count|PublicBI_controls_20260929/Medicare1_BENE_COUNT_full.txt|17290144
+publicbi_num_employees|PublicBI_controls_20260929/Corporations_num_employees_full.txt|739752
+publicbi_day_supply_bin|PublicBI_controls_20260929/Medicare1_Avg_Day_Supply_Bene_bin_full.txt|17290144"
+SWEEP_COLUMNS="$SWEEP_COLUMNS_STRUCTURED
+$SWEEP_COLUMNS_UNSTRUCTURED"
