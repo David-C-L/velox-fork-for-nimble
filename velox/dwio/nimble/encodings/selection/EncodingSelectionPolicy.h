@@ -200,28 +200,34 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
 /// so that no plan is shaped around an encoding its sections cannot take.
 /// kDefault, and any stream outside a section, is left untouched.
 ///
-/// kAddressable withdraws what isAddressableSectionEncoding rejects, at every
-/// depth, since a nested stream read through its own view is positioned by
-/// the same kind of seek as its section. kUnrestricted adds Huffman, which
-/// the list withholds for its bit-serial decode, to integer streams.
+/// kAddressableStrict withdraws what isAddressableSectionEncoding rejects, at
+/// every depth. kAddressableTopLevel withdraws it only where `rowAddressed`:
+/// from the section itself and from the streams below it that a read reaches
+/// per row (subintsplit::isRowAddressedStream), not from a stream its parent
+/// decodes whole on open. kUnrestricted adds Huffman, which the list
+/// withholds for its bit-serial decode, to integer streams.
 template <typename T>
 void applySectionCandidates(
     std::vector<std::pair<EncodingType, float>>& candidates,
-    const Encoding::Options& options) {
+    const Encoding::Options& options,
+    bool rowAddressed = true) {
   const auto setting = options.subIntSplit.sectionCandidates;
   if (!options.subIntSplit.sectionSelection ||
       setting == subintsplit::SectionCandidates::kDefault) {
     return;
   }
-  if (setting == subintsplit::SectionCandidates::kAddressable) {
-    candidates.erase(
-        std::remove_if(
-            candidates.begin(),
-            candidates.end(),
-            [](const auto& entry) {
-              return !subintsplit::isAddressableSectionEncoding(entry.first);
-            }),
-        candidates.end());
+  if (subintsplit::isAddressableSetting(setting)) {
+    if (setting == subintsplit::SectionCandidates::kAddressableStrict ||
+        rowAddressed) {
+      candidates.erase(
+          std::remove_if(
+              candidates.begin(),
+              candidates.end(),
+              [](const auto& entry) {
+                return !subintsplit::isAddressableSectionEncoding(entry.first);
+              }),
+          candidates.end());
+    }
     return;
   }
   using physicalType = typename TypeTraits<T>::physicalType;
@@ -521,12 +527,22 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       std::optional<CompressionOptions> compressionOptions,
       std::optional<NestedEncodingIdentifier> identifier,
       std::optional<std::vector<std::pair<EncodingType, float>>>
-          nestedEncodingReadFactors = std::nullopt)
+          nestedEncodingReadFactors = std::nullopt,
+      bool rowAddressed = true)
       : candidateEncodingReadFactors_{std::move(encodingReadFactors)},
         compressionOptions_{std::move(compressionOptions)},
         identifier_{identifier},
         nestedEncodingReadFactorsOverride_{
-            std::move(nestedEncodingReadFactors)} {}
+            std::move(nestedEncodingReadFactors)},
+        rowAddressed_{rowAddressed} {}
+
+  /// Whether a read reaches this policy's stream per row of the stream at
+  /// the top of the tree: true there, and below it only through children
+  /// subintsplit::isRowAddressedStream calls row addressed. Consulted by
+  /// applySectionCandidates under SectionCandidates::kAddressableTopLevel.
+  bool rowAddressed() const {
+    return rowAddressed_;
+  }
 
   EncodingSelectionResult select(
       std::span<const physicalType> values,
@@ -573,7 +589,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     }
 
     // A SubIntSplit section's streams, held to the section candidate setting.
-    applySectionCandidates<T>(candidateEncodingReadFactors, options);
+    applySectionCandidates<T>(
+        candidateEncodingReadFactors, options, rowAddressed_);
 
     bool subIntSplitForced{false};
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
@@ -720,7 +737,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         identifier_,
         nestedEncodingReadFactorsOverride_.has_value()
             ? nestedEncodingReadFactorsOverride_.value()
-            : candidateEncodingReadFactors_);
+            : candidateEncodingReadFactors_,
+        rowAddressed_);
   }
 
  protected:
@@ -745,7 +763,10 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         std::move(nestedEncodingReadFactors),
         compressionOptions_,
         nestedEncodingIdentifier,
-        std::nullopt);
+        std::nullopt,
+        rowAddressed_ &&
+            subintsplit::isRowAddressedStream(
+                parentEncodingType, nestedEncodingIdentifier));
   }
 
  private:
@@ -766,6 +787,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
   // parent's already-filtered candidates.
   const std::optional<std::vector<std::pair<EncodingType, float>>>
       nestedEncodingReadFactorsOverride_;
+  // See rowAddressed().
+  const bool rowAddressed_;
 };
 
 class ManualEncodingSelectionPolicyFactory {

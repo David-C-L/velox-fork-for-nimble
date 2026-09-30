@@ -27,6 +27,7 @@
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/encodings/views/MaterializedEncodingView.h"
 
 namespace facebook::nimble {
 
@@ -58,7 +59,10 @@ class RLEEncodingView final : public TypedEncodingView<T> {
     NIMBLE_CHECK_EQ(end, this->rowCount_);
 
     pos += runLengthsSize;
-    values_ = detail::createTypedEncodingView<runValueType>(
+    // Run values are one per run and read through their view; a stream
+    // without one (Delta, Varint) is decoded once here rather than failing
+    // this view, which would decode the whole stream instead.
+    values_ = detail::createTypedEncodingViewOrMaterialized<runValueType>(
         {pos, static_cast<size_t>(data.data() + data.size() - pos)},
         this->pool_,
         options);
