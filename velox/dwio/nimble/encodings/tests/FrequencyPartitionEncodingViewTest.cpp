@@ -184,7 +184,9 @@ TEST_F(FrequencyPartitionEncodingViewTest, edgeCases) {
   std::mt19937 rng{5};
   for (uint32_t run = 0; runs.size() < 50'000; ++run) {
     const uint64_t value = run % 3 == 0 ? rng() % 500 : rng() % 4;
-    runs.insert(runs.end(), 1 + rng() % 900, value);
+    for (auto length = 1 + rng() % 900; length > 0; --length) {
+      runs.push_back(value);
+    }
   }
   expectViewMatches(runs);
   // Every value distinct: the widest tier only.
