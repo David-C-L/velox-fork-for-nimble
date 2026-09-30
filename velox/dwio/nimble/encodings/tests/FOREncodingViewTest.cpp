@@ -21,6 +21,8 @@
 #include "velox/dwio/nimble/common/tests/GTestUtils.h"
 #include "velox/dwio/nimble/encodings/ForEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrefix.h"
+#include "velox/dwio/nimble/encodings/tests/EncodingLayoutTestHelper.h"
+#include "velox/dwio/nimble/encodings/views/FOREncodingView.h"
 
 using namespace facebook;
 
@@ -74,6 +76,50 @@ DEBUG_ONLY_TEST_F(FOREncodingViewTest, rejectsShortCompressedPayload) {
   NIMBLE_ASSERT_THROW(
       nimble::createEncodingView(malformed, pool_.get(), {}),
       "FOR packed payload is shorter than required");
+}
+
+// A per-frame child with no view of its own (Delta bit offsets, as
+// FrequencyPartition tier keys get on Snowflake) is decoded on open, and the
+// FOR stream stays a view.
+TEST_F(FOREncodingViewTest, childWithoutView) {
+  const nimble::EncodingLayout forLayout{
+      nimble::EncodingType::FOR,
+      {},
+      nimble::CompressionType::Uncompressed,
+      {nimble::TrivialEnc{}, nimble::TrivialEnc{}, nimble::DeltaEnc{}}};
+  const auto values = randomPforData(/*seed=*/41);
+  auto policy =
+      std::make_unique<nimble::ReplayedEncodingSelectionPolicy<uint32_t>>(
+          forLayout,
+          nimble::CompressionOptions{},
+          [](nimble::DataType type)
+              -> std::unique_ptr<nimble::EncodingSelectionPolicyBase> {
+            UNIQUE_PTR_FACTORY(type, nimble::TrivialNestedPolicy);
+          });
+  const auto encoded = nimble::EncodingFactory::encode<uint32_t>(
+      std::move(policy),
+      std::span<const uint32_t>{values.data(), values.size()},
+      *buffer_);
+  ASSERT_EQ(
+      nimble::EncodingPrefix::encodingType(encoded), nimble::EncodingType::FOR);
+  auto encoding = nimble::EncodingFactory().create(
+      *pool_, encoded, nullptr, nimble::Encoding::Options{});
+  nimble::Vector<uint32_t> expected{pool_.get(), values.size()};
+  encoding->materialize(values.size(), expected.data());
+  ASSERT_TRUE(std::equal(expected.begin(), expected.end(), values.begin()));
+
+  const auto view = nimble::createEncodingView(encoded, pool_.get(), {});
+  ASSERT_NE(
+      dynamic_cast<const nimble::FOREncodingView<uint32_t>*>(view.get()),
+      nullptr);
+  for (uint32_t row = 0; row < values.size(); ++row) {
+    uint32_t actual;
+    view->readAt(row, &actual);
+    ASSERT_EQ(actual, values[row]) << "row " << row;
+  }
+  std::vector<uint32_t> actual(values.size());
+  view->read(0, values.size(), actual.data());
+  EXPECT_TRUE(std::equal(actual.begin(), actual.end(), values.begin()));
 }
 
 TEST_F(FOREncodingViewTest, concurrent) {

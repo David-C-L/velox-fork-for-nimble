@@ -24,6 +24,7 @@
 #include "velox/dwio/nimble/common/Varint.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/encodings/views/MaterializedEncodingView.h"
 
 namespace facebook::nimble {
 
@@ -68,7 +69,7 @@ class FOREncodingView final : public TypedEncodingView<T> {
     lastFrameRows_ = this->rowCount_ - frameRowOffset(numFrames_ - 1);
 
     const auto bitWidthsSize = varint::readVarint32(&pos);
-    auto bitWidths = detail::createTypedEncodingView<uint8_t>(
+    auto bitWidths = detail::createTypedEncodingViewOrMaterialized<uint8_t>(
         {pos, bitWidthsSize}, pool, options);
     NIMBLE_CHECK_NOT_NULL(bitWidths);
     NIMBLE_CHECK_EQ(bitWidths->rowCount(), numFrames_);
@@ -79,8 +80,9 @@ class FOREncodingView final : public TypedEncodingView<T> {
     pos += bitWidthsSize;
 
     const auto referencesSize = varint::readVarint32(&pos);
-    auto references = detail::createTypedEncodingView<physicalType>(
-        {pos, referencesSize}, pool, options);
+    auto references =
+        detail::createTypedEncodingViewOrMaterialized<physicalType>(
+            {pos, referencesSize}, pool, options);
     NIMBLE_CHECK_NOT_NULL(references);
     NIMBLE_CHECK_EQ(references->rowCount(), numFrames_);
     references_.resize(numFrames_);
@@ -91,7 +93,7 @@ class FOREncodingView final : public TypedEncodingView<T> {
 
     bitOffsets_.resize(numFrames_);
     const auto bitOffsetsSize = varint::readVarint32(&pos);
-    auto bitOffsets = detail::createTypedEncodingView<uint64_t>(
+    auto bitOffsets = detail::createTypedEncodingViewOrMaterialized<uint64_t>(
         {pos, bitOffsetsSize}, pool, options);
     NIMBLE_CHECK_NOT_NULL(bitOffsets);
     NIMBLE_CHECK_EQ(bitOffsets->rowCount(), numFrames_);
