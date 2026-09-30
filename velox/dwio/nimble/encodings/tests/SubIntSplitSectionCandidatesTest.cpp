@@ -46,10 +46,11 @@ namespace {
 
 constexpr uint64_t kSeed = 20'260'930;
 
-// Values that mostly rise by a step in [0, 1000) and fall to a fresh random
-// 24-bit value with probability `fallRate`: Delta's own case at a low rate,
-// and at a high rate the mostly-restated stream selection gives it on
-// Snowflake's [22..50].
+// Values that mostly rise by a step in [0, 1000) and fall to a random value
+// below the current one with probability `fallRate`: Delta's own case. A fall
+// is always a restatement, so every delta is a step; a rise to a far value
+// would be stored as a wide delta, which V2 prices at its full width (an
+// upper bound nested selection can beat with PFOR-style exceptions).
 std::vector<uint64_t> makeRisingValues(size_t numRows, double fallRate) {
   std::mt19937_64 rng(kSeed);
   std::uniform_int_distribution<uint64_t> step(0, 999);
@@ -57,25 +58,37 @@ std::vector<uint64_t> makeRisingValues(size_t numRows, double fallRate) {
   std::vector<uint64_t> values(numRows);
   uint64_t current = rng() & ((uint64_t{1} << 24) - 1);
   for (auto& value : values) {
-    current = fall(rng) ? (rng() & ((uint64_t{1} << 24) - 1))
-                        : ((current + step(rng)) & ((uint64_t{1} << 24) - 1));
+    if (fall(rng) && current > 0) {
+      current = rng() % current;
+    } else {
+      current = std::min(current + step(rng), (uint64_t{1} << 24) - 1);
+    }
     value = current;
   }
   return values;
 }
 
-// A slowly rising 20-bit field over a 30-bit uniformly random one. The random
-// field is where selection takes Delta by default: about half its pairs rise,
-// so Delta stores it at its width plus a bit, which its 0.85 read factor
-// ranks under FixedBitWidth's 0.9 (Snowflake [22..50] and S2 [1..35] are the
-// measured cases). The rising field keeps the plan below the whole-value
-// floor, so the split survives.
-std::vector<uint64_t> makeRandomLowField(size_t numRows) {
+// A `width`-bit field that repeats its value with probability 0.08 and
+// otherwise falls by a random step of up to 1/64 of its range, wrapping: the
+// shape of Snowflake's [22..50] (92% restatements, the deltas mostly zero).
+// Each value is near-random within its width, so nothing stores it much
+// below the width, while Delta stores the restatements at the width and the
+// deltas in next to nothing. With `highField`, a slowly rising 20-bit field
+// sits above it, so a SubIntSplit plan keeps it as its own section, where
+// default selection takes Delta.
+std::vector<uint64_t>
+makeFallingWideField(size_t numRows, int width, bool highField = true) {
   std::mt19937_64 rng(kSeed);
+  const uint64_t mask = (uint64_t{1} << width) - 1;
+  std::bernoulli_distribution repeat(0.08);
   std::vector<uint64_t> values(numRows);
+  uint64_t low = rng() & mask;
   for (size_t i = 0; i < numRows; ++i) {
-    const uint64_t high = 500'000 + i / 256;
-    values[i] = (high << 30) | (rng() & ((uint64_t{1} << 30) - 1));
+    if (!repeat(rng)) {
+      low = (low - 1 - (rng() & (mask >> 6))) & mask;
+    }
+    const uint64_t high = highField ? 500'000 + i / 256 : 0;
+    values[i] = (high << width) | low;
   }
   return values;
 }
@@ -326,11 +339,12 @@ TEST_F(SubIntSplitSectionCandidatesTest, PlannerAndSelectionAgree) {
   EXPECT_EQ(boolList.size(), 2u);
 }
 
-// Precondition for the next test: by default a wide random field is written
-// as Delta, so the addressable setting has something to withdraw.
-TEST_F(SubIntSplitSectionCandidatesTest, DefaultWritesDeltaOnRandomField) {
-  const auto values = makeRandomLowField(1 << 16);
-  const auto types = sectionTypes(encode(values, TuningConfig{}));
+// Precondition for the next test: by default a falling wide field (Snowflake
+// [22..50]'s shape) is written as Delta, so the addressable setting has
+// something to withdraw.
+TEST_F(SubIntSplitSectionCandidatesTest, DefaultWritesDeltaOnFallingWideField) {
+  const auto types =
+      sectionTypes(encode(makeFallingWideField(1 << 16, 29), TuningConfig{}));
   EXPECT_NE(
       std::find(types.begin(), types.end(), EncodingType::Delta), types.end());
 }
@@ -340,7 +354,7 @@ TEST_F(SubIntSplitSectionCandidatesTest, DefaultWritesDeltaOnRandomField) {
 TEST_F(SubIntSplitSectionCandidatesTest, AddressablePlansHaveNoSequentialSection) {
   const auto tuning = tuningFor(SectionCandidates::kAddressable);
   for (const auto& values :
-       {makeRandomLowField(1 << 16),
+       {makeFallingWideField(1 << 16, 29),
         makeMultiFieldValues(1 << 16),
         makeSkewedLowField(1 << 16),
         makeRisingValues(1 << 16, 0.02)}) {
@@ -364,39 +378,48 @@ TEST_F(SubIntSplitSectionCandidatesTest, UnrestrictedPlansRoundTrip) {
   EXPECT_TRUE(planner.deltaCostModelV2);
   EXPECT_EQ(planner.excludedEncodings.count(EncodingType::Delta), 0u);
   for (const auto& values :
-       {makeRandomLowField(1 << 16),
+       {makeFallingWideField(1 << 16, 29),
         makeMultiFieldValues(1 << 16),
         makeSkewedLowField(1 << 16)}) {
     expectRoundTrip(encode(values, tuning), values);
   }
 }
 
-// On the whole stream, V2 Delta is within 10% of what DeltaEncoding writes,
-// both where Delta suits the stream (2% falls) and where it is mostly
-// restatements (60% falls), where V1 declines to price it at all.
+// The two streams the V2 Delta tests price: Delta's own case (steps with 2%
+// falls) and the mostly-restated case selection takes on Snowflake's
+// [22..50] (92% restatements), where V1 declines to price Delta at all.
+std::vector<std::pair<std::string, std::vector<uint64_t>>> deltaStreams(
+    size_t numRows) {
+  return {
+      {"rising, 2% falls", makeRisingValues(numRows, 0.02)},
+      {"falling, 92% restatements",
+       makeFallingWideField(numRows, 24, /*highField=*/false)}};
+}
+
+// On the whole stream, V2 Delta is within 10% of what DeltaEncoding writes.
 //
 // Tolerance: V2 prices each value stream as the cheaper of Trivial and
-// exact-width FixedBitWidth, which is what selection estimates for them; the
-// steps and restated values here are uniform, so no nested encoding writes
-// them much below that, and the rest of the gap is nested headers and the
-// SparseBool-or-bitmap choice for isRestatements. 10% bounds that with room;
-// a stream whose deltas nest into RLE (Snowflake's) sits further below.
+// exact-width FixedBitWidth, which is what selection estimates for them. The
+// steps and restated values here are near-uniform, so no nested encoding
+// writes them much below that; the falling stream's deltas are mostly zero
+// and nest into RLE, which V2 prices at the widest step (a wrap), about 2 of
+// its 24 bits per row. The rest of the gap is nested headers and the
+// SparseBool-or-bitmap choice for isRestatements.
 TEST_F(SubIntSplitSectionCandidatesTest, DeltaV2TracksEncodedSizeOnFullScan) {
   constexpr int kBitWidth = 24;
-  for (const double fallRate : {0.02, 0.6}) {
-    const auto values = makeRisingValues(65'536, fallRate);
+  for (const auto& [name, values] : deltaStreams(65'536)) {
     const SectionMetrics m = metricsOf(values);
     const size_t actual = deltaBytes(values);
     const double v2 = deltaCostBitsV2(m, values.size(), kBitWidth, values);
     EXPECT_LT(relativeError(v2, actual), 0.10)
-        << "falls " << fallRate << ": " << v2 / 8 << " vs " << actual;
+        << name << ": " << v2 / 8 << " vs " << actual;
     const double v1 = deltaCostBits(m, values.size(), kBitWidth);
     if (std::isfinite(v1)) {
-      EXPECT_LE(relativeError(v2, actual), relativeError(v1, actual));
+      EXPECT_LE(relativeError(v2, actual), relativeError(v1, actual)) << name;
     }
   }
-  EXPECT_TRUE(std::isinf(
-      deltaCostBits(metricsOf(makeRisingValues(65'536, 0.6)), 65'536, 24)));
+  EXPECT_TRUE(std::isinf(deltaCostBits(
+      metricsOf(makeFallingWideField(65'536, 24, false)), 65'536, 24)));
 }
 
 // From the default block sample, scaled as the selector scales it, V2 Delta
@@ -407,8 +430,7 @@ TEST_F(SubIntSplitSectionCandidatesTest, DeltaV2TracksEncodedSizeOnFullScan) {
 TEST_F(SubIntSplitSectionCandidatesTest, DeltaV2TracksEncodedSizeFromSample) {
   constexpr size_t kRows = 1 << 18;
   constexpr int kBitWidth = 24;
-  for (const double fallRate : {0.02, 0.6}) {
-    const auto stream = makeRisingValues(kRows, fallRate);
+  for (const auto& [name, stream] : deltaStreams(kRows)) {
     std::vector<uint64_t> sample;
     sampleIntoU64<uint64_t>(std::span<const uint64_t>(stream), sample);
     const SectionMetrics m = metricsOf(sample);
@@ -423,7 +445,7 @@ TEST_F(SubIntSplitSectionCandidatesTest, DeltaV2TracksEncodedSizeFromSample) {
                           defaultSamplerConfig().blockSize) *
         scale;
     EXPECT_LT(relativeError(v2, actual), 0.15)
-        << "falls " << fallRate << ": " << v2 / 8 << " vs " << actual;
+        << name << ": " << v2 / 8 << " vs " << actual;
   }
 }
 
