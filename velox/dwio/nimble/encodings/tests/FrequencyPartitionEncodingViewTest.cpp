@@ -46,21 +46,25 @@ class FrequencyPartitionEncodingViewTest
         "rows={} index={}", values.size(), static_cast<int>(indexType)));
     nimble::Encoding::Options options;
     options.frequencyPartitionIndex = static_cast<uint8_t>(indexType);
-    const auto serialized = nimble::test::Encoder<
-        nimble::FrequencyPartitionEncoding<T>>::
-        encode(*buffer_, values, nimble::CompressionType::Uncompressed, options);
+    const auto serialized =
+        nimble::test::Encoder<nimble::FrequencyPartitionEncoding<T>>::encode(
+            *buffer_, values, nimble::CompressionType::Uncompressed, options);
     const auto rowCount = static_cast<uint32_t>(values.size());
 
-    auto encoding = nimble::test::Encoder<nimble::FrequencyPartitionEncoding<
-        T>>::createEncoding(*buffer_, values, nullptr,
-                            nimble::CompressionType::Uncompressed, options);
+    auto encoding = nimble::test::
+        Encoder<nimble::FrequencyPartitionEncoding<T>>::createEncoding(
+            *buffer_,
+            values,
+            nullptr,
+            nimble::CompressionType::Uncompressed,
+            options);
     nimble::Vector<T> materialized{pool_.get(), rowCount};
     if (rowCount > 0) {
       encoding->materialize(rowCount, materialized.data());
     }
     if (indexType != nimble::FreqPartIndexType::NoIndex) {
-      ASSERT_TRUE(std::equal(
-          materialized.begin(), materialized.end(), values.begin()));
+      ASSERT_TRUE(
+          std::equal(materialized.begin(), materialized.end(), values.begin()));
     }
     const auto* expected =
         reinterpret_cast<const Physical*>(materialized.data());
@@ -98,13 +102,34 @@ class FrequencyPartitionEncodingViewTest
       for (const uint32_t offset : {base, base + 1, base + 255}) {
         for (const uint32_t length : {1u, 2u, 64u, 255u, 256u, 257u, 700u}) {
           if (offset < rowCount) {
-            ranges.emplace_back(
-                offset, std::min(length, rowCount - offset));
+            ranges.emplace_back(offset, std::min(length, rowCount - offset));
           }
         }
       }
       if (base > 0) {
         ranges.emplace_back(base - 1, std::min(2u, rowCount - (base - 1)));
+      }
+    }
+    // Multi-pass reads: passes are 1024 rows and end on block starts, so
+    // ranges start and end on, just before and just after multiples of 1024.
+    for (uint32_t base = 0; base <= rowCount; base += 1024) {
+      for (const uint32_t offset : {base, base + 1, base + 1023}) {
+        for (const uint32_t length : {1023u, 1024u, 1025u, 2348u}) {
+          if (offset < rowCount) {
+            ranges.emplace_back(offset, std::min(length, rowCount - offset));
+          }
+        }
+      }
+    }
+    // Tier boundaries: ranges that start or end where the value, and so
+    // possibly the tier, changes.
+    uint32_t boundaries = 0;
+    for (uint32_t row = 1; row < rowCount && boundaries < 200; ++row) {
+      if (expected[row] != expected[row - 1]) {
+        ++boundaries;
+        ranges.emplace_back(row, std::min(300u, rowCount - row));
+        const uint32_t start = row > 300 ? row - 300 : 0;
+        ranges.emplace_back(start, row - start);
       }
     }
     if (rowCount > 0) {
@@ -122,6 +147,18 @@ class FrequencyPartitionEncodingViewTest
       for (uint32_t i = 0; i < length; ++i) {
         ASSERT_EQ(actual[i], expected[offset + i])
             << "range " << offset << "+" << length << " row " << (offset + i);
+      }
+    }
+    // Whole-view reads in consecutive pieces, as SubIntSplit reads a section
+    // (1024 rows) and at sizes that straddle blocks and passes.
+    for (const uint32_t piece : {1024u, 1000u, 300u, 4096u}) {
+      std::vector<Physical> actual(rowCount + 1, Physical{});
+      for (uint32_t row = 0; row < rowCount; row += piece) {
+        view->read(row, std::min(piece, rowCount - row), actual.data() + row);
+      }
+      for (uint32_t row = 0; row < rowCount; ++row) {
+        ASSERT_EQ(actual[row], expected[row])
+            << "piece " << piece << " row " << row;
       }
     }
     nimble::test::expectRangeListReads(*view, materialized);
@@ -173,9 +210,12 @@ TEST_F(FrequencyPartitionEncodingViewTest, fallbackGroup) {
 }
 
 TEST_F(FrequencyPartitionEncodingViewTest, edgeCases) {
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{1}, uint64_t{42}});
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{256}, uint64_t{42}});
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{257}, uint64_t{42}});
+  expectViewMatches(
+      nimble::Vector<uint64_t>{pool_.get(), size_t{1}, uint64_t{42}});
+  expectViewMatches(
+      nimble::Vector<uint64_t>{pool_.get(), size_t{256}, uint64_t{42}});
+  expectViewMatches(
+      nimble::Vector<uint64_t>{pool_.get(), size_t{257}, uint64_t{42}});
   expectViewMatches(zipf<uint64_t>(255, 30, 3));
   expectViewMatches(zipf<uint64_t>(512, 30, 4));
   // Long runs, so whole 256-row strides hold a single tier (the bulk path)
