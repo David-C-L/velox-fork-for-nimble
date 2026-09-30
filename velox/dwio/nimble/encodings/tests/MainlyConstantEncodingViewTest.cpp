@@ -16,6 +16,7 @@
 
 #include "velox/dwio/nimble/encodings/tests/EncodingViewTestUtils.h"
 
+#include <array>
 #include <random>
 
 #include <gtest/gtest.h>
@@ -150,7 +151,7 @@ TEST_F(MainlyConstantRankDirectoryTest, wordAndBlockBoundaries) {
 
 TEST_F(MainlyConstantRankDirectoryTest, allCommonAndAllUncommon) {
   // All common: no other values at all.
-  expectViewMatches(nimble::Vector<int64_t>{pool_.get(), 5'000, 9}, 1);
+  expectViewMatches(nimble::Vector<int64_t>{pool_.get(), size_t{5'000}, int64_t{9}}, 1);
   // Every row distinct: one row is taken as common, all others are
   // uncommon, so whole blocks are read in bulk from the other values.
   nimble::Vector<int64_t> distinct{pool_.get()};
