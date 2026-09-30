@@ -267,8 +267,11 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     std::array<uint32_t, kStride> keys;
     tier.keys->read(rank, count, keys.data());
     if (!tier.resolved.empty()) {
+      // Held in a local: a store through a one-byte output may alias the
+      // vector's data pointer, which would otherwise be reloaded per row.
+      const physicalType* const resolved = tier.resolved.data();
       for (uint32_t i = 0; i < count; ++i) {
-        output[i] = tier.resolved[keys[i]];
+        output[i] = resolved[keys[i]];
       }
       return;
     }
