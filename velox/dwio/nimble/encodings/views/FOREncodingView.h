@@ -127,6 +127,7 @@ class FOREncodingView final : public TypedEncodingView<T> {
         "FOR packed payload is shorter than required");
 #endif
     packedData_ = payload.data();
+    packedDataBytes_ = payload.size();
   }
 
   ~FOREncodingView() override {
@@ -200,6 +201,16 @@ class FOREncodingView final : public TypedEncodingView<T> {
     if (bitOffsetInByte == 0 &&
         (bitWidth == 8 || bitWidth == 16 || bitWidth == 32 || bitWidth == 64)) {
       return byteAlignedResidualAt(byteOffset, bitWidth);
+    }
+
+    // A fixed 8-byte load compiles to one move; only the payload's last bytes
+    // need the exact-size load below.
+    if (bitOffsetInByte + bitWidth <= 64 &&
+        byteOffset + sizeof(uint64_t) <= packedDataBytes_) {
+      uint64_t word;
+      std::memcpy(&word, packedData_ + byteOffset, sizeof(word));
+      word >>= bitOffsetInByte;
+      return bitWidth == 64 ? word : word & ((uint64_t{1} << bitWidth) - 1);
     }
 
     // Velox's loadBits may overread the exact-size serialized payload. Load
@@ -279,6 +290,7 @@ class FOREncodingView final : public TypedEncodingView<T> {
   Vector<physicalType> references_;
   Vector<uint64_t> bitOffsets_;
   const char* packedData_{nullptr};
+  uint64_t packedDataBytes_{0};
 };
 
 } // namespace facebook::nimble
