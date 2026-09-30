@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <vector>
@@ -34,12 +35,13 @@ namespace facebook::nimble {
 /// (the index SubIntSplit gives its sections).
 ///
 /// On open the tag stream is decoded once into one byte per row (the tier, or
-/// the fallback bucket), and a rank sample is taken every 256 rows for every
-/// bucket. The tiers' dictionaries, keys and the fallback values stay nested
-/// views. A point read takes the row's tag, adds the sample at or before the
-/// row to a count of equal tags over at most 255 bytes, and reads that rank
-/// from the tier. A range read finds every bucket's rank once, at its first
-/// row, and then reads each bucket's rows in bulk.
+/// the fallback bucket), held in 256-row blocks, each led by every bucket's
+/// rank at the block's first row, so a point read's sample and tags share
+/// adjacent cache lines. The tiers' dictionaries, keys and the fallback values
+/// stay nested views. A point read takes the row's tag, adds its block's rank
+/// to a count of equal tags over at most 255 bytes, and reads that rank from
+/// the tier. A range read takes each block's ranks from its header, reads each
+/// bucket's rows in bulk and merges them into row order.
 ///
 /// A stream with any other index (NoIndex, PerTierBitmaps, EliasFano) is
 /// decoded whole on open and served from the decoded values.
@@ -53,8 +55,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       velox::memory::MemoryPool* pool,
       const Encoding::Options& options)
       : TypedEncodingView<T>{data, pool, options},
-        tags_{this->template getVectorBuffer<uint8_t>()},
-        rankSamples_{this->template getVectorBuffer<uint32_t>()} {
+        blocks_{this->template getVectorBuffer<uint8_t>()} {
     NIMBLE_CHECK_EQ(this->encodingType_, EncodingType::FrequencyPartition);
     const char* pos = data.data() + this->dataOffset_;
     const char* const end = data.data() + data.size();
@@ -139,8 +140,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
   }
 
   ~FrequencyPartitionEncodingView() override {
-    this->releaseVectorBuffer(rankSamples_);
-    this->releaseVectorBuffer(tags_);
+    this->releaseVectorBuffer(blocks_);
   }
 
  private:
@@ -155,60 +155,86 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     std::vector<physicalType> resolved;
   };
 
-  // Decodes the tags into one byte per row (a fallback tag becomes
-  // numTiers_) and samples every bucket's rank each kStride rows, with a
-  // sentinel past the end: rankSamples_[s * numBuckets + b] is the count of
-  // tag b in rows [0, s * kStride).
+  // Block layout: kHeaderBytes of per-bucket ranks (uint32_t, the count of
+  // each bucket's rows before the block), then kStride tags, one byte per
+  // row (a fallback tag becomes numTiers_). The last block's tags past the
+  // end are kPadTag, which no bucket matches.
+  static constexpr uint32_t kHeaderBytes = 32;
+  static constexpr uint32_t kBlockBytes = kHeaderBytes + kStride;
+  static constexpr uint8_t kPadTag = 0xFF;
+  static_assert(kMaxBuckets * sizeof(uint32_t) <= kHeaderBytes);
+
+  const uint8_t* block(uint32_t index) const {
+    return blocks_.data() + static_cast<size_t>(index) * kBlockBytes;
+  }
+
+  static uint32_t blockRank(const uint8_t* block, uint32_t bucket) {
+    uint32_t rank;
+    std::memcpy(&rank, block + bucket * sizeof(uint32_t), sizeof(rank));
+    return rank;
+  }
+
+  static const uint8_t* blockTags(const uint8_t* block) {
+    return block + kHeaderBytes;
+  }
+
+  // Rows in [0, length) of `tags` equal to `bucket`, in a loop the compiler
+  // vectorizes.
+  static uint32_t
+  countEqual(const uint8_t* tags, uint32_t length, uint8_t bucket) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < length; ++i) {
+      count += tags[i] == bucket;
+    }
+    return count;
+  }
+
   void buildTagIndex(
       std::string_view tagStream,
       const EncodingFactory& encodingFactory,
       const std::vector<uint32_t>& partitionSizes) {
     const uint32_t rowCount = this->rowCount_;
-    const uint32_t numBuckets = numTiers_ + 1;
-    const uint32_t numSamples = (rowCount + kStride - 1) / kStride + 1;
-    tags_.resize(rowCount);
-    rankSamples_.resize(numSamples * numBuckets);
+    const uint32_t numBlocks = (rowCount + kStride - 1) / kStride;
+    blocks_.resize(static_cast<size_t>(numBlocks) * kBlockBytes);
     std::array<uint32_t, kMaxBuckets> counts{};
     if (rowCount > 0) {
       auto noStringBufferFactory = [](uint32_t) -> void* { return nullptr; };
       auto tags = encodingFactory.create(
           *this->pool_, tagStream, noStringBufferFactory);
       NIMBLE_CHECK_EQ(tags->rowCount(), rowCount);
-      // Decoded a stride at a time, so the wide tags never exist whole.
+      // Decoded a block at a time, so the wide tags never exist whole.
       std::array<uint32_t, kStride> wide;
-      for (uint32_t start = 0; start < rowCount; start += kStride) {
+      for (uint32_t index = 0; index < numBlocks; ++index) {
+        auto* out = blocks_.data() + static_cast<size_t>(index) * kBlockBytes;
+        std::memset(out, 0, kHeaderBytes);
+        std::memcpy(out, counts.data(), kMaxBuckets * sizeof(uint32_t));
+        auto* blockTags = out + kHeaderBytes;
+        const uint32_t start = index * kStride;
         const uint32_t count = std::min(kStride, rowCount - start);
         tags->materialize(count, wide.data());
-        std::copy_n(
-            counts.begin(), numBuckets, &rankSamples_[start / kStride * numBuckets]);
         for (uint32_t i = 0; i < count; ++i) {
-          const auto bucket =
-              static_cast<uint8_t>(std::min(wide[i], numTiers_));
-          tags_[start + i] = bucket;
+          const auto bucket = static_cast<uint8_t>(std::min(wide[i], numTiers_));
+          blockTags[i] = bucket;
           ++counts[bucket];
         }
+        std::fill(blockTags + count, blockTags + kStride, kPadTag);
       }
     }
-    std::copy_n(
-        counts.begin(),
-        numBuckets,
-        &rankSamples_[(numSamples - 1) * numBuckets]);
     for (uint32_t bucket = 0; bucket < partitionSizes.size(); ++bucket) {
       NIMBLE_CHECK_EQ(counts[bucket], partitionSizes[bucket]);
     }
   }
 
-  // Rank of row `row` within its bucket `bucket`: the sample at or before it
-  // plus the equal tags between, at most kStride - 1 bytes, in a loop the
-  // compiler vectorizes.
+  uint8_t tagAt(uint32_t row) const {
+    return blockTags(block(row / kStride))[row % kStride];
+  }
+
+  // Rank of row `row` within its bucket: its block's rank plus the equal tags
+  // before it in the block, at most kStride - 1 bytes.
   uint32_t rankAt(uint8_t bucket, uint32_t row) const {
-    const uint32_t sample = row / kStride;
-    const uint8_t* const tags = tags_.data();
-    uint32_t count = 0;
-    for (uint32_t i = sample * kStride; i < row; ++i) {
-      count += tags[i] == bucket;
-    }
-    return rankSamples_[sample * (numTiers_ + 1) + bucket] + count;
+    const uint8_t* const current = block(row / kStride);
+    return blockRank(current, bucket) +
+        countEqual(blockTags(current), row % kStride, bucket);
   }
 
   physicalType valueAt(uint8_t bucket, uint32_t rank) const {
@@ -255,7 +281,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     if (decoded_) {
       return decoded_->readAt(index);
     }
-    const auto bucket = tags_[index];
+    const auto bucket = tagAt(index);
     return detail::castFromPhysicalType<T>(
         valueAt(bucket, rankAt(bucket, index)));
   }
@@ -265,7 +291,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     if (decoded_) {
       return TypedEncodingView<T>::castToPhysicalType(decoded_->readAt(index));
     }
-    const auto bucket = tags_[index];
+    const auto bucket = tagAt(index);
     return valueAt(bucket, rankAt(bucket, index));
   }
 
@@ -279,59 +305,84 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       decoded_->read(offset, length, output);
       return;
     }
+    // One block at a time: its header gives every bucket's rank at its
+    // first row, so only a range starting inside a block counts tags.
     const uint32_t numBuckets = numTiers_ + 1;
-    const uint8_t* const tags = tags_.data();
-    // Every bucket's rank at `offset`, from one sample and one scan.
-    std::array<uint32_t, kMaxBuckets> ranks{};
-    const uint32_t sample = offset / kStride;
-    std::copy_n(&rankSamples_[sample * numBuckets], numBuckets, ranks.begin());
-    for (uint32_t i = sample * kStride; i < offset; ++i) {
-      ++ranks[tags[i]];
-    }
-    // A stride of rows at a time: count each bucket's rows, read them in
-    // bulk, then scatter into row order.
-    std::array<std::array<physicalType, kStride>, kMaxBuckets> values;
     for (uint32_t done = 0; done < length;) {
-      const uint32_t count = std::min(kStride, length - done);
-      const uint8_t* const chunk = tags + offset + done;
-      std::array<uint32_t, kMaxBuckets> counts{};
-      for (uint32_t i = 0; i < count; ++i) {
-        ++counts[chunk[i]];
-      }
-      uint32_t onlyBucket = kMaxBuckets;
+      const uint32_t row = offset + done;
+      const uint8_t* const current = block(row / kStride);
+      const uint32_t skip = row % kStride;
+      const uint32_t count = std::min(kStride - skip, length - done);
+      std::array<uint32_t, kMaxBuckets> ranks;
       for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
-        if (counts[bucket] == count) {
-          onlyBucket = bucket;
-        }
+        ranks[bucket] = blockRank(current, bucket) +
+            (skip == 0 ? 0 : countEqual(blockTags(current), skip, bucket));
       }
-      if (onlyBucket != kMaxBuckets) {
-        readBucket(onlyBucket, ranks[onlyBucket], count, output + done);
-        ranks[onlyBucket] += count;
-      } else {
-        for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
-          if (counts[bucket] > 0) {
-            readBucket(
-                bucket, ranks[bucket], counts[bucket], values[bucket].data());
-            ranks[bucket] += counts[bucket];
-          }
-        }
-        std::array<uint32_t, kMaxBuckets> next{};
-        for (uint32_t i = 0; i < count; ++i) {
-          const auto bucket = chunk[i];
-          output[done + i] = values[bucket][next[bucket]++];
-        }
-      }
+      readRows(blockTags(current) + skip, count, ranks, output + done);
       done += count;
+    }
+  }
+
+  // Reads `count` <= kStride rows whose tags are `tags`, given each bucket's
+  // rank at the first. Each bucket's rows are read in bulk, then merged into
+  // row order along kLanes independent cursors, one per quarter of the rows,
+  // so the merge is not one serial chain of cursor updates.
+  void readRows(
+      const uint8_t* tags,
+      uint32_t count,
+      const std::array<uint32_t, kMaxBuckets>& ranks,
+      physicalType* output) const {
+    constexpr uint32_t kLanes = 4;
+    const uint32_t numBuckets = numTiers_ + 1;
+    const uint32_t laneRows = count / kLanes;
+    // Lane l covers [l * laneRows, (l + 1) * laneRows), the last lane also
+    // the remainder.
+    std::array<std::array<uint32_t, kMaxBuckets>, kLanes> laneCounts;
+    std::array<uint32_t, kMaxBuckets> totals{};
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t begin = lane * laneRows;
+      const uint32_t end = lane + 1 == kLanes ? count : begin + laneRows;
+      for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+        laneCounts[lane][bucket] =
+            countEqual(tags + begin, end - begin, static_cast<uint8_t>(bucket));
+        totals[bucket] += laneCounts[lane][bucket];
+      }
+    }
+    for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+      if (totals[bucket] == count) {
+        readBucket(bucket, ranks[bucket], count, output);
+        return;
+      }
+    }
+    std::array<std::array<physicalType, kStride>, kMaxBuckets> values;
+    std::array<std::array<const physicalType*, kMaxBuckets>, kLanes> cursors;
+    for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+      if (totals[bucket] > 0) {
+        readBucket(
+            bucket, ranks[bucket], totals[bucket], values[bucket].data());
+      }
+      const physicalType* cursor = values[bucket].data();
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        cursors[lane][bucket] = cursor;
+        cursor += laneCounts[lane][bucket];
+      }
+    }
+    for (uint32_t i = 0; i < laneRows; ++i) {
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const uint32_t row = lane * laneRows + i;
+        output[row] = *cursors[lane][tags[row]]++;
+      }
+    }
+    for (uint32_t row = kLanes * laneRows; row < count; ++row) {
+      output[row] = *cursors[kLanes - 1][tags[row]]++;
     }
   }
 
   uint32_t numTiers_{0};
   std::vector<Tier> tiers_;
   std::unique_ptr<TypedEncodingView<T>> fallback_;
-  // One byte per row: its tier, or numTiers_ for the fallback values.
-  Vector<uint8_t> tags_;
-  // [sample * (numTiers_ + 1) + bucket]; see buildTagIndex.
-  Vector<uint32_t> rankSamples_;
+  // 256-row blocks of ranks and tags; see kHeaderBytes.
+  Vector<uint8_t> blocks_;
   // Set, and nothing else, when the stream has no TierTagArray index.
   std::unique_ptr<TypedEncodingView<T>> decoded_;
 };
