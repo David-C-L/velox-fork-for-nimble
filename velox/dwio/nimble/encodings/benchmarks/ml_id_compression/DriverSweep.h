@@ -267,12 +267,32 @@ void writeValidationFailureRow(
   csv.endRow();
 }
 
+/// --mlidc_sis_section_candidates as a SectionCandidates. An unknown name
+/// fails rather than silently running the default.
+inline subintsplit::SectionCandidates sectionCandidatesFlag() {
+  const std::string& name = FLAGS_mlidc_sis_section_candidates;
+  if (name == "default") {
+    return subintsplit::SectionCandidates::kDefault;
+  }
+  if (name == "addressable") {
+    return subintsplit::SectionCandidates::kAddressable;
+  }
+  NIMBLE_CHECK(
+      name == "unrestricted",
+      "--mlidc_sis_section_candidates must be default, addressable or "
+      "unrestricted: {}",
+      name);
+  return subintsplit::SectionCandidates::kUnrestricted;
+}
+
 /// Applies the split planner's ablation flags, --mlidc_sis_split_penalty,
-/// --mlidc_sis_cost_model_v2 and --mlidc_sis_planner_samples. Their defaults
-/// leave the tuning as the library builds it.
+/// --mlidc_sis_cost_model_v2, --mlidc_sis_section_candidates and
+/// --mlidc_sis_planner_samples. Their defaults leave the tuning as the library
+/// builds it.
 inline void applyPlannerFlags(subintsplit::TuningConfig& tuning) {
   tuning.selector.splitPenalty = FLAGS_mlidc_sis_split_penalty;
   tuning.selector.costModelV2 = FLAGS_mlidc_sis_cost_model_v2;
+  tuning.sectionCandidates = sectionCandidatesFlag();
   // Negative keeps the library default; 0 is the sampler's whole column.
   if (FLAGS_mlidc_sis_planner_samples >= 0) {
     tuning.sampler.maxSamples =

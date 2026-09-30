@@ -36,6 +36,44 @@ enum class SubIntSplitAdmission : uint8_t {
   kBitFlipEntropy = 2,
 };
 
+/// Which encodings a SubIntSplit section, and every stream below one, may be
+/// given, in the split planner and in section selection alike.
+enum class SectionCandidates : uint8_t {
+  /// The writer's list (nestedEncodingReadFactors) and the planner's own
+  /// defaults, unchanged.
+  kDefault = 0,
+  /// Only encodings a reader can position in without a scan from the start
+  /// of the stream or from a checkpoint (see isAddressableSectionEncoding).
+  kAddressable = 1,
+  /// The default list plus Huffman, and Delta priced by deltaCostBitsV2.
+  /// Measures the compression kAddressable gives up.
+  kUnrestricted = 2,
+};
+
+/// Whether kAddressable admits `type` for a section or a stream below one:
+/// a point read costs O(1), a binary search, or a bounded scan of at most
+/// 256 fixed-width values, never a bit-serial decode or a prefix sum whose
+/// length grows with the row's position or its distance from a checkpoint.
+/// FrequencyPartition (TierTagArray index: a rank sample every 256 rows,
+/// then a scan of at most 256 one-byte tags) and MainlyConstant (rank
+/// directory over the isCommon bits) are admitted through their views.
+inline bool isAddressableSectionEncoding(EncodingType type) {
+  switch (type) {
+    // Prefix sum since the last restatement; no view, so a view decodes
+    // the whole stream on open.
+    case EncodingType::Delta:
+    // Variable-length values; no view, decoded whole on open.
+    case EncodingType::Varint:
+    // Bit-serial decode from a checkpoint every 256 rows.
+    case EncodingType::Huffman:
+    // Prefix sum inside a block.
+    case EncodingType::DeltaBlock:
+      return false;
+    default:
+      return true;
+  }
+}
+
 /// SubIntSplit's settings on Encoding::Options, held as
 /// Encoding::Options::subIntSplit: those top-level selection consults about
 /// SubIntSplit, and what SubIntSplit tells the selection of its own sections
@@ -46,6 +84,11 @@ struct Options {
   /// encoded with, rather than a column's own options. Marks the whole
   /// subtree below a section, so a nested stream is priced on decode too.
   bool sectionSelection{false};
+
+  /// Which encodings a section's streams may be given. Set, like
+  /// sectionSelection, by sectionEncodingOptions from TuningConfig; applies
+  /// only where sectionSelection is set. See SectionCandidates.
+  SectionCandidates sectionCandidates{SectionCandidates::kDefault};
 
   /// How much a section's decode cost counts against its encoded size, in
   /// bytes of encoded size per nanosecond per row of decode. Zero is

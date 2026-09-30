@@ -332,6 +332,18 @@ inline std::string cacheArmIdentity(
     id += "|admf";
   }
   id += "|v" + std::to_string(options.useVarintRowCount ? 1 : 0);
+  // Each changes the plan or a section's encoding. Appended only when set,
+  // so keys written before they existed stay valid.
+  if (selector.costModelV2) {
+    id += "|cm2";
+  }
+  if (selector.deltaCostModelV2) {
+    id += "|dm2";
+  }
+  if (tuning.sectionCandidates != subintsplit::SectionCandidates::kDefault) {
+    id += "|sc" +
+        std::to_string(static_cast<int>(tuning.sectionCandidates));
+  }
   // deltaZigzagAnchorStride is deliberately absent: no encoding here reads it,
   // and the build fingerprint covers it if that ever changes.
   return id;

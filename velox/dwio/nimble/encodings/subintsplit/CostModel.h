@@ -713,6 +713,75 @@ inline double deltaCostBits(
   return kOuterHeaderBits + deltasBits + restatementsBits + isRestatementsBits;
 }
 
+/// V2 Delta (opt-in, SelectorConfig::deltaCostModelV2): DeltaEncoding's real
+/// layout priced from the sample's adjacent pairs, as
+/// DeltaEncoding::estimateSize prices it for selection, at the width and
+/// options a section writes. The encoding stores a rising or equal step as a
+/// non-negative delta and restates the value after a fall; there is no
+/// zig-zag. So:
+///   deltas         = rising pairs, min(Trivial, exact FBW over [0, maxRise])
+///   restatements   = rows - deltas (the first row is one), min(Trivial,
+///                    exact FBW over [min, max])
+///   isRestatements = min(SparseBool, bit-packed Trivial<bool>)
+/// plus the outer prefix and two 4-byte offsets. Nested selection may store
+/// the two value streams below these prices (RLE deltas, for instance), so
+/// this is close to an upper bound of what selection writes.
+///
+/// Unlike deltaCostBits there is no monotonicity gate: a stream that is
+/// mostly restatements is priced as such, which is how selection prices and
+/// takes it (Snowflake [22..50] is 92% restatements). `sampleBlockSize` is as
+/// for rleCostBitsV2: a pair across a block join is no pair of the stream,
+/// so the rising fraction is taken over pairs inside blocks and applied to
+/// the section's numValues - 1 pairs.
+inline double deltaCostBitsV2(
+    const SectionMetrics& m,
+    size_t numValues,
+    int bitWidth,
+    const std::vector<uint64_t>& segValues,
+    size_t sampleBlockSize = 0) {
+  if (numValues < 2) {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (segValues.size() < numValues) {
+    return deltaCostBits(m, numValues, bitWidth);
+  }
+  uint64_t pairs = 0;
+  uint64_t rising = 0;
+  uint64_t maxRise = 0;
+  for (size_t i = 1; i < numValues; ++i) {
+    if (sampleBlockSize > 0 && i % sampleBlockSize == 0) {
+      continue;
+    }
+    ++pairs;
+    if (segValues[i] >= segValues[i - 1]) {
+      ++rising;
+      maxRise = std::max(maxRise, segValues[i] - segValues[i - 1]);
+    }
+  }
+  const double risingFraction =
+      pairs == 0 ? 0.0 : static_cast<double>(rising) / static_cast<double>(pairs);
+  const auto deltaCount = static_cast<uint64_t>(
+      std::llround(risingFraction * static_cast<double>(numValues - 1)));
+  const uint64_t restatementCount = numValues - deltaCount;
+
+  const uint64_t deltasBytes = deltaCount == 0
+      ? 0
+      : plainStreamBytesV2(deltaCount, 0, maxRise, bitWidth);
+  const uint64_t restatementsBytes =
+      plainStreamBytesV2(restatementCount, m.min, m.max, bitWidth);
+  const uint64_t isRestatementsBytes = std::min<uint64_t>(
+      SparseBoolEncoding::estimateSize(
+          numValues, restatementCount, sectionEstimateOptionsV2()),
+      EncodingPrefix::kFixedPrefixSize + 1 + (numValues + 7) / 8);
+  // Outer prefix plus the two 4-byte relative offsets (DeltaEncoding.h
+  // layout); nested headers are in the stream prices above.
+  constexpr uint64_t kOuterBytes = EncodingPrefix::kFixedPrefixSize + 8;
+  return static_cast<double>(
+             kOuterBytes + deltasBytes + restatementsBytes +
+             isRestatementsBytes) *
+      8.0;
+}
+
 // FOR (Frame of Reference): fixed-size frames, each bit-packed against a
 // local minimum (reference). The local bit width is estimated from the
 // average step size scaled to the frame size, capped by the segment's
@@ -878,7 +947,8 @@ inline SectionCost bestSectionCost(
     const DecodeCostWeighting& weighting,
     const AllowedEncodings& excluded = {},
     bool costModelV2 = false,
-    size_t sampleBlockSize = 0) noexcept {
+    size_t sampleBlockSize = 0,
+    bool deltaCostModelV2 = false) noexcept {
   SectionCost best;
   auto consider = [&](double sizeBits, EncodingType type) noexcept {
     if (!allowed.empty() && allowed.count(type) == 0) {
@@ -946,7 +1016,15 @@ inline SectionCost bestSectionCost(
   consider(
       blockBitPackingCostBits(segValues, numValues),
       EncodingType::BlockBitPacking);
-  consider(deltaCostBits(m, numValues, bitWidth), EncodingType::Delta);
+  consider(
+      deltaCostModelV2 ? deltaCostBitsV2(
+                             m,
+                             numValues,
+                             bitWidth,
+                             segValues,
+                             numValues < fullCount ? sampleBlockSize : 0)
+                       : deltaCostBits(m, numValues, bitWidth),
+      EncodingType::Delta);
   consider(forCostBits(m, numValues, bitWidth), EncodingType::FOR);
   // FrequencyPartition is only viable for low-cardinality segments.
   if (m.uniqueCount > 0 && !m.uniqueCountCapped && m.uniqueCount <= 1024) {

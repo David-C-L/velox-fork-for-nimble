@@ -21,6 +21,7 @@ namespace folly {
 class Executor;
 } // namespace folly
 
+#include "velox/dwio/nimble/encodings/subintsplit/Options.h"
 #include "velox/dwio/nimble/encodings/subintsplit/Sampler.h"
 #include "velox/dwio/nimble/encodings/subintsplit/SplitSelector.h"
 
@@ -37,6 +38,11 @@ struct TuningConfig {
   /// the sample per grid cell. They must stay in step with
   /// nestedEncodingReadFactors, which decides what a section may be.
   SelectorConfig selector{.allowHuffman = false, .allowDeltaBlock = false};
+
+  /// Which encodings sections may be given, in the planner and in section
+  /// selection together (see SectionCandidates). kDefault leaves both as
+  /// above; the others are evaluation settings.
+  SectionCandidates sectionCandidates{SectionCandidates::kDefault};
 
   /// Whether a fitted slope * row + base (a line frame) or a per-row step (a
   /// step frame) may be subtracted from every value before planning its

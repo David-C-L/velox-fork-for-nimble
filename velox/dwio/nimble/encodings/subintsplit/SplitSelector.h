@@ -101,6 +101,10 @@ struct SelectorConfig {
   /// not count a join between two sample blocks as a run. Set by the entry
   /// points that draw the sample.
   size_t sampleBlockSize{0};
+  /// Prices Delta with deltaCostBitsV2 (DeltaEncoding's layout from the
+  /// sample's adjacent pairs) instead of deltaCostBits. Off by default, which
+  /// leaves every plan unchanged; SectionCandidates::kUnrestricted sets it.
+  bool deltaCostModelV2{false};
 };
 
 /// Extra bits the DP charges each section after the first.
@@ -726,7 +730,8 @@ inline auto restrictedSectionCostFn(
           weighting = cfg.decodeWeighting,
           excluded = cfg.excludedEncodings,
           costModelV2 = cfg.costModelV2,
-          sampleBlockSize = cfg.sampleBlockSize](
+          sampleBlockSize = cfg.sampleBlockSize,
+          deltaCostModelV2 = cfg.deltaCostModelV2](
              const SectionMetrics& m,
              size_t numValues,
              size_t streamCount,
@@ -744,7 +749,8 @@ inline auto restrictedSectionCostFn(
         weighting,
         excluded,
         costModelV2,
-        sampleBlockSize);
+        sampleBlockSize,
+        deltaCostModelV2);
   };
 }
 

@@ -94,6 +94,7 @@ DECLARE_bool(mlidc_sis_admission_forces);
 DECLARE_double(mlidc_sis_max_size_regression);
 DECLARE_double(mlidc_sis_split_penalty);
 DECLARE_bool(mlidc_sis_cost_model_v2);
+DECLARE_string(mlidc_sis_section_candidates);
 DECLARE_int64(mlidc_sis_planner_samples);
 DECLARE_string(mlidc_sis_pinned_boundaries);
 DECLARE_string(mlidc_sis_pinned_label);

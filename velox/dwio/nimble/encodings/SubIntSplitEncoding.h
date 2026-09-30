@@ -128,6 +128,7 @@ inline Encoding::Options sectionEncodingOptions(
   sectionOptions.subIntSplit.decodeReadPath =
       tuning.selector.decodeWeighting.readPath;
   sectionOptions.subIntSplit.maxSizeRegression = tuning.maxSizeRegression;
+  sectionOptions.subIntSplit.sectionCandidates = tuning.sectionCandidates;
   return sectionOptions;
 }
 
@@ -257,6 +258,12 @@ class SubIntSplitEncoding
 
   std::string debugString(int offset) const final;
 
+  /// The configuration the split planner runs under for `tuning`. Public so
+  /// that a test can hold it against what section selection is offered.
+  static subintsplit::SelectorConfig plannerSelectorConfig(
+      const subintsplit::TuningConfig& tuning,
+      size_t rowCount);
+
  private:
   struct SectionInfo {
     int bitStart{0};
@@ -274,11 +281,6 @@ class SubIntSplitEncoding
   // decode must advance them together; folded Constant sections contribute
   // bits without a decoder.
   std::vector<SectionInfo> sections_;
-
-  // The configuration the split planner runs under for `tuning`.
-  static subintsplit::SelectorConfig plannerSelectorConfig(
-      const subintsplit::TuningConfig& tuning,
-      size_t rowCount);
 
   // Whether nested selection can estimate `type`, and so could ever choose
   // it for a section.
@@ -1612,6 +1614,41 @@ subintsplit::SelectorConfig SubIntSplitEncoding<T>::plannerSelectorConfig(
     if (!sectionSelectionEstimates(type)) {
       selectorConfig.excludedEncodings.insert(type);
     }
+  }
+  // Held to the candidates section selection is held to
+  // (applySectionCandidates), so a plan is never priced on an encoding its
+  // sections cannot take, nor blind to one they can.
+  switch (tuning.sectionCandidates) {
+    case subintsplit::SectionCandidates::kDefault:
+      break;
+    case subintsplit::SectionCandidates::kAddressable:
+      for (const auto type :
+           {EncodingType::Trivial,
+            EncodingType::FixedBitWidth,
+            EncodingType::Constant,
+            EncodingType::MainlyConstant,
+            EncodingType::RLE,
+            EncodingType::Varint,
+            EncodingType::Dictionary,
+            EncodingType::SimdForBitpack,
+            EncodingType::PFOR,
+            EncodingType::BlockBitPacking,
+            EncodingType::Delta,
+            EncodingType::FOR,
+            EncodingType::FrequencyPartition,
+            EncodingType::Huffman,
+            EncodingType::DeltaBlock}) {
+        if (!subintsplit::isAddressableSectionEncoding(type)) {
+          selectorConfig.excludedEncodings.insert(type);
+        }
+      }
+      selectorConfig.allowHuffman = false;
+      selectorConfig.allowDeltaBlock = false;
+      break;
+    case subintsplit::SectionCandidates::kUnrestricted:
+      selectorConfig.allowHuffman = true;
+      selectorConfig.deltaCostModelV2 = true;
+      break;
   }
   return selectorConfig;
 }

@@ -176,6 +176,16 @@ DEFINE_bool(
     "writes, distinct counts consistent between sample and full scan). Off, "
     "the default, leaves every plan as the library builds it. The cost model "
     "oracle driver applies it to its own selector config and estimates too.");
+DEFINE_string(
+    mlidc_sis_section_candidates,
+    "default",
+    "subintsplit::TuningConfig::sectionCandidates, applied to the split "
+    "planner and to section selection together: default (the writer's list, "
+    "unchanged), addressable (only encodings a reader positions in without a "
+    "scan: no Delta, DeltaBlock or Huffman, see "
+    "subintsplit::isAddressableSectionEncoding) or unrestricted (the default "
+    "list plus Huffman, with Delta priced by the V2 Delta model). Composes "
+    "with --mlidc_sis_cost_model_v2.");
 DEFINE_double(
     mlidc_sis_max_size_regression,
     0.05,

@@ -102,8 +102,11 @@ class RangePricer {
     }
     const std::span<const Storage> values{narrowed};
     const auto statistics = Statistics<Storage>::create(values);
+    // Held to the section candidate setting, as select() holds a section.
+    auto candidates = candidates_;
+    applySectionCandidates<Storage>(candidates, sectionOptions_);
     const auto selected = selectCandidate<Storage>(
-        candidates_, values, statistics, sectionOptions_);
+        candidates, values, statistics, sectionOptions_);
     if (!selected.estimatedSize.has_value()) {
       return {};
     }

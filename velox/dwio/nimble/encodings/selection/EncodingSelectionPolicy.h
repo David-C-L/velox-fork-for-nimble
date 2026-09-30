@@ -194,6 +194,48 @@ inline std::vector<std::pair<EncodingType, float>> nestedEncodingReadFactors(
   return nested;
 }
 
+/// Holds a SubIntSplit section's candidates, and those of every stream below
+/// it, to Encoding::Options::subIntSplit.sectionCandidates. The split planner
+/// is held to the same setting (SubIntSplitEncoding::plannerSelectorConfig),
+/// so that no plan is shaped around an encoding its sections cannot take.
+/// kDefault, and any stream outside a section, is left untouched.
+///
+/// kAddressable withdraws what isAddressableSectionEncoding rejects, at every
+/// depth, since a nested stream read through its own view is positioned by
+/// the same kind of seek as its section. kUnrestricted adds Huffman, which
+/// the list withholds for its bit-serial decode, to integer streams.
+template <typename T>
+void applySectionCandidates(
+    std::vector<std::pair<EncodingType, float>>& candidates,
+    const Encoding::Options& options) {
+  const auto setting = options.subIntSplit.sectionCandidates;
+  if (!options.subIntSplit.sectionSelection ||
+      setting == subintsplit::SectionCandidates::kDefault) {
+    return;
+  }
+  if (setting == subintsplit::SectionCandidates::kAddressable) {
+    candidates.erase(
+        std::remove_if(
+            candidates.begin(),
+            candidates.end(),
+            [](const auto& entry) {
+              return !subintsplit::isAddressableSectionEncoding(entry.first);
+            }),
+        candidates.end());
+    return;
+  }
+  using physicalType = typename TypeTraits<T>::physicalType;
+  if constexpr (isIntegralType<physicalType>() && !isBoolType<physicalType>()) {
+    if (std::none_of(candidates.begin(), candidates.end(), [](const auto& e) {
+          return e.first == EncodingType::Huffman;
+        })) {
+      // The factor the list gives Huffman where it admits it
+      // (nestedEncodingReadFactors, decoded-once streams).
+      candidates.emplace_back(EncodingType::Huffman, 0.85f);
+    }
+  }
+}
+
 /// The read factor select() weighs `encodingType` by: the table's factor,
 /// except Trivial's is withheld (raised to 1.0) where taking it would cost
 /// compression. Trivial stores at the storage type's width rather than the
@@ -529,6 +571,9 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
               }),
           candidateEncodingReadFactors.end());
     }
+
+    // A SubIntSplit section's streams, held to the section candidate setting.
+    applySectionCandidates<T>(candidateEncodingReadFactors, options);
 
     bool subIntSplitForced{false};
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
