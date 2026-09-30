@@ -17,8 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -47,6 +49,14 @@ namespace facebook::nimble {
 /// into row order along one cursor per bucket and block, so no row recounts
 /// its rank.
 ///
+/// A read of at least fullScanRows(rowCount) rows (a bulk read, or a range,
+/// index list, range list or willRead() hint that long) decodes the view once
+/// in one sequential pass instead: every bucket's values in one bulk read,
+/// then one merge over all the tags. Nothing is decoded on open. When the
+/// decoded values take at most kMaxCachedBytesPerRow per row they are kept
+/// and serve every later read (see kMaxCachedBytesPerRow); wider values are
+/// decoded into the read's output and dropped.
+///
 /// A stream with any other index (NoIndex, PerTierBitmaps, EliasFano) is
 /// decoded whole on open and served from the decoded values.
 template <typename T>
@@ -59,7 +69,9 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       velox::memory::MemoryPool* pool,
       const Encoding::Options& options)
       : TypedEncodingView<T>{data, pool, options},
-        blocks_{this->template getVectorBuffer<uint8_t>()} {
+        blocks_{this->template getVectorBuffer<uint8_t>()},
+        cache_{pool},
+        fullScanRows_{fullScanRows(this->rowCount_)} {
     NIMBLE_CHECK_EQ(this->encodingType_, EncodingType::FrequencyPartition);
     const char* pos = data.data() + this->dataOffset_;
     const char* const end = data.data() + data.size();
@@ -147,11 +159,68 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     this->releaseVectorBuffer(blocks_);
   }
 
+  /// Rows from which one read takes the full-scan path: kFullScanPercent of
+  /// the view's rows, rounded up, and at least one.
+  static uint32_t fullScanRows(uint32_t rowCount) {
+    return std::max<uint32_t>(
+        1,
+        static_cast<uint32_t>(
+            (static_cast<uint64_t>(rowCount) * kFullScanPercent + 99) / 100));
+  }
+
+  /// Whether a full scan has left the decoded values cached.
+  bool holdsDecodedCopy() const {
+    return cached_.load(std::memory_order_acquire) != nullptr;
+  }
+
+  /// A caller about to read `rows` rows in pieces (SubIntSplit reads a
+  /// section 1024 rows at a time) says so here, so a bulk read takes the
+  /// full-scan path even though no single piece is long enough.
+  void willRead(uint32_t rows) const final {
+    if (rows >= fullScanRows_ && decoded_ == nullptr) {
+      ensureCached();
+    }
+  }
+
  private:
   using FpEncoding = FrequencyPartitionEncoding<T>;
   static constexpr uint32_t kStride = FpEncoding::kRankSampleStride;
   static constexpr uint32_t kMaxBuckets = FpEncoding::kMaxTiers + 1;
   static constexpr uint32_t kResolvedDictionaryLimit = 1u << 16;
+
+  // The full-scan threshold T, as a percentage of the view's rows. Measured
+  // on taz with FrequencyPartitionFullScanCrossover.DISABLED_measure: 524,288
+  // rows, sections cut from the columns' SubIntSplit bit ranges and encoded
+  // with real nested selection, medians of 5. Per-row path = a read of L rows
+  // in SubIntSplit's 1024-row pieces; full scan = the first full-scan read
+  // (decode of all N rows plus the copy of L).
+  //
+  //   section            per-row ns/row  full scan ns/row  per-row/full at
+  //                      (L = N)         (of N)            L=N/4 N/2  3N/4  N
+  //   snowflake [0..3]   5.67            4.18              0.32  0.61 0.96 1.34
+  //   snowflake [12..17] 2.97            1.90              0.36  0.73 1.14 1.52
+  //   s2 [36..43]        3.17            2.75              0.30  0.60 0.87 1.13
+  //   s2 [60..63]        0.69            0.68              0.25  0.49 0.72 0.95
+  //   s2 [44..59] (u16)  3.40            3.21              0.26  0.52 0.76 0.95
+  //
+  // A single read breaks even at about 3N/4 (0.68N to 0.88N where it does at
+  // all). The kept copy then reads at 0.05 ns/row (uint8; 0.37 for uint16),
+  // so from N/2 the first full scan costs at most about 2x the per-row read it
+  // replaces (1.6x on snowflake) and has paid for itself by the second
+  // such read. The old decode (FrequencyPartitionEncoding construction plus
+  // materialize) took 5.7 to 9.5 ms per section, 3.5x to 16x the full scan.
+  static constexpr uint32_t kFullScanPercent = 50;
+
+  // The full scan keeps its decoded values only when they take at most this
+  // many bytes per row: a uint8 or uint16 section, whose copy is at most
+  // 1.8x the 1.125 B/row tag index the view holds anyway, so a bulk read at
+  // most roughly doubles the view's own footprint. Wider values (a whole
+  // 64-bit column held as one FrequencyPartition section, say) would cost as
+  // much as the raw column, which is what the view exists to avoid; their
+  // full scans decode into the read's output and keep nothing.
+  static constexpr uint32_t kMaxCachedBytesPerRow = 2;
+  static constexpr bool kCacheable =
+      sizeof(physicalType) <= kMaxCachedBytesPerRow;
 
   struct Tier {
     std::unique_ptr<TypedEncodingView<T>> dictionary;
@@ -324,8 +393,47 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     if (decoded_) {
       return TypedEncodingView<T>::castToPhysicalType(decoded_->readAt(index));
     }
+    if (const auto* cached = cached_.load(std::memory_order_acquire)) {
+      return cached[index];
+    }
     const auto bucket = tagAt(index);
     return valueAt(bucket, rankAt(bucket, index));
+  }
+
+  void readPhysicalAt(std::span<const uint32_t> indices, physicalType* output)
+      const final {
+    if (decoded_ == nullptr &&
+        (holdsDecodedCopy() || indices.size() >= fullScanRows_)) {
+      if (const auto* cached = ensureCached()) {
+        for (size_t i = 0; i < indices.size(); ++i) {
+          NIMBLE_CHECK_LT(indices[i], this->rowCount_);
+          output[i] = cached[indices[i]];
+        }
+        return;
+      }
+    }
+    TypedEncodingView<T>::readPhysicalAt(indices, output);
+  }
+
+  void readPhysicalRanges(
+      std::span<const RowRange> ranges,
+      physicalType* output) const final {
+    if (decoded_ == nullptr) {
+      uint64_t rows = 0;
+      for (const auto& range : ranges) {
+        rows += range.numRows();
+      }
+      if (holdsDecodedCopy() || rows >= fullScanRows_) {
+        if (const auto* cached = ensureCached()) {
+          for (const auto& range : ranges) {
+            std::copy_n(cached + range.startRow, range.numRows(), output);
+            output += range.numRows();
+          }
+          return;
+        }
+      }
+    }
+    TypedEncodingView<T>::readPhysicalRanges(ranges, output);
   }
 
   void readPhysical(uint32_t offset, uint32_t length, physicalType* output)
@@ -336,6 +444,14 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     }
     if (decoded_) {
       decoded_->read(offset, length, output);
+      return;
+    }
+    if (length >= fullScanRows_ || holdsDecodedCopy()) {
+      if (const auto* cached = ensureCached()) {
+        std::copy_n(cached + offset, length, output);
+      } else {
+        scanRange(offset, length, output);
+      }
       return;
     }
     std::array<uint32_t, kMaxBuckets> ranks;
@@ -358,6 +474,145 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       readPass(row, passEnd - row, ranks, endRanks, output + (row - offset));
       ranks = endRanks;
       row = passEnd;
+    }
+  }
+
+  // Decodes the whole view once into cache_ and returns it, or nullptr when
+  // the values are too wide to keep (kCacheable). Concurrent readers wait for
+  // the one decode.
+  const physicalType* ensureCached() const {
+    if constexpr (!kCacheable) {
+      return nullptr;
+    } else {
+      if (const auto* cached = cached_.load(std::memory_order_acquire)) {
+        return cached;
+      }
+      std::lock_guard<std::mutex> lock{cacheMutex_};
+      if (const auto* cached = cached_.load(std::memory_order_relaxed)) {
+        return cached;
+      }
+      cache_.resize(this->rowCount_);
+      scanRange(0, this->rowCount_, cache_.data());
+      cached_.store(cache_.data(), std::memory_order_release);
+      return cache_.data();
+    }
+  }
+
+  // The full-scan decode of rows [offset, offset + length), length > 0, in
+  // one sequential pass. Each bucket's values in the range are read in one
+  // bulk read into a scratch array (released on return), then the tags are
+  // merged into row order: the whole blocks split into kLanes runs of equal
+  // length whose cursors start from their first block's header, so the lanes
+  // are independent chains, and the partial blocks at either end and the
+  // blocks left over from the split run on the last cursor set.
+  void scanRange(uint32_t offset, uint32_t length, physicalType* output) const {
+    const uint32_t numBuckets = numTiers_ + 1;
+    const uint32_t end = offset + length;
+    std::array<uint32_t, kMaxBuckets> ranks;
+    std::array<uint32_t, kMaxBuckets> endRanks;
+    ranksAt(offset, ranks);
+    ranksAt(end, endRanks);
+    for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+      if (endRanks[bucket] - ranks[bucket] == length) {
+        readBucketRun(bucket, ranks[bucket], length, output);
+        return;
+      }
+    }
+    Vector<physicalType> values{this->pool_, length};
+    std::array<const physicalType*, kMaxBuckets> starts;
+    uint32_t filled = 0;
+    for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+      starts[bucket] = values.data() + filled;
+      const uint32_t bucketRows = endRanks[bucket] - ranks[bucket];
+      readBucketRun(bucket, ranks[bucket], bucketRows, values.data() + filled);
+      filled += bucketRows;
+    }
+    NIMBLE_DCHECK_EQ(filled, length);
+
+    // Cursors at block `index`'s first row, which lies in [offset, end].
+    const auto cursorsAt = [&](uint32_t index) {
+      std::array<const physicalType*, kMaxBuckets> cursors;
+      const uint8_t* const current = block(index);
+      for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+        cursors[bucket] =
+            starts[bucket] + (blockRank(current, bucket) - ranks[bucket]);
+      }
+      return cursors;
+    };
+    const auto mergeRows =
+        [&](uint32_t row,
+            uint32_t count,
+            std::array<const physicalType*, kMaxBuckets>& cursors) {
+          const uint8_t* const rowTags =
+              blockTags(block(row / kStride)) + row % kStride;
+          physicalType* const rowOutput = output + (row - offset);
+          for (uint32_t i = 0; i < count; ++i) {
+            rowOutput[i] = *cursors[rowTags[i]]++;
+          }
+        };
+
+    const uint32_t firstFull = (offset + kStride - 1) / kStride;
+    const uint32_t endFull = end / kStride;
+    if (firstFull >= endFull) {
+      // No whole block: at most two partial ones.
+      std::array<const physicalType*, kMaxBuckets> cursors = starts;
+      for (uint32_t row = offset; row < end;) {
+        const uint32_t stop = std::min(end, (row / kStride + 1) * kStride);
+        mergeRows(row, stop - row, cursors);
+        row = stop;
+      }
+      return;
+    }
+    std::array<const physicalType*, kMaxBuckets> head = starts;
+    mergeRows(offset, firstFull * kStride - offset, head);
+
+    const uint32_t laneBlocks = (endFull - firstFull) / kLanes;
+    std::array<std::array<const physicalType*, kMaxBuckets>, kLanes> cursors;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      cursors[lane] = cursorsAt(firstFull + lane * laneBlocks);
+    }
+    for (uint32_t step = 0; step < laneBlocks; ++step) {
+      std::array<const uint8_t*, kLanes> tags;
+      std::array<physicalType*, kLanes> outputs;
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const uint32_t index = firstFull + lane * laneBlocks + step;
+        tags[lane] = blockTags(block(index));
+        outputs[lane] = output + (index * kStride - offset);
+      }
+      mergeFullPass(cursors, tags, outputs);
+    }
+    // The last lane's cursors now stand at the first block past the split.
+    auto& tail = cursors[kLanes - 1];
+    if (laneBlocks == 0) {
+      tail = cursorsAt(firstFull);
+    }
+    for (uint32_t index = firstFull + kLanes * laneBlocks; index < endFull;
+         ++index) {
+      mergeRows(index * kStride, kStride, tail);
+    }
+    if (endFull * kStride < end) {
+      mergeRows(endFull * kStride, end - endFull * kStride, tail);
+    }
+  }
+
+  // Reads `count` values of bucket `bucket` from rank `rank` on, any count.
+  void readBucketRun(
+      uint8_t bucket,
+      uint32_t rank,
+      uint32_t count,
+      physicalType* output) const {
+    if (bucket == numTiers_) {
+      if (count > 0) {
+        fallback_->read(rank, count, output);
+      }
+      return;
+    }
+    for (uint32_t done = 0; done < count; done += kChunkRows) {
+      readBucket(
+          bucket,
+          rank + done,
+          std::min(kChunkRows, count - done),
+          output + done);
     }
   }
 
@@ -518,6 +773,12 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
   Vector<uint8_t> blocks_;
   // Set, and nothing else, when the stream has no TierTagArray index.
   std::unique_ptr<TypedEncodingView<T>> decoded_;
+  // The full scan's decoded values (kCacheable only), filled once under
+  // cacheMutex_ and published through cached_, which is null until then.
+  mutable Vector<physicalType> cache_;
+  mutable std::mutex cacheMutex_;
+  mutable std::atomic<const physicalType*> cached_{nullptr};
+  const uint32_t fullScanRows_;
 };
 
 } // namespace facebook::nimble

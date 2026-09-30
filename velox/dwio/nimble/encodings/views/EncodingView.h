@@ -70,6 +70,12 @@ class EncodingView {
       const std::function<void(uint32_t)>& setNull,
       void* output) const = 0;
 
+  /// Tells the view that the caller is about to read `rows` of its rows in
+  /// several smaller reads, as a parent that decodes in fixed-size chunks
+  /// does. A view whose one-pass decode beats its per-row path on a read
+  /// that long may decode once here; reads are correct without the hint.
+  virtual void willRead(uint32_t /*rows*/) const {}
+
   /// Returns the number of rows in the encoded stream.
   uint32_t rowCount() const {
     return rowCount_;
