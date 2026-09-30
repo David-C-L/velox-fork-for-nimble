@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -67,6 +68,9 @@ class FOREncodingView final : public TypedEncodingView<T> {
                 velox::bits::divRoundUp(this->rowCount_ - firstFrameRows_,
                                         frameSize_));
     lastFrameRows_ = this->rowCount_ - frameRowOffset(numFrames_ - 1);
+    if (std::has_single_bit(frameSize_)) {
+      frameShift_ = std::countr_zero(frameSize_);
+    }
 
     const auto bitWidthsSize = varint::readVarint32(&pos);
     auto bitWidths = detail::createTypedEncodingViewOrMaterialized<uint8_t>(
@@ -158,7 +162,10 @@ class FOREncodingView final : public TypedEncodingView<T> {
     if (row < firstFrameRows_) {
       return 0;
     }
-    const auto frame = 1 + (row - firstFrameRows_) / frameSize_;
+    // Encoders write 128-row frames; a shift avoids a division per read.
+    const auto frame = 1 +
+        (frameShift_ >= 0 ? (row - firstFrameRows_) >> frameShift_
+                          : (row - firstFrameRows_) / frameSize_);
     NIMBLE_CHECK_LT(frame, numFrames_);
     return frame;
   }
@@ -283,6 +290,8 @@ class FOREncodingView final : public TypedEncodingView<T> {
   }
 
   uint32_t frameSize_{0};
+  // log2(frameSize_) when it is a power of two, otherwise -1.
+  int32_t frameShift_{-1};
   uint32_t numFrames_{0};
   uint32_t firstFrameRows_{0};
   uint32_t lastFrameRows_{0};
