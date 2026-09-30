@@ -27,6 +27,9 @@
 #include "velox/dwio/nimble/encodings/views/EliasFanoEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FOREncodingView.h"
 #include "velox/dwio/nimble/encodings/views/FixedBitWidthEncodingView.h"
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+#include "velox/dwio/nimble/encodings/views/FrequencyPartitionEncodingView.h"
+#endif
 #include "velox/dwio/nimble/encodings/views/HuffmanEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/MainlyConstantEncodingView.h"
 #include "velox/dwio/nimble/encodings/views/NullableEncodingView.h"
@@ -177,6 +180,16 @@ std::unique_ptr<TypedEncodingView<T>> createTypedEncodingView(
       }
       NIMBLE_INCOMPATIBLE_ENCODING(
           "BlockBitPacking encoding should not be selected for non-numeric data types.");
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+    case EncodingType::FrequencyPartition:
+      if constexpr (isNumericType<physicalType>()) {
+        return std::make_unique<FrequencyPartitionEncodingView<T>>(
+            data, pool, options);
+      }
+      NIMBLE_INCOMPATIBLE_ENCODING(
+          "FrequencyPartition view only supports numeric data types, got {}.",
+          TypeTraits<T>::dataType);
+#endif
     case EncodingType::SubIntSplit:
     case EncodingType::SubIntSplitReordered:
       if constexpr (
@@ -254,6 +267,9 @@ bool supportsEncodingView(EncodingType encodingType) {
       EncodingType::SimdForBitpack,
       EncodingType::BitRangeSplit,
       EncodingType::BlockBitPacking,
+#ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
+      EncodingType::FrequencyPartition,
+#endif
       EncodingType::SubIntSplit,
       EncodingType::SubIntSplitReordered};
   return std::find(
