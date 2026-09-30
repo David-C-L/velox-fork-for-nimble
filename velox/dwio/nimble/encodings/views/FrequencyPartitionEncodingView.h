@@ -267,8 +267,11 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     std::array<uint32_t, kStride> keys;
     tier.keys->read(rank, count, keys.data());
     if (!tier.resolved.empty()) {
+      // Held in a local: a store through a one-byte output may alias the
+      // vector's data pointer, which would otherwise be reloaded per row.
+      const physicalType* const resolved = tier.resolved.data();
       for (uint32_t i = 0; i < count; ++i) {
-        output[i] = tier.resolved[keys[i]];
+        output[i] = resolved[keys[i]];
       }
       return;
     }
@@ -326,7 +329,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
   // Reads `count` <= kStride rows whose tags are `tags`, given each bucket's
   // rank at the first. Each bucket's rows are read in bulk, then merged into
   // row order along kLanes independent cursors, one per quarter of the rows,
-  // so the merge is not one serial chain of cursor updates.
+  // so neither the counting nor the merge is one serial chain of updates.
   void readRows(
       const uint8_t* tags,
       uint32_t count,
@@ -336,15 +339,19 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     const uint32_t numBuckets = numTiers_ + 1;
     const uint32_t laneRows = count / kLanes;
     // Lane l covers [l * laneRows, (l + 1) * laneRows), the last lane also
-    // the remainder.
-    std::array<std::array<uint32_t, kMaxBuckets>, kLanes> laneCounts;
+    // the remainder. Each lane's histogram is its own chain of updates.
+    std::array<std::array<uint32_t, kMaxBuckets>, kLanes> laneCounts{};
+    for (uint32_t i = 0; i < laneRows; ++i) {
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        ++laneCounts[lane][tags[lane * laneRows + i]];
+      }
+    }
+    for (uint32_t row = kLanes * laneRows; row < count; ++row) {
+      ++laneCounts[kLanes - 1][tags[row]];
+    }
     std::array<uint32_t, kMaxBuckets> totals{};
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint32_t begin = lane * laneRows;
-      const uint32_t end = lane + 1 == kLanes ? count : begin + laneRows;
       for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
-        laneCounts[lane][bucket] =
-            countEqual(tags + begin, end - begin, static_cast<uint8_t>(bucket));
         totals[bucket] += laneCounts[lane][bucket];
       }
     }
