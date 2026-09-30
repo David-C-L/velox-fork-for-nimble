@@ -40,8 +40,12 @@ namespace facebook::nimble {
 /// adjacent cache lines. The tiers' dictionaries, keys and the fallback values
 /// stay nested views. A point read takes the row's tag, adds its block's rank
 /// to a count of equal tags over at most 255 bytes, and reads that rank from
-/// the tier. A range read takes each block's ranks from its header, reads each
-/// bucket's rows in bulk and merges them into row order.
+/// the tier. A range read takes every bucket's rank at its first row once,
+/// then walks the tags a chunk of kChunkRows rows at a time: each bucket's
+/// values for the chunk are read in bulk (the counts come from the ranks at the
+/// chunk's two ends, which are block headers inside a long range) and merged
+/// into row order along one cursor per bucket and block, so no row recounts
+/// its rank.
 ///
 /// A stream with any other index (NoIndex, PerTierBitmaps, EliasFano) is
 /// decoded whole on open and served from the decoded values.
@@ -163,6 +167,14 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
   static constexpr uint32_t kBlockBytes = kHeaderBytes + kStride;
   static constexpr uint8_t kPadTag = 0xFF;
   static_assert(kMaxBuckets * sizeof(uint32_t) <= kHeaderBytes);
+  // Rows a range read decodes per pass. A multiple of kStride, so every pass
+  // after the first starts on a block and its ranks are that block's header;
+  // SubIntSplit reads its sections 1024 rows at a time, so one of its reads is
+  // one pass. The blocks of a pass are merged as kLanes independent cursor
+  // sets.
+  static constexpr uint32_t kChunkRows = 1024;
+  static constexpr uint32_t kLanes = kChunkRows / kStride;
+  static_assert(kChunkRows % kStride == 0);
 
   const uint8_t* block(uint32_t index) const {
     return blocks_.data() + static_cast<size_t>(index) * kBlockBytes;
@@ -195,7 +207,9 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       const std::vector<uint32_t>& partitionSizes) {
     const uint32_t rowCount = this->rowCount_;
     const uint32_t numBlocks = (rowCount + kStride - 1) / kStride;
-    blocks_.resize(static_cast<size_t>(numBlocks) * kBlockBytes);
+    // One more header after the last block holds the totals, so the ranks at
+    // rowCount are a header read like any other block start.
+    blocks_.resize(static_cast<size_t>(numBlocks) * kBlockBytes + kHeaderBytes);
     std::array<uint32_t, kMaxBuckets> counts{};
     if (rowCount > 0) {
       auto noStringBufferFactory = [](uint32_t) -> void* { return nullptr; };
@@ -213,13 +227,18 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
         const uint32_t count = std::min(kStride, rowCount - start);
         tags->materialize(count, wide.data());
         for (uint32_t i = 0; i < count; ++i) {
-          const auto bucket = static_cast<uint8_t>(std::min(wide[i], numTiers_));
+          const auto bucket =
+              static_cast<uint8_t>(std::min(wide[i], numTiers_));
           blockTags[i] = bucket;
           ++counts[bucket];
         }
         std::fill(blockTags + count, blockTags + kStride, kPadTag);
       }
     }
+    auto* totals =
+        blocks_.data() + static_cast<size_t>(numBlocks) * kBlockBytes;
+    std::memset(totals, 0, kHeaderBytes);
+    std::memcpy(totals, counts.data(), kMaxBuckets * sizeof(uint32_t));
     for (uint32_t bucket = 0; bucket < partitionSizes.size(); ++bucket) {
       NIMBLE_CHECK_EQ(counts[bucket], partitionSizes[bucket]);
     }
@@ -237,6 +256,16 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
         countEqual(blockTags(current), row % kStride, bucket);
   }
 
+  // Every bucket's rank at `row`, which may be rowCount.
+  void ranksAt(uint32_t row, std::array<uint32_t, kMaxBuckets>& ranks) const {
+    const uint8_t* const current = block(row / kStride);
+    const uint32_t skip = row % kStride;
+    for (uint32_t bucket = 0; bucket <= numTiers_; ++bucket) {
+      ranks[bucket] = blockRank(current, bucket) +
+          (skip == 0 ? 0 : countEqual(blockTags(current), skip, bucket));
+    }
+  }
+
   physicalType valueAt(uint8_t bucket, uint32_t rank) const {
     if (bucket == numTiers_) {
       return fallbackAt(rank);
@@ -246,14 +275,15 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
     if (!tier.resolved.empty()) {
       return tier.resolved[key];
     }
-    return TypedEncodingView<T>::castToPhysicalType(tier.dictionary->readAt(key));
+    return TypedEncodingView<T>::castToPhysicalType(
+        tier.dictionary->readAt(key));
   }
 
   physicalType fallbackAt(uint32_t rank) const {
     return TypedEncodingView<T>::castToPhysicalType(fallback_->readAt(rank));
   }
 
-  // Reads `count` values of bucket `bucket` from rank `rank` on.
+  // Reads `count` <= kChunkRows values of bucket `bucket` from rank `rank` on.
   void readBucket(
       uint8_t bucket,
       uint32_t rank,
@@ -264,7 +294,7 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       return;
     }
     const auto& tier = tiers_[bucket];
-    std::array<uint32_t, kStride> keys;
+    std::array<uint32_t, kChunkRows> keys;
     tier.keys->read(rank, count, keys.data());
     if (!tier.resolved.empty()) {
       // Held in a local: a store through a one-byte output may alias the
@@ -308,21 +338,117 @@ class FrequencyPartitionEncodingView final : public TypedEncodingView<T> {
       decoded_->read(offset, length, output);
       return;
     }
-    // One block at a time: its header gives every bucket's rank at its
-    // first row, so only a range starting inside a block counts tags.
+    std::array<uint32_t, kMaxBuckets> ranks;
+    ranksAt(offset, ranks);
+    const uint32_t skip = offset % kStride;
+    if (skip + length <= kStride) {
+      readRows(
+          blockTags(block(offset / kStride)) + skip, length, ranks, output);
+      return;
+    }
+    // Each pass ends on a block start (or the range's end), so the next
+    // pass's ranks are this pass's end ranks: the tags are counted at most at
+    // the range's two ends.
+    const uint32_t end = offset + length;
+    for (uint32_t row = offset; row < end;) {
+      const uint32_t passEnd =
+          std::min(end, row / kStride * kStride + kChunkRows);
+      std::array<uint32_t, kMaxBuckets> endRanks;
+      ranksAt(passEnd, endRanks);
+      readPass(row, passEnd - row, ranks, endRanks, output + (row - offset));
+      ranks = endRanks;
+      row = passEnd;
+    }
+  }
+
+  // Reads rows [row, row + count), which lie in at most kLanes blocks, given
+  // every bucket's rank at both ends. Each bucket's values are read in bulk,
+  // then each block's rows take them in order from cursors set from its
+  // header, so the blocks merge independently and no tag is counted.
+  void readPass(
+      uint32_t row,
+      uint32_t count,
+      const std::array<uint32_t, kMaxBuckets>& ranks,
+      const std::array<uint32_t, kMaxBuckets>& endRanks,
+      physicalType* output) const {
     const uint32_t numBuckets = numTiers_ + 1;
-    for (uint32_t done = 0; done < length;) {
-      const uint32_t row = offset + done;
-      const uint8_t* const current = block(row / kStride);
-      const uint32_t skip = row % kStride;
-      const uint32_t count = std::min(kStride - skip, length - done);
-      std::array<uint32_t, kMaxBuckets> ranks;
-      for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
-        ranks[bucket] = blockRank(current, bucket) +
-            (skip == 0 ? 0 : countEqual(blockTags(current), skip, bucket));
+    std::array<physicalType, kChunkRows> values;
+    std::array<const physicalType*, kMaxBuckets> starts;
+    uint32_t filled = 0;
+    for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+      const uint32_t bucketRows = endRanks[bucket] - ranks[bucket];
+      if (bucketRows == count) {
+        readBucket(bucket, ranks[bucket], count, output);
+        return;
       }
-      readRows(blockTags(current) + skip, count, ranks, output + done);
-      done += count;
+      starts[bucket] = values.data() + filled;
+      if (bucketRows > 0) {
+        readBucket(bucket, ranks[bucket], bucketRows, values.data() + filled);
+      }
+      filled += bucketRows;
+    }
+    NIMBLE_DCHECK_EQ(filled, count);
+
+    const uint32_t firstBlock = row / kStride;
+    const uint32_t numBlocks = (row + count - 1) / kStride - firstBlock + 1;
+    std::array<std::array<const physicalType*, kMaxBuckets>, kLanes> cursors;
+    std::array<const uint8_t*, kLanes> tags;
+    std::array<physicalType*, kLanes> outputs;
+    std::array<uint32_t, kLanes> rows;
+    for (uint32_t lane = 0; lane < numBlocks; ++lane) {
+      const uint8_t* const current = block(firstBlock + lane);
+      const uint32_t begin = lane == 0 ? row : (firstBlock + lane) * kStride;
+      const uint32_t stop =
+          std::min(row + count, (firstBlock + lane + 1) * kStride);
+      tags[lane] = blockTags(current) + begin % kStride;
+      outputs[lane] = output + (begin - row);
+      rows[lane] = stop - begin;
+      for (uint32_t bucket = 0; bucket < numBuckets; ++bucket) {
+        cursors[lane][bucket] = starts[bucket] +
+            (lane == 0 ? 0 : blockRank(current, bucket) - ranks[bucket]);
+      }
+    }
+    if (numBlocks == kLanes && rows[0] == kStride &&
+        rows[kLanes - 1] == kStride) {
+      mergeFullPass(cursors, tags, outputs);
+      return;
+    }
+    for (uint32_t lane = 0; lane < numBlocks; ++lane) {
+      const uint8_t* const laneTags = tags[lane];
+      physicalType* const laneOutput = outputs[lane];
+      auto& laneCursors = cursors[lane];
+      for (uint32_t i = 0; i < rows[lane]; ++i) {
+        laneOutput[i] = *laneCursors[laneTags[i]]++;
+      }
+    }
+  }
+
+  // Merges kLanes whole blocks at once, one row of each per step, so the
+  // lanes' cursor updates are independent chains. The lane pointers are
+  // locals: a store through a one-byte output may alias an array of them,
+  // which would otherwise be reloaded per row.
+  static void mergeFullPass(
+      std::array<std::array<const physicalType*, kMaxBuckets>, kLanes>& cursors,
+      const std::array<const uint8_t*, kLanes>& tags,
+      const std::array<physicalType*, kLanes>& outputs) {
+    static_assert(kLanes == 4);
+    const uint8_t* const tags0 = tags[0];
+    const uint8_t* const tags1 = tags[1];
+    const uint8_t* const tags2 = tags[2];
+    const uint8_t* const tags3 = tags[3];
+    physicalType* const output0 = outputs[0];
+    physicalType* const output1 = outputs[1];
+    physicalType* const output2 = outputs[2];
+    physicalType* const output3 = outputs[3];
+    auto& cursors0 = cursors[0];
+    auto& cursors1 = cursors[1];
+    auto& cursors2 = cursors[2];
+    auto& cursors3 = cursors[3];
+    for (uint32_t i = 0; i < kStride; ++i) {
+      output0[i] = *cursors0[tags0[i]]++;
+      output1[i] = *cursors1[tags1[i]]++;
+      output2[i] = *cursors2[tags2[i]]++;
+      output3[i] = *cursors3[tags3[i]]++;
     }
   }
 
