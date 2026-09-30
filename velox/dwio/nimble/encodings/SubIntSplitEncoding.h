@@ -1621,7 +1621,10 @@ subintsplit::SelectorConfig SubIntSplitEncoding<T>::plannerSelectorConfig(
   switch (tuning.sectionCandidates) {
     case subintsplit::SectionCandidates::kDefault:
       break;
-    case subintsplit::SectionCandidates::kAddressable:
+    // The top-level rule differs from the strict one only below a section's
+    // own encoding, which the planner does not price.
+    case subintsplit::SectionCandidates::kAddressableStrict:
+    case subintsplit::SectionCandidates::kAddressableTopLevel:
       for (const auto type :
            {EncodingType::Trivial,
             EncodingType::FixedBitWidth,

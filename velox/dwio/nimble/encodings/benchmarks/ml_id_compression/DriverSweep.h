@@ -275,12 +275,15 @@ inline subintsplit::SectionCandidates sectionCandidatesFlag() {
     return subintsplit::SectionCandidates::kDefault;
   }
   if (name == "addressable") {
-    return subintsplit::SectionCandidates::kAddressable;
+    return subintsplit::SectionCandidates::kAddressableTopLevel;
+  }
+  if (name == "addressable_strict") {
+    return subintsplit::SectionCandidates::kAddressableStrict;
   }
   NIMBLE_CHECK(
       name == "unrestricted",
-      "--mlidc_sis_section_candidates must be default, addressable or "
-      "unrestricted: {}",
+      "--mlidc_sis_section_candidates must be default, addressable, "
+      "addressable_strict or unrestricted: {}",
       name);
   return subintsplit::SectionCandidates::kUnrestricted;
 }

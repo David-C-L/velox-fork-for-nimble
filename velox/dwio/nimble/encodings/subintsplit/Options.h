@@ -17,6 +17,7 @@
 
 #include <cstdint>
 
+#include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
 #include "velox/dwio/nimble/encodings/subintsplit/DecodeCost.h"
 
 namespace facebook::nimble::subintsplit {
@@ -42,15 +43,31 @@ enum class SectionCandidates : uint8_t {
   /// The writer's list (nestedEncodingReadFactors) and the planner's own
   /// defaults, unchanged.
   kDefault = 0,
-  /// Only encodings a reader can position in without a scan from the start
-  /// of the stream or from a checkpoint (see isAddressableSectionEncoding).
-  kAddressable = 1,
+  /// The strict rule: only encodings a reader can position in without a
+  /// scan from the start of the stream or from a checkpoint (see
+  /// isAddressableSectionEncoding), for a section and every stream below it.
+  kAddressableStrict = 1,
   /// The default list plus Huffman, and Delta priced by deltaCostBitsV2.
-  /// Measures the compression kAddressable gives up.
+  /// Measures the compression the addressable settings give up.
   kUnrestricted = 2,
+  /// The top-level rule: a section's own encoding, and every stream below it
+  /// that a read reaches per row (isRowAddressedStream), are held to
+  /// isAddressableSectionEncoding. A stream sized by runs, distinct values,
+  /// frames or exceptions is decoded once when a view opens, so it may take
+  /// any encoding, as may every stream below it. The planner is held exactly
+  /// as under kAddressableStrict, since it prices a section's own encoding
+  /// only.
+  kAddressableTopLevel = 3,
 };
 
-/// Whether kAddressable admits `type` for a section or a stream below one:
+/// Whether `setting` holds some of a section's streams to
+/// isAddressableSectionEncoding.
+inline bool isAddressableSetting(SectionCandidates setting) {
+  return setting == SectionCandidates::kAddressableStrict ||
+      setting == SectionCandidates::kAddressableTopLevel;
+}
+
+/// Whether the addressable settings admit `type` for a stream they hold:
 /// a point read costs O(1), a binary search, or a bounded scan of at most
 /// 256 fixed-width values, never a bit-serial decode or a prefix sum whose
 /// length grows with the row's position or its distance from a checkpoint.
@@ -70,6 +87,52 @@ inline bool isAddressableSectionEncoding(EncodingType type) {
     case EncodingType::DeltaBlock:
       return false;
     default:
+      return true;
+  }
+}
+
+/// Whether the child stream `child` of a `parent` stream is read per row of
+/// its parent: its length grows with the parent's row count and a read of
+/// the parent reaches it through a view, so under kAddressableTopLevel it is
+/// held to isAddressableSectionEncoding like the section itself. False for a
+/// child sized by runs, distinct values, frames, blocks or exceptions, which
+/// the parent's view decodes whole when it opens (RLEEncodingView,
+/// DictionaryEncodingView's alphabet, FOREncodingView,
+/// BlockBitPackingEncodingView, PFOREncodingView, and
+/// FrequencyPartitionEncodingView's sizes and dictionaries). An encoding not
+/// listed is taken to read every child per row, which only withdraws more.
+inline bool isRowAddressedStream(
+    EncodingType parent,
+    NestedEncodingIdentifier child) {
+  switch (parent) {
+    case EncodingType::RLE:
+      // Run lengths and run values: one entry per run.
+      return false;
+    case EncodingType::Dictionary:
+      // The alphabet has one entry per distinct value; the indices one per
+      // row.
+      return child == EncodingIdentifiers::Dictionary::Indices;
+    case EncodingType::FOR:
+      // Bit widths, references and bit offsets: one entry per frame.
+    case EncodingType::BlockBitPacking:
+      // Baselines, bit widths and offsets: one entry per block.
+    case EncodingType::PFOR:
+      // Exception positions and values: at most the rows the chosen width
+      // leaves uncovered.
+      return false;
+    case EncodingType::FrequencyPartition:
+      // Partition offsets and sizes (one per tier) and each tier's
+      // dictionary (its distinct values) are decoded on open; each tier's
+      // keys, the unencoded values and the tier tags hold one entry per row
+      // of their partition or of the stream.
+      return !(
+          child == EncodingIdentifiers::FrequencyPartition::PartitionOffsets ||
+          child == EncodingIdentifiers::FrequencyPartition::PartitionSizes ||
+          (child >= EncodingIdentifiers::FrequencyPartition::Dict1Bit &&
+           child <= EncodingIdentifiers::FrequencyPartition::Dict32Bit));
+    default:
+      // SubIntSplit's sections, MainlyConstant's isCommon and other values,
+      // SparseBool's indices, Trivial's lengths, and anything else.
       return true;
   }
 }

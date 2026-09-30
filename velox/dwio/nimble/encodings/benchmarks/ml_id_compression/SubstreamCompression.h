@@ -123,9 +123,10 @@ class AllowedSetSelectionPolicy
   AllowedSetSelectionPolicy(
       ReadFactors readFactors,
       std::unordered_set<nimble::EncodingType> allowed,
-      std::optional<nimble::NestedEncodingIdentifier> identifier)
+      std::optional<nimble::NestedEncodingIdentifier> identifier,
+      bool rowAddressed = true)
       : nimble::ManualEncodingSelectionPolicy<
-            T>{identifier.has_value() ? held(readFactors, allowed) : readFactors, std::nullopt, identifier},
+            T>{identifier.has_value() ? held(readFactors, allowed) : readFactors, std::nullopt, identifier, std::nullopt, rowAddressed},
         readFactors_{
             identifier.has_value() ? held(std::move(readFactors), allowed)
                                    : std::move(readFactors)},
@@ -143,7 +144,10 @@ class AllowedSetSelectionPolicy
         AllowedSetSelectionPolicy,
         std::move(nested),
         allowed_,
-        nestedEncodingIdentifier);
+        nestedEncodingIdentifier,
+        this->rowAddressed() &&
+            nimble::subintsplit::isRowAddressedStream(
+                parentEncodingType, nestedEncodingIdentifier));
   }
 
  private:
@@ -455,7 +459,9 @@ class BenchEncodingSelectionPolicy
           std::move(readFactors),
           compressionOptionsFor(compressionType_),
           nestedEncodingIdentifier,
-          std::nullopt);
+          std::nullopt,
+          nimble::subintsplit::isRowAddressedStream(
+              parentEncodingType, nestedEncodingIdentifier));
     }
     UNIQUE_PTR_FACTORY(
         type,

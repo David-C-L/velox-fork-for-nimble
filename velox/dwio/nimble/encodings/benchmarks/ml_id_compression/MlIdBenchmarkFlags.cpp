@@ -181,9 +181,14 @@ DEFINE_string(
     "default",
     "subintsplit::TuningConfig::sectionCandidates, applied to the split "
     "planner and to section selection together: default (the writer's list, "
-    "unchanged), addressable (only encodings a reader positions in without a "
-    "scan: no Delta, DeltaBlock or Huffman, see "
-    "subintsplit::isAddressableSectionEncoding) or unrestricted (the default "
+    "unchanged), addressable (the top-level rule: a section's own encoding "
+    "and every stream a read reaches per row are held to encodings a reader "
+    "positions in without a scan, no Delta, Varint, DeltaBlock or Huffman, "
+    "see subintsplit::isAddressableSectionEncoding and isRowAddressedStream; "
+    "streams sized by runs, distinct values, frames or exceptions may take "
+    "any encoding), addressable_strict (the same encodings withdrawn from "
+    "every stream below a section, which is what addressable selected up to "
+    "evaluation 643ce0832) or unrestricted (the default "
     "list plus Huffman, with Delta priced by the V2 Delta model). Composes "
     "with --mlidc_sis_cost_model_v2.");
 DEFINE_double(
