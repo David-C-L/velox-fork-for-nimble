@@ -20,6 +20,7 @@
 #include "folly/ScopeGuard.h"
 #include "velox/dwio/nimble/encodings/common/EncodingPrimitives.h"
 #include "velox/dwio/nimble/encodings/views/EncodingViewFactory.h"
+#include "velox/dwio/nimble/encodings/views/MaterializedEncodingView.h"
 
 namespace facebook::nimble {
 
@@ -36,7 +37,10 @@ class DictionaryEncodingView final : public TypedEncodingView<T> {
     NIMBLE_CHECK_EQ(this->encodingType_, EncodingType::Dictionary);
     const char* pos = data.data() + this->dataOffset_;
     const auto alphabetSize = encoding::readUint32(pos);
-    alphabet_ = detail::createTypedEncodingView<T>(
+    // The alphabet is one entry per distinct value; one without a view is
+    // decoded once here rather than failing this view. The indices, one per
+    // row, stay a view.
+    alphabet_ = detail::createTypedEncodingViewOrMaterialized<T>(
         {pos, alphabetSize}, this->pool_, options);
     NIMBLE_CHECK_NOT_NULL(alphabet_);
     pos += alphabetSize;
