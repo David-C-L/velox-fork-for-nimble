@@ -414,6 +414,12 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     }
   }
 
+  void willRead(uint32_t rows) const final {
+    for (const auto& section : sections_) {
+      section.view->willRead(rows);
+    }
+  }
+
   void readResidualRange(uint32_t offset, uint32_t length, physicalType* output)
       const {
     if (length == 0) {
@@ -452,6 +458,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
     // avoids a separate fill pass. That only works when there is nothing to
     // seed with, so a non-zero constant contribution is filled first instead.
     const bool seedWithConstant = constantBits_ != 0 || sections_.empty();
+
+    // Each section sees only 1024-row reads below, so a long read is
+    // announced first: a section whose one-pass decode wins on a read this
+    // long (FrequencyPartition) can take it.
+    if (length > kViewChunkSize) {
+      willRead(length);
+    }
 
     for (uint32_t chunkStart = 0; chunkStart < length;
          chunkStart += kViewChunkSize) {
@@ -557,6 +570,13 @@ class SubIntSplitEncodingView final : public TypedEncodingView<T> {
       std::span<const RowRange> ranges,
       physicalType* output) const {
     alignas(64) physicalType staged[kViewChunkSize];
+    uint64_t totalRows = 0;
+    for (const auto& range : ranges) {
+      totalRows += range.numRows();
+    }
+    if (totalRows > kViewChunkSize) {
+      willRead(static_cast<uint32_t>(totalRows));
+    }
     size_t rangeIndex = 0;
     while (rangeIndex < ranges.size()) {
       const uint32_t groupOffset = ranges[rangeIndex].startRow;
