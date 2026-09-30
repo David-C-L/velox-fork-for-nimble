@@ -173,9 +173,9 @@ TEST_F(FrequencyPartitionEncodingViewTest, fallbackGroup) {
 }
 
 TEST_F(FrequencyPartitionEncodingViewTest, edgeCases) {
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), 1, 42});
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), 256, 42});
-  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), 257, 42});
+  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{1}, uint64_t{42}});
+  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{256}, uint64_t{42}});
+  expectViewMatches(nimble::Vector<uint64_t>{pool_.get(), size_t{257}, uint64_t{42}});
   expectViewMatches(zipf<uint64_t>(255, 30, 3));
   expectViewMatches(zipf<uint64_t>(512, 30, 4));
   // Long runs, so whole 256-row strides hold a single tier (the bulk path)
