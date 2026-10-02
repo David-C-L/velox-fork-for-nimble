@@ -43,6 +43,8 @@
 #include "velox/dwio/nimble/common/Buffer.h"
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/compression/Compression.h"
+#include "velox/dwio/nimble/encodings/ALPEncoding.h"
+#include "velox/dwio/nimble/encodings/ALPRDEncoding.h"
 #include "velox/dwio/nimble/encodings/HuffmanEncoding.h"
 #include "velox/dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "velox/dwio/nimble/encodings/benchmarks/BenchmarkUtils.h"
@@ -104,6 +106,16 @@ DECLARE_bool(mlidc_allow_delta_block);
 DECLARE_bool(mlidc_sis_withdraw_frequency_partition);
 DECLARE_int32(mlidc_block_codec_probes);
 DECLARE_string(mlidc_dtype);
+
+// TestUtils.h maps ALP but not ALP_RD to its EncodingType; the ALPRD arm
+// encodes through the same path, so it needs the mapping too.
+namespace facebook::nimble::test {
+template <typename T>
+struct EncodingTypeTraits<nimble::ALPRDEncoding<T>> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::ALPRD;
+};
+} // namespace facebook::nimble::test
 
 namespace facebook::nimble::mlidc {
 
@@ -1861,6 +1873,38 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
                          const subintsplit::TuningConfig& tuning) {
         auto impl = std::make_unique<
             NimbleViewBenchTargetImpl<SimdForBitpackEncoding<T>>>();
+        impl->encode(data, opts, tuning);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+  }
+
+  // ALP and ALP_RD are floating-point-only encodings. Neither is among the
+  // writer's default candidates, so Auto/view never reaches them; these arms
+  // force them at the top level, with default selection for ALP's nested
+  // integer and exception streams. ALP_RD has no view, so it is a cursor arm
+  // only, flagged like Dictionary (no fast skip).
+  if constexpr (std::is_floating_point_v<T>) {
+    encoders.push_back(
+        makeEncoderEntry<ALPEncoding<T>>(
+            "ALP", "Baseline", "alp", true, false, false));
+    encoders.push_back(
+        makeEncoderEntry<ALPRDEncoding<T>>(
+            "ALPRD", "Baseline", "alprd", true, false, false));
+    {
+      EncoderEntry<T> entry;
+      entry.name = "ALP/view";
+      entry.family = "Baseline";
+      entry.variant = "alp_view";
+      entry.isSequential = false;
+      entry.fastSkip = true;
+      entry.randomAccess = true;
+      entry.factory = [](const Vector<T>& data,
+                         const Encoding::Options& opts,
+                         const subintsplit::TuningConfig& tuning) {
+        auto impl =
+            std::make_unique<NimbleViewBenchTargetImpl<ALPEncoding<T>>>();
         impl->encode(data, opts, tuning);
         return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
       };
