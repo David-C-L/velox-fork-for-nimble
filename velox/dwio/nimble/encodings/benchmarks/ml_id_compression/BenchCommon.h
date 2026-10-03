@@ -244,14 +244,40 @@ class NimbleBenchTarget {
     }
   }
 
+  // Cold-open mode: every read first drops the decoder, so the Encoding's
+  // constructor (ALP decodes its whole integer stream there) is inside the
+  // timed region. Off by default; only the +cold arms set it.
+  void setColdOpen(bool value) {
+    coldOpen_ = value;
+  }
+
+  bool coldOpen() const {
+    return coldOpen_;
+  }
+
+  // Builds the decoder now / drops it, so a driver can time construction alone.
+  void openDecoder() {
+    decoder();
+  }
+
+  void closeDecoder() {
+    encoding_.reset();
+  }
+
   // reset + materialize all n rows into dst.
   void materializeAll(T* dst, uint32_t n) {
+    if (coldOpen_) {
+      encoding_.reset();
+    }
     decoder().reset();
     decoder().materialize(n, dst);
   }
 
   // reset + skip begin rows + materialize count rows into dst.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) {
+    if (coldOpen_) {
+      encoding_.reset();
+    }
     auto& encoding = decoder();
     encoding.reset();
     if (begin > 0) {
@@ -264,6 +290,9 @@ class NimbleBenchTarget {
   // materialize.  dst must have space for the total number of rows across all
   // ranges.
   void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst) {
+    if (coldOpen_) {
+      encoding_.reset();
+    }
     auto& encoding = decoder();
     encoding.reset();
     uint32_t cursor = 0;
@@ -331,6 +360,7 @@ class NimbleBenchTarget {
   Encoding::Options options_;
   subintsplit::TuningConfig tuning_;
   std::unique_ptr<Encoding> encoding_;
+  bool coldOpen_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -458,13 +488,17 @@ struct NimbleBenchTargetImpl
   // the whole column into a cache that later probes copy out of, giving the
   // arm a one-time build despite its sequential interface.
   bool buildsAccessStructure() const override {
-    return target.retainsDecodeCache();
+    return target.coldOpen() || target.retainsDecodeCache();
   }
 
   // Forces that first decode now. A one-row read is what populates the cache,
   // and for an unblocked transformed plan the span it decodes is the whole
   // column, so this is the cost a first probe pays.
   void buildAccessStructure() override {
+    if (target.coldOpen()) {
+      target.openDecoder();
+      return;
+    }
     if (!target.retainsDecodeCache()) {
       return;
     }
@@ -473,6 +507,10 @@ struct NimbleBenchTargetImpl
   }
 
   void discardAccessStructure() override {
+    if (target.coldOpen()) {
+      target.closeDecoder();
+      return;
+    }
     target.dropDecodeCache();
   }
   std::string describe() override {
@@ -608,8 +646,14 @@ class NimbleViewBenchTargetImpl
     timeViewConstruction_ = value;
   }
 
+  // Cold-open mode: every read, not only materializeAll, rebuilds the view
+  // first, so a point or range read is reported as open + read.
+  void setColdOpen(bool value) {
+    coldOpen_ = value;
+  }
+
   void materializeAll(T* dst, uint32_t n) override {
-    if (timeViewConstruction_) {
+    if (timeViewConstruction_ || coldOpen_) {
       discardAccessStructure();
     }
     buildAccessStructure();
@@ -619,6 +663,9 @@ class NimbleViewBenchTargetImpl
   // A single-row read goes through readAt rather than a length-1 range: that
   // is the API a point lookup would actually use.
   void materializeRange(uint32_t begin, uint32_t count, T* dst) override {
+    if (coldOpen_) {
+      discardAccessStructure();
+    }
     buildAccessStructure();
     if (count == 1) {
       view_->readAt(begin, dst);
@@ -632,6 +679,9 @@ class NimbleViewBenchTargetImpl
   // rather than answer them one by one.
   void skipThenMaterialize(std::span<const nimble::RowRange> ranges, T* dst)
       override {
+    if (coldOpen_) {
+      discardAccessStructure();
+    }
     buildAccessStructure();
     view_->read(ranges, {}, dst);
   }
@@ -687,6 +737,7 @@ class NimbleViewBenchTargetImpl
   subintsplit::TuningConfig tuning_;
   std::unique_ptr<EncodingView> view_;
   bool timeViewConstruction_{false};
+  bool coldOpen_{false};
 };
 
 template <typename T>
@@ -1906,6 +1957,67 @@ std::vector<EncoderEntry<T>> buildDefaultEncoders() {
         auto impl =
             std::make_unique<NimbleViewBenchTargetImpl<ALPEncoding<T>>>();
         impl->encode(data, opts, tuning);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+
+    // Cold-open twins: every read builds its reader first, so construction
+    // (ALP decodes its whole integer stream there) is inside the timed read.
+    // bulk is open + materialize all rows; point and range are open + one read.
+    // build_ns of these rows is the construction cost alone. Same encoded
+    // bytes as the arm without the suffix.
+    auto addColdCursor = [&encoders](auto tag, const char* name) {
+      using E = typename decltype(tag)::type;
+      auto entry = makeEncoderEntry<E>(
+          name, "Baseline", "cold", true, false, false);
+      entry.factory = [](const Vector<T>& data,
+                         const Encoding::Options& opts,
+                         const subintsplit::TuningConfig& tuning) {
+        auto impl = std::make_unique<NimbleBenchTargetImpl<E>>();
+        impl->target.encode(data, opts, tuning, /*realNestedSelection=*/true);
+        impl->target.setColdOpen(true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    };
+    addColdCursor(std::type_identity<ALPEncoding<T>>{}, "ALP+cold");
+    addColdCursor(std::type_identity<ALPRDEncoding<T>>{}, "ALPRD+cold");
+    {
+      EncoderEntry<T> entry;
+      entry.name = "ALP/view+cold";
+      entry.family = "Baseline";
+      entry.variant = "alp_view_cold";
+      entry.isSequential = false;
+      entry.fastSkip = true;
+      entry.randomAccess = true;
+      entry.factory = [](const Vector<T>& data,
+                         const Encoding::Options& opts,
+                         const subintsplit::TuningConfig& tuning) {
+        auto impl =
+            std::make_unique<NimbleViewBenchTargetImpl<ALPEncoding<T>>>();
+        impl->encode(data, opts, tuning);
+        impl->setColdOpen(true);
+        return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
+      };
+      encoders.push_back(std::move(entry));
+    }
+    {
+      EncoderEntry<T> entry;
+      entry.name = "SIS/realNested+view+cold";
+      entry.family = "SubIntSplit";
+      entry.variant = "real_nested_view_cold";
+      entry.inventory = "full";
+      entry.isSequential = false;
+      entry.fastSkip = true;
+      entry.randomAccess = true;
+      entry.factory = [](const Vector<T>& data,
+                         const Encoding::Options& opts,
+                         const subintsplit::TuningConfig& tuning) {
+        auto impl = std::make_unique<
+            NimbleViewBenchTargetImpl<SubIntSplitEncoding<T>>>();
+        impl->encodeWith(data, opts, tuning, /*realNestedSelection=*/true);
+        impl->setColdOpen(true);
         return std::unique_ptr<NimbleBenchTargetBase<T>>(std::move(impl));
       };
       encoders.push_back(std::move(entry));
