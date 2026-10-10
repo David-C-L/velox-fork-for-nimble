@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <memory>
 #include <algorithm>
 #include <array>
 
@@ -145,10 +146,33 @@ class MainlyConstantEncodingView final : public TypedEncodingView<T> {
     if (length == 0) {
       return;
     }
+    uint32_t rank = uncommonBefore(offset);
+    // A long read takes its uncommon values in one read of the child, so a
+    // child that decodes whole on a long read does so once instead of being
+    // asked for a few rows per block, and places them without a branch per
+    // row, which mispredicts when uncommon rows are frequent.
+    if (length > kBlockRows) {
+      const uint32_t numOthers = uncommonBefore(offset + length) - rank;
+      if (numOthers == 0) {
+        std::fill(output, output + length, commonValue_);
+        return;
+      }
+      // One spare slot: the fill reads the next uncommon value before it
+      // knows whether the row takes it.
+      const auto allOthers = std::make_unique<physicalType[]>(numOthers + 1);
+      otherValues_->read(rank, numOthers, allOthers.get());
+      allOthers[numOthers] = commonValue_;
+      uint32_t next = 0;
+      for (uint32_t i = 0; i < length; ++i) {
+        const uint32_t uncommon = isUncommon(offset + i) ? 1 : 0;
+        output[i] = uncommon != 0 ? allOthers[next] : commonValue_;
+        next += uncommon;
+      }
+      return;
+    }
     // A block of rows at a time: the uncommon values are read in bulk and
     // the common value filled around them.
     std::array<physicalType, kBlockRows> others;
-    uint32_t rank = uncommonBefore(offset);
     for (uint32_t done = 0; done < length;) {
       const uint32_t start = offset + done;
       const uint32_t count = std::min(kBlockRows, length - done);
