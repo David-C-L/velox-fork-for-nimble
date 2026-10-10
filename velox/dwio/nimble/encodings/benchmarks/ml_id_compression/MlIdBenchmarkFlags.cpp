@@ -235,6 +235,13 @@ DEFINE_int32(
     -1,
     "subintsplit::SelectorConfig::maxCandidateBoundaries. Negative keeps the "
     "library default.");
+DEFINE_int32(
+    mlidc_sis_time_planner_reps,
+    0,
+    "bench_compression only: when positive, times choosing the SubIntSplit "
+    "split for each dataset this many times (after two warm-ups) under the "
+    "planner and read-cost flags: sampling, costing the grid and the DP or "
+    "the budget search. Prints one planner_ms line per dataset.");
 DEFINE_bool(
     mlidc_dump_encoding,
     false,

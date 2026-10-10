@@ -303,6 +303,32 @@ inline void applyPlannerFlags(subintsplit::TuningConfig& tuning) {
   }
 }
 
+/// Applies the decode-weighting and read-cost flags. Their defaults leave the
+/// tuning as the library builds it, so every driver's selection is unchanged
+/// unless a flag is set.
+inline void applyReadCostFlags(subintsplit::TuningConfig& tuning) {
+  tuning.selector.decodeWeighting = {
+      .weight = FLAGS_mlidc_sis_decode_weight,
+      .accessPattern = static_cast<subintsplit::DecodeAccessPattern>(
+          FLAGS_mlidc_sis_decode_access_pattern),
+      .readPath = static_cast<subintsplit::DecodeReadPath>(
+          FLAGS_mlidc_sis_decode_read_path),
+      .model = static_cast<subintsplit::DecodeCostModel>(
+          FLAGS_mlidc_sis_decode_cost_model),
+      .sectionReadNanos = FLAGS_mlidc_sis_section_read_nanos,
+      .sizeBudget = FLAGS_mlidc_sis_size_budget,
+  };
+  tuning.maxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
+  tuning.sectionMaxSizeRegression =
+      FLAGS_mlidc_sis_section_max_size_regression;
+  tuning.selector.maxSections = FLAGS_mlidc_sis_max_sections;
+  tuning.selector.minSectionWidth = FLAGS_mlidc_sis_min_section_width;
+  if (FLAGS_mlidc_sis_max_candidate_boundaries >= 0) {
+    tuning.selector.maxCandidateBoundaries =
+        static_cast<size_t>(FLAGS_mlidc_sis_max_candidate_boundaries);
+  }
+}
+
 /// Encodes data with one encoder, or returns nullptr after writing a skip row.
 ///
 /// An encoder that cannot represent a dataset throws from its factory, which is
@@ -343,28 +369,7 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
   if (auto allowed = sisAllowedEncodings(); !allowed.empty()) {
     tuning.allowedEncodings = std::move(allowed);
   }
-  // Zero by default, so every driver's selection is unchanged unless the flag
-  // is set; reaches every arm through the tuning each factory is handed.
-  tuning.selector.decodeWeighting = {
-      .weight = FLAGS_mlidc_sis_decode_weight,
-      .accessPattern = static_cast<subintsplit::DecodeAccessPattern>(
-          FLAGS_mlidc_sis_decode_access_pattern),
-      .readPath = static_cast<subintsplit::DecodeReadPath>(
-          FLAGS_mlidc_sis_decode_read_path),
-      .model = static_cast<subintsplit::DecodeCostModel>(
-          FLAGS_mlidc_sis_decode_cost_model),
-      .sectionReadNanos = FLAGS_mlidc_sis_section_read_nanos,
-      .sizeBudget = FLAGS_mlidc_sis_size_budget,
-  };
-  tuning.maxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
-  tuning.sectionMaxSizeRegression =
-      FLAGS_mlidc_sis_section_max_size_regression;
-  tuning.selector.maxSections = FLAGS_mlidc_sis_max_sections;
-  tuning.selector.minSectionWidth = FLAGS_mlidc_sis_min_section_width;
-  if (FLAGS_mlidc_sis_max_candidate_boundaries >= 0) {
-    tuning.selector.maxCandidateBoundaries =
-        static_cast<size_t>(FLAGS_mlidc_sis_max_candidate_boundaries);
-  }
+  applyReadCostFlags(tuning);
   tuning.rowFrame = FLAGS_mlidc_sis_row_frame;
   applyPlannerFlags(tuning);
   // Admission and the estimate guards decide whether a stream picks

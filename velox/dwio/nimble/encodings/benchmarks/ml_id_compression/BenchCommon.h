@@ -102,6 +102,7 @@ DECLARE_int32(mlidc_sis_max_sections);
 DECLARE_double(mlidc_sis_section_max_size_regression);
 DECLARE_int32(mlidc_sis_min_section_width);
 DECLARE_int32(mlidc_sis_max_candidate_boundaries);
+DECLARE_int32(mlidc_sis_time_planner_reps);
 DECLARE_bool(mlidc_sis_cost_model_v2);
 DECLARE_string(mlidc_sis_section_candidates);
 DECLARE_int64(mlidc_sis_planner_samples);

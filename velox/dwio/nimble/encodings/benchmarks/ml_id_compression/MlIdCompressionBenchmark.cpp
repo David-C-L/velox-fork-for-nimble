@@ -16,10 +16,14 @@
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -98,6 +102,53 @@ int runBenchmark() {
     std::cout << "== Dataset: " << ds.name << " ==\n";
     auto data = ds.generate(n, seed);
     const size_t rawBytes = static_cast<size_t>(n) * kElemSize;
+
+    if (FLAGS_mlidc_sis_time_planner_reps > 0) {
+      if constexpr (std::is_same_v<Elem, uint64_t>) {
+        subintsplit::TuningConfig tuning;
+        applyReadCostFlags(tuning);
+        applyPlannerFlags(tuning);
+        const std::span<const uint64_t> values{data.data(), data.size()};
+        std::vector<double> millis;
+        size_t numSections = 0;
+        double weight = 0.0;
+        constexpr int kWarmups = 2;
+        for (int rep = 0; rep < FLAGS_mlidc_sis_time_planner_reps + kWarmups;
+             ++rep) {
+          const auto start = std::chrono::steady_clock::now();
+          std::vector<uint64_t> sample;
+          subintsplit::sampleIntoU64<uint64_t>(values, sample, tuning.sampler);
+          const auto config =
+              SubIntSplitEncoding<uint64_t>::plannerSelectorConfig(
+                  tuning, values.size());
+          if (config.decodeWeighting.sizeBudget >= 0.0) {
+            const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+                sample, 64, values.size(), tuning.allowedEncodings, config);
+            const auto budgeted = subintsplit::selectSplitsWithinSizeBudget(
+                candidateGrid, 64, config);
+            numSections = budgeted.plan.sections.size();
+            weight = budgeted.weight;
+          } else {
+            const auto grid = subintsplit::buildRestrictedCostGrid(
+                sample, 64, values.size(), tuning.allowedEncodings, config);
+            numSections = subintsplit::selectSplitsOverGrid(grid, 64, config)
+                              .sections.size();
+            weight = config.decodeWeighting.weight;
+          }
+          const auto end = std::chrono::steady_clock::now();
+          if (rep >= kWarmups) {
+            millis.push_back(
+                std::chrono::duration<double, std::milli>(end - start).count());
+          }
+        }
+        std::sort(millis.begin(), millis.end());
+        std::cout << "planner_ms dataset=" << ds.name
+                  << " median=" << millis[millis.size() / 2]
+                  << " min=" << millis.front() << " max=" << millis.back()
+                  << " sections=" << numSections << " weight=" << weight
+                  << "\n";
+      }
+    }
 
     for (const auto& enc : context.encoders) {
       auto target = makeTargetOrSkip<Elem>(enc, data, csv, kDriver, ds.name);
