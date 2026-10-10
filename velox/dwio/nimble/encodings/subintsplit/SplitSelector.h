@@ -1062,6 +1062,43 @@ inline BudgetedPlan selectSplitsWithinSizeBudget(
   return best;
 }
 
+/// One step of the trade between size and read cost: the plan the DP picks
+/// at `weight`, kept only where it is predicted to read faster than every
+/// plan at a lower weight.
+struct BudgetRung {
+  SelectorResult plan;
+  double weight{0.0};
+  std::vector<SectionCost> grid;
+};
+
+/// Every distinct step of the budget ladder, in ascending weight, so in
+/// descending predicted read cost. The first rung is the size-only plan.
+inline std::vector<BudgetRung> budgetLadderRungs(
+    const SectionCandidateGrid& candidateGrid,
+    int sz,
+    const SelectorConfig& cfg) {
+  std::vector<BudgetRung> rungs;
+  rungs.emplace_back();
+  rungs.back().grid = reweightGrid(candidateGrid, 0.0);
+  rungs.back().plan = selectSplitsOverGrid(rungs.back().grid, sz, cfg);
+  double bestNanos = planReadNanos(rungs.back().plan);
+  double weight = kBudgetLadderFirstWeight;
+  for (int step = 0; step < kBudgetLadderSteps;
+       ++step, weight *= kBudgetLadderStep) {
+    auto grid = reweightGrid(candidateGrid, weight);
+    auto plan = selectSplitsOverGrid(grid, sz, cfg);
+    if (plan.sections.empty() || !std::isfinite(plan.totalSizeBits)) {
+      continue;
+    }
+    const double nanos = planReadNanos(plan);
+    if (nanos < bestNanos) {
+      bestNanos = nanos;
+      rungs.push_back({std::move(plan), weight, std::move(grid)});
+    }
+  }
+  return rungs;
+}
+
 // The k cheapest segmentations of [0, sz) over `grid`, cheapest first, under
 // the same split penalty and minimum segment width as the DP. Lets a planner
 // hand a shortlist to a more accurate, more expensive scorer instead of

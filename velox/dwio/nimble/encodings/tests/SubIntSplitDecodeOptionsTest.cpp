@@ -286,6 +286,36 @@ TEST_F(SubIntSplitDecodeOptionsTest, sizeBudgetBoundsSizeAndIsMonotone) {
   }
 }
 
+// Held to encoded bytes, a budget is a guarantee: the stream is never more
+// than the budget larger than the size-only stream, and a larger budget is
+// never smaller on disk than it need be to read faster.
+TEST_F(SubIntSplitDecodeOptionsTest, strictSizeBudgetBoundsEncodedBytes) {
+  const auto values = makeMultiFieldValues(10'000);
+  const auto sizeOnly = encode(values, {}).size();
+  for (const auto pattern :
+       {subintsplit::DecodeAccessPattern::Point,
+        subintsplit::DecodeAccessPattern::Range}) {
+    for (const double budget : {0.0, 0.02, 0.05, 0.2, 1.0}) {
+      auto tuning = subintsplit::kDefaultTuningConfig;
+      tuning.selector.decodeWeighting.accessPattern = pattern;
+      tuning.selector.decodeWeighting.readPath =
+          subintsplit::DecodeReadPath::View;
+      tuning.selector.decodeWeighting.model =
+          subintsplit::DecodeCostModel::kCalibrated;
+      tuning.selector.decodeWeighting.sectionReadNanos = -1.0;
+      tuning.selector.decodeWeighting.sizeBudget = budget;
+      tuning.sizeBudgetOnEncodedBytes = true;
+      const auto encoded = encode(values, tuning);
+      EXPECT_LE(
+          static_cast<double>(encoded.size()),
+          static_cast<double>(sizeOnly) * (1.0 + budget))
+          << "budget " << budget;
+      EXPECT_EQ(decode(encoded, values.size(), {}), values)
+          << "budget " << budget;
+    }
+  }
+}
+
 // The new knobs are opt-in: at their defaults the bytes are the bytes.
 TEST_F(SubIntSplitDecodeOptionsTest, readCostKnobDefaultsKeepTheBytes) {
   const auto values = makeMultiFieldValues(10'000);

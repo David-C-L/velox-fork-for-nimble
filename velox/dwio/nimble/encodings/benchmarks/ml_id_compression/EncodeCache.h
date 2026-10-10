@@ -329,6 +329,7 @@ inline std::string cacheArmIdentity(
   id += "|sn" + std::to_string(selector.decodeWeighting.sectionReadNanos);
   id += "|sb" + std::to_string(selector.decodeWeighting.sizeBudget);
   id += "|ms" + std::to_string(selector.maxSections);
+  id += "|ss" + std::to_string(tuning.sizeBudgetOnEncodedBytes ? 1 : 0);
   id += "|sr" + std::to_string(tuning.sectionMaxSizeRegression);
   // Admission decides whether nested streams may pick SubIntSplit.
   id +=

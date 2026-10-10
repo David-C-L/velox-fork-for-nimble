@@ -216,6 +216,12 @@ DEFINE_double(
     "subintsplit::DecodeCostWeighting::sizeBudget: the most estimated size, "
     "as a fraction of the size-only plan's, the planner may spend on read "
     "cost. Negative is off. When set, --mlidc_sis_decode_weight is ignored.");
+DEFINE_bool(
+    mlidc_sis_size_budget_strict,
+    false,
+    "subintsplit::TuningConfig::sizeBudgetOnEncodedBytes: holds "
+    "--mlidc_sis_size_budget to encoded bytes by encoding the size-only plan "
+    "and bisecting the budget ladder.");
 DEFINE_int32(
     mlidc_sis_max_sections,
     0,

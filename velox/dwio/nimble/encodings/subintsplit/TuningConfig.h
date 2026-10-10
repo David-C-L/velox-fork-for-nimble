@@ -99,6 +99,13 @@ struct TuningConfig {
   /// default, uses maxSizeRegression.
   double sectionMaxSizeRegression{-1.0};
 
+  /// Holds a size budget (selector.decodeWeighting.sizeBudget) to encoded
+  /// bytes instead of the planner's estimate. The column is encoded size-only
+  /// first, then at steps of the budget ladder chosen by bisection, and the
+  /// fastest-reading step whose bytes are within the budget of the size-only
+  /// bytes is kept. Costs a few extra encodes. Off by default.
+  bool sizeBudgetOnEncodedBytes{false};
+
   /// Set by the encoder once a size budget (selector.decodeWeighting
   /// .sizeBudget) has been resolved to a decode weight: the plan handed over
   /// is already inside the budget, so it is not compared with the size-only

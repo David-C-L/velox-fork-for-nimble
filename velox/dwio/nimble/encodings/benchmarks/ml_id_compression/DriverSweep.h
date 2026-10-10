@@ -322,6 +322,7 @@ inline void applyReadCostFlags(subintsplit::TuningConfig& tuning) {
   tuning.sectionMaxSizeRegression =
       FLAGS_mlidc_sis_section_max_size_regression;
   tuning.selector.maxSections = FLAGS_mlidc_sis_max_sections;
+  tuning.sizeBudgetOnEncodedBytes = FLAGS_mlidc_sis_size_budget_strict;
   tuning.selector.minSectionWidth = FLAGS_mlidc_sis_min_section_width;
   if (FLAGS_mlidc_sis_max_candidate_boundaries >= 0) {
     tuning.selector.maxCandidateBoundaries =

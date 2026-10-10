@@ -1871,16 +1871,58 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
         valueCount,
         tuning.allowedEncodings,
         budgetConfig);
-    auto budgetedPlan = subintsplit::selectSplitsWithinSizeBudget(
-        candidateGrid, kBits, budgetConfig);
-    budgeted.grid = std::move(budgetedPlan.grid);
-    resolved.selector.decodeWeighting.weight = budgetedPlan.weight;
-    resolved.decodeWeightResolved = true;
     resolved.maxSizeRegression = tuning.selector.decodeWeighting.sizeBudget;
     if (resolved.sectionMaxSizeRegression < 0.0) {
       resolved.sectionMaxSizeRegression =
           std::numeric_limits<double>::infinity();
     }
+    if (tuning.sizeBudgetOnEncodedBytes) {
+      auto rungs =
+          subintsplit::budgetLadderRungs(candidateGrid, kBits, budgetConfig);
+      const auto encodeRung = [&](size_t index) {
+        PlanningSample rungPlanning;
+        rungPlanning.sample = budgeted.sample;
+        rungPlanning.grid = rungs[index].grid;
+        subintsplit::TuningConfig rungTuning = resolved;
+        rungTuning.selector.decodeWeighting.weight = rungs[index].weight;
+        rungTuning.decodeWeightResolved = rungs[index].weight != 0.0;
+        return encodeResiduals(
+            selection,
+            values,
+            buffer,
+            options,
+            rungTuning,
+            rowFrame,
+            &rungPlanning,
+            extraFlags,
+            stepFrame,
+            stepResiduals);
+      };
+      std::string_view chosen = encodeRung(0);
+      const double allowedBytes = static_cast<double>(chosen.size()) *
+          (1.0 + tuning.selector.decodeWeighting.sizeBudget);
+      // Bisects for the last rung that fits. Encoded size need not be
+      // monotone along the ladder, but every rung kept does fit, and a
+      // larger budget never settles on an earlier rung.
+      size_t low = 0;
+      size_t high = rungs.size() - 1;
+      while (low < high) {
+        const size_t middle = low + (high - low + 1) / 2;
+        const std::string_view encoded = encodeRung(middle);
+        if (static_cast<double>(encoded.size()) <= allowedBytes) {
+          chosen = encoded;
+          low = middle;
+        } else {
+          high = middle - 1;
+        }
+      }
+      return chosen;
+    }
+    auto budgetedPlan = subintsplit::selectSplitsWithinSizeBudget(
+        candidateGrid, kBits, budgetConfig);
+    budgeted.grid = std::move(budgetedPlan.grid);
+    resolved.selector.decodeWeighting.weight = budgetedPlan.weight;
+    resolved.decodeWeightResolved = true;
     return encodeResiduals(
         selection,
         values,
