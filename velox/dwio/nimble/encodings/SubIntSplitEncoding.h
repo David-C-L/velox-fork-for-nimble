@@ -131,6 +131,8 @@ inline Encoding::Options sectionEncodingOptions(
       tuning.selector.decodeWeighting.model;
   sectionOptions.subIntSplit.decodeWeightSectionsOnly =
       tuning.decodeWeightSectionsOnly;
+  sectionOptions.subIntSplit.decodeMixScale =
+      tuning.selector.decodeWeighting.mixScale;
   sectionOptions.subIntSplit.decodeSectionReadNanos =
       tuning.selector.decodeWeighting.sectionReadNanos;
   sectionOptions.subIntSplit.maxSizeRegression =
@@ -1866,13 +1868,19 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       subintsplit::sampleIntoU64<physicalType>(
           values, budgeted.sample, tuning.sampler);
     }
-    const auto budgetConfig = plannerSelectorConfig(tuning, valueCount);
-    const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+    auto budgetConfig = plannerSelectorConfig(tuning, valueCount);
+    auto candidateGrid = subintsplit::buildSectionCandidateGrid(
         budgeted.sample,
         kBits,
         valueCount,
         tuning.allowedEncodings,
         budgetConfig);
+    // A mix of patterns is resolved against the size-only plan here, and the
+    // resolved scale travels with the weight to section selection.
+    budgetConfig = subintsplit::resolveDecodeMix(
+        candidateGrid, kBits, std::move(budgetConfig));
+    resolved.selector.decodeWeighting.mixScale =
+        budgetConfig.decodeWeighting.mixScale;
     resolved.maxSizeRegression = tuning.selector.decodeWeighting.sizeBudget;
     if (resolved.sectionMaxSizeRegression < 0.0) {
       resolved.sectionMaxSizeRegression =

@@ -118,12 +118,13 @@ int runBenchmark() {
           const auto start = std::chrono::steady_clock::now();
           std::vector<uint64_t> sample;
           subintsplit::sampleIntoU64<uint64_t>(values, sample, tuning.sampler);
-          const auto config =
-              SubIntSplitEncoding<uint64_t>::plannerSelectorConfig(
-                  tuning, values.size());
+          auto config = SubIntSplitEncoding<uint64_t>::plannerSelectorConfig(
+              tuning, values.size());
           if (config.decodeWeighting.sizeBudget >= 0.0) {
-            const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+            auto candidateGrid = subintsplit::buildSectionCandidateGrid(
                 sample, 64, values.size(), tuning.allowedEncodings, config);
+            config = subintsplit::resolveDecodeMix(
+                candidateGrid, 64, std::move(config));
             const auto budgeted = subintsplit::selectSplitsWithinSizeBudget(
                 candidateGrid, 64, config);
             numSections = budgeted.plan.sections.size();

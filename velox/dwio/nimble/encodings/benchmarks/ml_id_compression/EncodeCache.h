@@ -328,6 +328,10 @@ inline std::string cacheArmIdentity(
       std::to_string(static_cast<int>(selector.decodeWeighting.model));
   id += "|sn" + std::to_string(selector.decodeWeighting.sectionReadNanos);
   id += "|sb" + std::to_string(selector.decodeWeighting.sizeBudget);
+  id += "|mx" + std::to_string(selector.decodeWeighting.mix[0]) + "," +
+      std::to_string(selector.decodeWeighting.mix[1]) + "," +
+      std::to_string(selector.decodeWeighting.mix[2]);
+  id += "|ps" + std::to_string(selector.decodeWeighting.maxPatternSlowdown);
   id += "|ms" + std::to_string(selector.maxSections);
   id += "|ss" + std::to_string(tuning.sizeBudgetOnEncodedBytes ? 1 : 0);
   id += "|so" + std::to_string(tuning.decodeWeightSectionsOnly ? 1 : 0);

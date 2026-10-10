@@ -18,6 +18,7 @@
 
 #ifdef NIMBLE_ENABLE_EXPERIMENTAL_ENCODINGS
 
+#include <array>
 #include <algorithm>
 #include <iostream>
 #include <memory>
@@ -303,6 +304,40 @@ inline void applyPlannerFlags(subintsplit::TuningConfig& tuning) {
   }
 }
 
+/// Parses --mlidc_sis_decode_mix into DecodeCostWeighting::mix's order
+/// (point, bulk, range).
+inline std::array<double, 3> decodeMixFlag() {
+  std::array<double, 3> mix{};
+  std::string_view rest{FLAGS_mlidc_sis_decode_mix};
+  while (!rest.empty()) {
+    const auto comma = rest.find(',');
+    const std::string_view entry = rest.substr(0, comma);
+    rest = comma == std::string_view::npos ? std::string_view{}
+                                           : rest.substr(comma + 1);
+    const auto colon = entry.find(':');
+    NIMBLE_CHECK(
+        colon != std::string_view::npos,
+        "--mlidc_sis_decode_mix entries are pattern:weight: {}",
+        entry);
+    const std::string_view name = entry.substr(0, colon);
+    const double weight = std::stod(std::string{entry.substr(colon + 1)});
+    NIMBLE_CHECK(
+        weight >= 0.0, "--mlidc_sis_decode_mix weights are not negative.");
+    if (name == "point") {
+      mix[0] = weight;
+    } else if (name == "bulk") {
+      mix[1] = weight;
+    } else {
+      NIMBLE_CHECK(
+          name == "range",
+          "--mlidc_sis_decode_mix patterns are point, bulk and range: {}",
+          name);
+      mix[2] = weight;
+    }
+  }
+  return mix;
+}
+
 /// Applies the decode-weighting and read-cost flags. Their defaults leave the
 /// tuning as the library builds it, so every driver's selection is unchanged
 /// unless a flag is set.
@@ -317,6 +352,8 @@ inline void applyReadCostFlags(subintsplit::TuningConfig& tuning) {
           FLAGS_mlidc_sis_decode_cost_model),
       .sectionReadNanos = FLAGS_mlidc_sis_section_read_nanos,
       .sizeBudget = FLAGS_mlidc_sis_size_budget,
+      .mix = decodeMixFlag(),
+      .maxPatternSlowdown = FLAGS_mlidc_sis_max_pattern_slowdown,
   };
   tuning.maxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
   tuning.sectionMaxSizeRegression =

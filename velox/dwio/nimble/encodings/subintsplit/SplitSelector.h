@@ -955,6 +955,22 @@ inline SectionCandidateGrid buildSectionCandidateGrid(
   return result;
 }
 
+/// Prices every candidate's decode cost again under `weighting`, so a grid
+/// costed for one pattern can be searched for another, or for a mix.
+inline void repriceCandidates(
+    SectionCandidateGrid& candidateGrid,
+    const DecodeCostWeighting& weighting) {
+  for (auto& cell : candidateGrid.candidates) {
+    for (auto& candidate : cell) {
+      candidate.decodeNanosPerRow = decodeNanosPerRow(
+          candidate.encoding,
+          weighting,
+          candidate.sizeBits,
+          candidateGrid.numSamples);
+    }
+  }
+}
+
 /// The grid of `candidateGrid` as bestSectionCost would have costed it at
 /// decode weight `weight`.
 inline std::vector<SectionCost> reweightGrid(
@@ -997,6 +1013,58 @@ inline double planReadNanos(const SelectorResult& plan) noexcept {
     total += section.decodeNanosPerRow;
   }
   return total;
+}
+
+/// What `plan` is predicted to cost a read under `pattern` alone, in
+/// nanoseconds per row read, whatever the plan was priced for.
+inline double planPatternNanos(
+    const SelectorResult& plan,
+    const DecodeCostWeighting& weighting,
+    DecodeAccessPattern pattern,
+    const SectionCandidateGrid& candidateGrid) noexcept {
+  const double scale = static_cast<double>(candidateGrid.fullCount) /
+      static_cast<double>(candidateGrid.numSamples);
+  double total = 0.0;
+  for (const auto& section : plan.sections) {
+    total += patternDecodeNanosPerRow(
+        section.encoding,
+        weighting,
+        pattern,
+        section.sizeCostBits / scale,
+        candidateGrid.numSamples);
+  }
+  return total;
+}
+
+/// Resolves cfg.decodeWeighting.mix against the size-only plan and prices
+/// `candidateGrid` for the result: each pattern's weight is divided by what
+/// the size-only plan is predicted to cost under that pattern, so every
+/// candidate's cost becomes its share of a weighted mean slowdown in which
+/// the size-only plan costs 1. Returns `cfg` unchanged when no mix is set.
+inline SelectorConfig resolveDecodeMix(
+    SectionCandidateGrid& candidateGrid,
+    int sz,
+    SelectorConfig cfg) {
+  auto& weighting = cfg.decodeWeighting;
+  const double total = weighting.mix[0] + weighting.mix[1] + weighting.mix[2];
+  if (!(total > 0.0)) {
+    return cfg;
+  }
+  weighting.mixScale = {};
+  const auto sizeOnly =
+      selectSplitsOverGrid(reweightGrid(candidateGrid, 0.0), sz, cfg);
+  for (size_t i = 0; i < kMixPatterns.size(); ++i) {
+    if (weighting.mix[i] <= 0.0) {
+      continue;
+    }
+    const double nanos =
+        planPatternNanos(sizeOnly, weighting, kMixPatterns[i], candidateGrid);
+    if (nanos > 0.0) {
+      weighting.mixScale[i] = weighting.mix[i] / total / nanos;
+    }
+  }
+  repriceCandidates(candidateGrid, weighting);
+  return cfg;
 }
 
 /// The plan selectSplitsWithinSizeBudget settled on, and the weight that
@@ -1091,7 +1159,25 @@ inline std::vector<BudgetRung> budgetLadderRungs(
       continue;
     }
     const double nanos = planReadNanos(plan);
-    if (nanos < bestNanos) {
+    if (nanos >= bestNanos) {
+      continue;
+    }
+    // Held to the guard: a plan that buys the priced cost by making some
+    // pattern much slower than the size-only plan is not offered.
+    bool withinGuard = true;
+    if (cfg.decodeWeighting.maxPatternSlowdown > 0.0) {
+      for (const auto pattern : kMixPatterns) {
+        const double before = planPatternNanos(
+            rungs.front().plan, cfg.decodeWeighting, pattern, candidateGrid);
+        const double after =
+            planPatternNanos(plan, cfg.decodeWeighting, pattern, candidateGrid);
+        if (after > before * cfg.decodeWeighting.maxPatternSlowdown) {
+          withinGuard = false;
+          break;
+        }
+      }
+    }
+    if (withinGuard) {
       bestNanos = nanos;
       rungs.push_back({std::move(plan), weight, std::move(grid)});
     }

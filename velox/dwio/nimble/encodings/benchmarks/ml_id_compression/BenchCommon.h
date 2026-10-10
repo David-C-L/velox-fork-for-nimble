@@ -99,6 +99,8 @@ DECLARE_int32(mlidc_sis_decode_cost_model);
 DECLARE_double(mlidc_sis_section_read_nanos);
 DECLARE_double(mlidc_sis_size_budget);
 DECLARE_int32(mlidc_sis_max_sections);
+DECLARE_string(mlidc_sis_decode_mix);
+DECLARE_double(mlidc_sis_max_pattern_slowdown);
 DECLARE_bool(mlidc_sis_size_budget_strict);
 DECLARE_bool(mlidc_sis_decode_weight_sections_only);
 DECLARE_double(mlidc_sis_section_max_size_regression);

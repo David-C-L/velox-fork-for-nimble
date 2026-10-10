@@ -228,6 +228,19 @@ DEFINE_bool(
     "subintsplit::TuningConfig::decodeWeightSectionsOnly: applies the decode "
     "weight to a section's own encoding choice and not to the streams below "
     "it.");
+DEFINE_string(
+    mlidc_sis_decode_mix,
+    "",
+    "subintsplit::DecodeCostWeighting::mix: how much each access pattern "
+    "counts in the size budget's read cost, e.g. \"point:0.5,bulk:0.5\". "
+    "Patterns are point, bulk and range; one left out counts for nothing. "
+    "Empty prices --mlidc_sis_decode_access_pattern alone.");
+DEFINE_double(
+    mlidc_sis_max_pattern_slowdown,
+    0.0,
+    "subintsplit::DecodeCostWeighting::maxPatternSlowdown: the most any one "
+    "of point, bulk and range may be predicted slower than the size-only "
+    "plan, as a factor, under --mlidc_sis_size_budget_strict. 0 is no limit.");
 DEFINE_int32(
     mlidc_sis_max_sections,
     0,

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "velox/dwio/nimble/encodings/selection/EncodingIdentifier.h"
@@ -180,6 +181,9 @@ struct Options {
   /// Applies decodeWeight to a section's own encoding choice only, leaving
   /// the streams below the section to be chosen on size. Off by default.
   bool decodeWeightSectionsOnly{false};
+
+  /// See DecodeCostWeighting::mixScale.
+  std::array<double, 3> decodeMixScale{};
 
   /// See DecodeCostWeighting::sectionReadNanos.
   double decodeSectionReadNanos{0.0};

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -544,6 +545,13 @@ decodeCostBits(double nanosPerRow, size_t numValues, double weight) noexcept {
 /// The default is the whole point: weight zero reproduces size-only selection
 /// bit for bit, so adding this to a call site changes nothing until someone
 /// asks for a change.
+/// The patterns DecodeCostWeighting::mix weighs, in its order.
+inline constexpr std::array<DecodeAccessPattern, 3> kMixPatterns{
+    DecodeAccessPattern::Point,
+    DecodeAccessPattern::Bulk,
+    DecodeAccessPattern::Range,
+};
+
 struct DecodeCostWeighting {
   double weight{0.0};
   DecodeAccessPattern accessPattern{DecodeAccessPattern::Bulk};
@@ -561,6 +569,22 @@ struct DecodeCostWeighting {
   /// `weight` and searches for the weight whose plan has the lowest predicted
   /// read cost within the budget. Negative, the default, is off.
   double sizeBudget{-1.0};
+  /// How much each access pattern counts in the size budget's read cost, in
+  /// the order of kMixPatterns (point, bulk, range). All zero, the default,
+  /// prices accessPattern alone. Otherwise each pattern's predicted cost is
+  /// divided by the size-only plan's cost under that pattern, so the
+  /// objective is a weighted mean of predicted slowdowns and the weights
+  /// compare like with like. Read only by the size budget.
+  std::array<double, 3> mix{};
+  /// `mix` resolved against the size-only plan: per pattern, the weight over
+  /// that plan's predicted nanoseconds. Set by the planner; when any entry is
+  /// non-zero a section's decode cost is the mixScale-weighted sum of its
+  /// per-pattern costs, a pure number in which the size-only plan costs 1.
+  std::array<double, 3> mixScale{};
+  /// The most any one pattern (point, bulk or range) may be predicted slower
+  /// than the size-only plan, as a factor, for a plan the encoded-bytes
+  /// budget may settle on. 0, the default, is no limit.
+  double maxPatternSlowdown{0.0};
 
   /// Whether any decode pricing is requested.
   bool active() const noexcept {
@@ -576,13 +600,13 @@ inline double sectionReadNanosFor(const DecodeCostWeighting& weighting) noexcept
       : calibratedSectionReadNanos(weighting.accessPattern, weighting.readPath);
 }
 
-/// Nanoseconds per row read a section costs under `weighting`: its
-/// encoding's rate from the weighting's rate table, plus the per-section
-/// term when the section is not Constant. With the default model and a zero
-/// per-section term this is decodeNanosPerRow above, bit for bit.
-inline double decodeNanosPerRow(
+/// Nanoseconds per row read a section costs under `weighting` for `pattern`:
+/// its encoding's rate from the weighting's rate table, plus the per-section
+/// term when the section is not Constant.
+inline double patternDecodeNanosPerRow(
     EncodingType encodingType,
     const DecodeCostWeighting& weighting,
+    DecodeAccessPattern pattern,
     double estimatedSizeBits,
     size_t numValues) noexcept {
   if (numValues == 0 || !std::isfinite(estimatedSizeBits)) {
@@ -590,24 +614,60 @@ inline double decodeNanosPerRow(
   }
   double nanos = 0.0;
   if (weighting.model == DecodeCostModel::kCalibrated) {
-    const DecodeRate rate = calibratedDecodeRate(
-        encodingType, weighting.accessPattern, weighting.readPath);
+    const DecodeRate rate =
+        calibratedDecodeRate(encodingType, pattern, weighting.readPath);
     const double bytesPerRow =
         estimatedSizeBits / 8.0 / static_cast<double>(numValues);
     nanos = rate.baseNanosPerRow + rate.nanosPerEncodedByteRow * bytesPerRow;
   } else {
     nanos = decodeNanosPerRow(
         encodingType,
-        weighting.accessPattern,
+        pattern,
         weighting.readPath,
         estimatedSizeBits,
         numValues);
   }
   if (encodingType != EncodingType::Constant &&
       weighting.sectionReadNanos != 0.0) {
-    nanos += sectionReadNanosFor(weighting);
+    nanos += weighting.sectionReadNanos >= 0.0
+        ? weighting.sectionReadNanos
+        : calibratedSectionReadNanos(pattern, weighting.readPath);
   }
   return nanos;
+}
+
+/// What a section costs to read under `weighting`: nanoseconds per row read
+/// for its accessPattern, or, once a mix has been resolved, the weighted sum
+/// of its per-pattern costs relative to the size-only plan. With the default
+/// model, a zero per-section term and no mix this is decodeNanosPerRow above,
+/// bit for bit.
+inline double decodeNanosPerRow(
+    EncodingType encodingType,
+    const DecodeCostWeighting& weighting,
+    double estimatedSizeBits,
+    size_t numValues) noexcept {
+  if (weighting.mixScale[0] == 0.0 && weighting.mixScale[1] == 0.0 &&
+      weighting.mixScale[2] == 0.0) {
+    return patternDecodeNanosPerRow(
+        encodingType,
+        weighting,
+        weighting.accessPattern,
+        estimatedSizeBits,
+        numValues);
+  }
+  double blended = 0.0;
+  for (size_t i = 0; i < kMixPatterns.size(); ++i) {
+    if (weighting.mixScale[i] != 0.0) {
+      blended += weighting.mixScale[i] *
+          patternDecodeNanosPerRow(
+              encodingType,
+              weighting,
+              kMixPatterns[i],
+              estimatedSizeBits,
+              numValues);
+    }
+  }
+  return blended;
 }
 
 /// The whole-plan decode cost of sections whose individual costs are

@@ -316,6 +316,77 @@ TEST_F(SubIntSplitDecodeOptionsTest, strictSizeBudgetBoundsEncodedBytes) {
   }
 }
 
+// A resolved mix prices the size-only plan at exactly 1, a one-pattern mix
+// picks the plans that pattern alone picks, and the guard never offers a plan
+// predicted to slow a pattern past its factor.
+TEST_F(SubIntSplitDecodeOptionsTest, decodeMixIsRelativeToTheSizeOnlyPlan) {
+  const auto values = makeMultiFieldValues(2'048);
+  static const subintsplit::AllowedEncodings kAll;
+  auto config = subintsplit::defaultSelectorConfig();
+  config.streamRowCount = values.size();
+  config.decodeWeighting.readPath = subintsplit::DecodeReadPath::View;
+  config.decodeWeighting.model = subintsplit::DecodeCostModel::kCalibrated;
+  config.decodeWeighting.sectionReadNanos = -1.0;
+  config.decodeWeighting.accessPattern = subintsplit::DecodeAccessPattern::Point;
+
+  auto pointGrid = subintsplit::buildSectionCandidateGrid(
+      values, 64, values.size(), kAll, config);
+  const auto pointRungs = subintsplit::budgetLadderRungs(pointGrid, 64, config);
+
+  auto mixed = config;
+  mixed.decodeWeighting.mix = {0.5, 0.5, 0.0};
+  auto mixedGrid = subintsplit::buildSectionCandidateGrid(
+      values, 64, values.size(), kAll, mixed);
+  mixed = subintsplit::resolveDecodeMix(mixedGrid, 64, mixed);
+  const auto mixedRungs = subintsplit::budgetLadderRungs(mixedGrid, 64, mixed);
+  ASSERT_FALSE(mixedRungs.empty());
+  EXPECT_NEAR(subintsplit::planReadNanos(mixedRungs.front().plan), 1.0, 1e-9);
+
+  auto pointOnly = config;
+  pointOnly.decodeWeighting.mix = {1.0, 0.0, 0.0};
+  auto pointOnlyGrid = subintsplit::buildSectionCandidateGrid(
+      values, 64, values.size(), kAll, pointOnly);
+  pointOnly = subintsplit::resolveDecodeMix(pointOnlyGrid, 64, pointOnly);
+  const auto pointOnlyRungs =
+      subintsplit::budgetLadderRungs(pointOnlyGrid, 64, pointOnly);
+  ASSERT_FALSE(pointOnlyRungs.empty());
+  EXPECT_EQ(
+      pointOnlyRungs.back().plan.sections.size(),
+      pointRungs.back().plan.sections.size());
+
+  auto guarded = config;
+  guarded.decodeWeighting.maxPatternSlowdown = 1.0;
+  const auto guardedRungs =
+      subintsplit::budgetLadderRungs(pointGrid, 64, guarded);
+  for (const auto& rung : guardedRungs) {
+    for (const auto pattern : subintsplit::kMixPatterns) {
+      EXPECT_LE(
+          subintsplit::planPatternNanos(
+              rung.plan, guarded.decodeWeighting, pattern, pointGrid),
+          subintsplit::planPatternNanos(
+              guardedRungs.front().plan,
+              guarded.decodeWeighting,
+              pattern,
+              pointGrid) *
+              (1.0 + 1e-12));
+    }
+  }
+
+  for (const double budget : {0.02, 0.1}) {
+    auto tuning = subintsplit::kDefaultTuningConfig;
+    tuning.selector.decodeWeighting = config.decodeWeighting;
+    tuning.selector.decodeWeighting.mix = {0.5, 0.5, 0.0};
+    tuning.selector.decodeWeighting.maxPatternSlowdown = 1.1;
+    tuning.selector.decodeWeighting.sizeBudget = budget;
+    tuning.sizeBudgetOnEncodedBytes = true;
+    const auto encoded = encode(values, tuning);
+    EXPECT_LE(
+        static_cast<double>(encoded.size()),
+        static_cast<double>(encode(values, {}).size()) * (1.0 + budget));
+    EXPECT_EQ(decode(encoded, values.size(), {}), values);
+  }
+}
+
 // The new knobs are opt-in: at their defaults the bytes are the bytes.
 TEST_F(SubIntSplitDecodeOptionsTest, readCostKnobDefaultsKeepTheBytes) {
   const auto values = makeMultiFieldValues(10'000);

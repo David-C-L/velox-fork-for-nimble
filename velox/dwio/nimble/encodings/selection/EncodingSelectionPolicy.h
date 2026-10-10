@@ -401,6 +401,7 @@ SelectedCandidate selectCandidate(
               .readPath = subIntSplitOptions.decodeReadPath,
               .model = subIntSplitOptions.decodeCostModel,
               .sectionReadNanos = subIntSplitOptions.decodeSectionReadNanos,
+              .mixScale = subIntSplitOptions.decodeMixScale,
           },
           static_cast<double>(estimatedSize.value()) * 8.0,
           values.size());
