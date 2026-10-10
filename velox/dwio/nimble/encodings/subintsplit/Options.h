@@ -177,6 +177,10 @@ struct Options {
   /// non-zero. See DecodeCostWeighting::model.
   DecodeCostModel decodeCostModel{DecodeCostModel::kOriginal};
 
+  /// Applies decodeWeight to a section's own encoding choice only, leaving
+  /// the streams below the section to be chosen on size. Off by default.
+  bool decodeWeightSectionsOnly{false};
+
   /// See DecodeCostWeighting::sectionReadNanos.
   double decodeSectionReadNanos{0.0};
 

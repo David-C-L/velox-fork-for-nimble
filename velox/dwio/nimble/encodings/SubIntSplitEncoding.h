@@ -129,6 +129,8 @@ inline Encoding::Options sectionEncodingOptions(
       tuning.selector.decodeWeighting.readPath;
   sectionOptions.subIntSplit.decodeCostModel =
       tuning.selector.decodeWeighting.model;
+  sectionOptions.subIntSplit.decodeWeightSectionsOnly =
+      tuning.decodeWeightSectionsOnly;
   sectionOptions.subIntSplit.decodeSectionReadNanos =
       tuning.selector.decodeWeighting.sectionReadNanos;
   sectionOptions.subIntSplit.maxSizeRegression =

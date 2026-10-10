@@ -222,6 +222,12 @@ DEFINE_bool(
     "subintsplit::TuningConfig::sizeBudgetOnEncodedBytes: holds "
     "--mlidc_sis_size_budget to encoded bytes by encoding the size-only plan "
     "and bisecting the budget ladder.");
+DEFINE_bool(
+    mlidc_sis_decode_weight_sections_only,
+    false,
+    "subintsplit::TuningConfig::decodeWeightSectionsOnly: applies the decode "
+    "weight to a section's own encoding choice and not to the streams below "
+    "it.");
 DEFINE_int32(
     mlidc_sis_max_sections,
     0,

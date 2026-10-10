@@ -100,6 +100,7 @@ DECLARE_double(mlidc_sis_section_read_nanos);
 DECLARE_double(mlidc_sis_size_budget);
 DECLARE_int32(mlidc_sis_max_sections);
 DECLARE_bool(mlidc_sis_size_budget_strict);
+DECLARE_bool(mlidc_sis_decode_weight_sections_only);
 DECLARE_double(mlidc_sis_section_max_size_regression);
 DECLARE_int32(mlidc_sis_min_section_width);
 DECLARE_int32(mlidc_sis_max_candidate_boundaries);

@@ -533,13 +533,15 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       std::optional<NestedEncodingIdentifier> identifier,
       std::optional<std::vector<std::pair<EncodingType, float>>>
           nestedEncodingReadFactors = std::nullopt,
-      bool rowAddressed = true)
+      bool rowAddressed = true,
+      bool belowSection = false)
       : candidateEncodingReadFactors_{std::move(encodingReadFactors)},
         compressionOptions_{std::move(compressionOptions)},
         identifier_{identifier},
         nestedEncodingReadFactorsOverride_{
             std::move(nestedEncodingReadFactors)},
-        rowAddressed_{rowAddressed} {}
+        rowAddressed_{rowAddressed},
+        belowSection_{belowSection} {}
 
   /// Whether a read reaches this policy's stream per row of the stream at
   /// the top of the tree: true there, and below it only through children
@@ -552,7 +554,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
   EncodingSelectionResult select(
       std::span<const physicalType> values,
       const Statistics<physicalType>& statistics,
-      const Encoding::Options& options) override {
+      const Encoding::Options& callerOptions) override {
     if (values.empty()) {
       return {
           .encodingType = EncodingType::Trivial,
@@ -560,6 +562,20 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
           .estimatedSize = std::nullopt,
       };
     }
+
+    // The decode rates describe a section read through its own view. A
+    // stream below a section is read by its parent's decoder instead, so
+    // when asked the weight is dropped there and the stream is chosen on
+    // size.
+    std::optional<Encoding::Options> sizeOnlyOptions;
+    if (belowSection_ && callerOptions.subIntSplit.sectionSelection &&
+        callerOptions.subIntSplit.decodeWeightSectionsOnly &&
+        callerOptions.subIntSplit.decodeWeight != 0.0) {
+      sizeOnlyOptions = callerOptions;
+      sizeOnlyOptions->subIntSplit.decodeWeight = 0.0;
+    }
+    const Encoding::Options& options =
+        sizeOnlyOptions.has_value() ? *sizeOnlyOptions : callerOptions;
 
     auto candidateEncodingReadFactors = candidateEncodingReadFactors_;
     // TODO: Remove this opt-in once ALP is production-ready for default
@@ -743,7 +759,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         nestedEncodingReadFactorsOverride_.has_value()
             ? nestedEncodingReadFactorsOverride_.value()
             : candidateEncodingReadFactors_,
-        rowAddressed_);
+        rowAddressed_,
+        belowSection_);
   }
 
  protected:
@@ -771,7 +788,8 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         std::nullopt,
         rowAddressed_ &&
             subintsplit::isRowAddressedStream(
-                parentEncodingType, nestedEncodingIdentifier));
+                parentEncodingType, nestedEncodingIdentifier),
+        parentEncodingType != EncodingType::SubIntSplit);
   }
 
  private:
@@ -794,6 +812,9 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       nestedEncodingReadFactorsOverride_;
   // See rowAddressed().
   const bool rowAddressed_;
+  // Whether this policy's stream is a child of something other than
+  // SubIntSplit, so not itself a section.
+  const bool belowSection_;
 };
 
 class ManualEncodingSelectionPolicyFactory {
