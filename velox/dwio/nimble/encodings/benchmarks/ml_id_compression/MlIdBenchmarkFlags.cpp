@@ -199,6 +199,42 @@ DEFINE_double(
     "selection would have chosen. Inert at --mlidc_sis_decode_weight=0, where "
     "the two plans are the same plan. Pass something large to reproduce the "
     "unbounded objective, which pays an uncompressed column for speed.");
+DEFINE_int32(
+    mlidc_sis_decode_cost_model,
+    0,
+    "subintsplit::DecodeCostWeighting::model: 0 prices section decode with "
+    "the original rate tables, 1 with the calibrated ones.");
+DEFINE_double(
+    mlidc_sis_section_read_nanos,
+    0.0,
+    "subintsplit::DecodeCostWeighting::sectionReadNanos: nanoseconds per row "
+    "read charged to every section that is not Constant. 0 charges nothing; "
+    "negative takes the calibrated figure for the pattern and read path.");
+DEFINE_double(
+    mlidc_sis_size_budget,
+    -1.0,
+    "subintsplit::DecodeCostWeighting::sizeBudget: the most estimated size, "
+    "as a fraction of the size-only plan's, the planner may spend on read "
+    "cost. Negative is off. When set, --mlidc_sis_decode_weight is ignored.");
+DEFINE_int32(
+    mlidc_sis_max_sections,
+    0,
+    "subintsplit::SelectorConfig::maxSections: most sections a plan may have "
+    "that are not Constant. 0 is unlimited.");
+DEFINE_double(
+    mlidc_sis_section_max_size_regression,
+    -1.0,
+    "subintsplit::TuningConfig::sectionMaxSizeRegression. Negative uses "
+    "--mlidc_sis_max_size_regression.");
+DEFINE_int32(
+    mlidc_sis_min_section_width,
+    1,
+    "subintsplit::SelectorConfig::minSectionWidth.");
+DEFINE_int32(
+    mlidc_sis_max_candidate_boundaries,
+    -1,
+    "subintsplit::SelectorConfig::maxCandidateBoundaries. Negative keeps the "
+    "library default.");
 DEFINE_bool(
     mlidc_dump_encoding,
     false,

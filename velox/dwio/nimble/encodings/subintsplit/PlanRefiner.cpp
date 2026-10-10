@@ -147,16 +147,22 @@ class PlanSearch {
     PlanPrice total{
         selectorConfig_.splitPenalty * static_cast<double>(ranges.size() - 1),
         0.0};
+    int numRead = 0;
     for (const auto& [bitStart, bitEnd] : ranges) {
       const RangePrice& range = pricer_.price(bitStart, bitEnd);
       if (!std::isfinite(range.sizeBits)) {
         return {};
       }
+      // Held to the cap the split DP is held to.
+      numRead += range.encoding != EncodingType::Constant ? 1 : 0;
+      if (selectorConfig_.maxSections > 0 &&
+          numRead > selectorConfig_.maxSections) {
+        return {};
+      }
       const double sizeBits = range.sizeBits * scale_;
       const double nanosPerRow = decodeNanosPerRow(
           range.encoding,
-          selectorConfig_.decodeWeighting.accessPattern,
-          selectorConfig_.decodeWeighting.readPath,
+          selectorConfig_.decodeWeighting,
           range.sizeBits,
           pricer_.sampleRows());
       total.sizeBits += sizeBits;
@@ -298,7 +304,10 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
     if (!sizeOnly.empty() &&
         search.price(chosen, weight).sizeBits >
             search.price(sizeOnly, 0.0).sizeBits *
-                (1.0 + options.subIntSplit.maxSizeRegression)) {
+                (1.0 +
+                 (options.subIntSplit.planMaxSizeRegression >= 0.0
+                      ? options.subIntSplit.planMaxSizeRegression
+                      : options.subIntSplit.maxSizeRegression))) {
       chosen = std::move(sizeOnly);
     }
   }
@@ -318,8 +327,7 @@ RefinedPlan SubIntSplitPlanRefiner::refine(
     segment.sizeCostBits = range.sizeBits * scale;
     segment.decodeNanosPerRow = decodeNanosPerRow(
         range.encoding,
-        selectorConfig.decodeWeighting.accessPattern,
-        selectorConfig.decodeWeighting.readPath,
+        selectorConfig.decodeWeighting,
         range.sizeBits,
         pricer.sampleRows());
     segment.cost = segment.sizeCostBits +

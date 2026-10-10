@@ -323,6 +323,13 @@ inline std::string cacheArmIdentity(
   // The size bound decides whether the weighted plan or the size-only one is
   // written.
   id += "|r" + std::to_string(tuning.maxSizeRegression);
+  // Each of these changes the plan or the encodings its sections are given.
+  id += "|dm" +
+      std::to_string(static_cast<int>(selector.decodeWeighting.model));
+  id += "|sn" + std::to_string(selector.decodeWeighting.sectionReadNanos);
+  id += "|sb" + std::to_string(selector.decodeWeighting.sizeBudget);
+  id += "|ms" + std::to_string(selector.maxSections);
+  id += "|sr" + std::to_string(tuning.sectionMaxSizeRegression);
   // Admission decides whether nested streams may pick SubIntSplit.
   id +=
       "|adm" + std::to_string(static_cast<int>(options.subIntSplit.admission));

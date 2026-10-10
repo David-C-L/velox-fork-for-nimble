@@ -15,6 +15,7 @@
  */
 
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -178,6 +179,124 @@ TEST_F(SubIntSplitDecodeOptionsTest, decodeCostCostsStorage) {
   prohibitive.selector.decodeCostBitsPerValue = 1'000.0;
 
   EXPECT_GT(encode(values, prohibitive).size(), encode(values, {}).size());
+}
+
+// The cap counts the sections a read visits, so no plan may exceed it, a
+// looser cap can only lower the DP's cost, and a cap no plan reaches has to
+// reproduce the uncapped plan.
+TEST_F(SubIntSplitDecodeOptionsTest, maxSectionsCapsTheSectionsARead) {
+  const auto values = makeMultiFieldValues(2'048);
+  const auto uncapped = subintsplit::selectSplits(values, 64, values.size());
+  const auto numRead = [](const subintsplit::SelectorResult& plan) {
+    int count = 0;
+    for (const auto& section : plan.sections) {
+      count += section.encoding != EncodingType::Constant ? 1 : 0;
+    }
+    return count;
+  };
+  ASSERT_GT(numRead(uncapped), 2);
+
+  double previousCost = std::numeric_limits<double>::infinity();
+  for (int cap = 1; cap <= numRead(uncapped) + 1; ++cap) {
+    auto config = subintsplit::defaultSelectorConfig();
+    config.maxSections = cap;
+    const auto plan =
+        subintsplit::selectSplits(values, 64, values.size(), config);
+    ASSERT_FALSE(plan.sections.empty()) << "cap " << cap;
+    EXPECT_LE(numRead(plan), cap);
+    EXPECT_LE(plan.totalCost, previousCost) << "cap " << cap;
+    EXPECT_GE(plan.totalCost, uncapped.totalCost) << "cap " << cap;
+    previousCost = plan.totalCost;
+    if (cap >= numRead(uncapped)) {
+      EXPECT_DOUBLE_EQ(plan.totalCost, uncapped.totalCost);
+      EXPECT_EQ(plan.sections.size(), uncapped.sections.size());
+    }
+
+    auto tuning = subintsplit::kDefaultTuningConfig;
+    tuning.selector.maxSections = cap;
+    const auto encoded = encode(values, tuning);
+    EXPECT_EQ(decode(encoded, values.size(), {}), values) << "cap " << cap;
+  }
+}
+
+// Re-pricing a candidate grid must give the grid the cost models would have
+// produced at that weight, or the budget search is searching something else.
+TEST_F(SubIntSplitDecodeOptionsTest, reweightedGridMatchesACostedGrid) {
+  const auto values = makeMultiFieldValues(2'048);
+  static const subintsplit::AllowedEncodings kAll;
+  auto config = subintsplit::defaultSelectorConfig();
+  config.streamRowCount = 100'000;
+  config.decodeWeighting.accessPattern = subintsplit::DecodeAccessPattern::Range;
+  config.decodeWeighting.readPath = subintsplit::DecodeReadPath::View;
+  const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+      values, 64, 100'000, kAll, config);
+  for (const double weight : {0.0, 0.01, 0.3, 5.0}) {
+    auto weighted = config;
+    weighted.decodeWeighting.weight = weight;
+    const auto expected = subintsplit::buildRestrictedCostGrid(
+        values, 64, 100'000, kAll, weighted);
+    const auto actual = subintsplit::reweightGrid(candidateGrid, weight);
+    ASSERT_EQ(expected.size(), actual.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      ASSERT_EQ(expected[i].encoding, actual[i].encoding)
+          << "weight " << weight << " cell " << i;
+      ASSERT_EQ(expected[i].weightedBits, actual[i].weightedBits)
+          << "weight " << weight << " cell " << i;
+      ASSERT_EQ(expected[i].sizeBits, actual[i].sizeBits)
+          << "weight " << weight << " cell " << i;
+    }
+  }
+}
+
+// A budget is a bound on estimated size and a promise about read cost: the
+// plan stays inside the budget, and a larger budget never reads slower.
+TEST_F(SubIntSplitDecodeOptionsTest, sizeBudgetBoundsSizeAndIsMonotone) {
+  const auto values = makeMultiFieldValues(2'048);
+  static const subintsplit::AllowedEncodings kAll;
+  for (const auto pattern :
+       {subintsplit::DecodeAccessPattern::Bulk,
+        subintsplit::DecodeAccessPattern::Point,
+        subintsplit::DecodeAccessPattern::Range}) {
+    auto config = subintsplit::defaultSelectorConfig();
+    config.streamRowCount = values.size();
+    config.decodeWeighting.accessPattern = pattern;
+    config.decodeWeighting.readPath = subintsplit::DecodeReadPath::View;
+    config.decodeWeighting.sectionReadNanos = 1.0;
+    const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+        values, 64, values.size(), kAll, config);
+    double previousNanos = std::numeric_limits<double>::infinity();
+    for (const double budget : {0.0, 0.01, 0.02, 0.05, 0.1, 0.5, 10.0}) {
+      config.decodeWeighting.sizeBudget = budget;
+      const auto budgeted =
+          subintsplit::selectSplitsWithinSizeBudget(candidateGrid, 64, config);
+      ASSERT_FALSE(budgeted.plan.sections.empty());
+      EXPECT_LE(
+          budgeted.plan.totalSizeBits, budgeted.sizeOnlyBits * (1.0 + budget));
+      const double nanos = subintsplit::planReadNanos(budgeted.plan);
+      EXPECT_LE(nanos, previousNanos) << "budget " << budget;
+      EXPECT_LE(nanos, budgeted.sizeOnlyReadNanos);
+      previousNanos = nanos;
+
+      auto tuning = subintsplit::kDefaultTuningConfig;
+      tuning.selector.decodeWeighting = config.decodeWeighting;
+      const auto encoded = encode(values, tuning);
+      EXPECT_EQ(decode(encoded, values.size(), {}), values)
+          << "budget " << budget;
+    }
+  }
+}
+
+// The new knobs are opt-in: at their defaults the bytes are the bytes.
+TEST_F(SubIntSplitDecodeOptionsTest, readCostKnobDefaultsKeepTheBytes) {
+  const auto values = makeMultiFieldValues(10'000);
+  auto explicitDefaults = subintsplit::kDefaultTuningConfig;
+  explicitDefaults.selector.maxSections = 0;
+  explicitDefaults.selector.decodeWeighting.sizeBudget = -1.0;
+  explicitDefaults.selector.decodeWeighting.sectionReadNanos = 0.0;
+  explicitDefaults.selector.decodeWeighting.model =
+      subintsplit::DecodeCostModel::kOriginal;
+  explicitDefaults.sectionMaxSizeRegression = -1.0;
+  EXPECT_EQ(encode(values, {}), encode(values, explicitDefaults));
 }
 
 } // namespace

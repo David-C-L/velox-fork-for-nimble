@@ -169,6 +169,17 @@ struct Options {
   /// against what size-only selection would have chosen.
   double maxSizeRegression{0.05};
 
+  /// maxSizeRegression for a whole plan, where a planner priced with these
+  /// options bounds one. Negative, the default, uses maxSizeRegression.
+  double planMaxSizeRegression{-1.0};
+
+  /// The rate table section decode is costed with when decodeWeight is
+  /// non-zero. See DecodeCostWeighting::model.
+  DecodeCostModel decodeCostModel{DecodeCostModel::kOriginal};
+
+  /// See DecodeCostWeighting::sectionReadNanos.
+  double decodeSectionReadNanos{0.0};
+
   /// How top-level selection admits SubIntSplit. kEstimate, the default,
   /// keeps SubIntSplitEncoding::estimateSize competing with the other
   /// candidates. kBitFlip offers SubIntSplit as a candidate only when the

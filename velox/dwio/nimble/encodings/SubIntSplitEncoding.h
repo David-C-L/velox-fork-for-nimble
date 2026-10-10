@@ -127,7 +127,14 @@ inline Encoding::Options sectionEncodingOptions(
       tuning.selector.decodeWeighting.accessPattern;
   sectionOptions.subIntSplit.decodeReadPath =
       tuning.selector.decodeWeighting.readPath;
-  sectionOptions.subIntSplit.maxSizeRegression = tuning.maxSizeRegression;
+  sectionOptions.subIntSplit.decodeCostModel =
+      tuning.selector.decodeWeighting.model;
+  sectionOptions.subIntSplit.decodeSectionReadNanos =
+      tuning.selector.decodeWeighting.sectionReadNanos;
+  sectionOptions.subIntSplit.maxSizeRegression =
+      tuning.sectionMaxSizeRegression >= 0.0 ? tuning.sectionMaxSizeRegression
+                                             : tuning.maxSizeRegression;
+  sectionOptions.subIntSplit.planMaxSizeRegression = tuning.maxSizeRegression;
   sectionOptions.subIntSplit.sectionCandidates = tuning.sectionCandidates;
   return sectionOptions;
 }
@@ -1824,6 +1831,69 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
 
   constexpr int kBits = static_cast<int>(sizeof(physicalType) * 8);
 
+  // A size budget is resolved to the decode weight whose plan reads cheapest
+  // inside it, and the stream is then encoded at that weight: the planner and
+  // every section's encoding selection trade size for read cost at one
+  // exchange rate. The grid the search settled on is handed over so it is
+  // costed once.
+  if (tuning.selector.decodeWeighting.sizeBudget >= 0.0) {
+    const auto budgetMode =
+        selection.getConfig(std::string(subintsplit::kSplitModeConfigKey));
+    const bool budgetReplayed = budgetMode.has_value() &&
+        *budgetMode == subintsplit::kSplitModePreserve;
+    subintsplit::TuningConfig resolved = tuning;
+    resolved.selector.decodeWeighting.sizeBudget = -1.0;
+    resolved.selector.decodeWeighting.weight = 0.0;
+    if (budgetReplayed) {
+      return encodeResiduals(
+          selection,
+          values,
+          buffer,
+          options,
+          resolved,
+          rowFrame,
+          planning,
+          extraFlags,
+          stepFrame,
+          stepResiduals);
+    }
+    PlanningSample budgeted;
+    if (planning != nullptr) {
+      budgeted.sample = std::move(planning->sample);
+    } else {
+      subintsplit::sampleIntoU64<physicalType>(
+          values, budgeted.sample, tuning.sampler);
+    }
+    const auto budgetConfig = plannerSelectorConfig(tuning, valueCount);
+    const auto candidateGrid = subintsplit::buildSectionCandidateGrid(
+        budgeted.sample,
+        kBits,
+        valueCount,
+        tuning.allowedEncodings,
+        budgetConfig);
+    auto budgetedPlan = subintsplit::selectSplitsWithinSizeBudget(
+        candidateGrid, kBits, budgetConfig);
+    budgeted.grid = std::move(budgetedPlan.grid);
+    resolved.selector.decodeWeighting.weight = budgetedPlan.weight;
+    resolved.decodeWeightResolved = true;
+    resolved.maxSizeRegression = tuning.selector.decodeWeighting.sizeBudget;
+    if (resolved.sectionMaxSizeRegression < 0.0) {
+      resolved.sectionMaxSizeRegression =
+          std::numeric_limits<double>::infinity();
+    }
+    return encodeResiduals(
+        selection,
+        values,
+        buffer,
+        options,
+        resolved,
+        rowFrame,
+        &budgeted,
+        extraFlags,
+        stepFrame,
+        stepResiduals);
+  }
+
   std::vector<subintsplit::SectionPlan> segments;
   // What the planner thinks its own plan stores the column in. Infinite for a
   // replayed layout, which was not planned here and so was never priced. Read
@@ -1879,7 +1949,7 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
             cuts[boundary] = true;
           }
         }
-        const auto shortlist = planning != nullptr
+        auto shortlist = planning != nullptr
             ? subintsplit::shortlistSplitsOverGrid(
                   planning->grid,
                   kBits,
@@ -1894,6 +1964,22 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
                   selectorConfig,
                   subintsplit::kHybridShortlist,
                   cuts);
+        // The shortlist is not held to maxSections, so the capped DP's plan
+        // is nominated for the refiner to start from one that is.
+        if (selectorConfig.maxSections > 0) {
+          auto capped = planning != nullptr
+              ? subintsplit::selectSplitsOverGrid(
+                    planning->grid, kBits, selectorConfig)
+              : subintsplit::selectSplitsRestricted(
+                    sampleBuf,
+                    kBits,
+                    valueCount,
+                    tuning.allowedEncodings,
+                    selectorConfig);
+          if (!capped.sections.empty()) {
+            shortlist.insert(shortlist.begin(), std::move(capped.sections));
+          }
+        }
         auto refined =
             subintsplit::SubIntSplitPlanRefiner::refine<physicalType>(
                 values,
@@ -1932,7 +2018,8 @@ std::string_view SubIntSplitEncoding<T>::encodeResiduals(
       // given up, since the weighted plan's own totalSizeBits says what it
       // stores and not what it could have stored. Paid only when the weight is
       // on, and the sample is the same one already extracted.
-      if (selectorConfig.decodeWeighting.weight != 0.0) {
+      if (selectorConfig.decodeWeighting.weight != 0.0 &&
+          !tuning.decodeWeightResolved) {
         auto sizeOnlyConfig = selectorConfig;
         sizeOnlyConfig.decodeWeighting = subintsplit::DecodeCostWeighting{};
         auto sizeOnly = subintsplit::selectSplitsRestricted(

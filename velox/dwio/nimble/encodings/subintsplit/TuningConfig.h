@@ -94,6 +94,17 @@ struct TuningConfig {
   /// selection. Inert at the default decode weight of zero.
   double maxSizeRegression{0.05};
 
+  /// maxSizeRegression for a section's own encoding selection, when the
+  /// section should be held to a different bound from the plan. Negative, the
+  /// default, uses maxSizeRegression.
+  double sectionMaxSizeRegression{-1.0};
+
+  /// Set by the encoder once a size budget (selector.decodeWeighting
+  /// .sizeBudget) has been resolved to a decode weight: the plan handed over
+  /// is already inside the budget, so it is not compared with the size-only
+  /// plan again. Never set by a caller.
+  bool decodeWeightResolved{false};
+
   /// Executor sections are encoded on concurrently. Null encodes them one
   /// after another on the calling thread.
   folly::Executor* sectionExecutor{nullptr};

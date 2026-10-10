@@ -351,8 +351,20 @@ std::unique_ptr<NimbleBenchTargetBase<T>> makeTargetOrSkip(
           FLAGS_mlidc_sis_decode_access_pattern),
       .readPath = static_cast<subintsplit::DecodeReadPath>(
           FLAGS_mlidc_sis_decode_read_path),
+      .model = static_cast<subintsplit::DecodeCostModel>(
+          FLAGS_mlidc_sis_decode_cost_model),
+      .sectionReadNanos = FLAGS_mlidc_sis_section_read_nanos,
+      .sizeBudget = FLAGS_mlidc_sis_size_budget,
   };
   tuning.maxSizeRegression = FLAGS_mlidc_sis_max_size_regression;
+  tuning.sectionMaxSizeRegression =
+      FLAGS_mlidc_sis_section_max_size_regression;
+  tuning.selector.maxSections = FLAGS_mlidc_sis_max_sections;
+  tuning.selector.minSectionWidth = FLAGS_mlidc_sis_min_section_width;
+  if (FLAGS_mlidc_sis_max_candidate_boundaries >= 0) {
+    tuning.selector.maxCandidateBoundaries =
+        static_cast<size_t>(FLAGS_mlidc_sis_max_candidate_boundaries);
+  }
   tuning.rowFrame = FLAGS_mlidc_sis_row_frame;
   applyPlannerFlags(tuning);
   // Admission and the estimate guards decide whether a stream picks

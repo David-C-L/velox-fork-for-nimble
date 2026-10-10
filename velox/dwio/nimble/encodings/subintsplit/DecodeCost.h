@@ -70,6 +70,15 @@ inline bool paysSectionOpen(DecodeReadPath readPath) noexcept {
       readPath == DecodeReadPath::ViewWithOpen;
 }
 
+/// Which rate table prices decode.
+enum class DecodeCostModel : uint8_t {
+  /// cursorDecodeRate and viewDecodeRate.
+  kOriginal = 0,
+  /// calibratedDecodeRate: per-section costs fitted on whole-plan reads
+  /// through the view at 524,288 rows.
+  kCalibrated = 1,
+};
+
 /// How well a rate is supported by measurement. A model that cannot say this
 /// invites its weakest numbers to be read as its strongest.
 enum class DecodeCostConfidence : uint8_t {
@@ -397,6 +406,27 @@ inline DecodeRate decodeRate(
   return rate;
 }
 
+// CALIBRATED_RATES_BEGIN
+/// Nanoseconds per row read that one more section costs a read through
+/// `readPath` under `pattern`, whatever the section stores.
+/// TODO: Calibrate.
+inline double calibratedSectionReadNanos(
+    DecodeAccessPattern /*pattern*/,
+    DecodeReadPath /*readPath*/) noexcept {
+  return 0.0;
+}
+
+/// The calibrated decode rate for `encodingType` under `pattern`, on
+/// `readPath`.
+/// TODO: Calibrate.
+inline DecodeRate calibratedDecodeRate(
+    EncodingType encodingType,
+    DecodeAccessPattern pattern,
+    DecodeReadPath readPath) noexcept {
+  return decodeRate(encodingType, pattern, readPath);
+}
+// CALIBRATED_RATES_END
+
 /// Nanoseconds per row a section of `estimatedSizeBits` over `numValues` rows
 /// costs to decode, under `pattern`, on `readPath`.
 ///
@@ -442,7 +472,67 @@ struct DecodeCostWeighting {
   double weight{0.0};
   DecodeAccessPattern accessPattern{DecodeAccessPattern::Bulk};
   DecodeReadPath readPath{DecodeReadPath::Cursor};
+  /// Which rate table prices a section's decode. kOriginal, the default,
+  /// leaves every price as it was.
+  DecodeCostModel model{DecodeCostModel::kOriginal};
+  /// Nanoseconds per row read charged to every section that is not Constant,
+  /// on top of its encoding's rate: what one more section costs a read
+  /// whatever it stores. Zero, the default, charges nothing. Negative takes
+  /// calibratedSectionReadNanos for the pattern and read path.
+  double sectionReadNanos{0.0};
+  /// The most estimated size, as a fraction of the size-only plan's, that the
+  /// planner may spend on read cost. When non-negative the planner ignores
+  /// `weight` and searches for the weight whose plan has the lowest predicted
+  /// read cost within the budget. Negative, the default, is off.
+  double sizeBudget{-1.0};
+
+  /// Whether any decode pricing is requested.
+  bool active() const noexcept {
+    return weight != 0.0 || sizeBudget >= 0.0;
+  }
 };
+
+/// The per-section read cost `weighting` charges, resolving a negative
+/// sectionReadNanos to the calibrated figure.
+inline double sectionReadNanosFor(const DecodeCostWeighting& weighting) noexcept {
+  return weighting.sectionReadNanos >= 0.0
+      ? weighting.sectionReadNanos
+      : calibratedSectionReadNanos(weighting.accessPattern, weighting.readPath);
+}
+
+/// Nanoseconds per row read a section costs under `weighting`: its
+/// encoding's rate from the weighting's rate table, plus the per-section
+/// term when the section is not Constant. With the default model and a zero
+/// per-section term this is decodeNanosPerRow above, bit for bit.
+inline double decodeNanosPerRow(
+    EncodingType encodingType,
+    const DecodeCostWeighting& weighting,
+    double estimatedSizeBits,
+    size_t numValues) noexcept {
+  if (numValues == 0 || !std::isfinite(estimatedSizeBits)) {
+    return 0.0;
+  }
+  double nanos = 0.0;
+  if (weighting.model == DecodeCostModel::kCalibrated) {
+    const DecodeRate rate = calibratedDecodeRate(
+        encodingType, weighting.accessPattern, weighting.readPath);
+    const double bytesPerRow =
+        estimatedSizeBits / 8.0 / static_cast<double>(numValues);
+    nanos = rate.baseNanosPerRow + rate.nanosPerEncodedByteRow * bytesPerRow;
+  } else {
+    nanos = decodeNanosPerRow(
+        encodingType,
+        weighting.accessPattern,
+        weighting.readPath,
+        estimatedSizeBits,
+        numValues);
+  }
+  if (encodingType != EncodingType::Constant &&
+      weighting.sectionReadNanos != 0.0) {
+    nanos += sectionReadNanosFor(weighting);
+  }
+  return nanos;
+}
 
 /// The whole-plan decode cost of sections whose individual costs are
 /// `perSectionNanosPerRow`.

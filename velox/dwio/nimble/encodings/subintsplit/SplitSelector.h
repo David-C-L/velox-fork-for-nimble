@@ -105,6 +105,9 @@ struct SelectorConfig {
   /// sample's adjacent pairs) instead of deltaCostBits. Off by default, which
   /// leaves every plan unchanged; SectionCandidates::kUnrestricted sets it.
   bool deltaCostModelV2{false};
+  /// Most sections a plan may have that a read has to visit, which is every
+  /// section not encoded Constant. 0, the default, is unlimited.
+  int maxSections{0};
 };
 
 /// Extra bits the DP charges each section after the first.
@@ -597,12 +600,109 @@ inline std::vector<SectionCost> buildSectionCostGrid(
       std::forward<CostFn>(costFn));
 }
 
+/// Whether a read has to visit a section costed as `cell`. Constant sections
+/// are folded into one word when a stream is opened and cost a read nothing.
+inline bool countsTowardMaxSections(const SectionCost& cell) noexcept {
+  return !cell.trimmedEdge && cell.encoding != EncodingType::Constant;
+}
+
+/// The split DP held to at most cfg.maxSections sections a read visits:
+/// best[c][i] is the cheapest cover of bits [0, i) using c such sections.
+/// Returns no sections when no cover fits under the cap.
+inline SelectorResult selectSplitsOverGridCapped(
+    const std::vector<SectionCost>& bestCost,
+    int sz,
+    const SelectorConfig& cfg) {
+  const int cap = cfg.maxSections;
+  const size_t width = static_cast<size_t>(sz) + 1;
+  const double infinity = std::numeric_limits<double>::infinity();
+  std::vector<double> best(static_cast<size_t>(cap + 1) * width, infinity);
+  std::vector<int> prev(static_cast<size_t>(cap + 1) * width, -1);
+  best[0] = 0.0;
+  for (int i = 1; i <= sz; ++i) {
+    for (int j = 0; j < i; ++j) {
+      if (i - j < cfg.minSectionWidth) {
+        continue;
+      }
+      const auto& choice = bestCost[j * sz + (i - 1)];
+      if (!std::isfinite(choice.weightedBits)) {
+        continue;
+      }
+      const double splitCost = startsFreeSection(bestCost, j, choice)
+          ? 0.0
+          : sectionPenaltyBits(cfg);
+      const int counted = countsTowardMaxSections(choice) ? 1 : 0;
+      for (int c = 0; c + counted <= cap; ++c) {
+        const double before = best[static_cast<size_t>(c) * width + j];
+        if (!std::isfinite(before)) {
+          continue;
+        }
+        const double candidate = before + choice.weightedBits + splitCost;
+        const size_t at = static_cast<size_t>(c + counted) * width + i;
+        if (candidate < best[at]) {
+          best[at] = candidate;
+          prev[at] = j;
+        }
+      }
+    }
+  }
+
+  int bestCount = -1;
+  for (int c = 0; c <= cap; ++c) {
+    const double total = best[static_cast<size_t>(c) * width + sz];
+    if (std::isfinite(total) &&
+        (bestCount < 0 ||
+         total < best[static_cast<size_t>(bestCount) * width + sz])) {
+      bestCount = c;
+    }
+  }
+  SelectorResult result;
+  if (bestCount < 0) {
+    return result;
+  }
+  result.totalCost = best[static_cast<size_t>(bestCount) * width + sz];
+  int idx = sz;
+  int count = bestCount;
+  while (idx > 0) {
+    const int start = prev[static_cast<size_t>(count) * width + idx];
+    const SectionCost& cell = bestCost[start * sz + (idx - 1)];
+    SectionPlan plan;
+    plan.bitStart = start;
+    plan.bitEnd = idx - 1;
+    plan.encoding = cell.encoding;
+    plan.cost = cell.weightedBits;
+    plan.sizeCostBits = cell.sizeBits;
+    plan.decodeNanosPerRow = cell.decodeNanosPerRow;
+    result.sections.push_back(plan);
+    count -= countsTowardMaxSections(cell) ? 1 : 0;
+    idx = start;
+  }
+  std::reverse(result.sections.begin(), result.sections.end());
+  std::vector<double> sectionNanos;
+  sectionNanos.reserve(result.sections.size());
+  for (const auto& segment : result.sections) {
+    result.totalSizeBits += segment.sizeCostBits;
+    sectionNanos.push_back(segment.decodeNanosPerRow);
+  }
+  result.totalDecodeNanosPerRow = combineSectionDecodeNanos(
+      cfg.decodeWeighting.accessPattern,
+      cfg.decodeWeighting.readPath,
+      sectionNanos);
+  return result;
+}
+
 // Runs the split DP over a grid buildSectionCostGrid already costed, so a
 // caller pricing the same sample more than once pays for the grid once.
 inline SelectorResult selectSplitsOverGrid(
     const std::vector<SectionCost>& bestCost,
     int sz,
     const SelectorConfig& cfg) {
+  if (cfg.maxSections > 0) {
+    auto capped = selectSplitsOverGridCapped(bestCost, sz, cfg);
+    if (!capped.sections.empty()) {
+      return capped;
+    }
+  }
   std::vector<double> dp(sz + 1, std::numeric_limits<double>::infinity());
   std::vector<int> prev(sz + 1, -1);
   std::vector<EncodingType> chosen(sz + 1, EncodingType::Trivial);
@@ -723,8 +823,10 @@ inline bool allowsConstant(const AllowedEncodings& allowed) {
 // Holds a reference to `allowed`, which must outlive it.
 inline auto restrictedSectionCostFn(
     const AllowedEncodings& allowed,
-    const SelectorConfig& cfg) {
+    const SelectorConfig& cfg,
+    std::vector<std::vector<SectionCandidate>>* candidateSink = nullptr) {
   return [&allowed,
+          candidateSink,
           allowHuffman = cfg.allowHuffman,
           allowDeltaBlock = cfg.allowDeltaBlock,
           weighting = cfg.decodeWeighting,
@@ -737,7 +839,24 @@ inline auto restrictedSectionCostFn(
              size_t streamCount,
              int bitWidth,
              const std::vector<uint64_t>& segValues) noexcept {
-    return bestSectionCost(
+    if (candidateSink == nullptr) {
+      return bestSectionCost(
+          m,
+          numValues,
+          streamCount,
+          bitWidth,
+          segValues,
+          allowed,
+          allowHuffman,
+          allowDeltaBlock,
+          weighting,
+          excluded,
+          costModelV2,
+          sampleBlockSize,
+          deltaCostModelV2);
+    }
+    candidateSink->emplace_back();
+    SectionCost cell = bestSectionCost(
         m,
         numValues,
         streamCount,
@@ -750,7 +869,10 @@ inline auto restrictedSectionCostFn(
         excluded,
         costModelV2,
         sampleBlockSize,
-        deltaCostModelV2);
+        deltaCostModelV2,
+        &candidateSink->back());
+    cell.candidateIndex = static_cast<int32_t>(candidateSink->size() - 1);
+    return cell;
   };
 }
 
@@ -799,6 +921,145 @@ inline SelectorResult selectSplits(
     const SelectorConfig& cfg = defaultSelectorConfig()) {
   static const AllowedEncodings kAll;
   return selectSplitsRestricted(samples, kBits, fullCount, kAll, cfg);
+}
+
+/// A split grid that also keeps every encoding each cell was priced against,
+/// so the grid can be re-priced at any decode weight without costing the
+/// sample again.
+struct SectionCandidateGrid {
+  /// The grid as costed at the weight it was built with.
+  std::vector<SectionCost> grid;
+  /// candidates[cell.candidateIndex]: sizes on the sample, unscaled.
+  std::vector<std::vector<SectionCandidate>> candidates;
+  size_t numSamples{0};
+  size_t fullCount{0};
+};
+
+/// buildRestrictedCostGrid, keeping each cell's candidates.
+inline SectionCandidateGrid buildSectionCandidateGrid(
+    const std::vector<uint64_t>& samples,
+    int sz,
+    size_t fullCount,
+    const AllowedEncodings& allowed,
+    const SelectorConfig& cfg) {
+  SectionCandidateGrid result;
+  result.numSamples = samples.size();
+  result.fullCount = fullCount;
+  result.grid = buildSectionCostGrid(
+      samples,
+      sz,
+      fullCount,
+      cfg,
+      makeGridLayout(samples, sz, cfg, allowsConstant(allowed)),
+      restrictedSectionCostFn(allowed, cfg, &result.candidates));
+  return result;
+}
+
+/// The grid of `candidateGrid` as bestSectionCost would have costed it at
+/// decode weight `weight`.
+inline std::vector<SectionCost> reweightGrid(
+    const SectionCandidateGrid& candidateGrid,
+    double weight) {
+  std::vector<SectionCost> grid = candidateGrid.grid;
+  const double scale = static_cast<double>(candidateGrid.fullCount) /
+      static_cast<double>(candidateGrid.numSamples);
+  for (auto& cell : grid) {
+    if (cell.candidateIndex < 0) {
+      continue;
+    }
+    SectionCost best;
+    best.candidateIndex = cell.candidateIndex;
+    for (const auto& candidate :
+         candidateGrid.candidates[static_cast<size_t>(cell.candidateIndex)]) {
+      const double weighted = candidate.sizeBits +
+          decodeCostBits(
+              candidate.decodeNanosPerRow, candidateGrid.numSamples, weight);
+      if (weighted < best.weightedBits) {
+        best.weightedBits = weighted;
+        best.sizeBits = candidate.sizeBits;
+        best.decodeNanosPerRow = candidate.decodeNanosPerRow;
+        best.encoding = candidate.encoding;
+      }
+    }
+    best.weightedBits *= scale;
+    best.sizeBits *= scale;
+    cell = best;
+  }
+  return grid;
+}
+
+/// What a plan is predicted to cost a read, in nanoseconds per row read: the
+/// sum of its sections' decode costs, each of which already carries the
+/// per-section term of the weighting it was priced under.
+inline double planReadNanos(const SelectorResult& plan) noexcept {
+  double total = 0.0;
+  for (const auto& section : plan.sections) {
+    total += section.decodeNanosPerRow;
+  }
+  return total;
+}
+
+/// The plan selectSplitsWithinSizeBudget settled on, and the weight that
+/// produced it.
+struct BudgetedPlan {
+  SelectorResult plan;
+  /// The decode weight whose DP optimum `plan` is. Section encoding selection
+  /// is run at the same weight so the two agree on the exchange rate.
+  double weight{0.0};
+  /// The re-priced grid `plan` was selected over.
+  std::vector<SectionCost> grid;
+  /// Estimated size of the size-only plan, the budget's reference.
+  double sizeOnlyBits{0.0};
+  /// Predicted read cost of the size-only plan.
+  double sizeOnlyReadNanos{0.0};
+};
+
+/// Weights the budget search prices the grid at: a geometric ladder wide
+/// enough to cross from "decode is free" to "size is free" for every pattern,
+/// whose per-row costs span about four orders of magnitude.
+inline constexpr double kBudgetLadderFirstWeight = 1e-6;
+inline constexpr double kBudgetLadderStep = 1.4;
+inline constexpr int kBudgetLadderSteps = 62;
+
+/// Minimises predicted read cost subject to an estimated size at most
+/// (1 + cfg.decodeWeighting.sizeBudget) times the size-only plan's.
+///
+/// Every plan considered is the optimum of size + weight * read for some
+/// weight, so along the ladder size never falls and read cost never rises;
+/// the result is the last rung still inside the budget. A larger budget
+/// therefore never returns a plan predicted to read slower.
+inline BudgetedPlan selectSplitsWithinSizeBudget(
+    const SectionCandidateGrid& candidateGrid,
+    int sz,
+    const SelectorConfig& cfg) {
+  BudgetedPlan best;
+  best.grid = reweightGrid(candidateGrid, 0.0);
+  best.plan = selectSplitsOverGrid(best.grid, sz, cfg);
+  best.sizeOnlyBits = best.plan.totalSizeBits;
+  best.sizeOnlyReadNanos = planReadNanos(best.plan);
+  const double allowedBits =
+      best.sizeOnlyBits * (1.0 + std::max(0.0, cfg.decodeWeighting.sizeBudget));
+  double bestNanos = best.sizeOnlyReadNanos;
+  double weight = kBudgetLadderFirstWeight;
+  for (int step = 0; step < kBudgetLadderSteps;
+       ++step, weight *= kBudgetLadderStep) {
+    auto grid = reweightGrid(candidateGrid, weight);
+    auto plan = selectSplitsOverGrid(grid, sz, cfg);
+    if (plan.sections.empty() || !std::isfinite(plan.totalSizeBits)) {
+      continue;
+    }
+    if (plan.totalSizeBits > allowedBits) {
+      continue;
+    }
+    const double nanos = planReadNanos(plan);
+    if (nanos < bestNanos) {
+      bestNanos = nanos;
+      best.plan = std::move(plan);
+      best.grid = std::move(grid);
+      best.weight = weight;
+    }
+  }
+  return best;
 }
 
 // The k cheapest segmentations of [0, sz) over `grid`, cheapest first, under

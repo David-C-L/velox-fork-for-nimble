@@ -926,6 +926,19 @@ struct SectionCost {
   /// A trimmed constant edge: it pays no section penalty, and the varying
   /// range after it is priced as the first section, as when it is padded on.
   bool trimmedEdge{false};
+  /// Index of this cell's candidate list in a SectionCandidateGrid, or -1
+  /// where none was recorded.
+  int32_t candidateIndex{-1};
+};
+
+/// One encoding a section could be given: its estimated size on the sample
+/// and what it costs to read. Recorded per grid cell only when a caller asks,
+/// so the cell can be re-priced at another decode weight without costing the
+/// sample again.
+struct SectionCandidate {
+  double sizeBits{0.0};
+  double decodeNanosPerRow{0.0};
+  EncodingType encoding{EncodingType::Trivial};
 };
 
 /// Prices `allowed` on size and decode together and returns the cheapest
@@ -948,7 +961,8 @@ inline SectionCost bestSectionCost(
     const AllowedEncodings& excluded = {},
     bool costModelV2 = false,
     size_t sampleBlockSize = 0,
-    bool deltaCostModelV2 = false) noexcept {
+    bool deltaCostModelV2 = false,
+    std::vector<SectionCandidate>* candidates = nullptr) noexcept {
   SectionCost best;
   auto consider = [&](double sizeBits, EncodingType type) noexcept {
     if (!allowed.empty() && allowed.count(type) == 0) {
@@ -962,8 +976,11 @@ inline SectionCost bestSectionCost(
     if (!std::isfinite(sizeBits)) {
       return;
     }
-    const double decodeNanos = decodeNanosPerRow(
-        type, weighting.accessPattern, weighting.readPath, sizeBits, numValues);
+    const double decodeNanos =
+        decodeNanosPerRow(type, weighting, sizeBits, numValues);
+    if (candidates != nullptr) {
+      candidates->push_back({sizeBits, decodeNanos, type});
+    }
     const double weighted =
         sizeBits + decodeCostBits(decodeNanos, numValues, weighting.weight);
     if (weighted < best.weightedBits) {

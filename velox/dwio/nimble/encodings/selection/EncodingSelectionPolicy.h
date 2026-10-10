@@ -395,8 +395,13 @@ SelectedCandidate selectCandidate(
     if (decodeWeight != 0.0) {
       const double nanosPerRow = subintsplit::decodeNanosPerRow(
           encodingType,
-          subIntSplitOptions.decodeAccessPattern,
-          subIntSplitOptions.decodeReadPath,
+          subintsplit::DecodeCostWeighting{
+              .weight = decodeWeight,
+              .accessPattern = subIntSplitOptions.decodeAccessPattern,
+              .readPath = subIntSplitOptions.decodeReadPath,
+              .model = subIntSplitOptions.decodeCostModel,
+              .sectionReadNanos = subIntSplitOptions.decodeSectionReadNanos,
+          },
           static_cast<double>(estimatedSize.value()) * 8.0,
           values.size());
       cost += subintsplit::decodeCostBits(
