@@ -159,26 +159,34 @@ class MainlyConstantEncodingView final : public TypedEncodingView<T> {
       return;
     }
     uint32_t rank = uncommonBefore(offset);
-    // A long read takes its uncommon values in one read of the child, so a
-    // child that decodes whole on a long read does so once instead of being
-    // asked for a few rows per block, and places them without a branch per
-    // row, which mispredicts when uncommon rows are frequent.
+    // A long read takes its uncommon values in one read of the child and
+    // places them a word of flags at a time, visiting only the set bits, so
+    // the cost follows the uncommon rows and no branch depends on a row.
     if (length > kBlockRows) {
       const uint32_t numOthers = uncommonBefore(offset + length) - rank;
+      std::fill(output, output + length, commonValue_);
       if (numOthers == 0) {
-        std::fill(output, output + length, commonValue_);
         return;
       }
-      // One spare slot: the fill reads the next uncommon value before it
-      // knows whether the row takes it.
-      const auto allOthers = std::make_unique<physicalType[]>(numOthers + 1);
+      const auto allOthers = std::make_unique<physicalType[]>(numOthers);
       otherValues_->read(rank, numOthers, allOthers.get());
-      allOthers[numOthers] = commonValue_;
+      const uint32_t end = offset + length;
       uint32_t next = 0;
-      for (uint32_t i = 0; i < length; ++i) {
-        const uint32_t uncommon = isUncommon(offset + i) ? 1 : 0;
-        output[i] = uncommon != 0 ? allOthers[next] : commonValue_;
-        next += uncommon;
+      for (uint32_t word = offset / 64; word <= (end - 1) / 64; ++word) {
+        uint64_t bits = uncommon_[word];
+        const uint32_t wordStart = word * 64;
+        if (wordStart < offset) {
+          bits &= ~uint64_t{0} << (offset - wordStart);
+        }
+        if (end - wordStart < 64) {
+          bits &= (uint64_t{1} << (end - wordStart)) - 1;
+        }
+        while (bits != 0) {
+          const uint32_t row =
+              wordStart + static_cast<uint32_t>(__builtin_ctzll(bits));
+          output[row - offset] = allOthers[next++];
+          bits &= bits - 1;
+        }
       }
       return;
     }
