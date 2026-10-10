@@ -15,9 +15,9 @@
  */
 #pragma once
 
-#include <memory>
 #include <algorithm>
 #include <array>
+#include <memory>
 
 #include "velox/dwio/nimble/common/Vector.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
@@ -69,6 +69,18 @@ class MainlyConstantEncodingView final : public TypedEncodingView<T> {
   ~MainlyConstantEncodingView() override {
     this->releaseVectorBuffer(blockRanks_);
     this->releaseVectorBuffer(uncommon_);
+  }
+
+  /// Passes a caller's hint down in the child's own rows: a caller about to
+  /// read every row is about to read every uncommon value, and a child that
+  /// decodes whole on a long read has to be told so, since each piece of the
+  /// read asks it for only that piece's uncommon values.
+  void willRead(uint32_t rows) const final {
+    const uint64_t numOthers = otherValues_->rowCount();
+    otherValues_->willRead(
+        rows >= this->rowCount_
+            ? static_cast<uint32_t>(numOthers)
+            : static_cast<uint32_t>(numOthers * rows / this->rowCount_));
   }
 
  private:
