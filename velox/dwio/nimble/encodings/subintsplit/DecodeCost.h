@@ -424,7 +424,7 @@ inline double calibratedSectionReadNanos(
   switch (pattern) {
     case DecodeAccessPattern::Point:
     case DecodeAccessPattern::Gather:
-      return 30.0;
+      return 12.0;
     case DecodeAccessPattern::Bulk:
     case DecodeAccessPattern::Range:
       return kViewAssemblyNanosPerRowPerSection;
@@ -436,14 +436,14 @@ inline double calibratedSectionReadNanos(
 /// `readPath`, excluding calibratedSectionReadNanos.
 ///
 /// View path only; the cursor paths return the original rates. Each figure is
-/// a least-squares fit, on relative error, of hot reads of 149 distinct plans
-/// over seven columns at 524,288 rows against how many sections of each
+/// a least-squares fit, on relative error, of hot reads of 251 distinct plans
+/// over eight columns at 524,288 rows against how many sections of each
 /// encoding the plan has (taz, 2026-10-10). Point is nanoseconds per probe
 /// and fits to a median 6% error; range is nanoseconds per row of a 64-row
-/// range (17%); bulk is nanoseconds per row of a full scan (13%, but up to
-/// 70% on columns the fit did not see, since a section's width matters there
-/// and is not modelled). Encodings no measured plan used keep their original
-/// rate.
+/// range (19%); bulk is nanoseconds per row of a full scan (20%, and up to
+/// 78% on a column held out of the fit, since a section's width matters
+/// there and is not modelled). Encodings no measured plan used keep their
+/// original rate.
 inline DecodeRate calibratedDecodeRate(
     EncodingType encodingType,
     DecodeAccessPattern pattern,
@@ -457,92 +457,51 @@ inline DecodeRate calibratedDecodeRate(
   if (encodingType == EncodingType::Constant) {
     return fitted(0.0);
   }
-  switch (pattern) {
-    case DecodeAccessPattern::Point:
-    case DecodeAccessPattern::Gather:
-      switch (encodingType) {
-        case EncodingType::Delta:
-          return fitted(0.0);
-        case EncodingType::Trivial:
-          return fitted(18.0);
-        case EncodingType::FixedBitWidth:
-          return fitted(28.0);
-        case EncodingType::PFOR:
-          return fitted(48.0);
-        case EncodingType::BlockBitPacking:
-          return fitted(51.0);
-        case EncodingType::FOR:
-          return fitted(58.0);
-        case EncodingType::MainlyConstant:
-          return fitted(63.0);
-        case EncodingType::SimdForBitpack:
-          return fitted(81.0);
-        case EncodingType::FrequencyPartition:
-          return fitted(93.0);
-        case EncodingType::RLE:
-          return fitted(156.0);
-        default: {
-          // The original point rates fold a 31 ns probe in.
-          DecodeRate rate = viewDecodeRate(encodingType, pattern);
-          rate.baseNanosPerRow = std::max(0.0, rate.baseNanosPerRow - 31.0);
-          return rate;
-        }
-      }
-    case DecodeAccessPattern::Range:
-      switch (encodingType) {
-        case EncodingType::Delta:
-          return fitted(0.0);
-        case EncodingType::MainlyConstant:
-          return fitted(0.4);
-        case EncodingType::Trivial:
-          return fitted(0.9);
-        case EncodingType::PFOR:
-          return fitted(3.3);
-        case EncodingType::FOR:
-          return fitted(3.6);
-        case EncodingType::SimdForBitpack:
-          return fitted(4.5);
-        case EncodingType::BlockBitPacking:
-          return fitted(7.1);
-        case EncodingType::RLE:
-          return fitted(7.6);
-        case EncodingType::FrequencyPartition:
-          return fitted(9.1);
-        case EncodingType::FixedBitWidth:
-          return fitted(9.5);
-        default:
-          return viewDecodeRate(encodingType, pattern);
-      }
-    case DecodeAccessPattern::Bulk:
-      switch (encodingType) {
-        case EncodingType::Trivial:
-          return fitted(0.1);
-        case EncodingType::PFOR:
-          return fitted(0.34);
-        // Fitted at zero, which the width of the section explains rather
-        // than the encoding; held at the original rates instead.
-        case EncodingType::Delta:
-          return fitted(0.37);
-        case EncodingType::FrequencyPartition:
-          return fitted(0.5);
-        case EncodingType::MainlyConstant:
-          return fitted(0.4);
-        case EncodingType::FixedBitWidth:
-          return fitted(0.75);
-        case EncodingType::RLE:
-          return fitted(1.28);
-        case EncodingType::BlockBitPacking:
-          return fitted(1.31);
-        case EncodingType::FOR:
-          return fitted(1.44);
-        case EncodingType::SimdForBitpack:
-          return fitted(2.0);
-        default:
-          return viewDecodeRate(encodingType, pattern);
-      }
+  struct Fit {
+    EncodingType encodingType;
+    double point;
+    double range;
+    double bulk;
+  };
+  // Point is net of calibratedSectionReadNanos. Bulk figures the fit put at
+  // zero are held at 0.1: a section's width explains them, not its encoding.
+  static constexpr Fit kFits[] = {
+      {EncodingType::Delta, 0.0, 0.0, 0.1},
+      {EncodingType::Trivial, 34.0, 1.3, 0.1},
+      {EncodingType::FixedBitWidth, 51.0, 7.85, 0.84},
+      {EncodingType::Dictionary, 53.0, 0.56, 0.1},
+      {EncodingType::MainlyConstant, 56.0, 0.2, 0.92},
+      {EncodingType::BlockBitPacking, 57.0, 3.98, 0.75},
+      {EncodingType::PFOR, 60.0, 3.85, 0.49},
+      {EncodingType::FOR, 71.0, 3.37, 1.71},
+      {EncodingType::SimdForBitpack, 91.0, 4.41, 2.44},
+      {EncodingType::FrequencyPartition, 108.0, 9.01, 0.19},
+      {EncodingType::RLE, 178.0, 8.38, 1.45},
+  };
+  for (const auto& fit : kFits) {
+    if (fit.encodingType != encodingType) {
+      continue;
+    }
+    switch (pattern) {
+      case DecodeAccessPattern::Point:
+      case DecodeAccessPattern::Gather:
+        return fitted(fit.point);
+      case DecodeAccessPattern::Range:
+        return fitted(fit.range);
+      case DecodeAccessPattern::Bulk:
+        return fitted(fit.bulk);
+    }
   }
-  return viewDecodeRate(encodingType, pattern);
+  // No measured plan used this encoding, so it keeps its original rate, net
+  // of the 31 ns probe the original point rates fold in.
+  DecodeRate rate = viewDecodeRate(encodingType, pattern);
+  if (pattern == DecodeAccessPattern::Point ||
+      pattern == DecodeAccessPattern::Gather) {
+    rate.baseNanosPerRow = std::max(0.0, rate.baseNanosPerRow - 31.0);
+  }
+  return rate;
 }
+// CALIBRATED_RATES_END
 
 /// Nanoseconds per row a section of `estimatedSizeBits` over `numValues` rows
 /// costs to decode, under `pattern`, on `readPath`.

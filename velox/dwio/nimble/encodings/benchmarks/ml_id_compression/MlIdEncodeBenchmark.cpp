@@ -141,9 +141,11 @@ int runBenchmark() {
     for (const auto& enc : context.encoders) {
       facebook::nimble::Encoding::Options opts;
       subintsplit::TuningConfig tuning;
-      // Only the upstream feature switches and the planner flags are applied
-      // here; other sweep flags do not reach this driver.
+      // Only the upstream feature switches, the read-cost flags and the
+      // planner flags are applied here; other sweep flags do not reach this
+      // driver.
       applyUpstreamFeatures(FLAGS_mlidc_sis_upstream_features, opts, tuning);
+      applyReadCostFlags(tuning);
       applyPlannerFlags(tuning);
       std::unique_ptr<NimbleBenchTargetBase<Elem>> target;
 
